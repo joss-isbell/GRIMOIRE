@@ -263,7 +263,7 @@ class McpIntegration:
                     t.name: {
                         "name": t.name,
                         "description": getattr(t, "description", "") or "",
-                        "inputSchema": getattr(t, "inputSchema", None) or {},
+                        "inputSchema": getattr(t, "input_schema", None) or {},
                     }
                     for t in resp.tools
                 }

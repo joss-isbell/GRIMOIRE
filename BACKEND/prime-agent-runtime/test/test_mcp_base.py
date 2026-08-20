@@ -32,7 +32,7 @@ class _FakeSession:
             t = Tool()
             t.name = name
             t.description = desc
-            t.inputSchema = schema
+            t.input_schema = schema
             return t
 
         resp = type("Resp", (), {})()
@@ -154,6 +154,20 @@ class McpIntegrationTest(unittest.TestCase):
         with self.assertRaises(McpToolError) as ctx:
             mcp_base._parse_result(result)
         self.assertIn("boom", str(ctx.exception))
+
+    def test_list_tools_reads_mcp_python_input_schema(self):
+        schema = {
+            "type": "object",
+            "properties": {"team": {"type": "string"}},
+            "required": ["team"],
+        }
+        session = _FakeSession(tools=[("list_issues", "List issues", schema)], result=None)
+        with self._patch_session(session):
+            tools = _run(_Integration().list_tools())
+        self.assertEqual(
+            tools,
+            [{"name": "list_issues", "description": "List issues", "inputSchema": schema}],
+        )
 
     def test_auto_bound_tool_calls_session(self):
         session = _FakeSession(
