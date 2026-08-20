@@ -467,7 +467,6 @@ export async function runAgentsViewMode(options: AgentsViewModeOptions): Promise
 				startupNotice: combineAgentsViewStartupNotices(result.statusMessage, opened.cwdFallbackNotice),
 				verbose: options.verbose,
 				returnToAgentsView: true,
-				forceFullscreen: true,
 				// The agents view renders the global notices itself, so suppress them in-session.
 				agentsViewOwnsStartupNotices: true,
 				sessionDepth: opened.summary.rlmDepth,

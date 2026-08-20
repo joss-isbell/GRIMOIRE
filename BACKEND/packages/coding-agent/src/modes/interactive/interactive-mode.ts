@@ -1427,12 +1427,7 @@ export class InteractiveMode {
 		this.setupEditorSubmitHandler();
 
 		this.ui.start();
-		this.fullscreenEnabled =
-			(this.options.forceFullscreen === true || this.settingsManager.getFullscreen()) &&
-			process.stdout.isTTY === true;
-		if (this.fullscreenEnabled) {
-			this.applyFullscreen(true);
-		}
+		this.initializeFullscreen();
 		this.isInitialized = true;
 
 		await this.rebindCurrentSession();
@@ -7131,6 +7126,13 @@ export class InteractiveMode {
 		return [this.editorContainer, this.subagentSummaryLine, this.footerSlot];
 	}
 
+	private initializeFullscreen(): void {
+		this.fullscreenEnabled =
+			(this.options.forceFullscreen === true || this.settingsManager.getFullscreen()) &&
+			process.stdout.isTTY === true;
+		this.applyFullscreen(this.fullscreenEnabled);
+	}
+
 	/** Enter or leave fullscreen rendering without touching the persisted setting. */
 	private applyFullscreen(enabled: boolean): void {
 		if (enabled) {
@@ -7148,6 +7150,7 @@ export class InteractiveMode {
 			});
 		} else {
 			this.ui.exitFullscreen();
+			this.ui.terminal.leaveAltScreen();
 		}
 	}
 
