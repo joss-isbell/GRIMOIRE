@@ -523,4 +523,174 @@ describe("incident compactor survival bounds", () => {
 		);
 		expect(compactor.admitObservation()).toBe(false);
 	});
+	it("reserves aggregate stopped-artifact storage before either 600 KiB stream can exceed a 1 MiB ceiling", () => {
+		const target = fixture("stopped-aggregate-ceiling");
+		mkdirSync(target.agentDir, { recursive: true, mode: 0o700 });
+		const firstSource = join(target.root, "first.bin");
+		const secondSource = join(target.root, "second.bin");
+		writeFileSync(firstSource, Buffer.alloc(600 * 1024, 0x11), { mode: 0o600 });
+		writeFileSync(secondSource, Buffer.alloc(600 * 1024, 0x22), { mode: 0o600 });
+		const ceiling = 1024 * 1024;
+		const compactor = createCompactor({
+			agentDir: target.agentDir,
+			freeReserveBytes: 0,
+			storageByteCeiling: ceiling,
+		});
+		finishStorageDiscovery(compactor);
+
+		const first = compactor.streamStoppedTargetArtifact(RUN_ID, firstSource, "exact", {
+			deadlineMs: Date.now() + 1_000,
+			byteBudget: 1,
+		});
+		expect(first).toMatchObject({ state: "pending", copiedBytes: 1, totalBytes: 600 * 1024 });
+		const afterFirst = compactor.survivalSnapshot();
+		expect(afterFirst.accountedStorageBytes).toBe(compactor.accountedStorageBytes);
+		expect(afterFirst.reservedStorageBytes).toBe(compactor.reservedStorageBytes);
+		expect(afterFirst.reservedStorageBytes).toBeGreaterThan(600 * 1024);
+		expect(afterFirst.accountedStorageBytes + afterFirst.reservedStorageBytes).toBeLessThanOrEqual(ceiling);
+
+		const second = compactor.streamStoppedTargetArtifact(RUN_ID, secondSource, "exact", {
+			deadlineMs: Date.now() + 1_000,
+			byteBudget: 1,
+		});
+		expect(second).toMatchObject({ state: "pending", reason: "storage_paused", copiedBytes: 0 });
+		const afterSecond = compactor.survivalSnapshot();
+		expect(afterSecond.accountedStorageBytes).toBe(afterFirst.accountedStorageBytes);
+		expect(afterSecond.reservedStorageBytes).toBe(afterFirst.reservedStorageBytes);
+		expect(afterSecond.accountedStorageBytes + afterSecond.reservedStorageBytes).toBeLessThanOrEqual(ceiling);
+
+		const completed = compactor.streamStoppedTargetArtifact(RUN_ID, firstSource, "exact", {
+			deadlineMs: Date.now() + 1_000,
+			byteBudget: 1024 * 1024,
+		});
+		expect(completed).toMatchObject({ state: "complete", artifact: { bytes: 600 * 1024 } });
+		const afterCompletion = compactor.survivalSnapshot();
+		expect(afterCompletion.accountedStorageBytes).toBe(compactor.accountedStorageBytes);
+		expect(afterCompletion.reservedStorageBytes).toBe(0);
+		expect(afterCompletion.accountedStorageBytes).toBeLessThanOrEqual(ceiling);
+	});
+
+	it("bounds stopped-artifact reservations at eight streams and releases all reservations on double dispose", () => {
+		const target = fixture("stopped-eight");
+		mkdirSync(target.agentDir, { recursive: true, mode: 0o700 });
+		const ceiling = 4 * 1024 * 1024;
+		const compactor = createCompactor({
+			agentDir: target.agentDir,
+			freeReserveBytes: 0,
+			storageByteCeiling: ceiling,
+		});
+		finishStorageDiscovery(compactor);
+		for (let index = 0; index < 8; index += 1) {
+			const source = join(target.root, `source-${index}.bin`);
+			writeFileSync(source, Buffer.from([index]), { mode: 0o600 });
+			expect(
+				compactor.streamStoppedTargetArtifact(`${RUN_ID}-${index}`, source, "exact", {
+					deadlineMs: Date.now() + 1_000,
+					byteBudget: 0,
+				}),
+			).toMatchObject({ state: "pending", reason: "work_budget" });
+			const snapshot = compactor.survivalSnapshot();
+			expect(snapshot.accountedStorageBytes).toBe(compactor.accountedStorageBytes);
+			expect(snapshot.reservedStorageBytes).toBe(compactor.reservedStorageBytes);
+			expect(snapshot.reservedStorageBytes).toBeGreaterThan(0);
+			expect(snapshot.accountedStorageBytes + snapshot.reservedStorageBytes).toBeLessThanOrEqual(ceiling);
+		}
+		const rejectedSource = join(target.root, "source-rejected.bin");
+		writeFileSync(rejectedSource, "rejected", { mode: 0o600 });
+		const beforeRejected = compactor.survivalSnapshot();
+		expect(
+			compactor.streamStoppedTargetArtifact("ninth", rejectedSource, "exact", {
+				deadlineMs: Date.now() + 1_000,
+				byteBudget: 0,
+			}),
+		).toMatchObject({ state: "pending", reason: "work_budget" });
+		const afterRejected = compactor.survivalSnapshot();
+		expect(afterRejected.accountedStorageBytes).toBe(beforeRejected.accountedStorageBytes);
+		expect(afterRejected.reservedStorageBytes).toBe(beforeRejected.reservedStorageBytes);
+		compactor.dispose();
+		const afterDispose = compactor.survivalSnapshot();
+		expect(afterDispose.accountedStorageBytes).toBe(beforeRejected.accountedStorageBytes);
+		expect(afterDispose.reservedStorageBytes).toBe(0);
+		compactor.dispose();
+		expect(compactor.survivalSnapshot()).toMatchObject({
+			accountedStorageBytes: afterDispose.accountedStorageBytes,
+			reservedStorageBytes: 0,
+		});
+	});
+
+	it("reserves directory, publication, and run-reference growth before creating a stopped stream", () => {
+		const target = fixture("stopped-reference-overhead");
+		mkdirSync(target.agentDir, { recursive: true, mode: 0o700 });
+		const source = join(target.root, "small.bin");
+		writeFileSync(source, Buffer.alloc(4 * 1024, 0x44), { mode: 0o600 });
+		const ceiling = 128 * 1024;
+		const compactor = createCompactor({
+			agentDir: target.agentDir,
+			freeReserveBytes: 0,
+			storageByteCeiling: ceiling,
+		});
+		finishStorageDiscovery(compactor);
+		expect(
+			compactor.streamStoppedTargetArtifact(RUN_ID, source, "exact", {
+				deadlineMs: Date.now() + 1_000,
+				byteBudget: 1,
+			}),
+		).toMatchObject({ state: "pending", reason: "storage_paused" });
+		const snapshot = compactor.survivalSnapshot();
+		expect(snapshot.accountedStorageBytes).toBe(0);
+		expect(snapshot.reservedStorageBytes).toBe(0);
+		expect(existsSync(join(target.agentDir, "incident-recorder"))).toBe(false);
+	});
+
+	it("converts a late success once and releases a late mutation error without affecting the other stream", () => {
+		const target = fixture("stopped-late-results");
+		mkdirSync(target.agentDir, { recursive: true, mode: 0o700 });
+		const successSource = join(target.root, "success.bin");
+		const errorSource = join(target.root, "error.bin");
+		writeFileSync(successSource, Buffer.alloc(64 * 1024, 0x55), { mode: 0o600 });
+		writeFileSync(errorSource, Buffer.alloc(64 * 1024, 0x66), { mode: 0o600 });
+		const ceiling = 2 * 1024 * 1024;
+		const compactor = createCompactor({
+			agentDir: target.agentDir,
+			freeReserveBytes: 0,
+			storageByteCeiling: ceiling,
+		});
+		finishStorageDiscovery(compactor);
+		for (const [runId, source] of [
+			[RUN_ID, successSource],
+			["mutated", errorSource],
+		] as const) {
+			expect(
+				compactor.streamStoppedTargetArtifact(runId, source, "exact", {
+					deadlineMs: Date.now() + 1_000,
+					byteBudget: 32 * 1024,
+				}),
+			).toMatchObject({ state: "pending", copiedBytes: 32 * 1024 });
+			const snapshot = compactor.survivalSnapshot();
+			expect(snapshot.accountedStorageBytes + snapshot.reservedStorageBytes).toBeLessThanOrEqual(ceiling);
+		}
+		const beforeError = compactor.survivalSnapshot();
+		writeFileSync(errorSource, Buffer.alloc(64 * 1024, 0x77), { mode: 0o600 });
+		expect(
+			compactor.streamStoppedTargetArtifact("mutated", errorSource, "exact", {
+				deadlineMs: Date.now() + 1_000,
+				byteBudget: 128 * 1024,
+			}),
+		).toMatchObject({ state: "error", reason: "artifact_source_changed_during_capture" });
+		const afterError = compactor.survivalSnapshot();
+		expect(afterError.accountedStorageBytes).toBe(beforeError.accountedStorageBytes);
+		expect(afterError.reservedStorageBytes).toBeLessThan(beforeError.reservedStorageBytes);
+		expect(afterError.reservedStorageBytes).toBeGreaterThan(0);
+		expect(afterError.accountedStorageBytes + afterError.reservedStorageBytes).toBeLessThanOrEqual(ceiling);
+		expect(
+			compactor.streamStoppedTargetArtifact(RUN_ID, successSource, "exact", {
+				deadlineMs: Date.now() + 1_000,
+				byteBudget: 128 * 1024,
+			}),
+		).toMatchObject({ state: "complete", artifact: { bytes: 64 * 1024 } });
+		const afterSuccess = compactor.survivalSnapshot();
+		expect(afterSuccess.accountedStorageBytes).toBe(compactor.accountedStorageBytes);
+		expect(afterSuccess.reservedStorageBytes).toBe(0);
+		expect(afterSuccess.accountedStorageBytes).toBeLessThanOrEqual(ceiling);
+	});
 });
