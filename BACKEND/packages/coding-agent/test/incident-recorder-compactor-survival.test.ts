@@ -213,23 +213,22 @@ describe("incident compactor survival bounds", () => {
 		linkSync(cas, journalPin);
 		const immutableTemporary = join(dirname(gap), `.${basename(gap)}.tmp-123-${"7".repeat(64)}`);
 		linkSync(gap, immutableTemporary);
-		const sysdigOwner = join(recorderRoot, "sysdig-pins", "owners", `${sysdigId}.scap`);
+		const sysdigSource = join(target.root, "stock-ring", "ring.scap0");
 		const sysdigPin = join(incidentRoot, "sysdig-pins", "segments", `${sysdigId}.scap`);
-		mkdirSync(dirname(sysdigOwner), { recursive: true, mode: 0o700 });
+		mkdirSync(dirname(sysdigSource), { recursive: true, mode: 0o700 });
 		mkdirSync(dirname(sysdigPin), { recursive: true, mode: 0o700 });
-		writeFileSync(sysdigOwner, "sysdig", { mode: 0o600 });
-		linkSync(sysdigOwner, sysdigPin);
-		const sysdigStat = lstatSync(sysdigOwner);
+		writeFileSync(sysdigSource, "sysdig", { mode: 0o600 });
+		linkSync(sysdigSource, sysdigPin);
+		const sysdigStat = lstatSync(sysdigPin);
 		writeJson(join(incidentRoot, "sysdig-pins", "records", `${sysdigId}.json`), {
 			version: 1,
 			id: sysdigId,
-			sourcePath: join(target.root, "stock-ring", "ring.scap0"),
+			sourcePath: sysdigSource,
 			sourceName: "ring.scap0",
 			observedAtWallTimeMs: 1,
 			phase: "initial",
 			source: { dev: String(sysdigStat.dev), ino: String(sysdigStat.ino), bytes: 6, mtimeMs: 1 },
 			pinnedPath: sysdigPin,
-			storageOwnerPath: sysdigOwner,
 			captureMethod: "hard_link",
 			captureReason: "closed_segment_hard_link",
 			bytesAtCapture: 6,
@@ -250,8 +249,8 @@ describe("incident compactor survival bounds", () => {
 			{ shape: "journal pin", owner: cas, reference: journalPin, admission: "allow" },
 			{ shape: "immutable crash temp", owner: gap, reference: immutableTemporary, admission: "allow" },
 			{
-				shape: "Sysdig persistent owner and incident ref",
-				owner: sysdigOwner,
+				shape: "Sysdig incident-owned pin",
+				owner: sysdigSource,
 				reference: sysdigPin,
 				admission: "allow",
 			},
@@ -264,7 +263,7 @@ describe("incident compactor survival bounds", () => {
 			"incomplete canonical and run ref",
 			"journal pin",
 			"immutable crash temp",
-			"Sysdig persistent owner and incident ref",
+			"Sysdig incident-owned pin",
 			"unknown hard-link shape",
 		]);
 		for (const row of taxonomy.filter((entry) => entry.admission === "allow")) {
@@ -289,8 +288,8 @@ describe("incident compactor survival bounds", () => {
 		expect(unknown.admitObservation()).toBe(false);
 	});
 
-	it("accounts one shared Sysdig storage owner across newly published incident hard links and restart", () => {
-		const target = fixture("sysdig-owner");
+	it("uses incident-owned Sysdig pins and conservatively accounts each retained reference", () => {
+		const target = fixture("sysdig-pin-owner");
 		const ringDir = join(target.root, "stock-ring");
 		const ringBase = join(ringDir, "ring.scap");
 		const firstIncident = join(target.agentDir, "incidents", "incident-one");
@@ -317,7 +316,7 @@ describe("incident compactor survival bounds", () => {
 		compactor.requestPin("22222222-2222-4222-8222-222222222222", secondIncident, anchor);
 		const afterSecond = compactor.accountedStorageBytes;
 		expect(afterFirst - before).toBeGreaterThanOrEqual(allocatedBytes(closed));
-		expect(afterSecond - afterFirst).toBeLessThan(allocatedBytes(closed));
+		expect(afterSecond - afterFirst).toBeGreaterThanOrEqual(allocatedBytes(closed));
 
 		const records = [firstIncident, secondIncident].map((incidentDir) => {
 			const recordsDir = join(incidentDir, "sysdig-pins", "records");
@@ -325,20 +324,18 @@ describe("incident compactor survival bounds", () => {
 				.map((name) => JSON.parse(readFileSync(join(recordsDir, name), "utf8")) as Record<string, unknown>)
 				.find((record) => record.sourceName === "ring.scap0");
 		});
-		expect(records[0]?.captureMethod).toBe("hard_link");
-		expect(records[0]?.storageOwnerPath).toBe(records[1]?.storageOwnerPath);
-		expect(statSync(String(records[0]?.pinnedPath)).ino).toBe(statSync(closed).ino);
-		expect(statSync(String(records[0]?.storageOwnerPath)).ino).toBe(statSync(closed).ino);
-		const persistentOwner = String(records[0]?.storageOwnerPath);
-		const survivingPin = String(records[1]?.pinnedPath);
-		expect(persistentOwner.startsWith(join(target.agentDir, "incident-recorder", "sysdig-pins", "owners"))).toBe(
-			true,
-		);
+		for (const record of records) {
+			expect(record?.captureMethod).toBe("hard_link");
+			expect(record).not.toHaveProperty("storageOwnerPath");
+			expect(statSync(String(record?.pinnedPath)).ino).toBe(statSync(closed).ino);
+		}
+		expect(existsSync(join(target.agentDir, "incident-recorder", "sysdig-pins", "owners"))).toBe(false);
 
+		const survivingPin = String(records[1]?.pinnedPath);
+		rmSync(closed);
 		rmSync(firstIncident, { recursive: true, force: true });
-		expect(existsSync(persistentOwner)).toBe(true);
 		expect(existsSync(survivingPin)).toBe(true);
-		expect(statSync(persistentOwner).ino).toBe(statSync(survivingPin).ino);
+		expect(readFileSync(survivingPin)).toEqual(Buffer.alloc(1024 * 1024, 0x41));
 
 		const restarted = createCompactor({ agentDir: target.agentDir, freeReserveBytes: 0 });
 		finishStorageDiscovery(restarted);

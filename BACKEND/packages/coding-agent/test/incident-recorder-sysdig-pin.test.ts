@@ -88,7 +88,9 @@ describe("stock Sysdig incident pins", () => {
 		const activeRecord = records.find((record) => record.sourceName === "ring.scap1");
 		expect(closedRecord?.captureMethod).toBe("hard_link");
 		expect(closedRecord?.captureReason).toBe("closed_segment_hard_link");
+		expect(closedRecord).not.toHaveProperty("storageOwnerPath");
 		expect(statSync(closedRecord.pinnedPath).ino).toBe(statSync(closed).ino);
+		expect(existsSync(join(target.agentDir, "incident-recorder", "sysdig-pins", "owners"))).toBe(false);
 		expect(activeRecord?.captureMethod).toBe("bounded_copy");
 		expect(activeRecord?.captureReason).toBe("active_segment_snapshot");
 		expect(statSync(activeRecord.pinnedPath).ino).not.toBe(statSync(active).ino);
@@ -162,7 +164,7 @@ describe("stock Sysdig incident pins", () => {
 		).toBe(true);
 		expect(existsSync(join(target.incidentDir, "sysdig-pin-request.json"))).toBe(true);
 	});
-	it("accounts a shared live Sysdig inode only once across incident hard links", () => {
+	it("conservatively accounts each incident pin without a second owner namespace", () => {
 		const target = fixture();
 		const anchor = Date.now();
 		writeSegment(`${target.ringBase}0`, "x".repeat(1024 * 1024), anchor - 2_000);
@@ -180,7 +182,8 @@ describe("stock Sysdig incident pins", () => {
 		compactor.requestPin("22222222-2222-4222-8222-222222222222", secondIncident, anchor);
 		const afterSecond = compactor.accountedStorageBytes;
 		expect(afterFirst - before).toBeGreaterThan(1024 * 1024);
-		expect(afterSecond - afterFirst).toBeLessThan(256 * 1024);
+		expect(afterSecond - afterFirst).toBeGreaterThan(1024 * 1024);
+		expect(existsSync(join(target.agentDir, "incident-recorder", "sysdig-pins", "owners"))).toBe(false);
 	});
 
 	it("never creates a 33rd record across repeated rotated captures", () => {

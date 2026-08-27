@@ -1052,34 +1052,47 @@ export class IncidentRecorderCompactor {
 			throw new Error("sysdig_hard_link_storage_owner_record_unavailable");
 		}
 		const storageOwnerPath = record.storageOwnerPath;
-		const ownerRelative =
-			typeof storageOwnerPath === "string" ? relativeDescendant(this.root, storageOwnerPath) : undefined;
 		if (
 			record.version !== 1 ||
 			record.id !== match[2] ||
 			record.pinnedPath !== path ||
 			record.captureMethod !== "hard_link" ||
-			typeof storageOwnerPath !== "string" ||
 			typeof record.source?.dev !== "string" ||
-			typeof record.source.ino !== "string" ||
-			ownerRelative !== `sysdig-pins/owners/${record.id}.scap`
+			typeof record.source.ino !== "string"
 		) {
-			throw new Error("sysdig_hard_link_storage_owner_record_invalid");
+			throw new Error("sysdig_hard_link_record_invalid");
 		}
-		try {
-			const owner = lstatSync(storageOwnerPath, { bigint: true });
-			if (
-				!owner.isFile() ||
-				owner.isSymbolicLink() ||
-				owner.dev.toString() !== record.source.dev ||
-				owner.ino.toString() !== record.source.ino
-			) {
-				throw new Error("owner_identity_invalid");
+		if (typeof storageOwnerPath === "string") {
+			const ownerRelative = relativeDescendant(this.root, storageOwnerPath);
+			if (ownerRelative !== `sysdig-pins/owners/${record.id}.scap`)
+				throw new Error("sysdig_hard_link_storage_owner_record_invalid");
+			try {
+				const owner = lstatSync(storageOwnerPath, { bigint: true });
+				if (
+					!owner.isFile() ||
+					owner.isSymbolicLink() ||
+					owner.dev.toString() !== record.source.dev ||
+					owner.ino.toString() !== record.source.ino
+				) {
+					throw new Error("owner_identity_invalid");
+				}
+			} catch {
+				throw new Error("sysdig_hard_link_storage_owner_record_invalid");
 			}
-		} catch {
-			throw new Error("sysdig_hard_link_storage_owner_record_invalid");
+			return storageOwnerPath;
 		}
-		return storageOwnerPath;
+		if (storageOwnerPath !== undefined) throw new Error("sysdig_hard_link_record_invalid");
+		const pinned = lstatSync(path, { bigint: true });
+		if (
+			!pinned.isFile() ||
+			pinned.isSymbolicLink() ||
+			pinned.dev.toString() !== record.source.dev ||
+			pinned.ino.toString() !== record.source.ino
+		)
+			throw new Error("sysdig_hard_link_record_invalid");
+		// New pins own themselves. Counting each incident pin conservatively avoids
+		// an unbounded inode set and removes the second persistent owner namespace.
+		return path;
 	}
 
 	private storagePathDisposition(
@@ -2708,24 +2721,27 @@ export class IncidentRecorderCompactor {
 			const existing = JSON.parse(readFileSync(recordPath, "utf8")) as SysdigPinnedSegmentRecord;
 			if (existing.id === id && existing.pinnedPath === pinnedPath) {
 				if (existing.captureMethod === "hard_link") {
-					const expectedOwnerPath = join(this.root, "sysdig-pins", "owners", `${id}.scap`);
-					if (existing.storageOwnerPath !== expectedOwnerPath)
-						throw new Error("legacy_sysdig_hard_link_missing_persistent_storage_owner");
-					const owner = statSync(existing.storageOwnerPath, { bigint: true });
 					const pinned = statSync(existing.pinnedPath, { bigint: true });
-					if (
-						owner.dev !== metadata.dev ||
-						owner.ino !== metadata.ino ||
-						pinned.dev !== owner.dev ||
-						pinned.ino !== owner.ino
-					)
-						throw new Error("sysdig_hard_link_storage_owner_mismatch");
+					if (pinned.dev !== metadata.dev || pinned.ino !== metadata.ino)
+						throw new Error("sysdig_hard_link_identity_mismatch");
+					if (existing.storageOwnerPath) {
+						const expectedOwnerPath = join(this.root, "sysdig-pins", "owners", `${id}.scap`);
+						if (existing.storageOwnerPath !== expectedOwnerPath)
+							throw new Error("legacy_sysdig_hard_link_storage_owner_invalid");
+						const owner = statSync(existing.storageOwnerPath, { bigint: true });
+						if (owner.dev !== pinned.dev || owner.ino !== pinned.ino)
+							throw new Error("legacy_sysdig_hard_link_storage_owner_invalid");
+					}
 				}
 				return existing;
 			}
 		} catch (error) {
-			if (error instanceof Error && error.message.startsWith("legacy_sysdig_hard_link")) throw error;
-			if (error instanceof Error && error.message === "sysdig_hard_link_storage_owner_mismatch") throw error;
+			if (
+				error instanceof Error &&
+				(error.message.startsWith("legacy_sysdig_hard_link") ||
+					error.message === "sysdig_hard_link_identity_mismatch")
+			)
+				throw error;
 		}
 		this.ensureDiskAdmission(source.bytes + 256 * 1024);
 		this.ensureOwnedDirectory(segmentsDir);
@@ -2736,49 +2752,24 @@ export class IncidentRecorderCompactor {
 			: "closed_segment_hard_link";
 		let hardLinkErrorCode: string | undefined;
 		let digest: string | undefined;
-		let storageOwnerPath: string | undefined;
 		let linked = false;
 		const sourceAlreadyAccounted =
 			relativeDescendant(this.root, sourcePath) !== undefined ||
 			relativeDescendant(join(this.options.agentDir, "incidents"), sourcePath) !== undefined;
 		if (!preferCopy && !sourceAlreadyAccounted) {
-			storageOwnerPath = join(this.root, "sysdig-pins", "owners", `${id}.scap`);
 			try {
-				let owner: BigIntStats | undefined;
-				try {
-					owner = lstatSync(storageOwnerPath, { bigint: true });
-				} catch (error) {
-					if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-				}
-				if (owner) {
-					if (
-						!owner.isFile() ||
-						owner.isSymbolicLink() ||
-						owner.dev !== metadata.dev ||
-						owner.ino !== metadata.ino
-					) {
-						throw new Error("sysdig_storage_owner_identity_mismatch");
-					}
-				} else {
-					if (metadata.nlink !== 1n) throw new Error("sysdig_source_has_unowned_hard_links");
-					this.withOwnedDirectoryMutation(dirname(storageOwnerPath), 1, () =>
-						linkSync(sourcePath, storageOwnerPath as string),
-					);
-					this.accountStoragePath(storageOwnerPath);
-				}
-				this.linkOwnedVerified(storageOwnerPath, pinnedPath);
+				this.withOwnedDirectoryMutation(segmentsDir, 1, () => linkSync(sourcePath, pinnedPath));
 				const linkedStat = lstatSync(pinnedPath, { bigint: true });
-				if (linkedStat.dev !== metadata.dev || linkedStat.ino !== metadata.ino) {
+				if (linkedStat.dev !== metadata.dev || linkedStat.ino !== metadata.ino)
 					throw new Error("sysdig_hard_link_identity_mismatch");
-				}
 				linked = true;
 			} catch (error) {
 				if ((error as NodeJS.ErrnoException).code === "EEXIST") throw error;
-				// A persistent owner created before a later publication failure remains
-				// accounted and reference-safe. Ordinary incident expiry cannot unlink it.
+				try {
+					rmSync(pinnedPath, { force: true });
+				} catch {}
 				hardLinkErrorCode = (error as NodeJS.ErrnoException).code ?? "UNKNOWN";
 				captureReason = "hard_link_unavailable";
-				storageOwnerPath = undefined;
 			}
 		} else if (!preferCopy) {
 			hardLinkErrorCode = "SOURCE_ALREADY_ACCOUNTED";
@@ -2847,15 +2838,14 @@ export class IncidentRecorderCompactor {
 			phase,
 			source,
 			pinnedPath,
-			...(storageOwnerPath ? { storageOwnerPath } : {}),
 			captureMethod,
 			captureReason,
 			...(hardLinkErrorCode ? { hardLinkErrorCode } : {}),
 			bytesAtCapture: source.bytes,
 			...(digest ? { sha256AtCapture: digest } : {}),
 		};
-		if (!linked) this.accountStoragePath(pinnedPath);
 		this.writeOwnedJson(recordPath, record, 64 * 1024);
+		this.accountStoragePath(pinnedPath);
 		return record;
 	}
 
