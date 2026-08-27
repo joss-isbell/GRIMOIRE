@@ -2,9 +2,9 @@ import { createHash } from "node:crypto";
 import {
 	closeSync,
 	type Dir,
-	existsSync,
 	constants as fsConstants,
 	fstatSync,
+	fsyncSync,
 	linkSync,
 	lstatSync,
 	mkdirSync,
@@ -27,6 +27,7 @@ const ACTIVE_MARKER = ".recorder-active";
 const TERMINAL_MARKER = ".retention-terminal.json";
 const GC_PREFIX = ".retention-gc-";
 const MAX_METADATA_BYTES = 1024 * 1024;
+const RETENTION_TREE_MAX_DEPTH = 64;
 const CAS_NAME = /^([0-9a-f]{64})(?:\.collision-[A-Za-z0-9_.+-]+)?\.blob$/;
 
 export interface IncidentRetentionOptions {
@@ -65,32 +66,35 @@ interface SmallRead {
 function boundedRead(path: string, maximum = MAX_METADATA_BYTES): SmallRead {
 	let descriptor: number | undefined;
 	try {
-		const beforeOpen = lstatSync(path);
+		const beforeOpen = lstatSync(path, { bigint: true });
 		if (!beforeOpen.isFile() || beforeOpen.isSymbolicLink()) return { state: "uncertain" };
 		descriptor = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-		const stat = fstatSync(descriptor);
+		const stat = fstatSync(descriptor, { bigint: true });
 		if (
 			stat.dev !== beforeOpen.dev ||
 			stat.ino !== beforeOpen.ino ||
+			stat.size !== beforeOpen.size ||
+			stat.mtimeNs !== beforeOpen.mtimeNs ||
+			stat.ctimeNs !== beforeOpen.ctimeNs ||
 			!stat.isFile() ||
-			!Number.isSafeInteger(stat.size) ||
-			stat.size < 0 ||
-			stat.size > maximum
+			stat.size < 0n ||
+			stat.size > BigInt(maximum)
 		)
 			return { state: "uncertain" };
-		const value = Buffer.alloc(stat.size);
+		const value = Buffer.alloc(Number(stat.size));
 		let offset = 0;
 		while (offset < value.length) {
 			const count = readSync(descriptor, value, offset, value.length - offset, offset);
 			if (count <= 0) return { state: "uncertain" };
 			offset += count;
 		}
-		const after = fstatSync(descriptor);
+		const after = fstatSync(descriptor, { bigint: true });
 		if (
 			after.dev !== stat.dev ||
 			after.ino !== stat.ino ||
 			after.size !== stat.size ||
-			after.mtimeMs !== stat.mtimeMs
+			after.mtimeNs !== stat.mtimeNs ||
+			after.ctimeNs !== stat.ctimeNs
 		)
 			return { state: "uncertain" };
 		return { state: "ok", bytes: value };
@@ -103,7 +107,6 @@ function boundedRead(path: string, maximum = MAX_METADATA_BYTES): SmallRead {
 			} catch {}
 	}
 }
-
 function smallJson(path: string): { state: SmallRead["state"]; value?: Record<string, unknown> } {
 	const read = boundedRead(path);
 	if (read.state !== "ok" || !read.bytes) return { state: read.state };
@@ -171,45 +174,21 @@ function defaultProcessIdentity(pid: number): ReturnType<NonNullable<IncidentRet
 	return startId && /^[0-9]+$/.test(startId) ? { state: "live", startId: `proc:${startId}` } : { state: "uncertain" };
 }
 
-function readDirBounded(path: string, budget: Budget, visit: (name: string, stat: Stats) => void): void {
-	let directory: Dir | undefined;
-	try {
-		directory = opendirSync(path);
-		for (;;) {
-			if (budget.scanned >= budget.maxEntries) {
-				budget.moreWork = true;
-				return;
-			}
-			const entry = directory.readSync();
-			if (!entry) return;
-			budget.scanned += 1;
-			let stat: Stats;
-			try {
-				stat = lstatSync(join(path, entry.name));
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code !== "ENOENT")
-					budget.uncertainties.push(`stat:${path}/${entry.name}`);
-				continue;
-			}
-			visit(entry.name, stat);
-		}
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "ENOENT") budget.uncertainties.push(`directory:${path}`);
-	} finally {
-		try {
-			directory?.closeSync();
-		} catch {}
-	}
+interface BoundDirectoryFrame {
+	path: string;
+	descriptor: number;
+	directory: Dir;
 }
 
-const resumableDirectories = new Map<string, Dir>();
+const resumableDirectories = new Map<string, BoundDirectoryFrame>();
 const incidentScanStates = new Map<string, { protectedRuns: Set<string>; pending: boolean }>();
 const runScanStates = new Map<string, { hashes: Set<string>; activeRuns: Set<string>; unsafeForCas: boolean }>();
 
 interface TreeWalkState {
 	root: string;
-	stack: Array<{ path: string; directory: Dir }>;
+	stack: BoundDirectoryFrame[];
 	complete: boolean;
+	openUncertain?: boolean;
 }
 interface CasMarkState extends TreeWalkState {
 	marked: Set<string>;
@@ -218,10 +197,11 @@ interface CasMarkState extends TreeWalkState {
 		path: string;
 		descriptor: number;
 		offset: number;
-		size: number;
-		dev: number;
-		ino: number;
-		mtimeMs: number;
+		size: bigint;
+		dev: bigint;
+		ino: bigint;
+		mtimeNs: bigint;
+		ctimeNs: bigint;
 		carry: string;
 	};
 	leaseBoundaryMs: number;
@@ -231,17 +211,60 @@ const completedReferencePrunes = new Set<string>();
 const completedRunOwnerPrunes = new Set<string>();
 const casMarkStates = new Map<string, CasMarkState>();
 const casSweepStates = new Map<string, TreeWalkState>();
-const completedCasMarks = new Map<string, Set<string>>();
+const legacySysdigOwnerSweepStates = new Map<string, TreeWalkState>();
 
-function createTreeWalk(root: string): TreeWalkState {
+function createBoundDirectoryFrame(openPath: string, displayPath = openPath, expected?: Stats): BoundDirectoryFrame {
+	const descriptor = openStableDirectory(openPath, expected);
 	try {
-		return { root, stack: [{ path: root, directory: opendirSync(root) }], complete: false };
+		return { path: displayPath, descriptor, directory: opendirSync(`/proc/self/fd/${descriptor}`) };
 	} catch (error) {
-		return { root, stack: [], complete: (error as NodeJS.ErrnoException).code === "ENOENT" };
+		closeSync(descriptor);
+		throw error;
 	}
 }
 
-function nextTreeFile(state: TreeWalkState, budget: Budget): { path: string; stat: Stats } | undefined {
+function closeBoundDirectoryFrame(frame: BoundDirectoryFrame): void {
+	try {
+		frame.directory.closeSync();
+	} catch {}
+	try {
+		closeSync(frame.descriptor);
+	} catch {}
+}
+
+function closeTreeWalkState(state: TreeWalkState): void {
+	for (const frame of state.stack.splice(0)) closeBoundDirectoryFrame(frame);
+}
+
+function discardTreeWalk(map: Map<string, TreeWalkState>, key: string): void {
+	const state = map.get(key);
+	if (state) closeTreeWalkState(state);
+	map.delete(key);
+}
+
+function createTreeWalk(root: string): TreeWalkState {
+	try {
+		return { root, stack: [createBoundDirectoryFrame(root)], complete: false };
+	} catch (error) {
+		return {
+			root,
+			stack: [],
+			complete: (error as NodeJS.ErrnoException).code === "ENOENT",
+			openUncertain: (error as NodeJS.ErrnoException).code !== "ENOENT",
+		};
+	}
+}
+
+function nextTreeFile(
+	state: TreeWalkState,
+	budget: Budget,
+): { path: string; name: string; parentDescriptor: number; stat: Stats } | undefined {
+	if (state.openUncertain) {
+		state.openUncertain = false;
+		state.complete = true;
+		budget.uncertainties.push(`walk-open:${state.root}`);
+		return undefined;
+	}
 	while (state.stack.length > 0) {
 		if (budget.scanned >= budget.maxEntries) {
 			budget.moreWork = true;
@@ -254,21 +277,22 @@ function nextTreeFile(state: TreeWalkState, budget: Budget): { path: string; sta
 			entry = frame.directory.readSync();
 		} catch {
 			budget.uncertainties.push(`walk-directory:${frame.path}`);
+			closeTreeWalkState(state);
 			state.complete = true;
 			return undefined;
 		}
 		if (!entry) {
-			try {
-				frame.directory.closeSync();
-			} catch {}
+			closeBoundDirectoryFrame(frame);
 			state.stack.pop();
 			continue;
 		}
 		budget.scanned += 1;
 		const path = join(frame.path, entry.name);
+		let boundPath: string;
 		let stat: Stats;
 		try {
-			stat = lstatSync(path);
+			boundPath = boundEntryPath(frame.descriptor, entry.name);
+			stat = lstatSync(boundPath);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") budget.uncertainties.push(`walk-stat:${path}`);
 			continue;
@@ -278,57 +302,69 @@ function nextTreeFile(state: TreeWalkState, budget: Budget): { path: string; sta
 			continue;
 		}
 		if (stat.isDirectory()) {
+			if (state.stack.length >= RETENTION_TREE_MAX_DEPTH) {
+				budget.uncertainties.push(`walk-depth:${path}`);
+				return undefined;
+			}
 			try {
-				state.stack.push({ path, directory: opendirSync(path) });
+				state.stack.push(createBoundDirectoryFrame(boundPath, path, stat));
 			} catch (error) {
 				if ((error as NodeJS.ErrnoException).code !== "ENOENT") budget.uncertainties.push(`walk-open:${path}`);
 			}
 			continue;
 		}
-		return { path, stat };
+		return { path, name: entry.name, parentDescriptor: frame.descriptor, stat };
 	}
 	state.complete = true;
 	return undefined;
 }
 
-function readDirResumable(path: string, budget: Budget, visit: (name: string, stat: Stats) => void): void {
-	let directory = resumableDirectories.get(path);
+function readDirResumable(
+	path: string,
+	budget: Budget,
+	visit: (name: string, stat: Stats, parentDescriptor: number) => void,
+): void {
+	let frame = resumableDirectories.get(path);
 	try {
-		if (!directory) {
-			directory = opendirSync(path);
-			resumableDirectories.set(path, directory);
+		if (!frame) {
+			frame = createBoundDirectoryFrame(path);
+			resumableDirectories.set(path, frame);
 		}
 		for (;;) {
 			if (budget.scanned >= budget.maxEntries || budget.deleted >= budget.maxDeletes) {
 				budget.moreWork = true;
 				return;
 			}
-			const entry = directory.readSync();
+			const entry = frame.directory.readSync();
 			if (!entry) {
-				directory.closeSync();
+				closeBoundDirectoryFrame(frame);
 				resumableDirectories.delete(path);
 				return;
 			}
 			budget.scanned += 1;
 			let stat: Stats;
 			try {
-				stat = lstatSync(join(path, entry.name));
+				stat = lstatSync(boundEntryPath(frame.descriptor, entry.name));
 			} catch (error) {
 				if ((error as NodeJS.ErrnoException).code !== "ENOENT")
 					budget.uncertainties.push(`stat:${path}/${entry.name}`);
 				continue;
 			}
-			visit(entry.name, stat);
+			const uncertaintyCount = budget.uncertainties.length;
+			visit(entry.name, stat, frame.descriptor);
+			if (budget.uncertainties.length > uncertaintyCount) {
+				closeBoundDirectoryFrame(frame);
+				resumableDirectories.delete(path);
+				budget.moreWork = true;
+				return;
+			}
 		}
 	} catch (error) {
-		try {
-			directory?.closeSync();
-		} catch {}
+		if (frame) closeBoundDirectoryFrame(frame);
 		resumableDirectories.delete(path);
 		if ((error as NodeJS.ErrnoException).code !== "ENOENT") budget.uncertainties.push(`directory:${path}`);
 	}
 }
-
 function expired(stat: Stats, nowMs: number): boolean {
 	return Number.isFinite(stat.mtimeMs) && nowMs - stat.mtimeMs >= INCIDENT_DIAGNOSTIC_RETENTION_MS;
 }
@@ -634,45 +670,125 @@ function incidentDisposition(path: string, nowMs: number): "retain" | "delete" |
 	return nowMs >= retainUntil ? "delete" : "retain";
 }
 
-function tombstone(path: string): string | undefined {
-	const target = join(join(path, ".."), `${GC_PREFIX}${basename(path)}`);
+function safeEntryName(name: string): boolean {
+	return name.length > 0 && name !== "." && name !== ".." && basename(name) === name && !name.includes("\0");
+}
+
+function sameIdentity(left: Stats, right: Stats): boolean {
+	return left.dev === right.dev && left.ino === right.ino;
+}
+
+function openStableDirectory(path: string, expected?: Stats): number {
+	const before = lstatSync(path);
+	if (!before.isDirectory() || before.isSymbolicLink() || (expected && !sameIdentity(before, expected)))
+		throw new Error("directory_identity_invalid");
+	const descriptor = openSync(path, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+	const opened = fstatSync(descriptor);
+	if (!opened.isDirectory() || !sameIdentity(opened, before)) {
+		closeSync(descriptor);
+		throw new Error("directory_identity_changed");
+	}
+	return descriptor;
+}
+
+// Node does not expose unlinkat(2). On Linux/WSL, /proc/self/fd keeps every
+// retention lookup and mutation relative to the directory descriptor we opened.
+function boundEntryPath(parentDescriptor: number, name: string): string {
+	if (!safeEntryName(name)) throw new Error("entry_name_invalid");
+	return `/proc/self/fd/${parentDescriptor}/${name}`;
+}
+
+function tombstone(
+	path: string,
+	expected: Stats,
+	budget: Budget,
+	retainedParentDescriptor?: number,
+): string | undefined {
+	const parentPath = dirname(path);
+	const name = basename(path);
+	const boundName = /^\.retention-gc-(\d+)-(\d+)-[0-9a-f]{16}$/.exec(name);
+	const alreadyBound = boundName?.[1] === String(expected.dev) && boundName[2] === String(expected.ino);
+	const identityToken = createHash("sha256").update(name).digest("hex").slice(0, 16);
+	const targetName = alreadyBound ? name : `${GC_PREFIX}${expected.dev}-${expected.ino}-${identityToken}`;
+	let parentDescriptor = retainedParentDescriptor;
+	let ownsParentDescriptor = false;
 	try {
-		renameSync(path, target);
-		return target;
+		if (parentDescriptor === undefined) {
+			parentDescriptor = openStableDirectory(parentPath);
+			ownsParentDescriptor = true;
+		}
+		const source = boundEntryPath(parentDescriptor, name);
+		const target = boundEntryPath(parentDescriptor, targetName);
+		const current = lstatSync(source);
+		if (!sameIdentity(current, expected) || !current.isDirectory() || current.isSymbolicLink())
+			throw new Error("tombstone_source_identity_changed");
+		if (name === targetName) return path;
+		try {
+			lstatSync(target);
+			throw new Error("tombstone_target_exists");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
+		renameSync(source, target);
+		const renamed = lstatSync(target);
+		if (!sameIdentity(renamed, expected)) throw new Error("tombstone_identity_changed");
+		return join(parentPath, targetName);
 	} catch {
+		budget.uncertainties.push(`rename-for-delete:${path}`);
 		return undefined;
+	} finally {
+		if (ownsParentDescriptor && parentDescriptor !== undefined)
+			try {
+				closeSync(parentDescriptor);
+			} catch {}
 	}
 }
 
-function removeTreeIncremental(path: string, budget: Budget, depth = 0): void {
+function removeBoundTreeEntry(
+	parentDescriptor: number,
+	parentDisplayPath: string,
+	name: string,
+	budget: Budget,
+	depth: number,
+	expected?: Stats,
+): void {
+	const displayPath = join(parentDisplayPath, name);
 	if (depth > 16) {
-		budget.uncertainties.push(`delete-depth:${path}`);
+		budget.uncertainties.push(`delete-depth:${displayPath}`);
 		return;
 	}
 	if (budget.deleted >= budget.maxDeletes || budget.scanned >= budget.maxEntries) {
 		budget.moreWork = true;
 		return;
 	}
+	let path: string;
 	let stat: Stats;
 	try {
+		path = boundEntryPath(parentDescriptor, name);
 		stat = lstatSync(path);
+		if (expected && !sameIdentity(stat, expected)) throw new Error("delete_entry_identity_changed");
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "ENOENT") budget.uncertainties.push(`delete-stat:${path}`);
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") budget.uncertainties.push(`delete-stat:${displayPath}`);
 		return;
 	}
 	budget.scanned += 1;
-	if (!stat.isDirectory()) {
+	if (!stat.isDirectory() || stat.isSymbolicLink()) {
 		try {
+			const current = lstatSync(path);
+			if (!sameIdentity(current, stat)) throw new Error("delete_file_identity_changed");
 			unlinkSync(path);
 			budget.deleted += 1;
-		} catch {
-			budget.uncertainties.push(`delete-file:${path}`);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT")
+				budget.uncertainties.push(`delete-file:${displayPath}`);
 		}
 		return;
 	}
+	let childDescriptor: number | undefined;
 	let directory: Dir | undefined;
 	try {
-		directory = opendirSync(path);
+		childDescriptor = openStableDirectory(path, stat);
+		directory = opendirSync(`/proc/self/fd/${childDescriptor}`);
 		for (;;) {
 			if (budget.deleted >= budget.maxDeletes || budget.scanned >= budget.maxEntries) {
 				budget.moreWork = true;
@@ -680,26 +796,76 @@ function removeTreeIncremental(path: string, budget: Budget, depth = 0): void {
 			}
 			const entry = directory.readSync();
 			if (!entry) break;
-			removeTreeIncremental(join(path, entry.name), budget, depth + 1);
+			if (!safeEntryName(entry.name)) {
+				budget.uncertainties.push(`delete-name:${displayPath}`);
+				continue;
+			}
+			removeBoundTreeEntry(childDescriptor, displayPath, entry.name, budget, depth + 1);
 		}
 	} catch {
-		budget.uncertainties.push(`delete-directory:${path}`);
+		budget.uncertainties.push(`delete-directory:${displayPath}`);
 		return;
 	} finally {
 		try {
 			directory?.closeSync();
 		} catch {}
+		if (childDescriptor !== undefined)
+			try {
+				closeSync(childDescriptor);
+			} catch {}
 	}
 	if (budget.deleted >= budget.maxDeletes) {
 		budget.moreWork = true;
 		return;
 	}
 	try {
+		const current = lstatSync(path);
+		if (!sameIdentity(current, stat)) throw new Error("delete_directory_identity_changed");
 		rmdirSync(path);
 		budget.deleted += 1;
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOTEMPTY") budget.moreWork = true;
-		else if ((error as NodeJS.ErrnoException).code !== "ENOENT") budget.uncertainties.push(`delete-rmdir:${path}`);
+		else if ((error as NodeJS.ErrnoException).code !== "ENOENT")
+			budget.uncertainties.push(`delete-rmdir:${displayPath}`);
+	}
+}
+
+function unlinkBoundPath(
+	path: string,
+	expected: Stats,
+	budget: Budget,
+	label: string,
+	retainedParentDescriptor?: number,
+): boolean {
+	let parentDescriptor = retainedParentDescriptor;
+	let ownsParentDescriptor = false;
+	let descriptor: number | undefined;
+	try {
+		if (parentDescriptor === undefined) {
+			parentDescriptor = openStableDirectory(dirname(path));
+			ownsParentDescriptor = true;
+		}
+		const bound = boundEntryPath(parentDescriptor, basename(path));
+		descriptor = openSync(bound, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+		const current = fstatSync(descriptor);
+		if (!current.isFile() || !sameIdentity(current, expected)) throw new Error("unlink_identity_changed");
+		const named = lstatSync(bound);
+		if (!sameIdentity(named, current)) throw new Error("unlink_name_identity_changed");
+		unlinkSync(bound);
+		budget.deleted += 1;
+		return true;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") budget.uncertainties.push(`${label}:${path}`);
+		return false;
+	} finally {
+		if (descriptor !== undefined)
+			try {
+				closeSync(descriptor);
+			} catch {}
+		if (ownsParentDescriptor && parentDescriptor !== undefined)
+			try {
+				closeSync(parentDescriptor);
+			} catch {}
 	}
 }
 
@@ -717,18 +883,20 @@ function pruneArtifactDirectories(
 	runSafety: { activeRuns: Set<string>; unsafeForCas: boolean },
 ): boolean {
 	let pendingIncident = false;
-	readDirResumable(root, budget, (name, stat) => {
+	readDirResumable(root, budget, (name, stat, parentDescriptor) => {
 		if (budget.deleted >= budget.maxDeletes) {
 			budget.moreWork = true;
 			return;
 		}
 		const path = join(root, name);
+		const decisionPath = boundEntryPath(parentDescriptor, name);
 		if (!stat.isDirectory()) {
 			budget.uncertainties.push(`unexpected-artifact:${path}`);
 			return;
 		}
 		if (name.startsWith(GC_PREFIX)) {
-			removeTreeIncremental(path, budget);
+			const rebound = tombstone(path, stat, budget, parentDescriptor);
+			if (rebound) removeBoundTreeEntry(parentDescriptor, root, basename(rebound), budget, 0, stat);
 			return;
 		}
 		if (kind === "incident" && name.startsWith(".") && name.endsWith(".partial")) {
@@ -740,7 +908,7 @@ function pruneArtifactDirectories(
 			const runId = name.slice(-36);
 			const runHash = /^[0-9a-f-]{36}$/i.test(runId) ? createHash("sha256").update(runId).digest("hex") : undefined;
 			if (runHash) activeRunHashes.add(runHash);
-			const protection = runProtection(path, machineId, bootId, identity);
+			const protection = runProtection(decisionPath, machineId, bootId, identity);
 			if (protection === "active") {
 				protectedActiveRuns.push(name);
 				runSafety.activeRuns.add(name);
@@ -758,14 +926,14 @@ function pruneArtifactDirectories(
 				budget.uncertainties.push(`run-identity:${path}`);
 				return;
 			}
-			const isExpired = runExpired(path, nowMs);
+			const isExpired = runExpired(decisionPath, nowMs);
 			if (isExpired === undefined) {
 				budget.uncertainties.push(`run-terminal:${path}`);
 				return;
 			}
 			if (!isExpired) return;
 		} else {
-			const disposition = incidentDisposition(path, nowMs);
+			const disposition = incidentDisposition(decisionPath, nowMs);
 			if (disposition === "pending") {
 				pendingIncident = true;
 				incidentProtectedRuns.add(name);
@@ -785,19 +953,16 @@ function pruneArtifactDirectories(
 			const runId = name.slice(-36);
 			if (/^[0-9a-f-]{36}$/i.test(runId)) activeRunHashes.delete(createHash("sha256").update(runId).digest("hex"));
 		}
-		const renamed = tombstone(path);
-		if (!renamed) {
-			budget.uncertainties.push(`rename-for-delete:${path}`);
-			return;
-		}
-		removeTreeIncremental(renamed, budget);
+		const renamed = tombstone(path, stat, budget, parentDescriptor);
+		if (!renamed) return;
+		removeBoundTreeEntry(parentDescriptor, root, basename(renamed), budget, 0, stat);
 	});
 	return pendingIncident;
 }
 
 function pruneRunReferenceOwners(root: string, nowMs: number, budget: Budget, retainedRunHashes: Set<string>): void {
 	const ownersRoot = join(root, "runs");
-	readDirResumable(ownersRoot, budget, (name, stat) => {
+	readDirResumable(ownersRoot, budget, (name, stat, parentDescriptor) => {
 		if (budget.deleted >= budget.maxDeletes) {
 			budget.moreWork = true;
 			return;
@@ -808,43 +973,93 @@ function pruneRunReferenceOwners(root: string, nowMs: number, budget: Budget, re
 			return;
 		}
 		if (name.startsWith(GC_PREFIX)) {
-			removeTreeIncremental(path, budget);
+			const rebound = tombstone(path, stat, budget, parentDescriptor);
+			if (rebound) removeBoundTreeEntry(parentDescriptor, ownersRoot, basename(rebound), budget, 0, stat);
 			return;
 		}
 		if (retainedRunHashes.has(name) || !expired(stat, nowMs)) return;
-		const renamed = tombstone(path);
-		if (!renamed) {
-			budget.uncertainties.push(`rename-run-ref-owner:${path}`);
-			return;
-		}
-		removeTreeIncremental(renamed, budget);
+		const renamed = tombstone(path, stat, budget, parentDescriptor);
+		if (!renamed) return;
+		removeBoundTreeEntry(parentDescriptor, ownersRoot, basename(renamed), budget, 0, stat);
 	});
 	if (!resumableDirectories.has(ownersRoot)) completedRunOwnerPrunes.add(root);
 }
 
-function pruneReferences(root: string, nowMs: number, budget: Budget, activeRunHashes: Set<string>): void {
+function pruneReferences(root: string, nowMs: number, budget: Budget): void {
 	let state = referenceWalkStates.get(root);
 	if (!state || state.complete) {
 		state = createTreeWalk(root);
 		referenceWalkStates.set(root, state);
 	}
 	while (!state.complete && budget.deleted < budget.maxDeletes && budget.scanned < budget.maxEntries) {
+		const uncertaintyCount = budget.uncertainties.length;
 		const entry = nextTreeFile(state, budget);
+		if (budget.uncertainties.length > uncertaintyCount) {
+			discardTreeWalk(referenceWalkStates, root);
+			return;
+		}
 		if (!entry) break;
 		if (!entry.stat.isFile() || !expired(entry.stat, nowMs)) continue;
 		const relative = entry.path.slice(root.length + 1).split("/");
 		if (relative[0] === "runs") continue;
-		try {
-			unlinkSync(entry.path);
-			budget.deleted += 1;
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ENOENT") budget.uncertainties.push(`ref-delete:${entry.path}`);
+		unlinkBoundPath(entry.path, entry.stat, budget, "ref-delete", entry.parentDescriptor);
+		if (budget.uncertainties.length > uncertaintyCount) {
+			discardTreeWalk(referenceWalkStates, root);
+			return;
 		}
 	}
 	if (state.complete) {
 		referenceWalkStates.delete(root);
 		completedReferencePrunes.add(root);
 	}
+}
+
+function advanceLegacySysdigOwnerSweep(root: string, budget: Budget): void {
+	let state = legacySysdigOwnerSweepStates.get(root);
+	if (!state || state.complete) {
+		state = createTreeWalk(root);
+		legacySysdigOwnerSweepStates.set(root, state);
+	}
+	while (!state.complete && budget.deleted < budget.maxDeletes && budget.scanned < budget.maxEntries) {
+		const uncertaintyCount = budget.uncertainties.length;
+		const entry = nextTreeFile(state, budget);
+		if (budget.uncertainties.length > uncertaintyCount) {
+			discardTreeWalk(legacySysdigOwnerSweepStates, root);
+			return;
+		}
+		if (!entry) break;
+		if (!entry.stat.isFile() || !/^[0-9a-f]{64}\.scap$/.test(entry.name)) {
+			budget.uncertainties.push(`legacy-sysdig-owner-shape:${entry.path}`);
+			discardTreeWalk(legacySysdigOwnerSweepStates, root);
+			return;
+		}
+		if (entry.stat.nlink !== 1) continue;
+		let descriptor: number | undefined;
+		try {
+			const bound = boundEntryPath(entry.parentDescriptor, entry.name);
+			descriptor = openSync(bound, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+			const current = fstatSync(descriptor);
+			const named = lstatSync(bound);
+			if (!current.isFile() || !sameIdentity(current, entry.stat) || !sameIdentity(named, current))
+				throw new Error("legacy_sysdig_owner_identity_changed");
+			if (current.nlink !== 1) continue;
+			unlinkSync(bound);
+			budget.deleted += 1;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT")
+				budget.uncertainties.push(`legacy-sysdig-owner-delete:${entry.path}`);
+		} finally {
+			if (descriptor !== undefined)
+				try {
+					closeSync(descriptor);
+				} catch {}
+		}
+		if (budget.uncertainties.length > uncertaintyCount) {
+			discardTreeWalk(legacySysdigOwnerSweepStates, root);
+			return;
+		}
+	}
+	if (state.complete) legacySysdigOwnerSweepStates.delete(root);
 }
 
 function addCasMarks(state: CasMarkState, budget: Budget, text: string): void {
@@ -866,12 +1081,13 @@ function advanceLargeMarkFile(state: CasMarkState, budget: Budget): void {
 		const count = readSync(file.descriptor, buffer, 0, buffer.length, file.offset);
 		budget.scanned += 1;
 		if (count === 0) {
-			const after = fstatSync(file.descriptor);
+			const after = fstatSync(file.descriptor, { bigint: true });
 			if (
 				after.dev !== file.dev ||
 				after.ino !== file.ino ||
 				after.size !== file.size ||
-				after.mtimeMs !== file.mtimeMs
+				after.mtimeNs !== file.mtimeNs ||
+				after.ctimeNs !== file.ctimeNs
 			) {
 				state.uncertain = true;
 				budget.uncertainties.push(`reference-changed:${file.path}`);
@@ -922,6 +1138,7 @@ function advanceCasMark(
 		const uncertaintyCount = budget.uncertainties.length;
 		const entry = nextTreeFile(state, budget);
 		if (budget.uncertainties.length > uncertaintyCount) state.uncertain = true;
+		if (state.uncertain) break;
 		if (!entry) {
 			if (!state.complete) break;
 			extended.rootIndex += 1;
@@ -933,6 +1150,7 @@ function advanceCasMark(
 			state.root = next.root;
 			state.stack = next.stack;
 			state.complete = next.complete;
+			state.openUncertain = next.openUncertain;
 			continue;
 		}
 		if (!entry.stat.isFile()) continue;
@@ -947,10 +1165,27 @@ function advanceCasMark(
 		if (name === "journal-pin-manifest.json" || name === "sysdig-pin-manifest.json") continue;
 		if (!/\.(?:json|jsonl)$/i.test(name)) continue;
 		if (entry.stat.size > 64 * 1024) {
+			let descriptor: number | undefined;
 			try {
-				const descriptor = openSync(entry.path, "r");
-				const opened = fstatSync(descriptor);
-				if (opened.dev !== entry.stat.dev || opened.ino !== entry.stat.ino || !opened.isFile())
+				const bound = boundEntryPath(entry.parentDescriptor, entry.name);
+				const before = lstatSync(bound, { bigint: true });
+				descriptor = openSync(bound, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+				const opened = fstatSync(descriptor, { bigint: true });
+				if (
+					!before.isFile() ||
+					before.isSymbolicLink() ||
+					opened.dev !== before.dev ||
+					opened.ino !== before.ino ||
+					opened.size !== before.size ||
+					opened.mtimeNs !== before.mtimeNs ||
+					opened.ctimeNs !== before.ctimeNs ||
+					Number(before.dev) !== entry.stat.dev ||
+					Number(before.ino) !== entry.stat.ino ||
+					Number(before.size) !== entry.stat.size ||
+					Number(before.mtimeNs) / 1_000_000 !== entry.stat.mtimeMs ||
+					Number(before.ctimeNs) / 1_000_000 !== entry.stat.ctimeMs ||
+					!opened.isFile()
+				)
 					throw new Error("reference_identity_changed");
 				state.currentFile = {
 					path: entry.path,
@@ -959,17 +1194,23 @@ function advanceCasMark(
 					size: opened.size,
 					dev: opened.dev,
 					ino: opened.ino,
-					mtimeMs: opened.mtimeMs,
+					mtimeNs: opened.mtimeNs,
+					ctimeNs: opened.ctimeNs,
 					carry: "",
 				};
+				descriptor = undefined;
 			} catch {
+				if (descriptor !== undefined)
+					try {
+						closeSync(descriptor);
+					} catch {}
 				state.uncertain = true;
 				budget.uncertainties.push(`reference-read:${entry.path}`);
 				break;
 			}
 			continue;
 		}
-		const read = boundedRead(entry.path, 64 * 1024);
+		const read = boundedRead(boundEntryPath(entry.parentDescriptor, entry.name), 64 * 1024);
 		if (read.state !== "ok" || !read.bytes) {
 			state.uncertain = true;
 			budget.uncertainties.push(`reference-read:${entry.path}`);
@@ -977,6 +1218,15 @@ function advanceCasMark(
 		}
 		addCasMarks(state, budget, read.bytes.toString("utf8"));
 		if (state.uncertain) break;
+	}
+	if (state.uncertain) {
+		if (state.currentFile)
+			try {
+				closeSync(state.currentFile.descriptor);
+			} catch {}
+		state.currentFile = undefined;
+		closeTreeWalkState(state);
+		casMarkStates.delete(key);
 	}
 	return { complete: false, uncertain: state.uncertain };
 }
@@ -988,7 +1238,12 @@ function advanceCasSweep(root: string, nowMs: number, budget: Budget, marked: Se
 		casSweepStates.set(root, state);
 	}
 	while (!state.complete && budget.deleted < budget.maxDeletes && budget.scanned < budget.maxEntries) {
+		const uncertaintyCount = budget.uncertainties.length;
 		const entry = nextTreeFile(state, budget);
+		if (budget.uncertainties.length > uncertaintyCount) {
+			discardTreeWalk(casSweepStates, root);
+			return false;
+		}
 		if (!entry) break;
 		const match = CAS_NAME.exec(basename(entry.path));
 		if (
@@ -1001,33 +1256,19 @@ function advanceCasSweep(root: string, nowMs: number, budget: Budget, marked: Se
 		)
 			continue;
 		let descriptor: number | undefined;
-		let parentDescriptor: number | undefined;
 		try {
-			const parentPath = dirname(entry.path);
-			const parentBefore = lstatSync(parentPath);
-			if (!parentBefore.isDirectory() || parentBefore.isSymbolicLink())
-				throw new Error("cas_parent_not_stable_directory");
-			parentDescriptor = openSync(
-				parentPath,
-				fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
-			);
-			const openedParent = fstatSync(parentDescriptor);
-			if (openedParent.dev !== parentBefore.dev || openedParent.ino !== parentBefore.ino)
-				throw new Error("cas_parent_identity_changed");
-			const boundPath = `/proc/self/fd/${parentDescriptor}/${basename(entry.path)}`;
+			const boundPath = boundEntryPath(entry.parentDescriptor, entry.name);
 			descriptor = openSync(boundPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
 			const current = fstatSync(descriptor);
-			const parentNow = lstatSync(parentPath);
+			const named = lstatSync(boundPath);
 			if (
 				!current.isFile() ||
 				current.dev !== entry.stat.dev ||
 				current.ino !== entry.stat.ino ||
-				current.nlink !== 1 ||
-				parentNow.dev !== openedParent.dev ||
-				parentNow.ino !== openedParent.ino ||
-				!expired(current, nowMs)
+				!sameIdentity(named, current)
 			)
-				continue;
+				throw new Error("cas_delete_identity_changed");
+			if (current.nlink !== 1 || !expired(current, nowMs)) continue;
 			unlinkSync(boundPath);
 			budget.deleted += 1;
 		} catch (error) {
@@ -1037,10 +1278,10 @@ function advanceCasSweep(root: string, nowMs: number, budget: Budget, marked: Se
 				try {
 					closeSync(descriptor);
 				} catch {}
-			if (parentDescriptor !== undefined)
-				try {
-					closeSync(parentDescriptor);
-				} catch {}
+		}
+		if (budget.uncertainties.length > uncertaintyCount) {
+			discardTreeWalk(casSweepStates, root);
+			return false;
 		}
 	}
 	if (state.complete) casSweepStates.delete(root);
@@ -1073,6 +1314,26 @@ function ensureLeaseProtocolBoundary(root: string, nowMs: number): number | unde
 		// A completed mark from a pre-lease implementation cannot classify the
 		// new protocol boundary. Discard it; incomplete generations never sweep.
 		removePersistedMark(root);
+		let boundaryDescriptor: number | undefined;
+		let rootDescriptor: number | undefined;
+		try {
+			boundaryDescriptor = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+			if (!fstatSync(boundaryDescriptor).isFile()) throw new Error("lease_boundary_not_regular_file");
+			fsyncSync(boundaryDescriptor);
+			rootDescriptor = openStableDirectory(root);
+			fsyncSync(rootDescriptor);
+		} catch {
+			return undefined;
+		} finally {
+			if (boundaryDescriptor !== undefined)
+				try {
+					closeSync(boundaryDescriptor);
+				} catch {}
+			if (rootDescriptor !== undefined)
+				try {
+					closeSync(rootDescriptor);
+				} catch {}
+		}
 		record = decisionJson(path);
 	}
 	const activated = record.state === "ok" ? record.value?.activatedAtWallTimeMs : undefined;
@@ -1085,76 +1346,157 @@ function ensureLeaseProtocolBoundary(root: string, nowMs: number): number | unde
 		: undefined;
 }
 
-function persistedMarkPaths(root: string): { directory: string; log: string; proof: string } {
-	const directory = join(root, "retention");
+function persistedMarkPaths(root: string): {
+	directory: string;
+	logName: string;
+	proofName: string;
+} {
 	return {
-		directory,
-		log: join(directory, "legacy-marks-v1.log"),
-		proof: join(directory, "legacy-marks-v1-complete.json"),
+		directory: join(root, "retention"),
+		logName: "legacy-marks-v2.log",
+		proofName: "legacy-marks-v2-complete.json",
 	};
 }
 
-function persistCompletedMark(root: string, marked: Set<string>): void {
+function fsyncBoundFile(path: string): void {
+	const descriptor = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+	try {
+		const metadata = fstatSync(descriptor);
+		if (!metadata.isFile()) throw new Error("mark_publication_not_regular_file");
+		fsyncSync(descriptor);
+	} finally {
+		closeSync(descriptor);
+	}
+}
+
+// Publish data first, fsync it and its directory, then publish the proof.
+// A crash can leave no proof or a hash mismatch, neither of which may sweep CAS.
+function persistCompletedMark(
+	root: string,
+	marked: Set<string>,
+	roots: readonly string[],
+	leaseBoundaryMs: number,
+): void {
 	const paths = persistedMarkPaths(root);
 	mkdirSync(paths.directory, { recursive: true, mode: 0o700 });
+	const rootDescriptor = openStableDirectory(root);
+	try {
+		fsyncSync(rootDescriptor);
+	} finally {
+		closeSync(rootDescriptor);
+	}
+	const directory = openStableDirectory(paths.directory);
+	const generation = `${process.pid}-${process.hrtime.bigint()}`;
+	const temporaryLogName = `.${paths.logName}.tmp-${generation}`;
+	const temporaryProofName = `.${paths.proofName}.tmp-${generation}`;
 	const logBytes = Buffer.from(`${[...marked].sort().join("\n")}\n`, "utf8");
-	const suffix = `${process.pid}-${process.hrtime.bigint()}`;
-	const temporaryLog = `${paths.log}.tmp-${suffix}`;
-	const temporaryProof = `${paths.proof}.tmp-${suffix}`;
-	writeFileSync(temporaryLog, logBytes, { mode: 0o600, flag: "wx" });
-	renameSync(temporaryLog, paths.log);
-	writeFileSync(
-		temporaryProof,
+	const proofBytes = Buffer.from(
 		`${JSON.stringify({
-			version: 1,
+			version: 2,
 			state: "complete",
+			protocol: "cas-hard-link-lease-before-reference",
+			generation,
+			leaseBoundaryMs,
+			roots: [...roots],
 			count: marked.size,
 			bytes: logBytes.length,
 			sha256: createHash("sha256").update(logBytes).digest("hex"),
 		})}\n`,
-		{ mode: 0o600, flag: "wx" },
+		"utf8",
 	);
-	renameSync(temporaryProof, paths.proof);
+	try {
+		const temporaryLog = boundEntryPath(directory, temporaryLogName);
+		const temporaryProof = boundEntryPath(directory, temporaryProofName);
+		const log = boundEntryPath(directory, paths.logName);
+		const proof = boundEntryPath(directory, paths.proofName);
+		writeFileSync(temporaryLog, logBytes, { mode: 0o600, flag: "wx" });
+		fsyncBoundFile(temporaryLog);
+		renameSync(temporaryLog, log);
+		fsyncSync(directory);
+		writeFileSync(temporaryProof, proofBytes, { mode: 0o600, flag: "wx" });
+		fsyncBoundFile(temporaryProof);
+		renameSync(temporaryProof, proof);
+		fsyncSync(directory);
+	} finally {
+		for (const name of [temporaryProofName, temporaryLogName])
+			try {
+				unlinkSync(boundEntryPath(directory, name));
+			} catch {}
+		closeSync(directory);
+	}
 }
 
-function loadPersistedMark(root: string): Set<string> | undefined {
+function loadPersistedMark(root: string, roots: readonly string[], leaseBoundaryMs: number): Set<string> | undefined {
 	const paths = persistedMarkPaths(root);
-	const proof = smallJson(paths.proof);
-	if (
-		proof.state !== "ok" ||
-		proof.value?.version !== 1 ||
-		proof.value.state !== "complete" ||
-		!Number.isSafeInteger(proof.value.count) ||
-		Number(proof.value.count) < 0 ||
-		Number(proof.value.count) > 65_536 ||
-		!Number.isSafeInteger(proof.value.bytes) ||
-		Number(proof.value.bytes) < 0 ||
-		Number(proof.value.bytes) > 5 * 1024 * 1024 ||
-		typeof proof.value.sha256 !== "string" ||
-		!/^[0-9a-f]{64}$/.test(proof.value.sha256)
-	)
+	let directory: number | undefined;
+	try {
+		directory = openStableDirectory(paths.directory);
+		const proof = smallJson(boundEntryPath(directory, paths.proofName));
+		if (
+			proof.state !== "ok" ||
+			proof.value?.version !== 2 ||
+			proof.value.state !== "complete" ||
+			proof.value.protocol !== "cas-hard-link-lease-before-reference" ||
+			typeof proof.value.generation !== "string" ||
+			!/^\d+-\d+$/.test(proof.value.generation) ||
+			proof.value.leaseBoundaryMs !== leaseBoundaryMs ||
+			!Array.isArray(proof.value.roots) ||
+			proof.value.roots.length !== roots.length ||
+			!proof.value.roots.every((value, index) => value === roots[index]) ||
+			!Number.isSafeInteger(proof.value.count) ||
+			Number(proof.value.count) < 0 ||
+			Number(proof.value.count) > 65_536 ||
+			!Number.isSafeInteger(proof.value.bytes) ||
+			Number(proof.value.bytes) < 0 ||
+			Number(proof.value.bytes) > 5 * 1024 * 1024 ||
+			typeof proof.value.sha256 !== "string" ||
+			!/^[0-9a-f]{64}$/.test(proof.value.sha256)
+		)
+			return undefined;
+		const log = boundedRead(boundEntryPath(directory, paths.logName), 5 * 1024 * 1024);
+		if (
+			log.state !== "ok" ||
+			!log.bytes ||
+			log.bytes.length !== proof.value.bytes ||
+			createHash("sha256").update(log.bytes).digest("hex") !== proof.value.sha256
+		)
+			return undefined;
+		const values = log.bytes.toString("utf8").trim().split("\n").filter(Boolean);
+		if (values.length !== proof.value.count || values.some((value) => !/^[0-9a-f]{64}$/.test(value)))
+			return undefined;
+		return new Set(values);
+	} catch {
 		return undefined;
-	const log = boundedRead(paths.log, 5 * 1024 * 1024);
-	if (
-		log.state !== "ok" ||
-		!log.bytes ||
-		log.bytes.length !== proof.value.bytes ||
-		createHash("sha256").update(log.bytes).digest("hex") !== proof.value.sha256
-	)
-		return undefined;
-	const values = log.bytes.toString("utf8").trim().split("\n").filter(Boolean);
-	if (values.length !== proof.value.count || values.some((value) => !/^[0-9a-f]{64}$/.test(value))) return undefined;
-	return new Set(values);
+	} finally {
+		if (directory !== undefined)
+			try {
+				closeSync(directory);
+			} catch {}
+	}
 }
 
 function removePersistedMark(root: string): void {
 	const paths = persistedMarkPaths(root);
-	for (const path of [paths.proof, paths.log])
-		try {
-			unlinkSync(path);
-		} catch {}
+	let directory: number | undefined;
+	try {
+		directory = openStableDirectory(paths.directory);
+		for (const name of [paths.proofName, paths.logName, "legacy-marks-v1-complete.json", "legacy-marks-v1.log"])
+			try {
+				const bound = boundEntryPath(directory, name);
+				const metadata = lstatSync(bound);
+				if (!metadata.isFile() || metadata.isSymbolicLink()) continue;
+				unlinkSync(bound);
+			} catch {}
+		fsyncSync(directory);
+	} catch {
+		// Missing or substituted proof storage blocks sweep but needs no cleanup.
+	} finally {
+		if (directory !== undefined)
+			try {
+				closeSync(directory);
+			} catch {}
+	}
 }
-
 function runIncidentRetentionPassOwned(options: IncidentRetentionOptions): IncidentRetentionResult {
 	const nowMs = options.nowMs ?? Date.now();
 	const budget: Budget = {
@@ -1201,7 +1543,7 @@ function runIncidentRetentionPassOwned(options: IncidentRetentionOptions): Incid
 		runState = { hashes: new Set<string>(), activeRuns: new Set<string>(), unsafeForCas: false };
 		runScanStates.set(runRoot, runState);
 	}
-	if (incidentScanComplete && runState) {
+	if (incidentScanComplete && runState && budget.uncertainties.length === 0) {
 		pruneArtifactDirectories(
 			runRoot,
 			"run",
@@ -1218,7 +1560,13 @@ function runIncidentRetentionPassOwned(options: IncidentRetentionOptions): Incid
 	}
 	const runScanComplete = incidentScanComplete && !resumableDirectories.has(runRoot);
 	if (runScanComplete && runState) protectedActiveRuns.splice(0, protectedActiveRuns.length, ...runState.activeRuns);
-	if (runScanComplete && runState && budget.deleted < budget.maxDeletes && budget.scanned < budget.maxEntries) {
+	if (
+		runScanComplete &&
+		runState &&
+		budget.uncertainties.length === 0 &&
+		budget.deleted < budget.maxDeletes &&
+		budget.scanned < budget.maxEntries
+	) {
 		const refsRoot = join(root, "refs");
 		if (!completedRunOwnerPrunes.has(refsRoot)) pruneRunReferenceOwners(refsRoot, nowMs, budget, runState.hashes);
 		if (
@@ -1227,8 +1575,15 @@ function runIncidentRetentionPassOwned(options: IncidentRetentionOptions): Incid
 			budget.deleted < budget.maxDeletes &&
 			budget.scanned < budget.maxEntries
 		)
-			pruneReferences(refsRoot, nowMs, budget, runState.hashes);
+			pruneReferences(refsRoot, nowMs, budget);
 	}
+	if (
+		runScanComplete &&
+		budget.uncertainties.length === 0 &&
+		budget.deleted < budget.maxDeletes &&
+		budget.scanned < budget.maxEntries
+	)
+		advanceLegacySysdigOwnerSweep(join(root, "sysdig-pins", "owners"), budget);
 	if (
 		runScanComplete &&
 		runState &&
@@ -1237,34 +1592,36 @@ function runIncidentRetentionPassOwned(options: IncidentRetentionOptions): Incid
 		budget.deleted < budget.maxDeletes &&
 		budget.scanned < budget.maxEntries
 	) {
-		const markKey = join(root, "retention-mark-v1");
-		let marked = completedCasMarks.get(markKey) ?? loadPersistedMark(root);
-		if (marked && !completedCasMarks.has(markKey)) completedCasMarks.set(markKey, marked);
-		if (!marked) {
-			const mark = advanceCasMark(
-				markKey,
-				[runRoot, incidentRoot, join(root, "refs")],
-				budget,
-				leaseBoundaryMs ?? Number.POSITIVE_INFINITY,
-			);
-			if (mark.complete && !mark.uncertain && mark.marked) {
-				marked = mark.marked;
-				persistCompletedMark(root, marked);
-				completedCasMarks.set(markKey, marked);
+		const markKey = join(root, "retention-mark-v2");
+		const markRoots = [runRoot, incidentRoot, join(root, "refs")];
+		const casRoot = join(root, "cas", "sha256");
+		if (leaseBoundaryMs !== undefined) {
+			let marked = loadPersistedMark(root, markRoots, leaseBoundaryMs);
+			if (!marked) {
+				discardTreeWalk(casSweepStates, casRoot);
+				const mark = advanceCasMark(markKey, markRoots, budget, leaseBoundaryMs);
+				if (mark.complete && !mark.uncertain && mark.marked) {
+					try {
+						persistCompletedMark(root, mark.marked, markRoots, leaseBoundaryMs);
+						marked = loadPersistedMark(root, markRoots, leaseBoundaryMs);
+						if (!marked) budget.uncertainties.push("durable-cas-mark-proof-unavailable");
+					} catch {
+						budget.uncertainties.push("durable-cas-mark-proof-publication-failed");
+					}
+				}
 			}
-		}
-		if (
-			marked &&
-			budget.uncertainties.length === 0 &&
-			budget.deleted < budget.maxDeletes &&
-			budget.scanned < budget.maxEntries
-		) {
-			if (advanceCasSweep(join(root, "cas", "sha256"), nowMs, budget, marked)) {
-				completedCasMarks.delete(markKey);
-				removePersistedMark(root);
-				const refsRoot = join(root, "refs");
-				completedReferencePrunes.delete(refsRoot);
-				completedRunOwnerPrunes.delete(refsRoot);
+			if (
+				marked &&
+				budget.uncertainties.length === 0 &&
+				budget.deleted < budget.maxDeletes &&
+				budget.scanned < budget.maxEntries
+			) {
+				if (advanceCasSweep(casRoot, nowMs, budget, marked)) {
+					removePersistedMark(root);
+					const refsRoot = join(root, "refs");
+					completedReferencePrunes.delete(refsRoot);
+					completedRunOwnerPrunes.delete(refsRoot);
+				}
 			}
 		}
 	}

@@ -7,6 +7,7 @@ import {
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
+	renameSync,
 	rmSync,
 	statSync,
 	symlinkSync,
@@ -243,6 +244,30 @@ describe("three-day diagnostic retention", () => {
 		expect(readdirSync(target.incidents).filter((name) => !name.startsWith(".retention-gc-"))).toHaveLength(0);
 	});
 
+	it("keeps an identity-bound tombstone stable across incremental delete passes", () => {
+		const target = fixture();
+		const incident = finalizedIncident(target, "incremental-expired", NOW - 4 * DAY);
+		writeFileSync(join(incident, "extra-a"), "a", { mode: 0o600 });
+		writeFileSync(join(incident, "extra-b"), "b", { mode: 0o600 });
+		const options = {
+			agentDir: target.agentDir,
+			nowMs: NOW,
+			maxEntries: 64,
+			maxDeletes: 1,
+			machineId: "machine",
+			bootId: "boot",
+		};
+		runIncidentRetentionPass(options);
+		const firstName = readdirSync(target.incidents).find((name) => name.startsWith(".retention-gc-"));
+		expect(firstName).toMatch(/^\.retention-gc-\d+-\d+-[0-9a-f]{16}$/);
+		runIncidentRetentionPass(options);
+		const secondName = readdirSync(target.incidents).find((name) => name.startsWith(".retention-gc-"));
+		expect(secondName).toBe(firstName);
+		for (let pass = 0; pass < 8 && readdirSync(target.incidents).length > 0; pass += 1)
+			runIncidentRetentionPass(options);
+		expect(readdirSync(target.incidents)).toHaveLength(0);
+	});
+
 	it("resumes directory discovery when a scan batch ends before expired entries", () => {
 		const target = fixture();
 		for (let index = 0; index < 4; index += 1) finalizedIncident(target, `fresh-${index}`, NOW - DAY);
@@ -263,6 +288,40 @@ describe("three-day diagnostic retention", () => {
 		expect(expired.every((path) => !existsSync(path))).toBe(true);
 		for (let index = 0; index < 4; index += 1)
 			expect(existsSync(join(target.incidents, `fresh-${index}`))).toBe(true);
+	});
+
+	it("keeps deletion bound to the originally opened incident directory after ancestor substitution", () => {
+		const target = fixture();
+		finalizedIncident(target, "first-fresh", NOW - DAY);
+		finalizedIncident(target, "second-expired", NOW - 4 * DAY);
+		runIncidentRetentionPass({
+			agentDir: target.agentDir,
+			nowMs: NOW,
+			maxEntries: 1,
+			maxDeletes: 16,
+			machineId: "machine",
+			bootId: "boot",
+		});
+
+		const retainedRoot = `${target.incidents}-retained`;
+		renameSync(target.incidents, retainedRoot);
+		mkdirSync(target.incidents, { recursive: true, mode: 0o700 });
+		const replacement = finalizedIncident(target, "second-expired", NOW - DAY);
+		for (let pass = 0; pass < 4 && existsSync(join(retainedRoot, "second-expired")); pass += 1)
+			runIncidentRetentionPass({
+				agentDir: target.agentDir,
+				nowMs: NOW,
+				maxEntries: 64,
+				maxDeletes: 16,
+				machineId: "machine",
+				bootId: "boot",
+			});
+
+		expect(existsSync(join(retainedRoot, "second-expired"))).toBe(false);
+		expect(existsSync(replacement)).toBe(true);
+		expect(JSON.parse(readFileSync(join(replacement, "summary.json"), "utf8"))).toMatchObject({
+			finalized: { wallTime: new Date(NOW - DAY).toISOString() },
+		});
 	});
 
 	it("matches the production proc:<start-ticks> identity format", () => {
@@ -400,6 +459,60 @@ describe("three-day diagnostic retention", () => {
 		expect(existsSync(removed)).toBe(false);
 	});
 
+	it("continues CAS sweep only from a complete durable v2 mark proof", () => {
+		const target = fixture();
+		const digests = [`aa${"1".repeat(62)}`, `aa${"2".repeat(62)}`, `aa${"3".repeat(62)}`];
+		for (const digest of digests) {
+			const blob = join(target.recorder, "cas", "sha256", "aa", `${digest}.blob`);
+			mkdirSync(dirname(blob), { recursive: true, mode: 0o700 });
+			writeFileSync(blob, digest, { mode: 0o600 });
+			old(blob, 4 * DAY);
+		}
+		const options = {
+			agentDir: target.agentDir,
+			nowMs: NOW,
+			maxEntries: 512,
+			maxDeletes: 1,
+			machineId: "machine",
+			bootId: "boot",
+		};
+		runIncidentRetentionPass(options);
+		const remainingAfterFirst = digests.filter((digest) =>
+			existsSync(join(target.recorder, "cas", "sha256", "aa", `${digest}.blob`)),
+		);
+		expect(remainingAfterFirst).toHaveLength(2);
+
+		const proofPath = join(target.recorder, "retention", "legacy-marks-v2-complete.json");
+		const logPath = join(target.recorder, "retention", "legacy-marks-v2.log");
+		const proof = JSON.parse(readFileSync(proofPath, "utf8")) as Record<string, unknown>;
+		const log = readFileSync(logPath);
+		expect(proof).toMatchObject({
+			version: 2,
+			state: "complete",
+			protocol: "cas-hard-link-lease-before-reference",
+			roots: [join(target.recorder, "runs"), target.incidents, join(target.recorder, "refs")],
+			bytes: log.length,
+			sha256: createHash("sha256").update(log).digest("hex"),
+		});
+
+		writeFileSync(logPath, "corrupt\n", { mode: 0o600 });
+		runIncidentRetentionPass({ ...options, maxEntries: 1 });
+		const remainingAfterCorruption = digests.filter((digest) =>
+			existsSync(join(target.recorder, "cas", "sha256", "aa", `${digest}.blob`)),
+		);
+		expect(remainingAfterCorruption).toEqual(remainingAfterFirst);
+		for (
+			let pass = 0;
+			pass < 8 &&
+			digests.some((digest) => existsSync(join(target.recorder, "cas", "sha256", "aa", `${digest}.blob`)));
+			pass += 1
+		)
+			runIncidentRetentionPass(options);
+		expect(digests.some((digest) => existsSync(join(target.recorder, "cas", "sha256", "aa", `${digest}.blob`)))).toBe(
+			false,
+		);
+	});
+
 	it("fails closed behind a live cross-process CAS owner, then commits canonical path plus lease after release", async () => {
 		const target = fixture();
 		const owner = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], { stdio: "ignore" });
@@ -473,13 +586,13 @@ describe("three-day diagnostic retention", () => {
 		expect(readFileSync(victim, "utf8")).toBe("victim");
 	});
 
-	it("does not follow a fixed persisted-mark temp symlink", () => {
+	it("replaces rather than follows a canonical persisted-mark symlink", () => {
 		const target = fixture();
 		const victim = join(target.root, "mark-victim");
 		writeFileSync(victim, "safe", { mode: 0o600 });
 		const retentionDir = join(target.recorder, "retention");
 		mkdirSync(retentionDir, { recursive: true, mode: 0o700 });
-		symlinkSync(victim, join(retentionDir, "legacy-marks-v1.log.tmp"));
+		symlinkSync(victim, join(retentionDir, "legacy-marks-v2.log"));
 		runIncidentRetentionPass({
 			agentDir: target.agentDir,
 			nowMs: NOW,
@@ -646,6 +759,49 @@ describe("three-day diagnostic retention", () => {
 		expect(existsSync(kept)).toBe(true);
 	});
 
+	it("invalidates a multi-pass mark when already-read reference bytes change with size and mtime restored", () => {
+		const target = fixture();
+		const digest = "9".repeat(64);
+		const blob = join(target.recorder, "cas", "sha256", "99", `${digest}.blob`);
+		mkdirSync(dirname(blob), { recursive: true, mode: 0o700 });
+		writeFileSync(blob, "retained", { mode: 0o600 });
+		old(blob, 4 * DAY);
+		const reference = join(target.recorder, "refs", "occurrences", "large.json");
+		const bytes = Buffer.from(`${JSON.stringify({ digest, padding: "x".repeat(160 * 1024) })}
+`);
+		mkdirSync(dirname(reference), { recursive: true, mode: 0o700 });
+		writeFileSync(reference, bytes, { mode: 0o600 });
+		old(reference, DAY);
+		const timestamps = statSync(reference);
+		const uncertainties: string[] = [];
+		for (let pass = 0; pass < 40; pass += 1) {
+			const result = runIncidentRetentionPass({
+				agentDir: target.agentDir,
+				nowMs: NOW,
+				maxEntries: 1,
+				maxDeletes: 16,
+				machineId: "machine",
+				bootId: "boot",
+			});
+			uncertainties.push(...result.uncertainties);
+			bytes[bytes.length - 2] = bytes[bytes.length - 2] === 0x78 ? 0x79 : 0x78;
+			writeFileSync(reference, bytes, { mode: 0o600 });
+			utimesSync(reference, timestamps.atime, timestamps.mtime);
+		}
+		expect(existsSync(blob)).toBe(true);
+		expect(uncertainties.some((value) => value.startsWith("reference-changed:"))).toBe(true);
+		for (let pass = 0; pass < 8; pass += 1)
+			runIncidentRetentionPass({
+				agentDir: target.agentDir,
+				nowMs: NOW,
+				maxEntries: 512,
+				maxDeletes: 16,
+				machineId: "machine",
+				bootId: "boot",
+			});
+		expect(existsSync(blob)).toBe(true);
+	});
+
 	it("keeps a durable incomplete pin local while unrelated cleanup progresses", () => {
 		const target = fixture();
 		const anchor = NOW - 2 * DAY;
@@ -756,6 +912,32 @@ describe("three-day diagnostic retention", () => {
 			});
 		expect(existsSync(newerOwner)).toBe(false);
 		expect(existsSync(blob)).toBe(false);
+	});
+
+	it("removes a legacy Sysdig owner only after its last incident pin is gone", () => {
+		const target = fixture();
+		const id = "c".repeat(64);
+		const owner = join(target.recorder, "sysdig-pins", "owners", `${id}.scap`);
+		const pin = join(target.incidents, "retained", "sysdig-pins", "segments", `${id}.scap`);
+		mkdirSync(dirname(owner), { recursive: true, mode: 0o700 });
+		finalizedIncident(target, "retained", NOW - DAY);
+		mkdirSync(dirname(pin), { recursive: true, mode: 0o700 });
+		writeFileSync(owner, "legacy-owner", { mode: 0o600 });
+		linkSync(owner, pin);
+		const options = {
+			agentDir: target.agentDir,
+			nowMs: NOW,
+			maxEntries: 512,
+			maxDeletes: 16,
+			machineId: "machine",
+			bootId: "boot",
+		};
+
+		runIncidentRetentionPass(options);
+		expect(existsSync(owner)).toBe(true);
+		rmSync(pin);
+		runIncidentRetentionPass(options);
+		expect(existsSync(owner)).toBe(false);
 	});
 
 	it("resumably backfills a proof for a proofless producer manifest larger than one MiB", () => {
