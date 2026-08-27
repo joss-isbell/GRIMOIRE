@@ -296,15 +296,30 @@ interface PendingWorkerEventSummaryRefresh {
 	initialDiagnosticCause: Record<string, unknown>;
 	latestDiagnosticCause: Record<string, unknown>;
 	coalescedCount: number;
+	coalescedCountSaturated: boolean;
+	promise: Promise<boolean>;
+	resolve: (changed: boolean) => void;
+	reject: (error: unknown) => void;
 }
 
 interface WorkerEventSummaryRefreshState {
-	active: boolean;
+	active?: Promise<boolean>;
 	lastStartedAt: number;
+	lastSuccessfulAt: number;
 	retryNotBefore: number;
 	pending?: PendingWorkerEventSummaryRefresh;
 	timer?: ReturnType<typeof setTimeout>;
 	cancelled: boolean;
+}
+
+interface PendingAgentPeerSync {
+	initialDiagnosticCause: Record<string, unknown>;
+	latestDiagnosticCause: Record<string, unknown>;
+	coalescedCount: number;
+	coalescedCountSaturated: boolean;
+	promise: Promise<void>;
+	resolve: () => void;
+	reject: (error: unknown) => void;
 }
 
 interface ResidentWorker {
@@ -687,7 +702,10 @@ export class DaemonSupervisor {
 	private commandJournal!: CommandRecoveryJournal;
 	private readonly streamReconstructor = new CompactAssistantStreamReconstructor();
 	private readonly compactCatchupInProgress = new Set<string>();
-	private agentPeerSyncQueue: Promise<void> = Promise.resolve();
+	private agentPeerSyncActive?: Promise<void>;
+	private agentPeerSyncPending?: PendingAgentPeerSync;
+	private completedAgentPeerFingerprint?: string;
+	private readonly workerClientGenerations = new WeakMap<DaemonWorkerClient, string>();
 	private readonly pendingSessionNames = new Set<string>();
 	private readonly catalog: DaemonCatalogClient;
 	private readonly settingsManager: SettingsManager;
@@ -2346,9 +2364,23 @@ export class DaemonSupervisor {
 		await Promise.all(
 			[...this.workers.values()]
 				.filter((worker) => !this.isWorkerStopping(worker))
-				.map((worker) => this.refreshWorkerSummaries(worker).catch(() => undefined)),
+				.map((worker) =>
+					this.refreshWorkerSummariesForObservation(
+						worker,
+						{
+							causeKind: "public_command",
+							causeCommandType: command.type,
+							causeClientId: this.protocolClientId(client),
+						},
+						"bounded",
+					).catch(() => undefined),
+				),
 		);
-		await this.syncAgentPeers().catch((error) => this.log(`Could not synchronize agent peers: ${String(error)}`));
+		await this.syncAgentPeers({
+			causeKind: "public_command",
+			causeCommandType: command.type,
+			causeClientId: this.protocolClientId(client),
+		}).catch((error) => this.log(`Could not synchronize agent peers: ${String(error)}`));
 		const clientOwnedWorkers = [...this.workers.values()].filter((worker) => !this.isVisibleWorker(worker));
 		// Stopping workers stay listed (with an honest workerState) because this
 		// list also feeds busy-daemon safety checks in daemon-launch.
@@ -3499,82 +3531,141 @@ export class DaemonSupervisor {
 		diagnosticCause: Record<string, unknown>,
 		priority: WorkerEventSummaryRefreshPriority,
 	): void {
+		if (!this.workerObservationIsCurrent(worker)) return;
+		const state = worker.eventSummaryRefresh;
+		const now = Date.now();
 		if (
-			this.shuttingDown ||
-			this.workers.get(worker.descriptor.workerId) !== worker ||
-			this.isWorkerStopping(worker)
+			state &&
+			(state.active !== undefined ||
+				now < state.retryNotBefore ||
+				(priority === "bounded" && now - state.lastStartedAt < WORKER_EVENT_SUMMARY_REFRESH_INTERVAL_MS))
 		) {
+			this.queueWorkerObservation(state, diagnosticCause, priority);
+			this.drainPendingWorkerObservation(worker, state);
 			return;
 		}
-		let state = worker.eventSummaryRefresh;
-		if (!state) {
-			state = {
-				active: false,
-				lastStartedAt: 0,
-				retryNotBefore: 0,
-				cancelled: false,
-			};
-			worker.eventSummaryRefresh = state;
+		void this.refreshWorkerSummariesForObservation(worker, diagnosticCause, priority).catch(() => undefined);
+	}
+
+	private workerObservationIsCurrent(worker: ResidentWorker): boolean {
+		return (
+			!this.shuttingDown && this.workers.get(worker.descriptor.workerId) === worker && !this.isWorkerStopping(worker)
+		);
+	}
+
+	private saturateCoalescedCount(target: { coalescedCount: number; coalescedCountSaturated: boolean }): void {
+		if (target.coalescedCount >= Number.MAX_SAFE_INTEGER) {
+			target.coalescedCount = Number.MAX_SAFE_INTEGER;
+			target.coalescedCountSaturated = true;
+			return;
 		}
+		target.coalescedCount += 1;
+	}
+
+	private queueWorkerObservation(
+		state: WorkerEventSummaryRefreshState,
+		diagnosticCause: Record<string, unknown>,
+		priority: WorkerEventSummaryRefreshPriority,
+	): Promise<boolean> {
 		if (state.pending) {
 			state.pending.priority = state.pending.priority === "urgent" || priority === "urgent" ? "urgent" : "bounded";
 			state.pending.latestPriority = priority;
 			state.pending.latestDiagnosticCause = diagnosticCause;
-			state.pending.coalescedCount += 1;
-		} else {
-			state.pending = {
-				priority,
-				initialPriority: priority,
-				latestPriority: priority,
-				initialDiagnosticCause: diagnosticCause,
-				latestDiagnosticCause: diagnosticCause,
-				coalescedCount: 0,
-			};
+			this.saturateCoalescedCount(state.pending);
+			return state.pending.promise;
 		}
-		this.drainWorkerEventSummaryRefresh(worker, state);
+		let resolvePending!: (changed: boolean) => void;
+		let rejectPending!: (error: unknown) => void;
+		const promise = new Promise<boolean>((resolve, reject) => {
+			resolvePending = resolve;
+			rejectPending = reject;
+		});
+		void promise.catch(() => undefined);
+		state.pending = {
+			priority,
+			initialPriority: priority,
+			latestPriority: priority,
+			initialDiagnosticCause: diagnosticCause,
+			latestDiagnosticCause: diagnosticCause,
+			coalescedCount: 0,
+			coalescedCountSaturated: false,
+			promise,
+			resolve: resolvePending,
+			reject: rejectPending,
+		};
+		return promise;
 	}
 
-	private drainWorkerEventSummaryRefresh(worker: ResidentWorker, state: WorkerEventSummaryRefreshState): void {
-		if (
-			state.cancelled ||
-			worker.eventSummaryRefresh !== state ||
-			this.shuttingDown ||
-			this.workers.get(worker.descriptor.workerId) !== worker ||
-			this.isWorkerStopping(worker)
-		) {
+	private refreshWorkerSummariesForObservation(
+		worker: ResidentWorker,
+		diagnosticCause: Record<string, unknown>,
+		priority: WorkerEventSummaryRefreshPriority,
+	): Promise<boolean> {
+		if (!this.workerObservationIsCurrent(worker)) {
+			return Promise.reject(new Error("Session worker is unavailable for summary observation"));
+		}
+		let state = worker.eventSummaryRefresh;
+		if (!state) {
+			state = { lastStartedAt: 0, lastSuccessfulAt: 0, retryNotBefore: 0, cancelled: false };
+			worker.eventSummaryRefresh = state;
+		}
+		const now = Date.now();
+		if (priority === "bounded" && now - state.lastSuccessfulAt < WORKER_EVENT_SUMMARY_REFRESH_INTERVAL_MS) {
+			return Promise.resolve(false);
+		}
+		if (state.active) {
+			return priority === "urgent" ? this.queueWorkerObservation(state, diagnosticCause, priority) : state.active;
+		}
+		if (now < state.retryNotBefore) {
+			if (priority === "bounded") return Promise.resolve(false);
+			const pending = this.queueWorkerObservation(state, diagnosticCause, priority);
+			this.schedulePendingWorkerObservation(worker, state, state.retryNotBefore - now);
+			return pending;
+		}
+		return this.startWorkerObservation(worker, state, diagnosticCause);
+	}
+
+	private schedulePendingWorkerObservation(
+		worker: ResidentWorker,
+		state: WorkerEventSummaryRefreshState,
+		delayMs: number,
+	): void {
+		if (state.timer) return;
+		state.timer = setTimeout(
+			() => {
+				state.timer = undefined;
+				this.drainPendingWorkerObservation(worker, state);
+			},
+			Math.max(0, delayMs),
+		);
+		state.timer.unref();
+	}
+
+	private drainPendingWorkerObservation(worker: ResidentWorker, state: WorkerEventSummaryRefreshState): void {
+		if (state.cancelled || worker.eventSummaryRefresh !== state || !this.workerObservationIsCurrent(worker)) {
 			this.clearWorkerEventSummaryRefresh(worker);
 			return;
 		}
 		if (state.active || !state.pending) return;
-
-		const pending = state.pending;
-		const boundedNotBefore =
-			pending.priority === "bounded" ? state.lastStartedAt + WORKER_EVENT_SUMMARY_REFRESH_INTERVAL_MS : 0;
-		const notBefore = Math.max(boundedNotBefore, state.retryNotBefore);
+		const notBefore = Math.max(
+			state.retryNotBefore,
+			state.pending.priority === "bounded"
+				? Math.max(state.lastStartedAt, state.lastSuccessfulAt) + WORKER_EVENT_SUMMARY_REFRESH_INTERVAL_MS
+				: 0,
+		);
 		const delayMs = notBefore - Date.now();
 		if (delayMs > 0) {
-			if (!state.timer) {
-				state.timer = setTimeout(() => {
-					state.timer = undefined;
-					this.drainWorkerEventSummaryRefresh(worker, state);
-				}, delayMs);
-				state.timer.unref();
-			}
+			this.schedulePendingWorkerObservation(worker, state, delayMs);
 			return;
 		}
-		if (state.timer) {
-			clearTimeout(state.timer);
-			state.timer = undefined;
-		}
-
+		const pending = state.pending;
 		state.pending = undefined;
-		state.active = true;
-		state.lastStartedAt = Date.now();
-		const scheduledDiagnosticCause = {
+		const cause = {
 			...pending.initialDiagnosticCause,
 			causeRefreshPriority: pending.priority,
 			causeInitialRefreshPriority: pending.initialPriority,
 			causeCoalescedCount: pending.coalescedCount,
+			causeCoalescedCountSaturated: pending.coalescedCountSaturated,
 			...(pending.coalescedCount > 0
 				? {
 						causeLatestEvent: {
@@ -3584,33 +3675,46 @@ export class DaemonSupervisor {
 					}
 				: {}),
 		};
-		void this.refreshWorkerSummaries(worker, false, scheduledDiagnosticCause, true)
-			.then((peerProjectionChanged) => {
+		this.startWorkerObservation(worker, state, cause).then(pending.resolve, pending.reject);
+	}
+
+	private startWorkerObservation(
+		worker: ResidentWorker,
+		state: WorkerEventSummaryRefreshState,
+		diagnosticCause: Record<string, unknown>,
+	): Promise<boolean> {
+		state.lastStartedAt = Date.now();
+		const observation = this.refreshWorkerSummaries(worker, false, diagnosticCause)
+			.then((changed) => {
+				state.lastSuccessfulAt = Date.now();
 				state.retryNotBefore = 0;
-				if (
-					!peerProjectionChanged ||
-					state.cancelled ||
-					worker.eventSummaryRefresh !== state ||
-					this.workers.get(worker.descriptor.workerId) !== worker
-				) {
-					return;
+				if (changed && diagnosticCause.causeKind === "worker_outbound_frame") {
+					void this.syncAgentPeers({ ...diagnosticCause, causeStage: "post_summary_refresh" }).catch(
+						() => undefined,
+					);
 				}
-				return this.syncAgentPeers({ ...scheduledDiagnosticCause, causeStage: "post_summary_refresh" });
+				return changed;
 			})
-			.catch(() => {
+			.catch((error) => {
 				state.retryNotBefore = Date.now() + WORKER_EVENT_SUMMARY_REFRESH_INTERVAL_MS;
+				throw error;
 			})
 			.finally(() => {
-				state.active = false;
-				this.drainWorkerEventSummaryRefresh(worker, state);
+				if (state.active === observation) state.active = undefined;
+				this.drainPendingWorkerObservation(worker, state);
 			});
+		state.active = observation;
+		return observation;
 	}
 
 	private clearWorkerEventSummaryRefresh(worker: ResidentWorker): void {
 		const state = worker.eventSummaryRefresh;
 		if (!state) return;
 		state.cancelled = true;
-		state.pending = undefined;
+		if (state.pending) {
+			state.pending.reject(new Error("Session worker summary observation was cancelled"));
+			state.pending = undefined;
+		}
 		if (state.timer) {
 			clearTimeout(state.timer);
 			state.timer = undefined;
@@ -3622,26 +3726,59 @@ export class DaemonSupervisor {
 		worker: ResidentWorker,
 		recovery = false,
 		diagnosticCause: Record<string, unknown> = { causeKind: "supervisor_internal" },
-		requireCurrentWorker = false,
 	): Promise<boolean> {
-		if (this.isWorkerStopping(worker)) {
-			throw new Error("Session worker is stopping");
-		}
-		if (!worker.client) {
-			throw new Error("Session worker is not connected");
-		}
+		if (this.isWorkerStopping(worker)) throw new Error("Session worker is stopping");
+		const capturedClient = worker.client;
+		if (!capturedClient) throw new Error("Session worker is not connected");
+		const capturedStopRevision = worker.stopRevision;
+		const assertCurrent = () => {
+			if (
+				this.shuttingDown ||
+				worker.client !== capturedClient ||
+				worker.stopRevision !== capturedStopRevision ||
+				this.isWorkerStopping(worker) ||
+				this.workers.get(worker.descriptor.workerId) !== worker
+			) {
+				throw new Error("Session worker changed during summary refresh");
+			}
+		};
 		const previousRoot = worker.summaries.get(worker.descriptor.rootActiveSessionId);
 		const previousPeerProjection = previousRoot ? this.agentPeerSummary(previousRoot) : undefined;
-		const response = await worker.client.request(
+		const response = await capturedClient.request(
 			{ type: "list" },
 			WORKER_EVENT_SUMMARY_REFRESH_INTERVAL_MS,
 			diagnosticCause,
 		);
-		if (requireCurrentWorker && this.workers.get(worker.descriptor.workerId) !== worker) {
-			throw new Error("Session worker was replaced during summary refresh");
-		}
+		assertCurrent();
 		const summaries = sessionSummariesFromResponse(response);
-		worker.summaries = new Map(summaries.map((summary) => [summary.activeSessionId ?? summary.id, summary]));
+		const candidateSummaries = new Map(summaries.map((summary) => [summary.activeSessionId ?? summary.id, summary]));
+		const root = candidateSummaries.get(worker.descriptor.rootActiveSessionId);
+		if (root && recovery) await this.assertRecoveryAllowed();
+		assertCurrent();
+
+		const originalDescriptor = worker.descriptor;
+		if (root) {
+			const candidateDescriptor: DaemonWorkerDescriptor = {
+				...originalDescriptor,
+				rootSessionId: root.sessionId,
+				sessionFile: root.sessionFile,
+				createCommand: durableDaemonCreateCommand({
+					type: "create",
+					sessionPath: root.sessionFile,
+					noSession: originalDescriptor.createCommand.noSession,
+				}),
+			};
+			worker.descriptor = candidateDescriptor;
+			try {
+				assertCurrent();
+				this.persistWorker(worker);
+			} catch (error) {
+				worker.descriptor = originalDescriptor;
+				throw error;
+			}
+		}
+		assertCurrent();
+		worker.summaries = candidateSummaries;
 		for (const summary of summaries) {
 			const activeSessionId = summary.activeSessionId ?? summary.id;
 			if (summary.streamingMessage?.role === "assistant") {
@@ -3649,20 +3786,6 @@ export class DaemonSupervisor {
 			} else if (!summary.isStreaming) {
 				this.streamReconstructor.clear(activeSessionId);
 			}
-		}
-		const root = worker.summaries.get(worker.descriptor.rootActiveSessionId);
-		if (root) {
-			if (recovery) {
-				await this.assertRecoveryAllowed();
-			}
-			worker.descriptor.rootSessionId = root.sessionId;
-			worker.descriptor.sessionFile = root.sessionFile;
-			worker.descriptor.createCommand = durableDaemonCreateCommand({
-				type: "create",
-				sessionPath: root.sessionFile,
-				noSession: worker.descriptor.createCommand.noSession,
-			});
-			this.persistWorker(worker);
 		}
 		const peerProjection = root ? this.agentPeerSummary(root) : undefined;
 		return JSON.stringify(previousPeerProjection) !== JSON.stringify(peerProjection);
@@ -3815,36 +3938,115 @@ export class DaemonSupervisor {
 	private syncAgentPeers(
 		diagnosticCause: Record<string, unknown> = { causeKind: "supervisor_internal" },
 	): Promise<void> {
-		const sync = this.agentPeerSyncQueue
-			.catch(() => undefined)
-			.then(async () => {
-				const readyWorkers = [...this.workers.values()].filter(
-					(worker): worker is ResidentWorker & { client: DaemonWorkerClient } =>
-						this.isLiveWorker(worker) && worker.descriptor.lifecycle === "ready" && worker.client !== undefined,
-				);
-				await Promise.all(
-					readyWorkers.map(async (worker) => {
-						const peers = [
-							...readyWorkers
-								.filter((candidate) => candidate !== worker)
-								.flatMap((candidate) => {
-									const root = candidate.summaries.get(candidate.descriptor.rootActiveSessionId);
-									return root ? [this.agentPeerSummary(root)] : [];
-								}),
-						];
-						const response = await worker.client.requestWorker(
-							{ type: "worker_sync_agent_peers", peers },
-							5000,
-							diagnosticCause,
-						);
-						if (!response.success) {
-							throw new Error(response.error);
-						}
-					}),
-				);
+		if (this.shuttingDown) return Promise.reject(new Error("Daemon supervisor is shutting down"));
+		if (this.agentPeerSyncActive) {
+			if (this.agentPeerSyncPending) {
+				this.agentPeerSyncPending.latestDiagnosticCause = diagnosticCause;
+				this.saturateCoalescedCount(this.agentPeerSyncPending);
+				return this.agentPeerSyncPending.promise;
+			}
+			let resolvePending!: () => void;
+			let rejectPending!: (error: unknown) => void;
+			const promise = new Promise<void>((resolve, reject) => {
+				resolvePending = resolve;
+				rejectPending = reject;
 			});
-		this.agentPeerSyncQueue = sync;
+			this.agentPeerSyncPending = {
+				initialDiagnosticCause: diagnosticCause,
+				latestDiagnosticCause: diagnosticCause,
+				coalescedCount: 0,
+				coalescedCountSaturated: false,
+				promise,
+				resolve: resolvePending,
+				reject: rejectPending,
+			};
+			return promise;
+		}
+		return this.startAgentPeerSync(diagnosticCause);
+	}
+
+	private startAgentPeerSync(diagnosticCause: Record<string, unknown>): Promise<void> {
+		const sync = this.runAgentPeerSync(diagnosticCause).finally(() => {
+			if (this.agentPeerSyncActive === sync) this.agentPeerSyncActive = undefined;
+			const pending = this.agentPeerSyncPending;
+			this.agentPeerSyncPending = undefined;
+			if (!pending) return;
+			if (this.shuttingDown) {
+				pending.reject(new Error("Daemon supervisor is shutting down"));
+				return;
+			}
+			const cause = {
+				...pending.initialDiagnosticCause,
+				causeCoalescedCount: pending.coalescedCount,
+				causeCoalescedCountSaturated: pending.coalescedCountSaturated,
+				...(pending.coalescedCount > 0 ? { causeLatestEvent: pending.latestDiagnosticCause } : {}),
+			};
+			this.startAgentPeerSync(cause).then(pending.resolve, pending.reject);
+		});
+		this.agentPeerSyncActive = sync;
 		return sync;
+	}
+
+	private clearAgentPeerSyncState(): void {
+		const pending = this.agentPeerSyncPending;
+		this.agentPeerSyncPending = undefined;
+		this.completedAgentPeerFingerprint = undefined;
+		pending?.reject(new Error("Daemon supervisor agent peer synchronization was cancelled"));
+	}
+
+	private async runAgentPeerSync(diagnosticCause: Record<string, unknown>): Promise<void> {
+		const readyWorkers = [...this.workers.values()]
+			.filter(
+				(worker): worker is ResidentWorker & { client: DaemonWorkerClient } =>
+					this.isLiveWorker(worker) && worker.descriptor.lifecycle === "ready" && worker.client !== undefined,
+			)
+			.sort((left, right) => left.descriptor.workerId.localeCompare(right.descriptor.workerId));
+		const payloads = readyWorkers.map((worker) => {
+			let clientGeneration = this.workerClientGenerations.get(worker.client);
+			if (!clientGeneration) {
+				clientGeneration = randomUUID();
+				this.workerClientGenerations.set(worker.client, clientGeneration);
+			}
+			const peers = readyWorkers
+				.filter((candidate) => candidate !== worker)
+				.flatMap((candidate) => {
+					const root = candidate.summaries.get(candidate.descriptor.rootActiveSessionId);
+					return root ? [this.agentPeerSummary(root)] : [];
+				});
+			return { worker, client: worker.client, clientGeneration, peers };
+		});
+		const fingerprint = createHash("sha256")
+			.update(
+				JSON.stringify(
+					payloads.map(({ worker, clientGeneration, peers }) => ({
+						workerId: worker.descriptor.workerId,
+						clientGeneration,
+						peers,
+					})),
+				),
+			)
+			.digest("hex");
+		if (fingerprint === this.completedAgentPeerFingerprint) return;
+		await Promise.all(
+			payloads.map(async ({ worker, client, peers }) => {
+				const response = await client.requestWorker(
+					{ type: "worker_sync_agent_peers", peers },
+					5000,
+					diagnosticCause,
+				);
+				if (!response.success) throw new Error(response.error);
+				if (
+					this.shuttingDown ||
+					this.workers.get(worker.descriptor.workerId) !== worker ||
+					worker.client !== client ||
+					!this.isLiveWorker(worker)
+				) {
+					throw new Error("Agent peer sync target changed during synchronization");
+				}
+			}),
+		);
+		if (this.shuttingDown) throw new Error("Daemon supervisor shut down during agent peer synchronization");
+		this.completedAgentPeerFingerprint = fingerprint;
 	}
 
 	private isVisibleWorker(worker: ResidentWorker): boolean {
@@ -5787,6 +5989,7 @@ export class DaemonSupervisor {
 
 	private async cleanupSupervisorResourcesOnce(): Promise<void> {
 		this.shuttingDown = true;
+		this.clearAgentPeerSyncState();
 		this.clearIdleEvictionTimer();
 		for (const worker of this.workers.values()) {
 			this.clearWorkerEventSummaryRefresh(worker);
@@ -5890,6 +6093,7 @@ export class DaemonSupervisor {
 			process.exit(exitCode);
 		}
 		this.shuttingDown = true;
+		this.clearAgentPeerSyncState();
 		this.clearIdleEvictionTimer();
 		for (const worker of this.workers.values()) {
 			this.clearWorkerEventSummaryRefresh(worker);
