@@ -304,7 +304,7 @@ describe("DaemonSupervisor public status/list observation fan-out", () => {
 		for (const worker of workers) worker.client.requestWorker.mockClear();
 		await runtime.syncAgentPeers({ causeKind: "client_reconnected" });
 		expect(replacementClient.requestWorker).toHaveBeenCalledTimes(1);
-		expect(workers[1]!.client.requestWorker).not.toHaveBeenCalled();
+		expect(workers[1]!.client.requestWorker).toHaveBeenCalledTimes(1);
 	}, 30_000);
 
 	it.each(["stop-intent", "shutdown", "replacement", "stop-revision", "client-replacement"] as const)(
@@ -341,10 +341,10 @@ describe("DaemonSupervisor public status/list observation fan-out", () => {
 	);
 
 	it("rolls back when persistence throws and retries the still-visible change exactly once", async () => {
-		const { runtime, workers } = makeHarness(1);
+		const { runtime, workers } = makeHarness(2);
 		const worker = workers[0]!;
 		await runtime.syncAgentPeers({ causeKind: "fixture_warmup" });
-		worker.client.requestWorker.mockClear();
+		for (const candidate of workers) candidate.client.requestWorker.mockClear();
 		const oldSummaries = worker.summaries;
 		const oldDescriptor = structuredClone(worker.descriptor);
 		const changed = summary(worker.descriptor.workerId, "changed");
@@ -359,11 +359,12 @@ describe("DaemonSupervisor public status/list observation fan-out", () => {
 		expect(worker.descriptor).toEqual(oldDescriptor);
 		expect(worker.client.requestWorker).not.toHaveBeenCalled();
 
+		await vi.advanceTimersByTimeAsync(5_000);
 		const retryResponse = await publicList(runtime, fakeCaller(), "retry-persist");
 		expect(retryResponse.success).toBe(true);
 		expect(worker.summaries.get(changed.activeSessionId ?? changed.id)?.sessionName).toBe(changed.sessionName);
-		expect(runtime.persistWorker).toHaveBeenCalledTimes(2);
-		expect(worker.client.requestWorker).toHaveBeenCalledTimes(1);
+		expect(runtime.persistWorker.mock.calls.filter(([candidate]) => candidate === worker)).toHaveLength(2);
+		for (const candidate of workers) expect(candidate.client.requestWorker).toHaveBeenCalledTimes(1);
 	});
 
 	it.each(["failure", "timeout"] as const)(
@@ -380,8 +381,12 @@ describe("DaemonSupervisor public status/list observation fan-out", () => {
 			expect(first.data?.sessions?.[0]?.sessionName).toBe("worker-1-cached");
 			expect(worker.client.request).toHaveBeenCalledTimes(1);
 			expect(vi.getTimerCount()).toBe(0);
-			const second = await publicList(runtime, fakeCaller(), `${shape}-2`);
-			expect(second.success).toBe(true);
+			const backedOff = await publicList(runtime, fakeCaller(), `${shape}-backoff`);
+			expect(backedOff.success).toBe(true);
+			expect(worker.client.request).toHaveBeenCalledTimes(1);
+			await vi.advanceTimersByTimeAsync(5_000);
+			const retry = await publicList(runtime, fakeCaller(), `${shape}-retry`);
+			expect(retry.success).toBe(true);
 			expect(worker.client.request).toHaveBeenCalledTimes(2);
 			expect(vi.getTimerCount()).toBe(0);
 		},
