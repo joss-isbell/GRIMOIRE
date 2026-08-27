@@ -12,7 +12,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { IncidentRecorderCompactor } from "../src/modes/daemon/incident-recorder-compactor.js";
 
@@ -30,6 +30,7 @@ function finishStorageDiscovery(compactor: IncidentRecorderCompactor, maximumSli
 		const before = compactor.survivalSnapshot();
 		expect(before.storageDiscoverySliceEntries).toBeLessThanOrEqual(512);
 		expect(before.storageDiscoveryDepth).toBeLessThanOrEqual(65);
+		expect(before.storageDiscoveryRetainedPaths).toBeLessThanOrEqual(67);
 		if (before.storageDiscoveryComplete) return;
 		const beforeEntries = before.storageDiscoveryEntries;
 		compactor.advanceBoundedDiscovery();
@@ -37,6 +38,7 @@ function finishStorageDiscovery(compactor: IncidentRecorderCompactor, maximumSli
 		expect(after.storageDiscoveryEntries - beforeEntries).toBeLessThanOrEqual(512);
 		expect(after.storageDiscoverySliceEntries).toBeLessThanOrEqual(512);
 		expect(after.storageDiscoveryDepth).toBeLessThanOrEqual(65);
+		expect(after.storageDiscoveryRetainedPaths).toBeLessThanOrEqual(67);
 		if (after.storageDiscoveryError) throw new Error(after.storageDiscoveryError);
 	}
 	throw new Error("storage discovery did not converge within the deterministic slice bound");
@@ -105,6 +107,178 @@ describe("incident compactor survival bounds", () => {
 		);
 	});
 
+	it("admits each new nested directory block before allocation near the storage ceiling", () => {
+		const target = fixture("directory-ceiling");
+		const recorderRoot = join(target.agentDir, "incident-recorder");
+		mkdirSync(recorderRoot, { recursive: true, mode: 0o700 });
+		const baseline = uniqueAllocatedBytes([recorderRoot]);
+		const ceiling = baseline + 64 * 1024;
+		const compactor = new IncidentRecorderCompactor({
+			agentDir: target.agentDir,
+			freeReserveBytes: 0,
+			storageByteCeiling: ceiling,
+		});
+		finishStorageDiscovery(compactor);
+		const nestedPath = join(recorderRoot, "nested-a", "nested-b", "nested-c", "value.json");
+		const writer = compactor as unknown as {
+			writeOwnedJson(path: string, value: unknown, extraWorstCase: number): void;
+		};
+
+		expect(() => writer.writeOwnedJson(nestedPath, { value: true }, 0)).toThrow(
+			"Incident compactor paused by disk admission policy",
+		);
+		expect(existsSync(nestedPath)).toBe(false);
+		expect(compactor.accountedStorageBytes).toBe(uniqueAllocatedBytes([recorderRoot]));
+		expect(compactor.accountedStorageBytes).toBeLessThanOrEqual(ceiling);
+	});
+
+	it("fails closed when a canonical owner is removed after a sibling was classified mid-scan", () => {
+		const target = fixture("canonical-mutation");
+		const recorderRoot = join(target.agentDir, "incident-recorder");
+		const digest = "a".repeat(64);
+		const canonical = join(recorderRoot, "cas", "sha256", "aa", `${digest}.blob`);
+		const sibling = join(recorderRoot, "refs", "runs", "b".repeat(64), `cas-${digest}.blob`);
+		mkdirSync(dirname(sibling), { recursive: true, mode: 0o700 });
+		mkdirSync(dirname(canonical), { recursive: true, mode: 0o700 });
+		writeFileSync(canonical, "retained", { mode: 0o600 });
+		linkSync(canonical, sibling);
+		let removed = false;
+		const compactor = new IncidentRecorderCompactor({
+			agentDir: target.agentDir,
+			freeReserveBytes: 0,
+			storageDiscoveryEntryHook(path, canonicalPath) {
+				if (!removed && path === sibling && canonicalPath === canonical) {
+					removed = true;
+					rmSync(canonical);
+				}
+			},
+		});
+		for (let slice = 0; slice < 128 && !compactor.survivalSnapshot().storageDiscoveryError; slice += 1) {
+			compactor.advanceBoundedDiscovery();
+		}
+
+		expect(removed).toBe(true);
+		expect(existsSync(canonical)).toBe(false);
+		expect(existsSync(sibling)).toBe(true);
+		expect(compactor.survivalSnapshot().storageDiscoveryError).toBeDefined();
+		expect(compactor.admitObservation(1)).toBe(false);
+	});
+
+	it("classifies the complete retained hard-link taxonomy and blocks unknown shapes", () => {
+		const target = fixture("storage-taxonomy");
+		const recorderRoot = join(target.agentDir, "incident-recorder");
+		const incidentRoot = join(target.agentDir, "incidents", "incident-taxonomy");
+		const runRoot = join(recorderRoot, "refs", "runs", "1".repeat(64));
+		const casId = "2".repeat(64);
+		const occurrenceId = "3".repeat(64);
+		const gapId = "4".repeat(64);
+		const incompleteId = "5".repeat(64);
+		const sysdigId = "6".repeat(64);
+		const cas = join(recorderRoot, "cas", "sha256", casId.slice(0, 2), `${casId}.blob`);
+		const occurrence = join(
+			recorderRoot,
+			"refs",
+			"occurrences",
+			"sha256",
+			occurrenceId.slice(0, 2),
+			`${occurrenceId}.json`,
+		);
+		const gap = join(recorderRoot, "refs", "gaps", `${gapId}.json`);
+		const incomplete = join(recorderRoot, "refs", "incomplete", `${incompleteId}.json`);
+		for (const path of [cas, occurrence, gap, incomplete]) {
+			mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+			writeFileSync(path, basename(path), { mode: 0o600 });
+		}
+		mkdirSync(runRoot, { recursive: true, mode: 0o700 });
+		const runCas = join(runRoot, `cas-${casId}.blob`);
+		const runOccurrence = join(runRoot, `seq-${"1".padStart(20, "0")}-${occurrenceId}.json`);
+		const runGap = join(runRoot, `seq-${"2".padStart(20, "0")}-gap-${gapId}.json`);
+		const runIncomplete = join(runRoot, `seq-${"3".padStart(20, "0")}-incomplete-${incompleteId}.json`);
+		linkSync(cas, runCas);
+		linkSync(occurrence, runOccurrence);
+		linkSync(gap, runGap);
+		linkSync(incomplete, runIncomplete);
+		const journalPin = join(incidentRoot, "journal-pins", "cas", `${casId}.blob`);
+		mkdirSync(dirname(journalPin), { recursive: true, mode: 0o700 });
+		linkSync(cas, journalPin);
+		const immutableTemporary = join(dirname(gap), `.${basename(gap)}.tmp-123-${"7".repeat(64)}`);
+		linkSync(gap, immutableTemporary);
+		const sysdigOwner = join(recorderRoot, "sysdig-pins", "owners", `${sysdigId}.scap`);
+		const sysdigPin = join(incidentRoot, "sysdig-pins", "segments", `${sysdigId}.scap`);
+		mkdirSync(dirname(sysdigOwner), { recursive: true, mode: 0o700 });
+		mkdirSync(dirname(sysdigPin), { recursive: true, mode: 0o700 });
+		writeFileSync(sysdigOwner, "sysdig", { mode: 0o600 });
+		linkSync(sysdigOwner, sysdigPin);
+		const sysdigStat = lstatSync(sysdigOwner);
+		writeJson(join(incidentRoot, "sysdig-pins", "records", `${sysdigId}.json`), {
+			version: 1,
+			id: sysdigId,
+			sourcePath: join(target.root, "stock-ring", "ring.scap0"),
+			sourceName: "ring.scap0",
+			observedAtWallTimeMs: 1,
+			phase: "initial",
+			source: { dev: String(sysdigStat.dev), ino: String(sysdigStat.ino), bytes: 6, mtimeMs: 1 },
+			pinnedPath: sysdigPin,
+			storageOwnerPath: sysdigOwner,
+			captureMethod: "hard_link",
+			captureReason: "closed_segment_hard_link",
+			bytesAtCapture: 6,
+		});
+		const unknownDir = join(recorderRoot, "unknown");
+		const unknownOwner = join(unknownDir, "owner.bin");
+		const unknownReference = join(unknownDir, "reference.bin");
+		const taxonomy = [
+			{ shape: "CAS canonical and run ref", owner: cas, reference: runCas, admission: "allow" },
+			{ shape: "occurrence canonical and run ref", owner: occurrence, reference: runOccurrence, admission: "allow" },
+			{ shape: "gap canonical and run ref", owner: gap, reference: runGap, admission: "allow" },
+			{
+				shape: "incomplete canonical and run ref",
+				owner: incomplete,
+				reference: runIncomplete,
+				admission: "allow",
+			},
+			{ shape: "journal pin", owner: cas, reference: journalPin, admission: "allow" },
+			{ shape: "immutable crash temp", owner: gap, reference: immutableTemporary, admission: "allow" },
+			{
+				shape: "Sysdig persistent owner and incident ref",
+				owner: sysdigOwner,
+				reference: sysdigPin,
+				admission: "allow",
+			},
+			{ shape: "unknown hard-link shape", owner: unknownOwner, reference: unknownReference, admission: "block" },
+		] as const;
+		expect(taxonomy.map((row) => row.shape)).toEqual([
+			"CAS canonical and run ref",
+			"occurrence canonical and run ref",
+			"gap canonical and run ref",
+			"incomplete canonical and run ref",
+			"journal pin",
+			"immutable crash temp",
+			"Sysdig persistent owner and incident ref",
+			"unknown hard-link shape",
+		]);
+		for (const row of taxonomy.filter((entry) => entry.admission === "allow")) {
+			expect(statSync(row.owner).ino).toBe(statSync(row.reference).ino);
+		}
+		const classified = new IncidentRecorderCompactor({ agentDir: target.agentDir, freeReserveBytes: 0 });
+		finishStorageDiscovery(classified);
+		expect(classified.accountedStorageBytes).toBe(
+			uniqueAllocatedBytes([recorderRoot, join(target.agentDir, "incidents")]),
+		);
+
+		mkdirSync(unknownDir, { recursive: true, mode: 0o700 });
+		writeFileSync(unknownOwner, "unknown", { mode: 0o600 });
+		linkSync(unknownOwner, unknownReference);
+		const unknown = new IncidentRecorderCompactor({ agentDir: target.agentDir, freeReserveBytes: 0 });
+		for (let slice = 0; slice < 128 && !unknown.survivalSnapshot().storageDiscoveryError; slice += 1) {
+			unknown.advanceBoundedDiscovery();
+		}
+		expect(unknown.survivalSnapshot().storageDiscoveryError).toBe(
+			"unclassified_hard_link_blocks_exact_storage_accounting",
+		);
+		expect(unknown.admitObservation()).toBe(false);
+	});
+
 	it("accounts one shared Sysdig storage owner across newly published incident hard links and restart", () => {
 		const target = fixture("sysdig-owner");
 		const ringDir = join(target.root, "stock-ring");
@@ -145,6 +319,16 @@ describe("incident compactor survival bounds", () => {
 		expect(records[0]?.storageOwnerPath).toBe(records[1]?.storageOwnerPath);
 		expect(statSync(String(records[0]?.pinnedPath)).ino).toBe(statSync(closed).ino);
 		expect(statSync(String(records[0]?.storageOwnerPath)).ino).toBe(statSync(closed).ino);
+		const persistentOwner = String(records[0]?.storageOwnerPath);
+		const survivingPin = String(records[1]?.pinnedPath);
+		expect(persistentOwner.startsWith(join(target.agentDir, "incident-recorder", "sysdig-pins", "owners"))).toBe(
+			true,
+		);
+
+		rmSync(firstIncident, { recursive: true, force: true });
+		expect(existsSync(persistentOwner)).toBe(true);
+		expect(existsSync(survivingPin)).toBe(true);
+		expect(statSync(persistentOwner).ino).toBe(statSync(survivingPin).ino);
 
 		const restarted = new IncidentRecorderCompactor({ agentDir: target.agentDir, freeReserveBytes: 0 });
 		finishStorageDiscovery(restarted);

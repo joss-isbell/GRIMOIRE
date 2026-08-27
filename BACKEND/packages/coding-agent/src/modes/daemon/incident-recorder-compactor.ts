@@ -18,7 +18,6 @@ import {
 	readSync,
 	renameSync,
 	rmSync,
-	type Stats,
 	statfsSync,
 	statSync,
 	utimesSync,
@@ -241,9 +240,28 @@ interface CursorCheckpoint {
 	producerSequences: Record<string, string>;
 }
 
+interface StorageTopologySignature {
+	dev: bigint;
+	ino: bigint;
+	mode: bigint;
+	nlink: bigint;
+	size: bigint;
+	blocks: bigint;
+	mtimeNs: bigint;
+	ctimeNs: bigint;
+}
+
 interface StorageDiscoveryFrame {
 	directory: Dir;
+	path: string;
 	depth: number;
+	topology: StorageTopologySignature;
+}
+
+interface StorageDiscoveryPassSummary {
+	bytes: number;
+	entries: number;
+	fingerprint: bigint;
 }
 
 interface StorageDiscovery {
@@ -252,6 +270,11 @@ interface StorageDiscovery {
 	stack: StorageDiscoveryFrame[];
 	entries: number;
 	lastSliceEntries: number;
+	pass: 0 | 1;
+	passBytes: number;
+	passEntries: number;
+	passFingerprint: bigint;
+	baseline?: StorageDiscoveryPassSummary;
 	complete: boolean;
 	error?: string;
 }
@@ -267,6 +290,8 @@ export interface IncidentRecorderCompactorSurvivalSnapshot {
 	storageDiscoveryEntries: number;
 	storageDiscoverySliceEntries: number;
 	storageDiscoveryDepth: number;
+	storageDiscoveryRetainedPaths: number;
+	storageDiscoveryPass: 0 | 1;
 	storageDiscoveryComplete: boolean;
 	incidentDiscoverySliceEntries: number;
 	sysdigDiscoverySliceEntries: number;
@@ -437,8 +462,7 @@ function writeAll(descriptor: number, value: Buffer): void {
 	}
 }
 
-function writeImmutable(path: string, value: Buffer): void {
-	mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+function writeImmutable(path: string, value: Buffer): boolean {
 	const temporary = join(
 		dirname(path),
 		`.${basename(path)}.tmp-${process.pid}-${sha256(`${process.hrtime.bigint()}`)}`,
@@ -454,11 +478,13 @@ function writeImmutable(path: string, value: Buffer): void {
 			linkSync(temporary, path);
 			rmSync(temporary, { force: true });
 			fsyncDirectory(dirname(path));
+			return true;
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 			const existing = readFileSync(path);
 			if (!existing.equals(value)) throw new Error(`Immutable incident reference collision at ${path}`);
 			rmSync(temporary, { force: true });
+			return false;
 		}
 	} finally {
 		if (descriptor !== undefined) closeSync(descriptor);
@@ -487,7 +513,6 @@ function linkVerified(source: string, target: string): void {
 }
 
 function writeCheckpoint(path: string, value: CursorCheckpoint): void {
-	mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
 	const temporary = `${path}.tmp-${process.pid}`;
 	let descriptor: number | undefined;
 	try {
@@ -668,9 +693,46 @@ interface StoppedTargetArtifactStream {
 	error?: string;
 }
 
-function allocatedStorageBytes(stat: { size: number; blocks?: number }): number {
-	const allocated = Number.isFinite(stat.blocks) ? Number(stat.blocks) * 512 : 0;
-	return Math.max(stat.size, allocated);
+function allocatedStorageBytes(stat: { size: number | bigint; blocks?: number | bigint }): number {
+	const size = Number(stat.size);
+	const blocks = stat.blocks === undefined ? 0 : Number(stat.blocks);
+	if (!Number.isSafeInteger(size) || size < 0 || !Number.isSafeInteger(blocks) || blocks < 0) {
+		throw new Error("Incident compactor storage metadata exceeds its numeric bound");
+	}
+	return Math.max(size, blocks * 512);
+}
+
+function storageTopologySignature(stat: BigIntStats): StorageTopologySignature {
+	return {
+		dev: stat.dev,
+		ino: stat.ino,
+		mode: stat.mode,
+		nlink: stat.nlink,
+		size: stat.size,
+		blocks: stat.blocks,
+		mtimeNs: stat.mtimeNs,
+		ctimeNs: stat.ctimeNs,
+	};
+}
+
+function sameStorageTopology(left: StorageTopologySignature, right: StorageTopologySignature): boolean {
+	return (
+		left.dev === right.dev &&
+		left.ino === right.ino &&
+		left.mode === right.mode &&
+		left.nlink === right.nlink &&
+		left.size === right.size &&
+		left.blocks === right.blocks &&
+		left.mtimeNs === right.mtimeNs &&
+		left.ctimeNs === right.ctimeNs
+	);
+}
+
+function storageFingerprint(path: string, stat?: BigIntStats): bigint {
+	const identity = stat
+		? [path, stat.dev, stat.ino, stat.mode, stat.nlink, stat.size, stat.blocks, stat.mtimeNs, stat.ctimeNs].join("\0")
+		: `${path}\0missing`;
+	return BigInt(`0x${sha256(identity)}`);
 }
 
 function relativeDescendant(root: string, path: string): string | undefined {
@@ -709,6 +771,8 @@ export interface IncidentRecorderCompactorOptions {
 	freeReserveBytes?: number;
 	/** Test/packaging override only. Production uses the stock root-owned Sysdig ring. */
 	sysdigRingBasePath?: string;
+	/** Test-only deterministic storage-topology mutation seam. */
+	storageDiscoveryEntryHook?: (path: string, canonicalPath: string | undefined) => void;
 }
 
 export class IncidentRecorderCompactor {
@@ -729,7 +793,6 @@ export class IncidentRecorderCompactor {
 	private incidentDiscoverySliceEntries = 0;
 	private sysdigRingDiscovery?: SysdigRingDiscovery;
 	private sysdigDiscoverySliceEntries = 0;
-	private readonly sysdigStorageOwners = new Map<string, string>();
 	private readonly activePinScans = new Set<string>();
 	private activePinTraversal?: PinTraversal;
 	private journalManifestValidation?: JournalManifestValidation;
@@ -744,6 +807,10 @@ export class IncidentRecorderCompactor {
 			stack: [],
 			entries: 0,
 			lastSliceEntries: 0,
+			pass: 0,
+			passBytes: 0,
+			passEntries: 0,
+			passFingerprint: 0n,
 			complete: false,
 		};
 		this.advanceStorageDiscovery();
@@ -760,11 +827,19 @@ export class IncidentRecorderCompactor {
 	}
 
 	private canonicalStoragePathForLink(path: string): string | undefined {
-		const immutableTemporary = /^\.(.+)\.tmp-\d+-[0-9a-f]{64}$/.exec(basename(path));
+		const immutableTemporary = /^\.(.+)\.tmp-\d+(?:-[0-9a-f]{64})?$/.exec(basename(path));
 		if (immutableTemporary?.[1]) return join(dirname(path), immutableTemporary[1]);
 		const recorderRelative = relativeDescendant(this.root, path);
 		if (recorderRelative !== undefined) {
-			let match = /^refs\/runs\/[0-9a-f]{64}\/cas-([0-9a-f]{64})\.blob$/.exec(recorderRelative);
+			let match = /^cas\/sha256\/([0-9a-f]{2})\/([0-9a-f]{64})\.blob$/.exec(recorderRelative);
+			if (match?.[1] && match[2] && match[1] === match[2].slice(0, 2)) return path;
+			match = /^refs\/occurrences\/sha256\/([0-9a-f]{2})\/([0-9a-f]{64})\.json$/.exec(recorderRelative);
+			if (match?.[1] && match[2] && match[1] === match[2].slice(0, 2)) return path;
+			match = /^refs\/(?:gaps|incomplete)\/([0-9a-f]{64})\.json$/.exec(recorderRelative);
+			if (match?.[1]) return path;
+			match = /^sysdig-pins\/owners\/([0-9a-f]{64})\.scap$/.exec(recorderRelative);
+			if (match?.[1]) return path;
+			match = /^refs\/runs\/[0-9a-f]{64}\/cas-([0-9a-f]{64})\.blob$/.exec(recorderRelative);
 			if (match?.[1]) {
 				const digest = match[1];
 				return join(this.root, "cas", "sha256", digest.slice(0, 2), `${digest}.blob`);
@@ -809,64 +884,61 @@ export class IncidentRecorderCompactor {
 		}
 		const storageOwnerPath = record.storageOwnerPath;
 		const ownerRelative =
-			typeof storageOwnerPath === "string"
-				? relativeDescendant(join(this.options.agentDir, "incidents"), storageOwnerPath)
-				: undefined;
+			typeof storageOwnerPath === "string" ? relativeDescendant(this.root, storageOwnerPath) : undefined;
 		if (
+			record.version !== 1 ||
 			record.id !== match[2] ||
 			record.pinnedPath !== path ||
 			record.captureMethod !== "hard_link" ||
 			typeof storageOwnerPath !== "string" ||
 			typeof record.source?.dev !== "string" ||
 			typeof record.source.ino !== "string" ||
-			!ownerRelative ||
-			!/^[^/]+\/sysdig-pins\/segments\/[0-9a-f]{64}\.scap$/.test(ownerRelative)
+			ownerRelative !== `sysdig-pins/owners/${record.id}.scap`
 		) {
 			throw new Error("sysdig_hard_link_storage_owner_record_invalid");
 		}
-		this.rememberSysdigStorageOwner(`${record.source.dev}\0${record.source.ino}`, storageOwnerPath);
+		try {
+			const owner = lstatSync(storageOwnerPath, { bigint: true });
+			if (
+				!owner.isFile() ||
+				owner.isSymbolicLink() ||
+				owner.dev.toString() !== record.source.dev ||
+				owner.ino.toString() !== record.source.ino
+			) {
+				throw new Error("owner_identity_invalid");
+			}
+		} catch {
+			throw new Error("sysdig_hard_link_storage_owner_record_invalid");
+		}
 		return storageOwnerPath;
 	}
 
-	private rememberSysdigStorageOwner(key: string, path: string): void {
-		this.sysdigStorageOwners.delete(key);
-		this.sysdigStorageOwners.set(key, path);
-		while (this.sysdigStorageOwners.size > SYSDIG_PIN_MAX_SEGMENTS) {
-			const oldest = this.sysdigStorageOwners.keys().next().value;
-			if (oldest === undefined) break;
-			this.sysdigStorageOwners.delete(oldest);
+	private storagePathDisposition(
+		path: string,
+		stat: BigIntStats,
+	): { account: boolean; canonicalPath: string | undefined } {
+		if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink <= 1n) {
+			this.options.storageDiscoveryEntryHook?.(path, undefined);
+			return { account: true, canonicalPath: undefined };
 		}
-	}
-
-	private shouldAccountStoragePath(path: string, stat: Stats): boolean {
-		if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink <= 1) return true;
 		const canonicalPath = this.canonicalStoragePathForLink(path);
-		if (canonicalPath) {
-			let canonical: Stats;
-			try {
-				canonical = lstatSync(canonicalPath);
-			} catch {
-				throw new Error("hard_link_canonical_storage_owner_unavailable");
-			}
-			if (
-				!canonical.isFile() ||
-				canonical.isSymbolicLink() ||
-				canonical.dev !== stat.dev ||
-				canonical.ino !== stat.ino
-			) {
-				throw new Error("hard_link_canonical_storage_owner_mismatch");
-			}
-			return resolve(canonicalPath) === resolve(path);
+		if (!canonicalPath) throw new Error("unclassified_hard_link_blocks_exact_storage_accounting");
+		let canonical: BigIntStats;
+		try {
+			canonical = lstatSync(canonicalPath, { bigint: true });
+		} catch {
+			throw new Error("hard_link_canonical_storage_owner_unavailable");
 		}
-		const recorderRelative = relativeDescendant(this.root, path);
 		if (
-			recorderRelative !== undefined &&
-			(/^cas\/sha256\//.test(recorderRelative) ||
-				/^refs\/(?:occurrences\/sha256|gaps|incomplete)\//.test(recorderRelative))
+			!canonical.isFile() ||
+			canonical.isSymbolicLink() ||
+			canonical.dev !== stat.dev ||
+			canonical.ino !== stat.ino
 		) {
-			return true;
+			throw new Error("hard_link_canonical_storage_owner_mismatch");
 		}
-		throw new Error("unclassified_hard_link_blocks_exact_storage_accounting");
+		this.options.storageDiscoveryEntryHook?.(path, canonicalPath);
+		return { account: resolve(canonicalPath) === resolve(path), canonicalPath };
 	}
 
 	private advanceStorageDiscovery(
@@ -887,33 +959,91 @@ export class IncidentRecorderCompactor {
 			}
 			return false;
 		};
+		const observe = (path: string, stat: BigIntStats): boolean => {
+			let disposition: ReturnType<IncidentRecorderCompactor["storagePathDisposition"]>;
+			try {
+				disposition = this.storagePathDisposition(path, stat);
+			} catch (error) {
+				fail(error instanceof Error ? error.message : String(error));
+				return false;
+			}
+			state.passFingerprint ^= storageFingerprint(path, stat);
+			state.passEntries += 1;
+			state.entries += 1;
+			worked += 1;
+			if (disposition.account) state.passBytes += allocatedStorageBytes(stat);
+			return true;
+		};
+		const finishPass = (): boolean => {
+			const summary: StorageDiscoveryPassSummary = {
+				bytes: state.passBytes,
+				entries: state.passEntries,
+				fingerprint: state.passFingerprint,
+			};
+			if (state.pass === 0) {
+				state.baseline = summary;
+				state.pass = 1;
+				state.rootIndex = 0;
+				state.passBytes = 0;
+				state.passEntries = 0;
+				state.passFingerprint = 0n;
+				return false;
+			}
+			const baseline = state.baseline;
+			if (
+				!baseline ||
+				baseline.bytes !== summary.bytes ||
+				baseline.entries !== summary.entries ||
+				baseline.fingerprint !== summary.fingerprint
+			) {
+				return fail("storage_discovery_topology_changed_between_passes");
+			}
+			this.storageBytes = summary.bytes;
+			state.complete = true;
+			state.lastSliceEntries = worked;
+			return true;
+		};
 		while (worked < entryBudget && Date.now() <= deadlineMs) {
 			if (state.stack.length === 0) {
 				const root = state.roots[state.rootIndex++];
 				if (!root) {
-					state.complete = true;
-					state.lastSliceEntries = worked;
-					return true;
-				}
-				let rootStat: ReturnType<typeof lstatSync>;
-				try {
-					rootStat = lstatSync(root);
-				} catch {
+					if (finishPass()) return true;
+					if (state.error) return false;
 					continue;
 				}
+				let rootStat: BigIntStats;
 				try {
-					if (this.shouldAccountStoragePath(root, rootStat)) this.storageBytes += allocatedStorageBytes(rootStat);
+					rootStat = lstatSync(root, { bigint: true });
 				} catch (error) {
-					return fail(error instanceof Error ? error.message : String(error));
-				}
-				state.entries += 1;
-				worked += 1;
-				if (!rootStat.isDirectory()) continue;
-				try {
-					state.stack.push({ directory: opendirSync(root), depth: 0 });
-				} catch {
+					if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+						return fail("storage_discovery_root_metadata_unavailable");
+					}
+					state.passFingerprint ^= storageFingerprint(root);
 					continue;
 				}
+				if (!observe(root, rootStat)) return false;
+				if (!rootStat.isDirectory()) continue;
+				if (rootStat.isSymbolicLink()) return fail("storage_discovery_symbolic_directory_rejected");
+				let directory: Dir;
+				let openedStat: BigIntStats;
+				try {
+					directory = opendirSync(root);
+					openedStat = lstatSync(root, { bigint: true });
+				} catch {
+					return fail("storage_discovery_directory_open_failed");
+				}
+				if (!sameStorageTopology(storageTopologySignature(rootStat), storageTopologySignature(openedStat))) {
+					try {
+						directory.closeSync();
+					} catch {}
+					return fail("storage_discovery_directory_changed_before_open");
+				}
+				state.stack.push({
+					directory,
+					path: root,
+					depth: 0,
+					topology: storageTopologySignature(openedStat),
+				});
 			}
 			const frame = state.stack.at(-1);
 			if (!frame) continue;
@@ -921,47 +1051,135 @@ export class IncidentRecorderCompactor {
 			try {
 				entry = frame.directory.readSync();
 			} catch {
-				try {
-					frame.directory.closeSync();
-				} catch {}
-				state.stack.pop();
-				continue;
+				return fail("storage_discovery_directory_read_failed");
 			}
 			if (!entry) {
+				let after: BigIntStats;
+				try {
+					after = lstatSync(frame.path, { bigint: true });
+				} catch {
+					return fail("storage_discovery_directory_disappeared_during_scan");
+				}
+				if (!sameStorageTopology(frame.topology, storageTopologySignature(after))) {
+					return fail("storage_discovery_directory_changed_during_scan");
+				}
 				try {
 					frame.directory.closeSync();
-				} catch {}
+				} catch {
+					return fail("storage_discovery_directory_close_failed");
+				}
 				state.stack.pop();
 				continue;
 			}
-			worked += 1;
-			state.entries += 1;
-			const path = join(String(frame.directory.path), entry.name);
-			let stat: ReturnType<typeof lstatSync>;
+			const path = join(frame.path, entry.name);
+			let stat: BigIntStats;
 			try {
-				stat = lstatSync(path);
+				stat = lstatSync(path, { bigint: true });
 			} catch {
-				continue;
+				return fail("storage_discovery_entry_disappeared_during_scan");
 			}
-			try {
-				if (this.shouldAccountStoragePath(path, stat)) this.storageBytes += allocatedStorageBytes(stat);
-			} catch (error) {
-				return fail(error instanceof Error ? error.message : String(error));
-			}
+			if (!observe(path, stat)) return false;
 			if (!stat.isDirectory()) continue;
+			if (stat.isSymbolicLink()) return fail("storage_discovery_symbolic_directory_rejected");
 			if (frame.depth + 1 > STORAGE_DISCOVERY_MAX_DEPTH) return fail("storage_discovery_depth_bound_exceeded");
+			let directory: Dir;
+			let openedStat: BigIntStats;
 			try {
-				state.stack.push({ directory: opendirSync(path), depth: frame.depth + 1 });
-			} catch {}
+				directory = opendirSync(path);
+				openedStat = lstatSync(path, { bigint: true });
+			} catch {
+				return fail("storage_discovery_directory_open_failed");
+			}
+			if (!sameStorageTopology(storageTopologySignature(stat), storageTopologySignature(openedStat))) {
+				try {
+					directory.closeSync();
+				} catch {}
+				return fail("storage_discovery_directory_changed_before_open");
+			}
+			state.stack.push({
+				directory,
+				path,
+				depth: frame.depth + 1,
+				topology: storageTopologySignature(openedStat),
+			});
 		}
 		state.lastSliceEntries = worked;
 		return false;
 	}
 
+	private ownedStorageRoot(path: string): string | undefined {
+		for (const root of this.storageDiscovery.roots) if (relativeDescendant(root, path) !== undefined) return root;
+		return undefined;
+	}
+
+	private directoryMutationReservation(path: string, entries = 1): number {
+		const filesystem = statfsSync(path);
+		const blockSize = Number(filesystem.bsize);
+		if (!Number.isSafeInteger(blockSize) || blockSize <= 0) {
+			throw new Error("Incident compactor filesystem block size is invalid");
+		}
+		return Math.max(64 * 1024, blockSize * (entries + 1));
+	}
+
+	private ensureOwnedDirectory(path: string): void {
+		const target = resolve(path);
+		const ownedRoot = this.ownedStorageRoot(target);
+		if (!ownedRoot) throw new Error("Incident compactor directory escaped its accounted storage roots");
+		const descendant = relativeDescendant(ownedRoot, target);
+		if (descendant === undefined) throw new Error("Incident compactor directory containment changed");
+		const names = [basename(ownedRoot), ...(descendant ? descendant.split("/") : [])];
+		let current = dirname(ownedRoot);
+		for (const name of names) {
+			const parent = current;
+			current = join(current, name);
+			try {
+				const existing = lstatSync(current, { bigint: true });
+				if (!existing.isDirectory() || existing.isSymbolicLink()) {
+					throw new Error("Incident compactor owned directory path is not a private directory");
+				}
+				continue;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			}
+			const parentOwned = this.ownedStorageRoot(parent) !== undefined;
+			const parentBefore = parentOwned ? allocatedStorageBytes(lstatSync(parent, { bigint: true })) : 0;
+			this.ensureDiskAdmission(this.directoryMutationReservation(parent));
+			try {
+				mkdirSync(current, { mode: 0o700 });
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+					throw new Error("Incident compactor owned directory topology changed during creation");
+				}
+				throw error;
+			}
+			const created = lstatSync(current, { bigint: true });
+			if (!created.isDirectory() || created.isSymbolicLink()) {
+				throw new Error("Incident compactor created directory identity is invalid");
+			}
+			this.storageBytes += allocatedStorageBytes(created);
+			if (parentOwned) {
+				const parentAfter = allocatedStorageBytes(lstatSync(parent, { bigint: true }));
+				this.storageBytes += Math.max(0, parentAfter - parentBefore);
+			}
+		}
+	}
+
+	private withOwnedDirectoryMutation<T>(directory: string, entryWorstCase: number, operation: () => T): T {
+		this.ensureOwnedDirectory(directory);
+		const before = allocatedStorageBytes(lstatSync(directory, { bigint: true }));
+		this.ensureDiskAdmission(this.directoryMutationReservation(directory, entryWorstCase));
+		try {
+			return operation();
+		} finally {
+			const after = allocatedStorageBytes(lstatSync(directory, { bigint: true }));
+			this.storageBytes += Math.max(0, after - before);
+		}
+	}
+
 	private accountStoragePath(path: string): void {
 		// Callers invoke this only after creating a new canonical file. Hard-link
 		// publication does not call it because it allocates no new file blocks.
-		this.storageBytes += allocatedStorageBytes(lstatSync(path));
+		this.storageBytes += allocatedStorageBytes(lstatSync(path, { bigint: true }));
 	}
 
 	private ensureDiskAdmission(worstCase: number): void {
@@ -995,9 +1213,8 @@ export class IncidentRecorderCompactor {
 	private writeOwnedJson(path: string, value: unknown, extraWorstCase = 256 * 1024): void {
 		const encoded = Buffer.from(`${JSON.stringify(value)}\n`, "utf8");
 		this.ensureDiskAdmission(encoded.length + extraWorstCase);
-		const existed = existsSync(path);
-		writeImmutable(path, encoded);
-		if (!existed) this.accountStoragePath(path);
+		const created = this.withOwnedDirectoryMutation(dirname(path), 2, () => writeImmutable(path, encoded));
+		if (created) this.accountStoragePath(path);
 	}
 
 	private writeOwnedCheckpoint(path: string, value: CursorCheckpoint): void {
@@ -1005,15 +1222,17 @@ export class IncidentRecorderCompactor {
 		this.ensureDiskAdmission(encodedBytes * 2 + 256 * 1024);
 		let previousBytes = 0;
 		try {
-			previousBytes = allocatedStorageBytes(statSync(path));
+			previousBytes = allocatedStorageBytes(lstatSync(path, { bigint: true }));
 		} catch {}
-		writeCheckpoint(path, value);
-		this.storageBytes = Math.max(0, this.storageBytes - previousBytes + allocatedStorageBytes(statSync(path)));
+		this.withOwnedDirectoryMutation(dirname(path), 2, () => writeCheckpoint(path, value));
+		this.storageBytes = Math.max(
+			0,
+			this.storageBytes - previousBytes + allocatedStorageBytes(lstatSync(path, { bigint: true })),
+		);
 	}
 
 	private linkOwnedVerified(source: string, target: string): void {
-		this.ensureDiskAdmission(64 * 1024);
-		linkVerified(source, target);
+		this.withOwnedDirectoryMutation(dirname(target), 1, () => linkVerified(source, target));
 	}
 
 	get diskPaused(): boolean {
@@ -1036,6 +1255,8 @@ export class IncidentRecorderCompactor {
 			storageDiscoveryEntries: this.storageDiscovery.entries,
 			storageDiscoverySliceEntries: this.storageDiscovery.lastSliceEntries,
 			storageDiscoveryDepth: this.storageDiscovery.stack.length,
+			storageDiscoveryRetainedPaths: this.storageDiscovery.roots.length + this.storageDiscovery.stack.length,
+			storageDiscoveryPass: this.storageDiscovery.pass,
 			storageDiscoveryComplete: this.storageDiscovery.complete,
 			incidentDiscoverySliceEntries: this.incidentDiscoverySliceEntries,
 			sysdigDiscoverySliceEntries: this.sysdigDiscoverySliceEntries,
@@ -1085,7 +1306,7 @@ export class IncidentRecorderCompactor {
 				return { state: "pending", reason: "storage_paused", copiedBytes: 0, totalBytes };
 			}
 			const directory = join(this.root, "cas", "sha256", "staging");
-			mkdirSync(directory, { recursive: true, mode: 0o700 });
+			this.ensureOwnedDirectory(directory);
 			const temporary = join(directory, `${key}.tmp`);
 			try {
 				rmSync(temporary, { force: true });
@@ -1103,7 +1324,7 @@ export class IncidentRecorderCompactor {
 					openedSource.ctimeMs !== metadata.ctimeMs
 				)
 					throw new Error("artifact_source_identity_changed_before_capture");
-				target = openSync(temporary, "wx", 0o600);
+				target = this.withOwnedDirectoryMutation(directory, 1, () => openSync(temporary, "wx", 0o600));
 				state = {
 					sourcePath,
 					encoding,
@@ -1177,10 +1398,10 @@ export class IncidentRecorderCompactor {
 						closeSync(state.target);
 						const digest = state.hash.digest("hex");
 						const path = join(this.root, "cas", "sha256", digest.slice(0, 2), `${digest}.blob`);
-						mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+						this.ensureOwnedDirectory(dirname(path));
 						let created = true;
 						try {
-							linkSync(state.temporary, path);
+							this.withOwnedDirectoryMutation(dirname(path), 1, () => linkSync(state.temporary, path));
 						} catch (error) {
 							const existing = lstatSync(path);
 							if (
@@ -1198,7 +1419,7 @@ export class IncidentRecorderCompactor {
 						if (created) this.accountStoragePath(path);
 						const runLeaseDirectory = join(this.root, "refs", "runs", sha256(runId));
 						this.ensureDiskAdmission(256 * 1024);
-						mkdirSync(runLeaseDirectory, { recursive: true, mode: 0o700 });
+						this.ensureOwnedDirectory(runLeaseDirectory);
 						utimesSync(path, new Date(), new Date());
 						this.linkOwnedVerified(path, join(runLeaseDirectory, `cas-${digest}.blob`));
 						fsyncDirectory(runLeaseDirectory);
@@ -1243,7 +1464,7 @@ export class IncidentRecorderCompactor {
 			await new Promise<void>((resolve) => setImmediate(resolve));
 		}
 		this.ensureDiskAdmission(256 * 1024);
-		mkdirSync(this.root, { recursive: true, mode: 0o700 });
+		this.ensureOwnedDirectory(this.root);
 		for (;;) {
 			if (this.diskPaused)
 				await new Promise<void>((resolve) => setTimeout(resolve, Math.max(1, this.pausedUntilMs - Date.now())));
@@ -1756,7 +1977,7 @@ export class IncidentRecorderCompactor {
 			);
 			const runReferenceDirectory = join(this.root, "refs", "runs", sha256(line.runId));
 			this.ensureDiskAdmission(256 * 1024);
-			mkdirSync(runReferenceDirectory, { recursive: true, mode: 0o700 });
+			this.ensureOwnedDirectory(runReferenceDirectory);
 			// Establish one lease per exact digest/run before publishing a path-only
 			// occurrence reference. This is idempotent for recurring identical bytes.
 			utimesSync(casPath, new Date(), new Date());
@@ -1882,7 +2103,7 @@ export class IncidentRecorderCompactor {
 		});
 		const runReferenceDirectory = join(this.root, "refs", "runs", sha256(assembly.line.runId));
 		this.ensureDiskAdmission(256 * 1024);
-		mkdirSync(runReferenceDirectory, { recursive: true, mode: 0o700 });
+		this.ensureOwnedDirectory(runReferenceDirectory);
 		const firstWrapper = assembly.references[0]?.wrapperSequence ?? "0";
 		const runReferencePath = join(
 			runReferenceDirectory,
@@ -1929,9 +2150,8 @@ export class IncidentRecorderCompactor {
 		if (sha256(value) !== digest) throw new Error("CAS digest precondition failed");
 		this.ensureDiskAdmission(value.length * 2 + 64 * 1024);
 		const path = join(this.root, "cas", "sha256", digest.slice(0, 2), `${digest}.blob`);
-		const existed = existsSync(path);
-		writeImmutable(path, value);
-		if (!existed) this.accountStoragePath(path);
+		const created = this.withOwnedDirectoryMutation(dirname(path), 2, () => writeImmutable(path, value));
+		if (created) this.accountStoragePath(path);
 		const observed = readFileSync(path);
 		if (observed.length !== value.length || sha256(observed) !== digest)
 			throw new Error("Existing CAS blob did not verify");
@@ -1954,7 +2174,7 @@ export class IncidentRecorderCompactor {
 					: "0";
 		const runDirectory = join(this.root, "refs", "runs", sha256(evidence.runId));
 		this.ensureDiskAdmission(256 * 1024);
-		mkdirSync(runDirectory, { recursive: true, mode: 0o700 });
+		this.ensureOwnedDirectory(runDirectory);
 		this.linkOwnedVerified(gapPath, join(runDirectory, `seq-${sequence.padStart(20, "0")}-gap-${id}.json`));
 		fsyncDirectory(runDirectory);
 	}
@@ -2155,7 +2375,7 @@ export class IncidentRecorderCompactor {
 		const directory = join(incidentDir, "sysdig-pins", "issues");
 		for (const reason of issues.slice(0, SYSDIG_PIN_MAX_DISCOVERY_ENTRIES)) {
 			try {
-				mkdirSync(directory, { recursive: true, mode: 0o700 });
+				this.ensureOwnedDirectory(directory);
 				this.writeOwnedJson(join(directory, `${sha256(reason)}.json`), { version: 1, reason }, 64 * 1024);
 			} catch {}
 		}
@@ -2208,8 +2428,9 @@ export class IncidentRecorderCompactor {
 			const existing = JSON.parse(readFileSync(recordPath, "utf8")) as SysdigPinnedSegmentRecord;
 			if (existing.id === id && existing.pinnedPath === pinnedPath) {
 				if (existing.captureMethod === "hard_link") {
-					if (typeof existing.storageOwnerPath !== "string")
-						throw new Error("legacy_sysdig_hard_link_missing_storage_owner");
+					const expectedOwnerPath = join(this.root, "sysdig-pins", "owners", `${id}.scap`);
+					if (existing.storageOwnerPath !== expectedOwnerPath)
+						throw new Error("legacy_sysdig_hard_link_missing_persistent_storage_owner");
 					const owner = statSync(existing.storageOwnerPath, { bigint: true });
 					const pinned = statSync(existing.pinnedPath, { bigint: true });
 					if (
@@ -2227,8 +2448,8 @@ export class IncidentRecorderCompactor {
 			if (error instanceof Error && error.message === "sysdig_hard_link_storage_owner_mismatch") throw error;
 		}
 		this.ensureDiskAdmission(source.bytes + 256 * 1024);
-		mkdirSync(segmentsDir, { recursive: true, mode: 0o700 });
-		mkdirSync(recordsDir, { recursive: true, mode: 0o700 });
+		this.ensureOwnedDirectory(segmentsDir);
+		this.ensureOwnedDirectory(recordsDir);
 		let captureMethod: SysdigPinnedSegmentRecord["captureMethod"] = "hard_link";
 		let captureReason: SysdigPinnedSegmentRecord["captureReason"] = preferCopy
 			? "active_segment_snapshot"
@@ -2240,37 +2461,41 @@ export class IncidentRecorderCompactor {
 		const sourceAlreadyAccounted =
 			relativeDescendant(this.root, sourcePath) !== undefined ||
 			relativeDescendant(join(this.options.agentDir, "incidents"), sourcePath) !== undefined;
-		const storageOwnerKey = `${source.dev}\0${source.ino}`;
 		if (!preferCopy && !sourceAlreadyAccounted) {
-			const knownOwner = this.sysdigStorageOwners.get(storageOwnerKey);
-			let ownerCreated = false;
+			storageOwnerPath = join(this.root, "sysdig-pins", "owners", `${id}.scap`);
 			try {
-				if (knownOwner) {
-					const owner = statSync(knownOwner, { bigint: true });
-					if (!owner.isFile() || owner.dev !== metadata.dev || owner.ino !== metadata.ino)
+				let owner: BigIntStats | undefined;
+				try {
+					owner = lstatSync(storageOwnerPath, { bigint: true });
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+				}
+				if (owner) {
+					if (
+						!owner.isFile() ||
+						owner.isSymbolicLink() ||
+						owner.dev !== metadata.dev ||
+						owner.ino !== metadata.ino
+					) {
 						throw new Error("sysdig_storage_owner_identity_mismatch");
-					storageOwnerPath = knownOwner;
-					linkVerified(storageOwnerPath, pinnedPath);
+					}
 				} else {
 					if (metadata.nlink !== 1n) throw new Error("sysdig_source_has_unowned_hard_links");
-					linkSync(sourcePath, pinnedPath);
-					storageOwnerPath = pinnedPath;
-					ownerCreated = true;
+					this.withOwnedDirectoryMutation(dirname(storageOwnerPath), 1, () =>
+						linkSync(sourcePath, storageOwnerPath as string),
+					);
+					this.accountStoragePath(storageOwnerPath);
 				}
-				const linkedStat = statSync(pinnedPath, { bigint: true });
-				if (linkedStat.dev !== metadata.dev || linkedStat.ino !== metadata.ino)
+				this.linkOwnedVerified(storageOwnerPath, pinnedPath);
+				const linkedStat = lstatSync(pinnedPath, { bigint: true });
+				if (linkedStat.dev !== metadata.dev || linkedStat.ino !== metadata.ino) {
 					throw new Error("sysdig_hard_link_identity_mismatch");
-				if (ownerCreated) this.accountStoragePath(pinnedPath);
-				this.rememberSysdigStorageOwner(storageOwnerKey, storageOwnerPath);
+				}
 				linked = true;
 			} catch (error) {
-				this.sysdigStorageOwners.delete(storageOwnerKey);
-				if (ownerCreated) {
-					try {
-						rmSync(pinnedPath, { force: true });
-					} catch {}
-				}
 				if ((error as NodeJS.ErrnoException).code === "EEXIST") throw error;
+				// A persistent owner created before a later publication failure remains
+				// accounted and reference-safe. Ordinary incident expiry cannot unlink it.
 				hardLinkErrorCode = (error as NodeJS.ErrnoException).code ?? "UNKNOWN";
 				captureReason = "hard_link_unavailable";
 				storageOwnerPath = undefined;
@@ -2280,56 +2505,58 @@ export class IncidentRecorderCompactor {
 			captureReason = "hard_link_unavailable";
 		}
 		if (!linked) {
-			captureMethod = "bounded_copy";
-			const temporary = join(segmentsDir, `.${id}.tmp-${process.pid}`);
-			let input: number | undefined;
-			let output: number | undefined;
-			try {
-				rmSync(temporary, { force: true });
-				input = openSync(sourcePath, "r");
-				const opened = fstatSync(input, { bigint: true });
-				if (
-					!opened.isFile() ||
-					opened.dev !== metadata.dev ||
-					opened.ino !== metadata.ino ||
-					Number(opened.size) < source.bytes
-				) {
-					throw new Error("sysdig_source_changed_before_bounded_copy");
+			this.withOwnedDirectoryMutation(segmentsDir, 2, () => {
+				captureMethod = "bounded_copy";
+				const temporary = join(segmentsDir, `.${id}.tmp-${process.pid}`);
+				let input: number | undefined;
+				let output: number | undefined;
+				try {
+					rmSync(temporary, { force: true });
+					input = openSync(sourcePath, "r");
+					const opened = fstatSync(input, { bigint: true });
+					if (
+						!opened.isFile() ||
+						opened.dev !== metadata.dev ||
+						opened.ino !== metadata.ino ||
+						Number(opened.size) < source.bytes
+					) {
+						throw new Error("sysdig_source_changed_before_bounded_copy");
+					}
+					output = openSync(temporary, "wx", 0o600);
+					const hash = createHash("sha256");
+					const buffer = Buffer.allocUnsafe(SYSDIG_PIN_COPY_BUFFER_BYTES);
+					let offset = 0;
+					while (offset < source.bytes) {
+						const count = readSync(input, buffer, 0, Math.min(buffer.length, source.bytes - offset), offset);
+						if (count <= 0) throw new Error("sysdig_source_truncated_during_bounded_copy");
+						hash.update(buffer.subarray(0, count));
+						writeAll(output, buffer.subarray(0, count));
+						offset += count;
+					}
+					const after = fstatSync(input, { bigint: true });
+					if (after.dev !== metadata.dev || after.ino !== metadata.ino || Number(after.size) < source.bytes) {
+						throw new Error("sysdig_source_changed_during_bounded_copy");
+					}
+					fsyncSync(output);
+					closeSync(input);
+					input = undefined;
+					closeSync(output);
+					output = undefined;
+					renameSync(temporary, pinnedPath);
+					fsyncDirectory(segmentsDir);
+					digest = hash.digest("hex");
+				} finally {
+					if (input !== undefined)
+						try {
+							closeSync(input);
+						} catch {}
+					if (output !== undefined)
+						try {
+							closeSync(output);
+						} catch {}
+					rmSync(temporary, { force: true });
 				}
-				output = openSync(temporary, "wx", 0o600);
-				const hash = createHash("sha256");
-				const buffer = Buffer.allocUnsafe(SYSDIG_PIN_COPY_BUFFER_BYTES);
-				let offset = 0;
-				while (offset < source.bytes) {
-					const count = readSync(input, buffer, 0, Math.min(buffer.length, source.bytes - offset), offset);
-					if (count <= 0) throw new Error("sysdig_source_truncated_during_bounded_copy");
-					hash.update(buffer.subarray(0, count));
-					writeAll(output, buffer.subarray(0, count));
-					offset += count;
-				}
-				const after = fstatSync(input, { bigint: true });
-				if (after.dev !== metadata.dev || after.ino !== metadata.ino || Number(after.size) < source.bytes) {
-					throw new Error("sysdig_source_changed_during_bounded_copy");
-				}
-				fsyncSync(output);
-				closeSync(input);
-				input = undefined;
-				closeSync(output);
-				output = undefined;
-				renameSync(temporary, pinnedPath);
-				fsyncDirectory(segmentsDir);
-				digest = hash.digest("hex");
-			} finally {
-				if (input !== undefined)
-					try {
-						closeSync(input);
-					} catch {}
-				if (output !== undefined)
-					try {
-						closeSync(output);
-					} catch {}
-				rmSync(temporary, { force: true });
-			}
+			});
 		}
 		const record: SysdigPinnedSegmentRecord = {
 			version: 1,
@@ -2575,7 +2802,7 @@ export class IncidentRecorderCompactor {
 		});
 		const sysdigManifestStat = lstatSync(manifestPath);
 		const sysdigPinDirectory = join(incidentDir, "sysdig-pins", "segments");
-		mkdirSync(sysdigPinDirectory, { recursive: true, mode: 0o700 });
+		this.ensureOwnedDirectory(sysdigPinDirectory);
 		const sysdigPinDirectoryStat = lstatSync(sysdigPinDirectory);
 		this.writeOwnedJson(join(incidentDir, "sysdig-pin-retention-proof.json"), {
 			version: 1,
@@ -3266,7 +3493,7 @@ export class IncidentRecorderCompactor {
 			state.phase = "linking";
 			state.pinCasDir = join(state.incidentDir, "journal-pins", "cas");
 			this.ensureDiskAdmission(256 * 1024);
-			mkdirSync(state.pinCasDir, { recursive: true, mode: 0o700 });
+			this.ensureOwnedDirectory(state.pinCasDir);
 		}
 		const pinCasDir = state.pinCasDir;
 		if (!pinCasDir) {
