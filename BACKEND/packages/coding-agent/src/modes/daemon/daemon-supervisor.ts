@@ -156,6 +156,7 @@ type DaemonCommandBody = DistributiveOmit<DaemonCommand, "id">;
 const structuredLog = getLogger("coding-agent.daemon-supervisor");
 const WORKER_CONNECT_TIMEOUT_MS = 30_000;
 const WORKER_REQUEST_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+const WORKER_EVENT_SUMMARY_REFRESH_INTERVAL_MS = 5_000;
 const INPUT_PAUSE_CLEANUP_TIMEOUT_MS = 5_000;
 const UPDATE_RESTART_MUTATION_DRAIN_TIMEOUT_MS = 80_000;
 const UPDATE_RESTART_WORKER_REQUEST_TIMEOUT_MS = 90_000;
@@ -286,6 +287,26 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"shutdown",
 ]);
 
+type WorkerEventSummaryRefreshPriority = "bounded" | "urgent";
+
+interface PendingWorkerEventSummaryRefresh {
+	priority: WorkerEventSummaryRefreshPriority;
+	initialPriority: WorkerEventSummaryRefreshPriority;
+	latestPriority: WorkerEventSummaryRefreshPriority;
+	initialDiagnosticCause: Record<string, unknown>;
+	latestDiagnosticCause: Record<string, unknown>;
+	coalescedCount: number;
+}
+
+interface WorkerEventSummaryRefreshState {
+	active: boolean;
+	lastStartedAt: number;
+	retryNotBefore: number;
+	pending?: PendingWorkerEventSummaryRefresh;
+	timer?: ReturnType<typeof setTimeout>;
+	cancelled: boolean;
+}
+
 interface ResidentWorker {
 	descriptor: DaemonWorkerDescriptor;
 	descriptorPath: string;
@@ -307,6 +328,7 @@ interface ResidentWorker {
 	ownerCleanupTimer?: ReturnType<typeof setTimeout>;
 	promotedOwnerClientId?: string;
 	updateRestartPrepareClient?: DaemonWorkerClient;
+	eventSummaryRefresh?: WorkerEventSummaryRefreshState;
 }
 
 interface SnapshotDuplicateValidation {
@@ -2501,6 +2523,7 @@ export class DaemonSupervisor {
 			worker.intentionalStop = true;
 			await this.recoverUncertainWorkerOperations(worker, false);
 			this.invalidateWorkerSessionInputPauses(worker, "Session worker stopped while input was paused");
+			this.clearWorkerEventSummaryRefresh(worker);
 			this.workers.delete(worker.descriptor.workerId);
 			this.deleteWorkerDescriptor(worker);
 			await this.syncAgentPeers().catch(() => undefined);
@@ -3471,18 +3494,152 @@ export class DaemonSupervisor {
 		);
 	}
 
+	private scheduleWorkerEventSummaryRefresh(
+		worker: ResidentWorker,
+		diagnosticCause: Record<string, unknown>,
+		priority: WorkerEventSummaryRefreshPriority,
+	): void {
+		if (
+			this.shuttingDown ||
+			this.workers.get(worker.descriptor.workerId) !== worker ||
+			this.isWorkerStopping(worker)
+		) {
+			return;
+		}
+		let state = worker.eventSummaryRefresh;
+		if (!state) {
+			state = {
+				active: false,
+				lastStartedAt: 0,
+				retryNotBefore: 0,
+				cancelled: false,
+			};
+			worker.eventSummaryRefresh = state;
+		}
+		if (state.pending) {
+			state.pending.priority = state.pending.priority === "urgent" || priority === "urgent" ? "urgent" : "bounded";
+			state.pending.latestPriority = priority;
+			state.pending.latestDiagnosticCause = diagnosticCause;
+			state.pending.coalescedCount += 1;
+		} else {
+			state.pending = {
+				priority,
+				initialPriority: priority,
+				latestPriority: priority,
+				initialDiagnosticCause: diagnosticCause,
+				latestDiagnosticCause: diagnosticCause,
+				coalescedCount: 0,
+			};
+		}
+		this.drainWorkerEventSummaryRefresh(worker, state);
+	}
+
+	private drainWorkerEventSummaryRefresh(worker: ResidentWorker, state: WorkerEventSummaryRefreshState): void {
+		if (
+			state.cancelled ||
+			worker.eventSummaryRefresh !== state ||
+			this.shuttingDown ||
+			this.workers.get(worker.descriptor.workerId) !== worker ||
+			this.isWorkerStopping(worker)
+		) {
+			this.clearWorkerEventSummaryRefresh(worker);
+			return;
+		}
+		if (state.active || !state.pending) return;
+
+		const pending = state.pending;
+		const boundedNotBefore =
+			pending.priority === "bounded" ? state.lastStartedAt + WORKER_EVENT_SUMMARY_REFRESH_INTERVAL_MS : 0;
+		const notBefore = Math.max(boundedNotBefore, state.retryNotBefore);
+		const delayMs = notBefore - Date.now();
+		if (delayMs > 0) {
+			if (!state.timer) {
+				state.timer = setTimeout(() => {
+					state.timer = undefined;
+					this.drainWorkerEventSummaryRefresh(worker, state);
+				}, delayMs);
+				state.timer.unref();
+			}
+			return;
+		}
+		if (state.timer) {
+			clearTimeout(state.timer);
+			state.timer = undefined;
+		}
+
+		state.pending = undefined;
+		state.active = true;
+		state.lastStartedAt = Date.now();
+		const scheduledDiagnosticCause = {
+			...pending.initialDiagnosticCause,
+			causeRefreshPriority: pending.priority,
+			causeInitialRefreshPriority: pending.initialPriority,
+			causeCoalescedCount: pending.coalescedCount,
+			...(pending.coalescedCount > 0
+				? {
+						causeLatestEvent: {
+							...pending.latestDiagnosticCause,
+							causeRefreshPriority: pending.latestPriority,
+						},
+					}
+				: {}),
+		};
+		void this.refreshWorkerSummaries(worker, false, scheduledDiagnosticCause, true)
+			.then((peerProjectionChanged) => {
+				state.retryNotBefore = 0;
+				if (
+					!peerProjectionChanged ||
+					state.cancelled ||
+					worker.eventSummaryRefresh !== state ||
+					this.workers.get(worker.descriptor.workerId) !== worker
+				) {
+					return;
+				}
+				return this.syncAgentPeers({ ...scheduledDiagnosticCause, causeStage: "post_summary_refresh" });
+			})
+			.catch(() => {
+				state.retryNotBefore = Date.now() + WORKER_EVENT_SUMMARY_REFRESH_INTERVAL_MS;
+			})
+			.finally(() => {
+				state.active = false;
+				this.drainWorkerEventSummaryRefresh(worker, state);
+			});
+	}
+
+	private clearWorkerEventSummaryRefresh(worker: ResidentWorker): void {
+		const state = worker.eventSummaryRefresh;
+		if (!state) return;
+		state.cancelled = true;
+		state.pending = undefined;
+		if (state.timer) {
+			clearTimeout(state.timer);
+			state.timer = undefined;
+		}
+		worker.eventSummaryRefresh = undefined;
+	}
+
 	private async refreshWorkerSummaries(
 		worker: ResidentWorker,
 		recovery = false,
 		diagnosticCause: Record<string, unknown> = { causeKind: "supervisor_internal" },
-	): Promise<void> {
+		requireCurrentWorker = false,
+	): Promise<boolean> {
 		if (this.isWorkerStopping(worker)) {
 			throw new Error("Session worker is stopping");
 		}
 		if (!worker.client) {
 			throw new Error("Session worker is not connected");
 		}
-		const response = await worker.client.request({ type: "list" }, 5000, diagnosticCause);
+		const previousRoot = worker.summaries.get(worker.descriptor.rootActiveSessionId);
+		const previousPeerProjection = previousRoot ? this.agentPeerSummary(previousRoot) : undefined;
+		const response = await worker.client.request(
+			{ type: "list" },
+			WORKER_EVENT_SUMMARY_REFRESH_INTERVAL_MS,
+			diagnosticCause,
+		);
+		if (requireCurrentWorker && this.workers.get(worker.descriptor.workerId) !== worker) {
+			throw new Error("Session worker was replaced during summary refresh");
+		}
 		const summaries = sessionSummariesFromResponse(response);
 		worker.summaries = new Map(summaries.map((summary) => [summary.activeSessionId ?? summary.id, summary]));
 		for (const summary of summaries) {
@@ -3507,6 +3664,8 @@ export class DaemonSupervisor {
 			});
 			this.persistWorker(worker);
 		}
+		const peerProjection = root ? this.agentPeerSummary(root) : undefined;
+		return JSON.stringify(previousPeerProjection) !== JSON.stringify(peerProjection);
 	}
 
 	private async familyCatalogEntries(): Promise<AgentFamilyCatalogEntry[]> {
@@ -4804,9 +4963,11 @@ export class DaemonSupervisor {
 				causeOutboundType: outboundType,
 				causeSessionEventType: sessionEventType,
 			};
-			void this.refreshWorkerSummaries(worker, false, diagnosticCause)
-				.then(() => this.syncAgentPeers({ ...diagnosticCause, causeStage: "post_summary_refresh" }))
-				.catch(() => undefined);
+			this.scheduleWorkerEventSummaryRefresh(
+				worker,
+				diagnosticCause,
+				outboundType === "session_replaced" || outboundType === "session_closed" ? "urgent" : "bounded",
+			);
 		}
 		if (
 			decodedOutbound?.type === "session_closed" &&
@@ -4820,6 +4981,7 @@ export class DaemonSupervisor {
 			// before its request resolves, so leave both intact while it is active.
 			if ((this.workerStopCounts?.get(worker) ?? 0) === 0) {
 				this.invalidateWorkerSessionInputPauses(worker, "Session worker stopped while input was paused");
+				this.clearWorkerEventSummaryRefresh(worker);
 				this.workers.delete(worker.descriptor.workerId);
 				this.deleteWorkerDescriptor(worker);
 				void this.syncAgentPeers().catch(() => undefined);
@@ -5382,6 +5544,7 @@ export class DaemonSupervisor {
 			assertStopStillApplies();
 		}
 		this.invalidateWorkerSessionInputPauses(worker, "Session worker stopped while input was paused");
+		this.clearWorkerEventSummaryRefresh(worker);
 		this.workers.delete(worker.descriptor.workerId);
 		if (removeDescriptor) {
 			this.deleteWorkerDescriptor(worker);
@@ -5625,6 +5788,9 @@ export class DaemonSupervisor {
 	private async cleanupSupervisorResourcesOnce(): Promise<void> {
 		this.shuttingDown = true;
 		this.clearIdleEvictionTimer();
+		for (const worker of this.workers.values()) {
+			this.clearWorkerEventSummaryRefresh(worker);
+		}
 		await this.idleEvictionSweep?.catch(() => undefined);
 		for (const cleanup of this.signalCleanupHandlers.splice(0)) {
 			await this.runCleanupStep("signal handler", cleanup);
@@ -5652,6 +5818,7 @@ export class DaemonSupervisor {
 		}
 		this.clients.clear();
 		for (const worker of this.workers.values()) {
+			this.clearWorkerEventSummaryRefresh(worker);
 			if (worker.ownerCleanupTimer) {
 				clearTimeout(worker.ownerCleanupTimer);
 				worker.ownerCleanupTimer = undefined;
@@ -5724,6 +5891,9 @@ export class DaemonSupervisor {
 		}
 		this.shuttingDown = true;
 		this.clearIdleEvictionTimer();
+		for (const worker of this.workers.values()) {
+			this.clearWorkerEventSummaryRefresh(worker);
+		}
 		await this.idleEvictionSweep?.catch(() => undefined);
 		if (closingReason) {
 			for (const client of this.clients) {
