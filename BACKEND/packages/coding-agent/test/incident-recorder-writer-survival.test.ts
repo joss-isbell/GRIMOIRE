@@ -1,13 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+	INCIDENT_RECORDER_PROTOCOL_MAX_OCCURRENCE_BYTES,
+	type IncidentRecorderEncodedFrame,
+} from "../src/modes/daemon/incident-recorder-protocol.js";
+import {
 	BoundedFrameEmitter,
 	INCIDENT_RECORDER_EMITTER_CHUNK_BYTES,
 	type IncidentRecorderAdmission,
 } from "../src/modes/daemon/incident-recorder-writer.js";
-import {
-	INCIDENT_RECORDER_PROTOCOL_MAX_OCCURRENCE_BYTES,
-	type IncidentRecorderEncodedFrame,
-} from "../src/modes/daemon/incident-recorder-protocol.js";
 
 const IDENTITY = {
 	runId: "11111111-1111-4111-8111-111111111111",
