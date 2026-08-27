@@ -293,6 +293,7 @@ export interface IncidentRecorderCompactorSurvivalSnapshot {
 	wrapperSequenceKeys: number;
 	producerSequenceKeys: number;
 	accountedStorageBytes: number;
+	reservedStorageBytes: number;
 	storageDiscoveryEntries: number;
 	storageDiscoverySliceEntries: number;
 	storageDiscoveryDepth: number;
@@ -686,7 +687,11 @@ export type StoppedTargetArtifactAdmission =
 	| { state: "complete"; artifact: StoppedTargetArtifactReference }
 	| { state: "error"; reason: string };
 
-interface StoppedTargetArtifactStream {
+interface StoppedStorageReservation {
+	reservationBytes: number;
+}
+
+interface StoppedTargetArtifactStream extends StoppedStorageReservation {
 	sourcePath: string;
 	encoding: string;
 	source: number;
@@ -802,6 +807,7 @@ export class IncidentRecorderCompactor {
 	private pendingEntryBytes = 0;
 	private pausedUntilMs = 0;
 	private storageBytes = 0;
+	private outstandingStorageReservationBytes = 0;
 	private readonly storageDiscovery: StorageDiscovery;
 	private incidentDiscovery?: Dir;
 	private incidentDiscoverySliceEntries = 0;
@@ -974,6 +980,7 @@ export class IncidentRecorderCompactor {
 		}
 		this.journalManifestValidation = undefined;
 		for (const state of this.stoppedTargetStreams.values()) {
+			this.releaseStoppedStorageReservation(state);
 			state.hash.destroy();
 			try {
 				rmSync(state.temporary, { force: true });
@@ -1268,7 +1275,7 @@ export class IncidentRecorderCompactor {
 	}
 
 	private directoryMutationReservation(path: string, entries = 1): number {
-		const filesystem = statfsSync(path);
+		const filesystem = statfsSync(existsSync(path) ? path : this.existingStorageStatPath());
 		const blockSize = Number(filesystem.bsize);
 		if (!Number.isSafeInteger(blockSize) || blockSize <= 0) {
 			throw new Error("Incident compactor filesystem block size is invalid");
@@ -1276,7 +1283,7 @@ export class IncidentRecorderCompactor {
 		return Math.max(64 * 1024, blockSize * (entries + 1));
 	}
 
-	private ensureOwnedDirectory(path: string): void {
+	private ensureOwnedDirectory(path: string, stoppedReservation?: StoppedStorageReservation): void {
 		const target = resolve(path);
 		const ownedRoot = this.ownedStorageRoot(target);
 		if (!ownedRoot) throw new Error("Incident compactor directory escaped its accounted storage roots");
@@ -1298,7 +1305,7 @@ export class IncidentRecorderCompactor {
 			}
 			const parentOwned = this.ownedStorageRoot(parent) !== undefined;
 			const parentBefore = parentOwned ? allocatedStorageBytes(lstatSync(parent, { bigint: true })) : 0;
-			this.ensureDiskAdmission(this.directoryMutationReservation(parent));
+			this.ensureDiskAdmission(this.directoryMutationReservation(parent), stoppedReservation?.reservationBytes ?? 0);
 			try {
 				mkdirSync(current, { mode: 0o700 });
 			} catch (error) {
@@ -1311,24 +1318,84 @@ export class IncidentRecorderCompactor {
 			if (!created.isDirectory() || created.isSymbolicLink()) {
 				throw new Error("Incident compactor created directory identity is invalid");
 			}
-			this.storageBytes += allocatedStorageBytes(created);
+			let accountedGrowth = allocatedStorageBytes(created);
 			if (parentOwned) {
 				const parentAfter = allocatedStorageBytes(lstatSync(parent, { bigint: true }));
-				this.storageBytes += Math.max(0, parentAfter - parentBefore);
+				accountedGrowth += Math.max(0, parentAfter - parentBefore);
 			}
+			if (stoppedReservation) this.consumeStoppedStorageReservation(stoppedReservation, accountedGrowth);
+			else this.storageBytes += accountedGrowth;
 		}
 	}
 
-	private withOwnedDirectoryMutation<T>(directory: string, entryWorstCase: number, operation: () => T): T {
-		this.ensureOwnedDirectory(directory);
+	private withOwnedDirectoryMutation<T>(
+		directory: string,
+		entryWorstCase: number,
+		operation: () => T,
+		stoppedReservation?: StoppedStorageReservation,
+	): T {
+		this.ensureOwnedDirectory(directory, stoppedReservation);
 		const before = allocatedStorageBytes(lstatSync(directory, { bigint: true }));
-		this.ensureDiskAdmission(this.directoryMutationReservation(directory, entryWorstCase));
+		this.ensureDiskAdmission(
+			this.directoryMutationReservation(directory, entryWorstCase),
+			stoppedReservation?.reservationBytes ?? 0,
+		);
 		try {
 			return operation();
 		} finally {
 			const after = allocatedStorageBytes(lstatSync(directory, { bigint: true }));
-			this.storageBytes += Math.max(0, after - before);
+			const accountedGrowth = Math.max(0, after - before);
+			if (stoppedReservation) this.consumeStoppedStorageReservation(stoppedReservation, accountedGrowth);
+			else this.storageBytes += accountedGrowth;
 		}
+	}
+
+	private existingStorageStatPath(): string {
+		let statPath = this.root;
+		while (!existsSync(statPath)) {
+			const parent = dirname(statPath);
+			if (parent === statPath) throw new Error("Incident compactor storage filesystem is unavailable");
+			statPath = parent;
+		}
+		return statPath;
+	}
+
+	private stoppedArtifactStorageReservation(totalBytes: number): number {
+		const statPath = this.existingStorageStatPath();
+		const filesystem = statfsSync(statPath);
+		const blockSize = Number(filesystem.bsize);
+		if (!Number.isSafeInteger(blockSize) || blockSize <= 0)
+			throw new Error("Incident compactor filesystem block size is invalid");
+		const fileBytes = totalBytes === 0 ? 0 : Math.ceil(totalBytes / blockSize) * blockSize;
+		// Staging, shard, and run-reference publication can create at most eight
+		// directories and three entries. Thirty-two filesystem blocks cover each
+		// new directory plus its parent growth, with room for allocation rounding.
+		const topologyAndReferenceBytes = Math.max(256 * 1024, blockSize * 32);
+		const reservation = fileBytes + topologyAndReferenceBytes;
+		if (!Number.isSafeInteger(reservation))
+			throw new Error("Incident compactor stopped artifact reservation exceeds its numeric bound");
+		return reservation;
+	}
+
+	private acquireStoppedStorageReservation(totalBytes: number): StoppedStorageReservation {
+		const reservationBytes = this.stoppedArtifactStorageReservation(totalBytes);
+		this.ensureDiskAdmission(reservationBytes);
+		this.outstandingStorageReservationBytes += reservationBytes;
+		return { reservationBytes };
+	}
+
+	private consumeStoppedStorageReservation(reservation: StoppedStorageReservation, accountedBytes: number): void {
+		if (!Number.isSafeInteger(accountedBytes) || accountedBytes < 0 || accountedBytes > reservation.reservationBytes)
+			throw new Error("Incident compactor stopped artifact exceeded its storage reservation");
+		reservation.reservationBytes -= accountedBytes;
+		this.outstandingStorageReservationBytes -= accountedBytes;
+		this.storageBytes += accountedBytes;
+	}
+
+	private releaseStoppedStorageReservation(reservation: StoppedStorageReservation): void {
+		if (reservation.reservationBytes === 0) return;
+		this.outstandingStorageReservationBytes -= reservation.reservationBytes;
+		reservation.reservationBytes = 0;
 	}
 
 	private accountStoragePath(path: string): void {
@@ -1337,9 +1404,15 @@ export class IncidentRecorderCompactor {
 		this.storageBytes += allocatedStorageBytes(lstatSync(path, { bigint: true }));
 	}
 
-	private ensureDiskAdmission(worstCase: number): void {
+	private ensureDiskAdmission(worstCase: number, coveredReservation = 0): void {
 		this.assertActive();
-		if (!Number.isSafeInteger(worstCase) || worstCase < 0)
+		if (
+			!Number.isSafeInteger(worstCase) ||
+			worstCase < 0 ||
+			!Number.isSafeInteger(coveredReservation) ||
+			coveredReservation < 0 ||
+			coveredReservation > this.outstandingStorageReservationBytes
+		)
 			throw new Error("Invalid incident compactor disk reservation");
 		if (!this.advanceStorageDiscovery()) {
 			const error = new Error(
@@ -1348,17 +1421,20 @@ export class IncidentRecorderCompactor {
 			error.code = "EAGAIN";
 			throw error;
 		}
-		if (Date.now() < this.pausedUntilMs) {
+		if (coveredReservation === 0 && Date.now() < this.pausedUntilMs) {
 			const error = new Error("Incident compactor remains paused by disk admission policy") as NodeJS.ErrnoException;
 			error.code = "ENOSPC";
 			throw error;
 		}
 		const ceiling = this.options.storageByteCeiling ?? 8 * 1024 ** 3;
 		const reserve = this.options.freeReserveBytes ?? 10 * 1024 ** 3;
-		const statPath = existsSync(this.root) ? this.root : this.options.agentDir;
-		const filesystem = statfsSync(statPath);
+		const filesystem = statfsSync(this.existingStorageStatPath());
 		const available = Number(filesystem.bavail) * Number(filesystem.bsize);
-		if (available - worstCase < reserve || this.storageBytes + worstCase > ceiling) {
+		const otherReservations = this.outstandingStorageReservationBytes - coveredReservation;
+		if (
+			available - otherReservations - worstCase < reserve ||
+			this.storageBytes + otherReservations + worstCase > ceiling
+		) {
 			this.pausedUntilMs = Date.now() + 30_000;
 			const error = new Error("Incident compactor paused by disk admission policy") as NodeJS.ErrnoException;
 			error.code = "ENOSPC";
@@ -1398,6 +1474,10 @@ export class IncidentRecorderCompactor {
 		return this.storageBytes;
 	}
 
+	get reservedStorageBytes(): number {
+		return this.outstandingStorageReservationBytes;
+	}
+
 	/** @internal Bounded state used by isolated survival fixtures and diagnostics. */
 	survivalSnapshot(): IncidentRecorderCompactorSurvivalSnapshot {
 		return {
@@ -1408,6 +1488,7 @@ export class IncidentRecorderCompactor {
 			wrapperSequenceKeys: this.wrapperSequences.size,
 			producerSequenceKeys: this.producerSequences.size,
 			accountedStorageBytes: this.storageBytes,
+			reservedStorageBytes: this.outstandingStorageReservationBytes,
 			storageDiscoveryEntries: this.storageDiscovery.entries,
 			storageDiscoverySliceEntries: this.storageDiscovery.lastSliceEntries,
 			storageDiscoveryDepth: this.storageDiscovery.stack.length,
@@ -1463,18 +1544,25 @@ export class IncidentRecorderCompactor {
 			}
 			if (!metadata.isFile()) return { state: "error", reason: "artifact_source_not_regular_file" };
 			const totalBytes = Number(metadata.size);
-			if (!Number.isSafeInteger(totalBytes) || !this.admitObservation(totalBytes + 256 * 1024)) {
-				return { state: "pending", reason: "storage_paused", copiedBytes: 0, totalBytes };
+			if (!Number.isSafeInteger(totalBytes))
+				return { state: "error", reason: "artifact_source_size_exceeds_numeric_bound" };
+			let reservation: StoppedStorageReservation;
+			try {
+				reservation = this.acquireStoppedStorageReservation(totalBytes);
+			} catch (error) {
+				if (["ENOSPC", "EAGAIN"].includes((error as NodeJS.ErrnoException).code ?? ""))
+					return { state: "pending", reason: "storage_paused", copiedBytes: 0, totalBytes };
+				return { state: "error", reason: error instanceof Error ? error.message : String(error) };
 			}
 			const directory = join(this.root, "cas", "sha256", "staging");
-			this.ensureOwnedDirectory(directory);
 			const temporary = join(directory, `${key}.tmp`);
-			try {
-				rmSync(temporary, { force: true });
-			} catch {}
 			let source: number | undefined;
 			let target: number | undefined;
 			try {
+				this.ensureOwnedDirectory(directory, reservation);
+				try {
+					rmSync(temporary, { force: true });
+				} catch {}
 				source = this.openRetainedDescriptor(
 					sourcePath,
 					fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
@@ -1489,8 +1577,11 @@ export class IncidentRecorderCompactor {
 					openedSource.ctimeMs !== metadata.ctimeMs
 				)
 					throw new Error("artifact_source_identity_changed_before_capture");
-				target = this.withOwnedDirectoryMutation(directory, 1, () =>
-					this.retainDescriptor(openSync(temporary, "wx", 0o600), temporary, "stopped-target"),
+				target = this.withOwnedDirectoryMutation(
+					directory,
+					1,
+					() => this.retainDescriptor(openSync(temporary, "wx", 0o600), temporary, "stopped-target"),
+					reservation,
 				);
 				state = {
 					sourcePath,
@@ -1505,7 +1596,9 @@ export class IncidentRecorderCompactor {
 					totalBytes,
 					copiedBytes: 0,
 					hash: createHash("sha256"),
+					reservationBytes: reservation.reservationBytes,
 				};
+				reservation.reservationBytes = 0;
 				this.stoppedTargetStreams.set(key, state);
 			} catch (error) {
 				if (source !== undefined) this.closeRetainedDescriptor(source);
@@ -1513,16 +1606,10 @@ export class IncidentRecorderCompactor {
 				try {
 					rmSync(temporary, { force: true });
 				} catch {}
+				this.releaseStoppedStorageReservation(reservation);
 				return { state: "error", reason: error instanceof Error ? error.message : String(error) };
 			}
 		}
-		if (this.diskPaused)
-			return {
-				state: "pending",
-				reason: "storage_paused",
-				copiedBytes: state.copiedBytes,
-				totalBytes: state.totalBytes,
-			};
 		let remaining = Math.max(0, Math.min(work.byteBudget, 4 * 1024 * 1024));
 		const buffer = Buffer.allocUnsafe(64 * 1024);
 		try {
@@ -1552,18 +1639,17 @@ export class IncidentRecorderCompactor {
 							currentPath.size !== currentFd.size ||
 							currentPath.mtimeMs !== currentFd.mtimeMs ||
 							currentPath.ctimeMs !== currentFd.ctimeMs
-						) {
+						)
 							throw new Error("artifact_source_changed_during_capture");
-						}
 						fsyncSync(state.target);
 						this.closeRetainedDescriptor(state.source);
 						this.closeRetainedDescriptor(state.target);
 						const digest = state.hash.digest("hex");
 						const path = join(this.root, "cas", "sha256", digest.slice(0, 2), `${digest}.blob`);
-						this.ensureOwnedDirectory(dirname(path));
+						this.ensureOwnedDirectory(dirname(path), state);
 						let created = true;
 						try {
-							this.withOwnedDirectoryMutation(dirname(path), 1, () => linkSync(state.temporary, path));
+							this.withOwnedDirectoryMutation(dirname(path), 1, () => linkSync(state.temporary, path), state);
 						} catch (error) {
 							const existing = lstatSync(path);
 							if (
@@ -1576,15 +1662,24 @@ export class IncidentRecorderCompactor {
 								throw error;
 							created = false;
 						}
+						if (created)
+							this.consumeStoppedStorageReservation(
+								state,
+								allocatedStorageBytes(lstatSync(path, { bigint: true })),
+							);
 						rmSync(state.temporary, { force: true });
-						this.stoppedTargetStreams.delete(key);
-						if (created) this.accountStoragePath(path);
 						const runLeaseDirectory = join(this.root, "refs", "runs", sha256(runId));
-						this.ensureDiskAdmission(256 * 1024);
-						this.ensureOwnedDirectory(runLeaseDirectory);
+						this.ensureOwnedDirectory(runLeaseDirectory, state);
 						utimesSync(path, new Date(), new Date());
-						this.linkOwnedVerified(path, join(runLeaseDirectory, `cas-${digest}.blob`));
+						this.withOwnedDirectoryMutation(
+							runLeaseDirectory,
+							1,
+							() => linkVerified(path, join(runLeaseDirectory, `cas-${digest}.blob`)),
+							state,
+						);
 						fsyncDirectory(runLeaseDirectory);
+						this.releaseStoppedStorageReservation(state);
+						this.stoppedTargetStreams.delete(key);
 						return {
 							state: "complete",
 							artifact: { algorithm: "sha256", digest, bytes: state.totalBytes, path, encoding },
@@ -1612,6 +1707,7 @@ export class IncidentRecorderCompactor {
 				rmSync(state.temporary, { force: true });
 			} catch {}
 			state.hash.destroy();
+			this.releaseStoppedStorageReservation(state);
 			this.stoppedTargetStreams.delete(key);
 			return { state: "error", reason: state.error };
 		}
