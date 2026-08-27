@@ -18,12 +18,13 @@ import {
 	readSync,
 	renameSync,
 	rmSync,
+	type Stats,
 	statfsSync,
 	statSync,
 	utimesSync,
 	writeSync,
 } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { acquireIncidentCasTransaction } from "./incident-recorder-cas-transaction.js";
 import {
 	encodeIncidentRecorderFrame,
@@ -60,6 +61,7 @@ const SYSDIG_RING_DEFAULT_BASE_PATH = "/var/log/grimoire/sysdig/ring.scap";
 const SYSDIG_RING_EXPECTED_SEGMENTS = 12;
 const SYSDIG_RING_ROTATION_BYTES = 320 * 1024 * 1024;
 const SYSDIG_PIN_MAX_DISCOVERY_ENTRIES = 256;
+const SYSDIG_DISCOVERY_BATCH_COUNT = 64;
 const SYSDIG_PIN_MAX_SEGMENTS = 32;
 const SYSDIG_PIN_MAX_SEGMENT_BYTES = 384 * 1024 * 1024;
 const SYSDIG_PIN_MAX_TOTAL_BYTES = 8 * 1024 * 1024 * 1024;
@@ -189,11 +191,35 @@ interface SysdigPinnedSegmentRecord {
 	phase: "initial" | "rotated" | "final";
 	source: { dev: string; ino: string; bytes: number; mtimeMs: number };
 	pinnedPath: string;
+	storageOwnerPath?: string;
 	captureMethod: "hard_link" | "bounded_copy";
 	captureReason: "closed_segment_hard_link" | "active_segment_snapshot" | "hard_link_unavailable";
 	hardLinkErrorCode?: string;
 	bytesAtCapture: number;
 	sha256AtCapture?: string;
+}
+
+interface SysdigRingCandidate {
+	path: string;
+	metadata: BigIntStats;
+}
+
+interface SysdigRingDiscovery {
+	incidentDir: string;
+	request: SysdigPinRequest;
+	phase: "initial" | "rotated" | "final";
+	observedAtWallTimeMs: number;
+	directory: Dir;
+	ringName: string;
+	candidates: SysdigRingCandidate[];
+	candidateCount: number;
+	issues: string[];
+	issuesTruncated: boolean;
+}
+
+interface SysdigDiscoveryResult {
+	complete: boolean;
+	issues: string[];
 }
 
 interface SysdigPinRecordState {
@@ -225,6 +251,7 @@ interface StorageDiscovery {
 	rootIndex: number;
 	stack: StorageDiscoveryFrame[];
 	entries: number;
+	lastSliceEntries: number;
 	complete: boolean;
 	error?: string;
 }
@@ -238,14 +265,13 @@ export interface IncidentRecorderCompactorSurvivalSnapshot {
 	producerSequenceKeys: number;
 	accountedStorageBytes: number;
 	storageDiscoveryEntries: number;
+	storageDiscoverySliceEntries: number;
 	storageDiscoveryDepth: number;
 	storageDiscoveryComplete: boolean;
+	incidentDiscoverySliceEntries: number;
+	sysdigDiscoverySliceEntries: number;
+	sysdigDiscoveryCandidates: number;
 	storageDiscoveryError?: string;
-}
-
-export interface IncidentRecorderJournalExportFixtureDecoder {
-	push(chunk: Uint8Array): void;
-	finish(): void;
 }
 
 class JournalExportParser {
@@ -647,6 +673,13 @@ function allocatedStorageBytes(stat: { size: number; blocks?: number }): number 
 	return Math.max(stat.size, allocated);
 }
 
+function relativeDescendant(root: string, path: string): string | undefined {
+	const value = relative(resolve(root), resolve(path));
+	if (value === "") return "";
+	if (value === ".." || value.startsWith(`..${sep}`) || isAbsolute(value)) return undefined;
+	return value.split(sep).join("/");
+}
+
 function readDirectoryBounded(path: string, maximumEntries: number): { entries: Dirent[]; overflow: boolean } {
 	const directory = opendirSync(path);
 	const entries: Dirent[] = [];
@@ -693,6 +726,10 @@ export class IncidentRecorderCompactor {
 	private storageBytes = 0;
 	private readonly storageDiscovery: StorageDiscovery;
 	private incidentDiscovery?: Dir;
+	private incidentDiscoverySliceEntries = 0;
+	private sysdigRingDiscovery?: SysdigRingDiscovery;
+	private sysdigDiscoverySliceEntries = 0;
+	private readonly sysdigStorageOwners = new Map<string, string>();
 	private readonly activePinScans = new Set<string>();
 	private activePinTraversal?: PinTraversal;
 	private journalManifestValidation?: JournalManifestValidation;
@@ -706,6 +743,7 @@ export class IncidentRecorderCompactor {
 			rootIndex: 0,
 			stack: [],
 			entries: 0,
+			lastSliceEntries: 0,
 			complete: false,
 		};
 		this.advanceStorageDiscovery();
@@ -721,15 +759,127 @@ export class IncidentRecorderCompactor {
 		} catch {}
 	}
 
+	private canonicalStoragePathForLink(path: string): string | undefined {
+		const immutableTemporary = /^\.(.+)\.tmp-\d+-[0-9a-f]{64}$/.exec(basename(path));
+		if (immutableTemporary?.[1]) return join(dirname(path), immutableTemporary[1]);
+		const recorderRelative = relativeDescendant(this.root, path);
+		if (recorderRelative !== undefined) {
+			let match = /^refs\/runs\/[0-9a-f]{64}\/cas-([0-9a-f]{64})\.blob$/.exec(recorderRelative);
+			if (match?.[1]) {
+				const digest = match[1];
+				return join(this.root, "cas", "sha256", digest.slice(0, 2), `${digest}.blob`);
+			}
+			match = /^refs\/runs\/[0-9a-f]{64}\/seq-\d{20}-([0-9a-f]{64})\.json$/.exec(recorderRelative);
+			if (match?.[1]) {
+				const id = match[1];
+				return join(this.root, "refs", "occurrences", "sha256", id.slice(0, 2), `${id}.json`);
+			}
+			match = /^refs\/runs\/[0-9a-f]{64}\/seq-\d{20}-gap-([0-9a-f]{64})\.json$/.exec(recorderRelative);
+			if (match?.[1]) return join(this.root, "refs", "gaps", `${match[1]}.json`);
+			match = /^refs\/runs\/[0-9a-f]{64}\/seq-\d{20}-incomplete-([0-9a-f]{64})\.json$/.exec(recorderRelative);
+			if (match?.[1]) return join(this.root, "refs", "incomplete", `${match[1]}.json`);
+			return undefined;
+		}
+		const incidentRelative = relativeDescendant(join(this.options.agentDir, "incidents"), path);
+		if (incidentRelative === undefined) return undefined;
+		let match = /^[^/]+\/journal-pins\/cas\/([0-9a-f]{64})\.blob$/.exec(incidentRelative);
+		if (match?.[1]) {
+			const digest = match[1];
+			return join(this.root, "cas", "sha256", digest.slice(0, 2), `${digest}.blob`);
+		}
+		match = /^([^/]+)\/sysdig-pins\/segments\/([0-9a-f]{64})\.scap$/.exec(incidentRelative);
+		if (!match?.[1] || !match[2]) return undefined;
+		const recordPath = join(
+			this.options.agentDir,
+			"incidents",
+			match[1],
+			"sysdig-pins",
+			"records",
+			`${match[2]}.json`,
+		);
+		let record: SysdigPinnedSegmentRecord;
+		try {
+			const recordStat = lstatSync(recordPath);
+			if (!recordStat.isFile() || recordStat.isSymbolicLink() || recordStat.size > 64 * 1024) {
+				throw new Error("record_metadata_invalid");
+			}
+			record = JSON.parse(readFileSync(recordPath, "utf8")) as SysdigPinnedSegmentRecord;
+		} catch {
+			throw new Error("sysdig_hard_link_storage_owner_record_unavailable");
+		}
+		const storageOwnerPath = record.storageOwnerPath;
+		const ownerRelative =
+			typeof storageOwnerPath === "string"
+				? relativeDescendant(join(this.options.agentDir, "incidents"), storageOwnerPath)
+				: undefined;
+		if (
+			record.id !== match[2] ||
+			record.pinnedPath !== path ||
+			record.captureMethod !== "hard_link" ||
+			typeof storageOwnerPath !== "string" ||
+			typeof record.source?.dev !== "string" ||
+			typeof record.source.ino !== "string" ||
+			!ownerRelative ||
+			!/^[^/]+\/sysdig-pins\/segments\/[0-9a-f]{64}\.scap$/.test(ownerRelative)
+		) {
+			throw new Error("sysdig_hard_link_storage_owner_record_invalid");
+		}
+		this.rememberSysdigStorageOwner(`${record.source.dev}\0${record.source.ino}`, storageOwnerPath);
+		return storageOwnerPath;
+	}
+
+	private rememberSysdigStorageOwner(key: string, path: string): void {
+		this.sysdigStorageOwners.delete(key);
+		this.sysdigStorageOwners.set(key, path);
+		while (this.sysdigStorageOwners.size > SYSDIG_PIN_MAX_SEGMENTS) {
+			const oldest = this.sysdigStorageOwners.keys().next().value;
+			if (oldest === undefined) break;
+			this.sysdigStorageOwners.delete(oldest);
+		}
+	}
+
+	private shouldAccountStoragePath(path: string, stat: Stats): boolean {
+		if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink <= 1) return true;
+		const canonicalPath = this.canonicalStoragePathForLink(path);
+		if (canonicalPath) {
+			let canonical: Stats;
+			try {
+				canonical = lstatSync(canonicalPath);
+			} catch {
+				throw new Error("hard_link_canonical_storage_owner_unavailable");
+			}
+			if (
+				!canonical.isFile() ||
+				canonical.isSymbolicLink() ||
+				canonical.dev !== stat.dev ||
+				canonical.ino !== stat.ino
+			) {
+				throw new Error("hard_link_canonical_storage_owner_mismatch");
+			}
+			return resolve(canonicalPath) === resolve(path);
+		}
+		const recorderRelative = relativeDescendant(this.root, path);
+		if (
+			recorderRelative !== undefined &&
+			(/^cas\/sha256\//.test(recorderRelative) ||
+				/^refs\/(?:occurrences\/sha256|gaps|incomplete)\//.test(recorderRelative))
+		) {
+			return true;
+		}
+		throw new Error("unclassified_hard_link_blocks_exact_storage_accounting");
+	}
+
 	private advanceStorageDiscovery(
 		entryBudget = STORAGE_DISCOVERY_ENTRY_BUDGET,
 		deadlineMs = Date.now() + STORAGE_DISCOVERY_SLICE_MS,
 	): boolean {
 		const state = this.storageDiscovery;
+		state.lastSliceEntries = 0;
 		if (state.complete || state.error) return state.complete;
 		let worked = 0;
 		const fail = (reason: string): false => {
 			state.error = reason;
+			state.lastSliceEntries = worked;
 			for (const frame of state.stack.splice(0)) {
 				try {
 					frame.directory.closeSync();
@@ -742,6 +892,7 @@ export class IncidentRecorderCompactor {
 				const root = state.roots[state.rootIndex++];
 				if (!root) {
 					state.complete = true;
+					state.lastSliceEntries = worked;
 					return true;
 				}
 				let rootStat: ReturnType<typeof lstatSync>;
@@ -750,7 +901,11 @@ export class IncidentRecorderCompactor {
 				} catch {
 					continue;
 				}
-				this.storageBytes += allocatedStorageBytes(rootStat);
+				try {
+					if (this.shouldAccountStoragePath(root, rootStat)) this.storageBytes += allocatedStorageBytes(rootStat);
+				} catch (error) {
+					return fail(error instanceof Error ? error.message : String(error));
+				}
 				state.entries += 1;
 				worked += 1;
 				if (!rootStat.isDirectory()) continue;
@@ -788,16 +943,18 @@ export class IncidentRecorderCompactor {
 			} catch {
 				continue;
 			}
-			// Hard-linked recorder refs consume no additional blocks. Counting each
-			// directory entry is conservative and removes the old per-inode Set whose
-			// cardinality grew with the full journal backlog.
-			this.storageBytes += allocatedStorageBytes(stat);
+			try {
+				if (this.shouldAccountStoragePath(path, stat)) this.storageBytes += allocatedStorageBytes(stat);
+			} catch (error) {
+				return fail(error instanceof Error ? error.message : String(error));
+			}
 			if (!stat.isDirectory()) continue;
 			if (frame.depth + 1 > STORAGE_DISCOVERY_MAX_DEPTH) return fail("storage_discovery_depth_bound_exceeded");
 			try {
 				state.stack.push({ directory: opendirSync(path), depth: frame.depth + 1 });
 			} catch {}
 		}
+		state.lastSliceEntries = worked;
 		return false;
 	}
 
@@ -877,32 +1034,19 @@ export class IncidentRecorderCompactor {
 			producerSequenceKeys: this.producerSequences.size,
 			accountedStorageBytes: this.storageBytes,
 			storageDiscoveryEntries: this.storageDiscovery.entries,
+			storageDiscoverySliceEntries: this.storageDiscovery.lastSliceEntries,
 			storageDiscoveryDepth: this.storageDiscovery.stack.length,
 			storageDiscoveryComplete: this.storageDiscovery.complete,
+			incidentDiscoverySliceEntries: this.incidentDiscoverySliceEntries,
+			sysdigDiscoverySliceEntries: this.sysdigDiscoverySliceEntries,
+			sysdigDiscoveryCandidates: this.sysdigRingDiscovery?.candidates.length ?? 0,
 			...(this.storageDiscovery.error ? { storageDiscoveryError: this.storageDiscovery.error } : {}),
 		};
 	}
 
-	/** @internal Advances one fixed discovery slice without opening journalctl. */
+	/** @internal Advances one fixed storage-discovery slice without opening journalctl. */
 	advanceBoundedDiscovery(): boolean {
 		return this.advanceStorageDiscovery();
-	}
-
-	/** @internal Parses only caller-supplied export bytes; it never opens journalctl. */
-	createJournalExportFixtureDecoder(): IncidentRecorderJournalExportFixtureDecoder {
-		let finished = false;
-		const parser = new JournalExportParser((fields) => this.acceptEntry(fields));
-		return {
-			push: (chunk) => {
-				if (finished) throw new Error("Incident journal export fixture decoder is finished");
-				parser.push(Buffer.from(chunk));
-			},
-			finish: () => {
-				if (finished) return;
-				finished = true;
-				parser.finish();
-			},
-		};
 	}
 
 	admitObservation(worstCaseBytes = 256 * 1024): boolean {
@@ -1755,7 +1899,10 @@ export class IncidentRecorderCompactor {
 		for (;;) {
 			const entry = this.pendingEntries[this.pendingEntryHead];
 			if (!entry?.resolved) {
-				if (this.pendingEntryHead >= 1024 && this.pendingEntryHead * 2 >= this.pendingEntries.length) {
+				if (this.pendingEntryHead === this.pendingEntries.length) {
+					this.pendingEntries.length = 0;
+					this.pendingEntryHead = 0;
+				} else if (this.pendingEntryHead >= 1024 && this.pendingEntryHead * 2 >= this.pendingEntries.length) {
 					this.pendingEntries.splice(0, this.pendingEntryHead);
 					this.pendingEntryHead = 0;
 				}
@@ -2059,8 +2206,26 @@ export class IncidentRecorderCompactor {
 		const recordPath = join(recordsDir, `${id}.json`);
 		try {
 			const existing = JSON.parse(readFileSync(recordPath, "utf8")) as SysdigPinnedSegmentRecord;
-			if (existing.id === id && existing.pinnedPath === pinnedPath) return existing;
-		} catch {}
+			if (existing.id === id && existing.pinnedPath === pinnedPath) {
+				if (existing.captureMethod === "hard_link") {
+					if (typeof existing.storageOwnerPath !== "string")
+						throw new Error("legacy_sysdig_hard_link_missing_storage_owner");
+					const owner = statSync(existing.storageOwnerPath, { bigint: true });
+					const pinned = statSync(existing.pinnedPath, { bigint: true });
+					if (
+						owner.dev !== metadata.dev ||
+						owner.ino !== metadata.ino ||
+						pinned.dev !== owner.dev ||
+						pinned.ino !== owner.ino
+					)
+						throw new Error("sysdig_hard_link_storage_owner_mismatch");
+				}
+				return existing;
+			}
+		} catch (error) {
+			if (error instanceof Error && error.message.startsWith("legacy_sysdig_hard_link")) throw error;
+			if (error instanceof Error && error.message === "sysdig_hard_link_storage_owner_mismatch") throw error;
+		}
 		this.ensureDiskAdmission(source.bytes + 256 * 1024);
 		mkdirSync(segmentsDir, { recursive: true, mode: 0o700 });
 		mkdirSync(recordsDir, { recursive: true, mode: 0o700 });
@@ -2070,21 +2235,49 @@ export class IncidentRecorderCompactor {
 			: "closed_segment_hard_link";
 		let hardLinkErrorCode: string | undefined;
 		let digest: string | undefined;
+		let storageOwnerPath: string | undefined;
 		let linked = false;
-		if (!preferCopy) {
+		const sourceAlreadyAccounted =
+			relativeDescendant(this.root, sourcePath) !== undefined ||
+			relativeDescendant(join(this.options.agentDir, "incidents"), sourcePath) !== undefined;
+		const storageOwnerKey = `${source.dev}\0${source.ino}`;
+		if (!preferCopy && !sourceAlreadyAccounted) {
+			const knownOwner = this.sysdigStorageOwners.get(storageOwnerKey);
+			let ownerCreated = false;
 			try {
-				linkSync(sourcePath, pinnedPath);
+				if (knownOwner) {
+					const owner = statSync(knownOwner, { bigint: true });
+					if (!owner.isFile() || owner.dev !== metadata.dev || owner.ino !== metadata.ino)
+						throw new Error("sysdig_storage_owner_identity_mismatch");
+					storageOwnerPath = knownOwner;
+					linkVerified(storageOwnerPath, pinnedPath);
+				} else {
+					if (metadata.nlink !== 1n) throw new Error("sysdig_source_has_unowned_hard_links");
+					linkSync(sourcePath, pinnedPath);
+					storageOwnerPath = pinnedPath;
+					ownerCreated = true;
+				}
 				const linkedStat = statSync(pinnedPath, { bigint: true });
 				if (linkedStat.dev !== metadata.dev || linkedStat.ino !== metadata.ino)
 					throw new Error("sysdig_hard_link_identity_mismatch");
+				if (ownerCreated) this.accountStoragePath(pinnedPath);
+				this.rememberSysdigStorageOwner(storageOwnerKey, storageOwnerPath);
 				linked = true;
 			} catch (error) {
+				this.sysdigStorageOwners.delete(storageOwnerKey);
+				if (ownerCreated) {
+					try {
+						rmSync(pinnedPath, { force: true });
+					} catch {}
+				}
 				if ((error as NodeJS.ErrnoException).code === "EEXIST") throw error;
-				// Linux protected_hardlinks normally rejects joss linking root-owned 0640 adm files.
-				// Keep the destination behind 0700 directories and make a bounded 0600 byte copy instead.
 				hardLinkErrorCode = (error as NodeJS.ErrnoException).code ?? "UNKNOWN";
 				captureReason = "hard_link_unavailable";
+				storageOwnerPath = undefined;
 			}
+		} else if (!preferCopy) {
+			hardLinkErrorCode = "SOURCE_ALREADY_ACCOUNTED";
+			captureReason = "hard_link_unavailable";
 		}
 		if (!linked) {
 			captureMethod = "bounded_copy";
@@ -2147,80 +2340,53 @@ export class IncidentRecorderCompactor {
 			phase,
 			source,
 			pinnedPath,
+			...(storageOwnerPath ? { storageOwnerPath } : {}),
 			captureMethod,
 			captureReason,
 			...(hardLinkErrorCode ? { hardLinkErrorCode } : {}),
 			bytesAtCapture: source.bytes,
 			...(digest ? { sha256AtCapture: digest } : {}),
 		};
-		this.accountStoragePath(pinnedPath);
+		if (!linked) this.accountStoragePath(pinnedPath);
 		this.writeOwnedJson(recordPath, record, 64 * 1024);
 		return record;
 	}
 
-	private captureSysdigRing(
-		incidentDir: string,
-		request: SysdigPinRequest,
-		phase: "initial" | "rotated" | "final",
-		nowMs: number,
-	): string[] {
-		const issues: string[] = [];
-		const ringDir = dirname(request.ringBasePath);
-		const ringName = basename(request.ringBasePath);
-		let discovery: { entries: Dirent[]; overflow: boolean };
+	private addSysdigDiscoveryIssue(state: SysdigRingDiscovery, issue: string): void {
+		if (state.issues.length < SYSDIG_PIN_MAX_DISCOVERY_ENTRIES - 1) {
+			state.issues.push(issue);
+			return;
+		}
+		if (!state.issuesTruncated) {
+			state.issues.push("ring_discovery_issue_bound_exceeded");
+			state.issuesTruncated = true;
+		}
+	}
+
+	private finishSysdigRingDiscovery(state: SysdigRingDiscovery): string[] {
 		try {
-			discovery = readDirectoryBounded(ringDir, SYSDIG_PIN_MAX_DISCOVERY_ENTRIES);
-		} catch {
-			const unavailable = ["ring_directory_unavailable"];
-			this.recordSysdigPinIssues(incidentDir, unavailable);
-			return unavailable;
-		}
-		if (discovery.overflow) issues.push("ring_directory_entry_bound_exceeded");
-		const candidates: Array<{ path: string; metadata: BigIntStats }> = [];
-		for (const entry of discovery.entries) {
-			if (!entry.name.startsWith(ringName)) continue;
-			const sourcePath = join(ringDir, entry.name);
-			try {
-				const metadata = lstatSync(sourcePath, { bigint: true });
-				if (!metadata.isFile()) {
-					issues.push(`non_regular_ring_entry:${entry.name}`);
-					continue;
-				}
-				const bytes = Number(metadata.size);
-				if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > SYSDIG_PIN_MAX_SEGMENT_BYTES) {
-					issues.push(`oversize_ring_entry:${entry.name}`);
-					continue;
-				}
-				candidates.push({ path: sourcePath, metadata });
-			} catch {
-				issues.push(`unstatable_ring_entry:${entry.name}`);
-			}
-		}
-		candidates.sort(
-			(left, right) =>
-				Number(right.metadata.mtimeMs - left.metadata.mtimeMs) ||
-				basename(right.path).localeCompare(basename(left.path)),
-		);
-		if (candidates.length > SYSDIG_RING_EXPECTED_SEGMENTS) issues.push("ring_has_more_than_configured_12_segments");
-		if (candidates.length > SYSDIG_PIN_MAX_SEGMENTS) issues.push("ring_segment_count_bound_exceeded");
-		const existing = this.readSysdigSegmentRecordState(incidentDir);
-		issues.push(...existing.issues);
-		if (existing.saturated) {
-			this.recordSysdigPinIssues(incidentDir, issues);
-			return issues;
-		}
+			state.directory.closeSync();
+		} catch {}
+		if (this.sysdigRingDiscovery === state) this.sysdigRingDiscovery = undefined;
+		if (state.candidateCount > SYSDIG_RING_EXPECTED_SEGMENTS)
+			this.addSysdigDiscoveryIssue(state, "ring_has_more_than_configured_12_segments");
+		if (state.candidateCount > SYSDIG_PIN_MAX_SEGMENTS)
+			this.addSysdigDiscoveryIssue(state, "ring_segment_count_bound_exceeded");
+		const existing = this.readSysdigSegmentRecordState(state.incidentDir);
+		const issues = [...state.issues, ...existing.issues];
+		if (existing.saturated) return issues;
 		const known = new Set(existing.records.map((record) => record.id));
 		let admittedBytes = existing.totalBytes;
 		let recordFileCount = existing.recordFileCount;
-		for (let index = 0; index < Math.min(candidates.length, SYSDIG_PIN_MAX_SEGMENTS); index += 1) {
-			const candidate = candidates[index];
+		for (let index = 0; index < state.candidates.length; index += 1) {
+			const candidate = state.candidates[index];
 			if (!candidate) continue;
 			const bytes = Number(candidate.metadata.size);
 			const id = sha256(
 				`${candidate.metadata.dev.toString()}\0${candidate.metadata.ino.toString()}\0${bytes}\0${Number(candidate.metadata.mtimeMs)}`,
 			);
 			if (known.has(id)) continue;
-			if (phase === "rotated" && index === 0) continue; // The newest file can still be receiving compressed blocks.
+			if (state.phase === "rotated" && index === 0) continue;
 			if (recordFileCount >= SYSDIG_PIN_MAX_SEGMENTS) {
 				issues.push("pin_record_count_bound_reached");
 				break;
@@ -2231,11 +2397,11 @@ export class IncidentRecorderCompactor {
 			}
 			try {
 				const record = this.captureSysdigSegment(
-					incidentDir,
+					state.incidentDir,
 					candidate.path,
 					candidate.metadata,
-					nowMs,
-					phase,
+					state.observedAtWallTimeMs,
+					state.phase,
 					index === 0,
 				);
 				known.add(record.id);
@@ -2247,21 +2413,109 @@ export class IncidentRecorderCompactor {
 				);
 			}
 		}
-		this.recordSysdigPinIssues(incidentDir, issues);
 		return issues;
+	}
+
+	private advanceSysdigRingDiscovery(state: SysdigRingDiscovery): SysdigDiscoveryResult {
+		this.sysdigDiscoverySliceEntries = 0;
+		for (let discovered = 0; discovered < SYSDIG_DISCOVERY_BATCH_COUNT; discovered += 1) {
+			let entry: Dirent | null;
+			try {
+				entry = state.directory.readSync();
+			} catch {
+				this.addSysdigDiscoveryIssue(state, "ring_directory_read_failed");
+				return { complete: true, issues: this.finishSysdigRingDiscovery(state) };
+			}
+			if (!entry) return { complete: true, issues: this.finishSysdigRingDiscovery(state) };
+			this.sysdigDiscoverySliceEntries += 1;
+			if (!entry.name.startsWith(state.ringName)) continue;
+			const sourcePath = join(String(state.directory.path), entry.name);
+			try {
+				const metadata = lstatSync(sourcePath, { bigint: true });
+				if (!metadata.isFile()) {
+					this.addSysdigDiscoveryIssue(state, `non_regular_ring_entry:${entry.name}`);
+					continue;
+				}
+				const bytes = Number(metadata.size);
+				if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > SYSDIG_PIN_MAX_SEGMENT_BYTES) {
+					this.addSysdigDiscoveryIssue(state, `oversize_ring_entry:${entry.name}`);
+					continue;
+				}
+				state.candidateCount += 1;
+				state.candidates.push({ path: sourcePath, metadata });
+				state.candidates.sort(
+					(left, right) =>
+						Number(right.metadata.mtimeMs - left.metadata.mtimeMs) ||
+						basename(right.path).localeCompare(basename(left.path)),
+				);
+				if (state.candidates.length > SYSDIG_PIN_MAX_SEGMENTS) state.candidates.pop();
+			} catch {
+				this.addSysdigDiscoveryIssue(state, `unstatable_ring_entry:${entry.name}`);
+			}
+		}
+		return { complete: false, issues: [] };
+	}
+
+	private captureSysdigRing(
+		incidentDir: string,
+		request: SysdigPinRequest,
+		phase: "initial" | "rotated" | "final",
+		nowMs: number,
+	): SysdigDiscoveryResult {
+		if (this.sysdigRingDiscovery) return { complete: false, issues: [] };
+		let directory: Dir;
+		try {
+			directory = opendirSync(dirname(request.ringBasePath));
+		} catch {
+			return { complete: true, issues: ["ring_directory_unavailable"] };
+		}
+		const state: SysdigRingDiscovery = {
+			incidentDir,
+			request,
+			phase,
+			observedAtWallTimeMs: nowMs,
+			directory,
+			ringName: basename(request.ringBasePath),
+			candidates: [],
+			candidateCount: 0,
+			issues: [],
+			issuesTruncated: false,
+		};
+		this.sysdigRingDiscovery = state;
+		return this.advanceSysdigRingDiscovery(state);
+	}
+
+	private completeActiveSysdigDiscovery(state: SysdigRingDiscovery, result: SysdigDiscoveryResult): void {
+		if (!result.complete) return;
+		if (state.phase === "final") {
+			this.finalizeSysdigPin(state.incidentDir, state.request, state.observedAtWallTimeMs, result.issues);
+			return;
+		}
+		this.recordSysdigPinIssues(state.incidentDir, result.issues);
 	}
 
 	private processSysdigPin(incidentDir: string, request: SysdigPinRequest, nowMs: number): void {
 		const manifestPath = join(incidentDir, "sysdig-pin-manifest.json");
 		if (existsSync(manifestPath)) return;
 		if (nowMs < request.resolveAfterWallTimeMs) {
-			this.captureSysdigRing(incidentDir, request, "rotated", nowMs);
+			const rotated = this.captureSysdigRing(incidentDir, request, "rotated", nowMs);
+			if (rotated.complete) this.recordSysdigPinIssues(incidentDir, rotated.issues);
 			return;
 		}
-		const gaps = [
-			...this.readSysdigPinIssues(incidentDir),
-			...this.captureSysdigRing(incidentDir, request, "final", nowMs),
-		];
+		const final = this.captureSysdigRing(incidentDir, request, "final", nowMs);
+		if (!final.complete) return;
+		this.finalizeSysdigPin(incidentDir, request, nowMs, final.issues);
+	}
+
+	private finalizeSysdigPin(
+		incidentDir: string,
+		request: SysdigPinRequest,
+		nowMs: number,
+		captureIssues: readonly string[],
+	): void {
+		const manifestPath = join(incidentDir, "sysdig-pin-manifest.json");
+		if (existsSync(manifestPath)) return;
+		const gaps = [...this.readSysdigPinIssues(incidentDir), ...captureIssues];
 		const recordState = this.readSysdigSegmentRecordState(incidentDir);
 		gaps.push(...recordState.issues);
 		const segments: Array<Record<string, unknown>> = [];
@@ -2367,7 +2621,13 @@ export class IncidentRecorderCompactor {
 		};
 		try {
 			this.writeOwnedJson(this.sysdigRequestPath(incidentDir), sysdigRequest);
-			this.captureSysdigRing(incidentDir, sysdigRequest, "initial", sysdigRequest.requestedAtWallTimeMs);
+			const initial = this.captureSysdigRing(
+				incidentDir,
+				sysdigRequest,
+				"initial",
+				sysdigRequest.requestedAtWallTimeMs,
+			);
+			if (initial.complete) this.recordSysdigPinIssues(incidentDir, initial.issues);
 		} catch (error) {
 			try {
 				this.writeOwnedJson(join(incidentDir, "sysdig-pin-incomplete.json"), {
@@ -2763,6 +3023,13 @@ export class IncidentRecorderCompactor {
 	}
 
 	processPendingPins(nowMs = Date.now()): void {
+		this.incidentDiscoverySliceEntries = 0;
+		this.sysdigDiscoverySliceEntries = 0;
+		if (this.sysdigRingDiscovery) {
+			const state = this.sysdigRingDiscovery;
+			this.completeActiveSysdigDiscovery(state, this.advanceSysdigRingDiscovery(state));
+			return;
+		}
 		if (this.journalManifestValidation) {
 			this.advanceJournalManifestValidation();
 			return;
@@ -2799,6 +3066,7 @@ export class IncidentRecorderCompactor {
 				this.incidentDiscovery = undefined;
 				return;
 			}
+			this.incidentDiscoverySliceEntries += 1;
 			if (!entry.isDirectory()) continue;
 			const incidentDir = join(incidentRoot, entry.name);
 			const requestPath = join(incidentDir, "journal-pin-request.json");
