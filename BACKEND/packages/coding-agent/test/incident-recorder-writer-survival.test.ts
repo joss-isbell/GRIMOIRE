@@ -138,6 +138,105 @@ describe("incident recorder producer survival", () => {
 		expect(writes.map(frameType)).toEqual(["first", "second"]);
 	});
 
+	it.each([
+		{ callbackOutcome: "success", callbackError: undefined, finalRecords: 4, finalBytes: 204_817 },
+		{
+			callbackOutcome: "failure",
+			callbackError: new Error("fixture late write failure"),
+			finalRecords: 5,
+			finalBytes: 204_828,
+		},
+	])(
+		"accounts an invalid-owner tail once and reconciles the uncertain active write after late $callbackOutcome",
+		async ({ callbackError, finalRecords, finalBytes }) => {
+			const writes: PendingWrite[] = [];
+			let admissionOwnerValid = true;
+			const emitter = new BoundedFrameEmitter(
+				(frames, complete) => writes.push({ frames, complete }),
+				TEST_MAXIMUM_BYTES,
+				IDENTITY,
+				() => true,
+				() => admissionOwnerValid,
+			);
+
+			expect(emitter.emitBytes("test", "active", Buffer.alloc(11), {})).toMatchObject({ accepted: true });
+			await waitFor(() => writes.length === 1, "active occurrence write did not start");
+			expect(emitter.emitBytes("test", "queued_product", Buffer.alloc(17), {})).toMatchObject({ accepted: true });
+			expect(emitter.emitControl("queued_control", {})).toMatchObject({ accepted: true });
+			expectRejected(emitter.emitBytes("test", "capacity_loss", Buffer.alloc(200 * 1024), {}), "queue_capacity");
+			await waitFor(
+				() => emitter.producerSnapshot().lossCheckpointQueued,
+				"loss checkpoint was not queued behind the active write",
+			);
+			expect(emitter.producerSnapshot()).toMatchObject({ queueOccurrences: 4, lossCheckpointQueued: true });
+
+			admissionOwnerValid = false;
+			expectRejected(emitter.emitDerived("test", "invalid_owner", {}), "stopped");
+			expect(emitter.lossCounters()).toEqual({ records: 4, bytes: 204_817 });
+			expect(emitter.producerSnapshot()).toMatchObject({
+				queueOccurrences: 0,
+				retainedWireBytes: 0,
+				uncertainRecords: 1,
+				uncertainBytes: 11,
+				lossCheckpointQueued: false,
+			});
+			expect(emitter.producerSnapshot().inFlightWireBytes).toBeGreaterThan(0);
+			expect(await emitter.flush()).toBe(false);
+
+			writes[0].complete(callbackError);
+			expect(emitter.lossCounters()).toEqual({ records: finalRecords, bytes: finalBytes });
+			expect(emitter.producerSnapshot()).toMatchObject({
+				queueOccurrences: 0,
+				retainedWireBytes: 0,
+				inFlightWireBytes: 0,
+				uncertainRecords: 0,
+				uncertainBytes: 0,
+				lossCheckpointQueued: false,
+			});
+
+			// A broken writer cannot turn one bounded callback tombstone into repeat loss.
+			writes[0].complete(callbackError ? undefined : new Error("duplicate late callback"));
+			expect(emitter.lossCounters()).toEqual({ records: finalRecords, bytes: finalBytes });
+		},
+	);
+
+	it("releases stop waiters while preserving terminal-tail loss and late active-write reconciliation", async () => {
+		const writes: PendingWrite[] = [];
+		let ownerValid = true;
+		const emitter = new BoundedFrameEmitter(
+			(frames, complete) => writes.push({ frames, complete }),
+			TEST_MAXIMUM_BYTES,
+			IDENTITY,
+			() => ownerValid,
+		);
+
+		expect(emitter.emitBytes("test", "active_during_stop", Buffer.alloc(9), {})).toMatchObject({ accepted: true });
+		await waitFor(() => writes.length === 1, "stop-race active occurrence write did not start");
+		expect(emitter.emitBytes("test", "stop_tail", Buffer.alloc(5), {})).toMatchObject({ accepted: true });
+		expect(emitter.emitControl("fixture_terminal", {}, true)).toMatchObject({ accepted: true });
+
+		const stopping = emitter.stop(10_000);
+		ownerValid = false;
+		expect(await emitter.flush()).toBe(false);
+		expect(await stopping).toBeUndefined();
+		expect(writes.map(frameType)).toEqual(["active_during_stop"]);
+		expect(emitter.lossCounters()).toEqual({ records: 2, bytes: 5 });
+		expect(emitter.producerSnapshot()).toMatchObject({
+			queueOccurrences: 0,
+			uncertainRecords: 1,
+			uncertainBytes: 9,
+		});
+
+		writes[0].complete(new Error("fixture late stop-race failure"));
+		expect(emitter.lossCounters()).toEqual({ records: 3, bytes: 14 });
+		expect(emitter.producerSnapshot()).toMatchObject({
+			queueOccurrences: 0,
+			inFlightWireBytes: 0,
+			uncertainRecords: 0,
+			uncertainBytes: 0,
+		});
+	});
+
 	it("keeps original loss pending without recursively counting failed loss checkpoints", async () => {
 		const writes: PendingWrite[] = [];
 		const emitter = new BoundedFrameEmitter(

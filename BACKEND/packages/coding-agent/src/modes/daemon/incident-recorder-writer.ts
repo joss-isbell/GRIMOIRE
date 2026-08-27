@@ -416,12 +416,19 @@ export interface IncidentRecorderProducerSnapshot {
 	queueOccurrences: number;
 	retainedWireBytes: number;
 	inFlightWireBytes: number;
+	uncertainRecords: number;
+	uncertainBytes: number;
 	lossCheckpointQueued: boolean;
 }
 
 type ProducerCounters = Omit<
 	IncidentRecorderProducerSnapshot,
-	"queueOccurrences" | "retainedWireBytes" | "inFlightWireBytes" | "lossCheckpointQueued"
+	| "queueOccurrences"
+	| "retainedWireBytes"
+	| "inFlightWireBytes"
+	| "uncertainRecords"
+	| "uncertainBytes"
+	| "lossCheckpointQueued"
 >;
 
 interface OutboundOccurrence {
@@ -442,6 +449,12 @@ interface OutboundOccurrence {
 	lossSnapshot?: { records: number; bytes: number };
 }
 
+interface ActiveOccurrenceWrite {
+	item: OutboundOccurrence;
+	settled: boolean;
+	invalidOwnerUncertain: boolean;
+}
+
 /** @internal Exported for isolated recorder survival fixtures. */
 export class BoundedFrameEmitter {
 	private readonly producerId = newIncidentRecorderIdentity();
@@ -453,6 +466,10 @@ export class BoundedFrameEmitter {
 	private writing = false;
 	private stopping = false;
 	private stopped = false;
+	private invalidOwnerDisabled = false;
+	private activeWrite?: ActiveOccurrenceWrite;
+	private uncertainRecords = 0;
+	private uncertainBytes = 0;
 	private terminalQueued = false;
 	private reportedLostRecords = 0;
 	private reportedLostBytes = 0;
@@ -498,11 +515,32 @@ export class BoundedFrameEmitter {
 	}
 
 	private disableInvalidOwner(): void {
+		if (this.invalidOwnerDisabled) return;
+		this.invalidOwnerDisabled = true;
 		this.stopped = true;
-		this.writing = false;
-		this.inFlightBytes = 0;
+
+		// The callback is the only authority for an occurrence whose async write has
+		// started. Retain one bounded callback tombstone until it proves success or
+		// failure. Every other admitted queue item was never attempted and is definite
+		// loss now. Loss checkpoints never account themselves as fresh loss.
+		const active = this.activeWrite?.settled === false ? this.activeWrite : undefined;
+		if (active) {
+			active.invalidOwnerUncertain = true;
+			if (active.item.payloadKind !== "loss") {
+				this.uncertainRecords = 1;
+				this.uncertainBytes = active.item.bytes.length;
+			}
+		}
+		for (const item of this.queue) {
+			if (item === active?.item || item.payloadKind === "loss") continue;
+			this.noteDrop(item.bytes.length, false);
+		}
+		this.lossCheckpointQueued = active?.item.lossSnapshot !== undefined;
 		this.queue.length = 0;
 		this.queuedBytes = 0;
+		this.writing = active !== undefined;
+		this.inFlightBytes = active?.item.estimatedWireBytes ?? 0;
+		this.lossCheckpointInProgress = false;
 		if (this.lossCheckpointRetry) clearTimeout(this.lossCheckpointRetry);
 		this.lossCheckpointRetry = undefined;
 		for (const resolve of this.drainWaiters.splice(0)) resolve();
@@ -790,12 +828,14 @@ export class BoundedFrameEmitter {
 	}
 
 	private pump(): void {
+		if (this.stopped) return;
 		if (!this.ownerIsValid()) {
 			this.disableInvalidOwner();
 			return;
 		}
 		if (this.writing) return;
 		this.enqueueLossCheckpoint();
+		if (this.stopped) return;
 		const item = this.queue[0];
 		if (!item) {
 			for (const resolve of this.drainWaiters.splice(0)) resolve();
@@ -803,22 +843,58 @@ export class BoundedFrameEmitter {
 		}
 		this.writing = true;
 		this.inFlightBytes = item.estimatedWireBytes;
+		const operation: ActiveOccurrenceWrite = {
+			item,
+			settled: false,
+			invalidOwnerUncertain: false,
+		};
+		this.activeWrite = operation;
 		this.buildFrames(item, (frames, buildError) => {
 			if (buildError || !frames) {
-				this.finishItem(item, buildError ?? new Error("Incident occurrence encoding failed"));
+				this.finishItem(operation, buildError ?? new Error("Incident occurrence encoding failed"));
 				return;
 			}
-			this.writeOccurrence(frames, (error) => this.finishItem(item, error));
+			this.writeOccurrence(frames, (error) => this.finishItem(operation, error));
 		});
 	}
 
-	private finishItem(item: OutboundOccurrence, error?: Error): void {
-		if (!this.ownerIsValid()) {
-			this.disableInvalidOwner();
-			return;
-		}
+	private settleInvalidOwnerWrite(operation: ActiveOccurrenceWrite, error?: Error): void {
+		if (operation.settled) return;
+		operation.settled = true;
+		if (this.activeWrite === operation) this.activeWrite = undefined;
 		this.writing = false;
 		this.inFlightBytes = 0;
+		const { item } = operation;
+		if (item.payloadKind !== "loss") {
+			this.uncertainRecords = Math.max(0, this.uncertainRecords - 1);
+			this.uncertainBytes = Math.max(0, this.uncertainBytes - item.bytes.length);
+			if (error) this.noteDrop(item.bytes.length, false);
+		}
+		if (item.lossSnapshot) {
+			if (!error) {
+				this.reportedLostRecords = Math.max(this.reportedLostRecords, item.lossSnapshot.records);
+				this.reportedLostBytes = Math.max(this.reportedLostBytes, item.lossSnapshot.bytes);
+			}
+			this.lossCheckpointQueued = false;
+		}
+	}
+
+	private finishItem(operation: ActiveOccurrenceWrite, error?: Error): void {
+		if (operation.settled) return;
+		if (operation.invalidOwnerUncertain) {
+			this.settleInvalidOwnerWrite(operation, error);
+			return;
+		}
+		if (!this.ownerIsValid()) {
+			this.disableInvalidOwner();
+			this.settleInvalidOwnerWrite(operation, error);
+			return;
+		}
+		operation.settled = true;
+		if (this.activeWrite === operation) this.activeWrite = undefined;
+		this.writing = false;
+		this.inFlightBytes = 0;
+		const { item } = operation;
 		const wasHead = this.queue[0] === item;
 		if (wasHead) {
 			this.queue.shift();
@@ -841,17 +917,19 @@ export class BoundedFrameEmitter {
 	}
 
 	async flush(deadlineMs = 1_000): Promise<boolean> {
+		if (this.stopped) return false;
 		if (!this.ownerIsValid()) {
 			this.disableInvalidOwner();
 			return false;
 		}
 		this.pump();
+		if (this.stopped) return false;
 		if (!this.writing && this.queue.length === 0) return true;
 		await Promise.race([
 			new Promise<void>((resolve) => this.drainWaiters.push(resolve)),
 			new Promise<void>((resolve) => setTimeout(resolve, deadlineMs).unref()),
 		]);
-		return !this.writing && this.queue.length === 0;
+		return !this.stopped && !this.writing && this.queue.length === 0;
 	}
 
 	lossCounters(): { records: number; bytes: number } {
@@ -865,6 +943,8 @@ export class BoundedFrameEmitter {
 			queueOccurrences: this.queue.length,
 			retainedWireBytes: this.queuedBytes,
 			inFlightWireBytes: this.inFlightBytes,
+			uncertainRecords: this.uncertainRecords,
+			uncertainBytes: this.uncertainBytes,
 			lossCheckpointQueued: this.lossCheckpointQueued,
 		};
 	}
@@ -883,6 +963,10 @@ export class BoundedFrameEmitter {
 		// arriving during this phase are rejected and counted, so the final loss marker
 		// and terminal record include them instead of freezing stale counters.
 		const drained = await this.flush(deadlineMs);
+		if (this.stopped) {
+			this.stopping = false;
+			return undefined;
+		}
 		let drainTimeoutLostRecords = 0;
 		let drainTimeoutLostBytes = 0;
 		let drainTimeoutUncertainRecords = 0;
