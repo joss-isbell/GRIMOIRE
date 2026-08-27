@@ -3570,6 +3570,7 @@ interface ServiceSamplingState {
 const serviceSamplingRuns = new Map<string, ServiceSamplingState>();
 let activeIncidentCompactor: IncidentRecorderCompactor | undefined;
 let serviceRunsDirectory: Dir | undefined;
+let serviceRunsDirectoryPath: string | undefined;
 const serviceRunPaths = new Map<string, string>();
 let serviceRunCursor = 0;
 
@@ -3587,14 +3588,43 @@ function linuxCountersAdvanced(
 	return false;
 }
 
+function closeServiceRunsDirectory(): void {
+	const directory = serviceRunsDirectory;
+	serviceRunsDirectory = undefined;
+	serviceRunsDirectoryPath = undefined;
+	if (!directory) return;
+	try {
+		directory.closeSync();
+	} catch {}
+}
+
+/** @internal Replaces or releases the service-owned compactor and retained run scan. */
+export function replaceIncidentRecorderServiceCompactor(replacement: IncidentRecorderCompactor | undefined): void {
+	const previous = activeIncidentCompactor;
+	if (previous === replacement) {
+		if (!replacement) closeServiceRunsDirectory();
+		return;
+	}
+	activeIncidentCompactor = replacement;
+	if (activeServiceRecorder?.compactor === previous) activeServiceRecorder = undefined;
+	closeServiceRunsDirectory();
+	previous?.dispose();
+}
+
 export async function inspectIncidentRecorderRuns(agentDir: string, nowMs = Date.now()): Promise<string[]> {
 	const runsRoot = join(agentDir, "incident-recorder", "runs");
-	if (!existsSync(runsRoot)) return [];
+	if (serviceRunsDirectoryPath !== undefined && serviceRunsDirectoryPath !== runsRoot) closeServiceRunsDirectory();
+	if (!existsSync(runsRoot)) {
+		closeServiceRunsDirectory();
+		return [];
+	}
 	const finalized: string[] = [];
 	if (!serviceRunsDirectory) {
 		try {
 			serviceRunsDirectory = opendirSync(runsRoot);
+			serviceRunsDirectoryPath = runsRoot;
 		} catch {
+			closeServiceRunsDirectory();
 			return [];
 		}
 	}
@@ -3603,13 +3633,11 @@ export async function inspectIncidentRecorderRuns(agentDir: string, nowMs = Date
 		try {
 			entry = serviceRunsDirectory.readSync();
 		} catch {
-			entry = null;
+			closeServiceRunsDirectory();
+			break;
 		}
 		if (!entry) {
-			try {
-				serviceRunsDirectory.closeSync();
-			} catch {}
-			serviceRunsDirectory = undefined;
+			closeServiceRunsDirectory();
 			break;
 		}
 		if (
@@ -3903,50 +3931,55 @@ export async function runIncidentRecorderService(agentDir = getAgentDir()): Prom
 		throw new Error("Incident recorder service requires Linux journald namespace support");
 	mkdirSync(join(agentDir, "incident-recorder", "runs"), { recursive: true, mode: 0o700 });
 	const compactor = new IncidentRecorderCompactor({ agentDir });
-	activeIncidentCompactor = compactor;
-	const serviceWriter = new IncidentRecorderWriter({
-		runDir: join(agentDir, "incident-recorder"),
-		runId: randomUUID(),
-		runToken: randomUUID(),
-		bootId: linuxBootId(),
-		wrapperStartId: getProcessStartId(process.pid),
-		serviceSink: true,
-	});
-	await serviceWriter.start();
-	activeServiceRecorder = { writer: serviceWriter, compactor };
-	const compactorRun = compactor.run();
-	let nextRetentionPassMs = 0;
-	for (;;) {
-		try {
-			await inspectIncidentRecorderRuns(agentDir);
-			const nowMs = Date.now();
-			if (!compactor.diskPaused) compactor.processPendingPins(nowMs);
-			if (nowMs >= nextRetentionPassMs) {
-				const retention = runIncidentRetentionPass({ agentDir, nowMs, ...INCIDENT_RETENTION_SERVICE_BUDGET });
-				if (retention.uncertainties.length > 0)
-					writePrivateJsonAtomicSync(join(agentDir, "incident-recorder", "retention-uncertainty.json"), {
-						version: 1,
-						state: "fail_closed",
-						observed: nowFields(),
-						reasons: retention.uncertainties.slice(0, 32),
-					});
-				if (retention.moreWork)
-					writePrivateJsonAtomicSync(join(agentDir, "incident-recorder", "retention-deferred.json"), {
-						version: 1,
-						state: "bounded_incremental_work_remains",
-						observed: nowFields(),
-						scannedEntries: retention.scannedEntries,
-						deletedEntries: retention.deletedEntries,
-					});
-				nextRetentionPassMs = nowMs + 60_000;
+	replaceIncidentRecorderServiceCompactor(compactor);
+	try {
+		const serviceWriter = new IncidentRecorderWriter({
+			runDir: join(agentDir, "incident-recorder"),
+			runId: randomUUID(),
+			runToken: randomUUID(),
+			bootId: linuxBootId(),
+			wrapperStartId: getProcessStartId(process.pid),
+			serviceSink: true,
+		});
+		await serviceWriter.start();
+		activeServiceRecorder = { writer: serviceWriter, compactor };
+		const compactorRun = compactor.run();
+		let nextRetentionPassMs = 0;
+		for (;;) {
+			try {
+				await inspectIncidentRecorderRuns(agentDir);
+				const nowMs = Date.now();
+				if (!compactor.diskPaused) compactor.processPendingPins(nowMs);
+				if (nowMs >= nextRetentionPassMs) {
+					const retention = runIncidentRetentionPass({ agentDir, nowMs, ...INCIDENT_RETENTION_SERVICE_BUDGET });
+					if (retention.uncertainties.length > 0)
+						writePrivateJsonAtomicSync(join(agentDir, "incident-recorder", "retention-uncertainty.json"), {
+							version: 1,
+							state: "fail_closed",
+							observed: nowFields(),
+							reasons: retention.uncertainties.slice(0, 32),
+						});
+					if (retention.moreWork)
+						writePrivateJsonAtomicSync(join(agentDir, "incident-recorder", "retention-deferred.json"), {
+							version: 1,
+							state: "bounded_incremental_work_remains",
+							observed: nowFields(),
+							scannedEntries: retention.scannedEntries,
+							deletedEntries: retention.deletedEntries,
+						});
+					nextRetentionPassMs = nowMs + 60_000;
+				}
+			} catch {
+				// A malformed or unavailable evidence source must not stop later recorder passes.
 			}
-		} catch {
-			// A malformed or unavailable evidence source must not stop later recorder passes.
+			await Promise.race([
+				compactorRun,
+				new Promise<void>((resolveDelay) => setTimeout(resolveDelay, serviceInspectionCadenceMs())),
+			]);
 		}
-		await Promise.race([
-			compactorRun,
-			new Promise<void>((resolveDelay) => setTimeout(resolveDelay, serviceInspectionCadenceMs())),
-		]);
+	} finally {
+		if (activeIncidentCompactor === compactor) replaceIncidentRecorderServiceCompactor(undefined);
+		else compactor.dispose();
 	}
 }
 

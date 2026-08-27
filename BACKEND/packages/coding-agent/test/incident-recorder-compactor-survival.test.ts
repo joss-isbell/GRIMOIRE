@@ -17,7 +17,16 @@ import { afterEach, describe, expect, it } from "vitest";
 import { IncidentRecorderCompactor } from "../src/modes/daemon/incident-recorder-compactor.js";
 
 const roots: string[] = [];
+const compactors: IncidentRecorderCompactor[] = [];
 const RUN_ID = "11111111-1111-4111-8111-111111111111";
+
+function createCompactor(
+	options: ConstructorParameters<typeof IncidentRecorderCompactor>[0],
+): IncidentRecorderCompactor {
+	const compactor = new IncidentRecorderCompactor(options);
+	compactors.push(compactor);
+	return compactor;
+}
 
 function fixture(name: string): { root: string; agentDir: string } {
 	const root = mkdtempSync(join(tmpdir(), `prime-agent-compactor-${name}-`));
@@ -75,6 +84,7 @@ function writeJson(path: string, value: unknown): void {
 }
 
 afterEach(() => {
+	for (const compactor of compactors.splice(0)) compactor.dispose();
 	for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
@@ -98,7 +108,7 @@ describe("incident compactor survival bounds", () => {
 		linkSync(pinnedCanonical, join(journalPin, `${pinnedDigest}.blob`));
 		linkSync(pinnedCanonical, join(dirname(pinnedCanonical), `.${pinnedDigest}.blob.tmp-123-${"a".repeat(64)}`));
 
-		const compactor = new IncidentRecorderCompactor({ agentDir: target.agentDir, freeReserveBytes: 0 });
+		const compactor = createCompactor({ agentDir: target.agentDir, freeReserveBytes: 0 });
 		finishStorageDiscovery(compactor);
 
 		expect(compactor.survivalSnapshot().storageDiscoveryEntries).toBeGreaterThan(4_096);
@@ -113,7 +123,7 @@ describe("incident compactor survival bounds", () => {
 		mkdirSync(recorderRoot, { recursive: true, mode: 0o700 });
 		const baseline = uniqueAllocatedBytes([recorderRoot]);
 		const ceiling = baseline + 64 * 1024;
-		const compactor = new IncidentRecorderCompactor({
+		const compactor = createCompactor({
 			agentDir: target.agentDir,
 			freeReserveBytes: 0,
 			storageByteCeiling: ceiling,
@@ -143,7 +153,7 @@ describe("incident compactor survival bounds", () => {
 		writeFileSync(canonical, "retained", { mode: 0o600 });
 		linkSync(canonical, sibling);
 		let removed = false;
-		const compactor = new IncidentRecorderCompactor({
+		const compactor = createCompactor({
 			agentDir: target.agentDir,
 			freeReserveBytes: 0,
 			storageDiscoveryEntryHook(path, canonicalPath) {
@@ -260,7 +270,7 @@ describe("incident compactor survival bounds", () => {
 		for (const row of taxonomy.filter((entry) => entry.admission === "allow")) {
 			expect(statSync(row.owner).ino).toBe(statSync(row.reference).ino);
 		}
-		const classified = new IncidentRecorderCompactor({ agentDir: target.agentDir, freeReserveBytes: 0 });
+		const classified = createCompactor({ agentDir: target.agentDir, freeReserveBytes: 0 });
 		finishStorageDiscovery(classified);
 		expect(classified.accountedStorageBytes).toBe(
 			uniqueAllocatedBytes([recorderRoot, join(target.agentDir, "incidents")]),
@@ -269,7 +279,7 @@ describe("incident compactor survival bounds", () => {
 		mkdirSync(unknownDir, { recursive: true, mode: 0o700 });
 		writeFileSync(unknownOwner, "unknown", { mode: 0o600 });
 		linkSync(unknownOwner, unknownReference);
-		const unknown = new IncidentRecorderCompactor({ agentDir: target.agentDir, freeReserveBytes: 0 });
+		const unknown = createCompactor({ agentDir: target.agentDir, freeReserveBytes: 0 });
 		for (let slice = 0; slice < 128 && !unknown.survivalSnapshot().storageDiscoveryError; slice += 1) {
 			unknown.advanceBoundedDiscovery();
 		}
@@ -294,7 +304,7 @@ describe("incident compactor survival bounds", () => {
 		writeFileSync(`${ringBase}1`, "active", { mode: 0o640 });
 		utimesSync(closed, (anchor - 2_000) / 1_000, (anchor - 2_000) / 1_000);
 		utimesSync(`${ringBase}1`, (anchor - 1_000) / 1_000, (anchor - 1_000) / 1_000);
-		const compactor = new IncidentRecorderCompactor({
+		const compactor = createCompactor({
 			agentDir: target.agentDir,
 			freeReserveBytes: 0,
 			sysdigRingBasePath: ringBase,
@@ -330,7 +340,7 @@ describe("incident compactor survival bounds", () => {
 		expect(existsSync(survivingPin)).toBe(true);
 		expect(statSync(persistentOwner).ino).toBe(statSync(survivingPin).ino);
 
-		const restarted = new IncidentRecorderCompactor({ agentDir: target.agentDir, freeReserveBytes: 0 });
+		const restarted = createCompactor({ agentDir: target.agentDir, freeReserveBytes: 0 });
 		finishStorageDiscovery(restarted);
 		expect(restarted.accountedStorageBytes).toBe(
 			uniqueAllocatedBytes([join(target.agentDir, "incident-recorder"), join(target.agentDir, "incidents")]),
@@ -339,7 +349,7 @@ describe("incident compactor survival bounds", () => {
 
 	it("preserves reverse pending-sequence lookup and drains the frontier without per-entry clones or shift", () => {
 		const target = fixture("frontier");
-		const compactor = new IncidentRecorderCompactor({ agentDir: target.agentDir, freeReserveBytes: 0 });
+		const compactor = createCompactor({ agentDir: target.agentDir, freeReserveBytes: 0 });
 		type FrontierEntry = {
 			resolved: boolean;
 			memoryBytes: number;
@@ -460,16 +470,18 @@ describe("incident compactor survival bounds", () => {
 			state: "pending",
 		});
 
-		const first = new IncidentRecorderCompactor({ agentDir: target.agentDir, freeReserveBytes: 0 });
+		const first = createCompactor({ agentDir: target.agentDir, freeReserveBytes: 0 });
 		finishStorageDiscovery(first);
 		first.processPendingPins(anchor);
 		expect(first.survivalSnapshot().incidentDiscoverySliceEntries).toBeLessThanOrEqual(64);
+		first.dispose();
 
-		const second = new IncidentRecorderCompactor({ agentDir: target.agentDir, freeReserveBytes: 0 });
+		const second = createCompactor({ agentDir: target.agentDir, freeReserveBytes: 0 });
 		finishStorageDiscovery(second);
 		for (let call = 0; call < 4; call += 1) second.processPendingPins(anchor);
+		second.dispose();
 
-		const restarted = new IncidentRecorderCompactor({ agentDir: target.agentDir, freeReserveBytes: 0 });
+		const restarted = createCompactor({ agentDir: target.agentDir, freeReserveBytes: 0 });
 		finishStorageDiscovery(restarted);
 		const observedSlices: Array<{ incident: number; sysdig: number; candidates: number }> = [];
 		for (let call = 0; call < 48; call += 1) {
@@ -493,6 +505,7 @@ describe("incident compactor survival bounds", () => {
 			(name) => (JSON.parse(readFileSync(join(recordsDir, name), "utf8")) as { sourceName: string }).sourceName,
 		);
 		expect(sourceNames).toEqual(expect.arrayContaining(["ring.scap0", "ring.scap1"]));
+		restarted.dispose();
 	});
 
 	it("fails storage admission closed for an unclassified regular hard link", () => {
@@ -501,7 +514,7 @@ describe("incident compactor survival bounds", () => {
 		mkdirSync(directory, { recursive: true, mode: 0o700 });
 		writeFileSync(join(directory, "one"), "payload", { mode: 0o600 });
 		linkSync(join(directory, "one"), join(directory, "two"));
-		const compactor = new IncidentRecorderCompactor({ agentDir: target.agentDir, freeReserveBytes: 0 });
+		const compactor = createCompactor({ agentDir: target.agentDir, freeReserveBytes: 0 });
 		for (let slice = 0; slice < 8 && !compactor.survivalSnapshot().storageDiscoveryError; slice += 1) {
 			compactor.advanceBoundedDiscovery();
 		}
