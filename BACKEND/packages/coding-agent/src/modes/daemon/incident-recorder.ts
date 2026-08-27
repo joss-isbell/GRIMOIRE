@@ -39,7 +39,10 @@ import {
 import { getAgentDir, getDaemonLogPath, VERSION } from "../../config.js";
 import { getProcessStartId } from "../../core/session-lease.js";
 import { acquireIncidentCasTransaction } from "./incident-recorder-cas-transaction.js";
-import { IncidentRecorderCompactor } from "./incident-recorder-compactor.js";
+import {
+	IncidentRecorderCompactor,
+	type StoppedTargetArtifactClosePublication,
+} from "./incident-recorder-compactor.js";
 import {
 	INCIDENT_RECORDER_CHILD_ENV,
 	INCIDENT_RECORDER_RUN_DIR_ENV,
@@ -96,7 +99,6 @@ const EVENT_FLUSH_INTERVAL_MS = 50;
 const RAW_MANIFEST_CHECKPOINT_MS = 5_000;
 const RAW_SEGMENT_ROTATION_MS = 5 * 60 * 1_000;
 const EVENT_BUFFER_BYTES = 64 * 1024;
-const ACTIVE_MARKER_GRACE_MS = 5 * 60 * 1_000;
 const RAW_RECORD_SCHEMA_VERSION = 2;
 const RAW_FRAME_PAYLOAD_BYTES = 32 * 1024;
 
@@ -2247,6 +2249,12 @@ function writeImmutableJsonOnce(path: string, value: unknown): void {
 	} finally {
 		if (descriptor !== undefined) closeSync(descriptor);
 	}
+	const directory = openSync(dirname(path), fsConstants.O_RDONLY | fsConstants.O_DIRECTORY);
+	try {
+		fsyncSync(directory);
+	} finally {
+		closeSync(directory);
+	}
 }
 
 async function sanitizeNodeReports(runDir: string, _removeRawDirectory = false): Promise<"pending" | "complete"> {
@@ -2288,6 +2296,7 @@ async function sanitizeNodeReports(runDir: string, _removeRawDirectory = false):
 			entry.name === "manifest.json" ||
 			entry.name.endsWith(".reference.json") ||
 			entry.name.endsWith(".pending.json") ||
+			entry.name.endsWith(".closed.json") ||
 			entry.name.endsWith(".error.json")
 		)
 			continue;
@@ -2303,18 +2312,22 @@ async function sanitizeNodeReports(runDir: string, _removeRawDirectory = false):
 	if (!entryName) return state.discoveryComplete ? "complete" : "pending";
 	const sourcePath = join(rawReportsDir, entryName);
 	let sourceMetadata: Record<string, unknown>;
+	const closePublicationPath = join(rawReportsDir, `${entryName}.closed.json`);
 	try {
-		const stat = statSync(sourcePath, { bigint: true });
+		const stat = lstatSync(sourcePath, { bigint: true });
+		if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("node_report_source_not_regular_file");
 		sourceMetadata = {
 			path: sourcePath,
 			dev: stat.dev.toString(),
 			ino: stat.ino.toString(),
 			bytes: Number(stat.size),
 			mtimeMs: Number(stat.mtimeMs),
+			ctimeMs: Number(stat.ctimeMs),
 		};
-		writeImmutableJsonOnce(join(rawReportsDir, `${entryName}.pending.json`), {
+		writeImmutableJsonOnce(closePublicationPath, {
 			schemaVersion: 1,
-			state: "pending",
+			state: "closed",
+			proof: "target_process_stopped",
 			source: sourceMetadata,
 		});
 	} catch (error) {
@@ -2330,6 +2343,7 @@ async function sanitizeNodeReports(runDir: string, _removeRawDirectory = false):
 		basename(runDir).slice(-36),
 		sourcePath,
 		"node-report-json-bytes",
+		closePublicationPath,
 		{ deadlineMs: Date.now() + 40, byteBudget: 4 * 1024 * 1024 },
 	);
 	if (!admission || admission.state === "pending") return "pending";
@@ -2364,7 +2378,12 @@ async function sanitizeNodeReports(runDir: string, _removeRawDirectory = false):
 
 interface ProviderArtifactCaptureState {
 	seenReferences: Set<string>;
-	pending: Array<{ provider: string; path: string; format: string }>;
+	pending: Array<{
+		provider: string;
+		path: string;
+		format: string;
+		closePublication?: StoppedTargetArtifactClosePublication;
+	}>;
 }
 const providerArtifactCaptureStates = new Map<string, ProviderArtifactCaptureState>();
 
@@ -2400,6 +2419,10 @@ function captureStoppedProviderArtifacts(runDir: string): "pending" | "complete"
 				provider,
 				path: fields.path,
 				format: typeof fields.format === "string" ? fields.format : "exact-provider-bytes",
+				closePublication:
+					fields.closePublication && typeof fields.closePublication === "object"
+						? (fields.closePublication as StoppedTargetArtifactClosePublication)
+						: undefined,
 			});
 		}
 	}
@@ -2415,8 +2438,25 @@ function captureStoppedProviderArtifacts(runDir: string): "pending" | "complete"
 		return "pending";
 	}
 	let metadata: Record<string, unknown>;
+	const closePublicationPath = join(evidenceDirectory, `${id}.closed.json`);
 	try {
-		const source = statSync(artifact.path, { bigint: true });
+		const source = lstatSync(artifact.path, { bigint: true });
+		const publication = artifact.closePublication;
+		if (
+			!source.isFile() ||
+			source.isSymbolicLink() ||
+			!publication ||
+			publication.schemaVersion !== 1 ||
+			publication.state !== "closed" ||
+			publication.proof !== "provider_published_closed" ||
+			publication.source?.path !== artifact.path ||
+			publication.source.dev !== source.dev.toString() ||
+			publication.source.ino !== source.ino.toString() ||
+			publication.source.bytes !== Number(source.size) ||
+			publication.source.mtimeMs !== Number(source.mtimeMs) ||
+			publication.source.ctimeMs !== Number(source.ctimeMs)
+		)
+			throw new Error("artifact_close_publication_required_or_stale");
 		metadata = {
 			provider: artifact.provider,
 			sourcePath: artifact.path,
@@ -2424,14 +2464,22 @@ function captureStoppedProviderArtifacts(runDir: string): "pending" | "complete"
 			ino: source.ino.toString(),
 			bytes: Number(source.size),
 			mtimeMs: Number(source.mtimeMs),
+			ctimeMs: Number(source.ctimeMs),
 		};
-		writeImmutableJsonOnce(join(evidenceDirectory, `${id}.pending.json`), {
-			schemaVersion: 1,
-			state: "pending",
-			source: metadata,
-		});
+		writeImmutableJsonOnce(closePublicationPath, publication);
 	} catch (error) {
-		writeImmutableJsonOnce(errorPath, { schemaVersion: 1, state: "error", reason: serializeError(error) });
+		writeImmutableJsonOnce(errorPath, {
+			schemaVersion: 1,
+			state: "gap_or_uncertainty",
+			sourcePath: artifact.path,
+			reason: serializeError(error),
+		});
+		appendRunEvent(runDir, {
+			type: "provider_artifact_capture_gap",
+			provider: artifact.provider,
+			sourcePath: artifact.path,
+			reason: serializeError(error),
+		});
 		state.pending.shift();
 		return "pending";
 	}
@@ -2439,6 +2487,7 @@ function captureStoppedProviderArtifacts(runDir: string): "pending" | "complete"
 		basename(runDir).slice(-36),
 		artifact.path,
 		artifact.format,
+		closePublicationPath,
 		{ deadlineMs: Date.now() + 40, byteBudget: 4 * 1024 * 1024 },
 	);
 	if (!admission || admission.state === "pending") return "pending";
@@ -2717,7 +2766,8 @@ function createRawApplicationManifest(
 				: undefined;
 		const source = typeof provenance?.source === "string" ? provenance.source : "legacy";
 		const pid = String(event.pid);
-		const bounds = (sourceBounds[source] ??= {});
+		const bounds = sourceBounds[source] ?? {};
+		sourceBounds[source] = bounds;
 		const point = { wallTime: event.wallTime, monotonicNs: event.monotonicNs };
 		const current = bounds[pid];
 		if (!current) bounds[pid] = { processStartId: recorder?.processStartId, start: point, end: point };
@@ -3275,6 +3325,7 @@ export interface IncidentProviderSourceManifest {
 		ino?: number;
 		bytes?: number;
 		sha256?: string;
+		closePublication?: StoppedTargetArtifactClosePublication;
 		[key: string]: unknown;
 	}>;
 	configuration?: unknown;

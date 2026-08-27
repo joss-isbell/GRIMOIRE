@@ -28,6 +28,40 @@ const roots: string[] = [];
 const DAY = 24 * 60 * 60 * 1_000;
 const NOW = Date.parse("2026-08-25T12:00:00.000Z");
 
+function streamClosedArtifact(
+	compactor: IncidentRecorderCompactor,
+	runId: string,
+	sourcePath: string,
+	encoding: string,
+	work: { deadlineMs: number; byteBudget: number },
+) {
+	const publicationPath = `${sourcePath}.closed-publication.json`;
+	if (!existsSync(publicationPath)) {
+		try {
+			const source = statSync(sourcePath, { bigint: true });
+			writeFileSync(
+				publicationPath,
+				`${JSON.stringify({
+					schemaVersion: 1,
+					state: "closed",
+					proof: "target_process_stopped",
+					source: {
+						path: sourcePath,
+						dev: source.dev.toString(),
+						ino: source.ino.toString(),
+						bytes: Number(source.size),
+						mtimeMs: Number(source.mtimeMs),
+						ctimeMs: Number(source.ctimeMs),
+					},
+				})}
+`,
+				{ mode: 0o600 },
+			);
+		} catch {}
+	}
+	return compactor.streamStoppedTargetArtifact(runId, sourcePath, encoding, publicationPath, work);
+}
+
 function fixture(): { root: string; agentDir: string; recorder: string; incidents: string } {
 	const root = mkdtempSync(join(tmpdir(), "prime-agent-retention-"));
 	roots.push(root);
@@ -387,12 +421,12 @@ describe("three-day diagnostic retention", () => {
 		const runId = "92929292-9292-4292-8292-929292929292";
 		const compactor = new IncidentRecorderCompactor({ agentDir: target.agentDir, freeReserveBytes: 0 });
 		try {
-			let admission = compactor.streamStoppedTargetArtifact(runId, source, "binary", {
+			let admission = streamClosedArtifact(compactor, runId, source, "binary", {
 				deadlineMs: Date.now() + 1_000,
 				byteBudget: 1024,
 			});
 			if (admission.state === "pending" && admission.reason === "work_budget")
-				admission = compactor.streamStoppedTargetArtifact(runId, source, "binary", {
+				admission = streamClosedArtifact(compactor, runId, source, "binary", {
 					deadlineMs: Date.now() + 1_000,
 					byteBudget: 1024,
 				});
@@ -402,7 +436,7 @@ describe("three-day diagnostic retention", () => {
 			if (pid && startId && getProcessStartId(pid) === startId) process.kill(pid, "SIGKILL");
 			await new Promise<void>((resolve) => owner.once("close", () => resolve()));
 		}
-		const completed = compactor.streamStoppedTargetArtifact(runId, source, "binary", {
+		const completed = streamClosedArtifact(compactor, runId, source, "binary", {
 			deadlineMs: Date.now() + 1_000,
 			byteBudget: 1024,
 		});
@@ -469,7 +503,7 @@ describe("three-day diagnostic retention", () => {
 		writeFileSync(victim, "lease-source", { mode: 0o600 });
 		symlinkSync(victim, join(owner, `cas-${digest}.blob`));
 		const compactor = new IncidentRecorderCompactor({ agentDir: target.agentDir, freeReserveBytes: 0 });
-		const result = compactor.streamStoppedTargetArtifact(runId, source, "binary", {
+		const result = streamClosedArtifact(compactor, runId, source, "binary", {
 			deadlineMs: Date.now() + 1_000,
 			byteBudget: 1024,
 		});
@@ -483,14 +517,14 @@ describe("three-day diagnostic retention", () => {
 		writeFileSync(source, "abcdefgh", { mode: 0o600 });
 		const original = statSync(source);
 		const compactor = new IncidentRecorderCompactor({ agentDir: target.agentDir, freeReserveBytes: 0 });
-		const first = compactor.streamStoppedTargetArtifact("93939393-9393-4393-8393-939393939393", source, "binary", {
+		const first = streamClosedArtifact(compactor, "93939393-9393-4393-8393-939393939393", source, "binary", {
 			deadlineMs: Date.now() + 1_000,
 			byteBudget: 4,
 		});
 		expect(first).toMatchObject({ state: "pending", copiedBytes: 4 });
 		writeFileSync(source, "WXYZefgh", { mode: 0o600 });
 		utimesSync(source, original.atime, original.mtime);
-		const second = compactor.streamStoppedTargetArtifact("93939393-9393-4393-8393-939393939393", source, "binary", {
+		const second = streamClosedArtifact(compactor, "93939393-9393-4393-8393-939393939393", source, "binary", {
 			deadlineMs: Date.now() + 1_000,
 			byteBudget: 64,
 		});
@@ -534,9 +568,8 @@ describe("three-day diagnostic retention", () => {
 		mkdirSync(dirname(unreferenced), { recursive: true, mode: 0o700 });
 		writeFileSync(unreferenced, "old", { mode: 0o600 });
 		old(unreferenced, 4 * DAY);
-		let lastResult: ReturnType<typeof runIncidentRetentionPass> | undefined;
 		for (let pass = 0; pass < 6_000 && existsSync(unreferenced); pass += 1)
-			lastResult = runIncidentRetentionPass({
+			runIncidentRetentionPass({
 				agentDir: target.agentDir,
 				nowMs: NOW,
 				maxEntries: 64,

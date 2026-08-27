@@ -20,6 +20,40 @@ const roots: string[] = [];
 const compactors: IncidentRecorderCompactor[] = [];
 const RUN_ID = "11111111-1111-4111-8111-111111111111";
 
+function streamClosedArtifact(
+	compactor: IncidentRecorderCompactor,
+	runId: string,
+	sourcePath: string,
+	encoding: string,
+	work: { deadlineMs: number; byteBudget: number },
+) {
+	const publicationPath = `${sourcePath}.closed-publication.json`;
+	if (!existsSync(publicationPath)) {
+		try {
+			const source = statSync(sourcePath, { bigint: true });
+			writeFileSync(
+				publicationPath,
+				`${JSON.stringify({
+					schemaVersion: 1,
+					state: "closed",
+					proof: "target_process_stopped",
+					source: {
+						path: sourcePath,
+						dev: source.dev.toString(),
+						ino: source.ino.toString(),
+						bytes: Number(source.size),
+						mtimeMs: Number(source.mtimeMs),
+						ctimeMs: Number(source.ctimeMs),
+					},
+				})}
+`,
+				{ mode: 0o600 },
+			);
+		} catch {}
+	}
+	return compactor.streamStoppedTargetArtifact(runId, sourcePath, encoding, publicationPath, work);
+}
+
 function createCompactor(
 	options: ConstructorParameters<typeof IncidentRecorderCompactor>[0],
 ): IncidentRecorderCompactor {
@@ -520,6 +554,44 @@ describe("incident compactor survival bounds", () => {
 		);
 		expect(compactor.admitObservation()).toBe(false);
 	});
+	it("requires a durable close publication and rejects a source changed after publication", () => {
+		const target = fixture("stopped-close-publication");
+		const source = join(target.root, "artifact.bin");
+		const publication = join(target.root, "artifact.closed.json");
+		writeFileSync(source, "before", { mode: 0o600 });
+		const compactor = createCompactor({ agentDir: target.agentDir, freeReserveBytes: 0 });
+		finishStorageDiscovery(compactor);
+
+		expect(
+			compactor.streamStoppedTargetArtifact(RUN_ID, source, "exact", publication, {
+				deadlineMs: Date.now() + 1_000,
+				byteBudget: 64,
+			}),
+		).toEqual({ state: "error", reason: "artifact_close_publication_required" });
+
+		const closed = statSync(source, { bigint: true });
+		writeJson(publication, {
+			schemaVersion: 1,
+			state: "closed",
+			proof: "target_process_stopped",
+			source: {
+				path: source,
+				dev: closed.dev.toString(),
+				ino: closed.ino.toString(),
+				bytes: Number(closed.size),
+				mtimeMs: Number(closed.mtimeMs),
+				ctimeMs: Number(closed.ctimeMs),
+			},
+		});
+		writeFileSync(source, "after!", { mode: 0o600 });
+		expect(
+			compactor.streamStoppedTargetArtifact(RUN_ID, source, "exact", publication, {
+				deadlineMs: Date.now() + 1_000,
+				byteBudget: 64,
+			}),
+		).toEqual({ state: "error", reason: "artifact_source_does_not_match_close_publication" });
+	});
+
 	it("reserves aggregate stopped-artifact storage before either 600 KiB stream can exceed a 1 MiB ceiling", () => {
 		const target = fixture("stopped-aggregate-ceiling");
 		mkdirSync(target.agentDir, { recursive: true, mode: 0o700 });
@@ -535,7 +607,7 @@ describe("incident compactor survival bounds", () => {
 		});
 		finishStorageDiscovery(compactor);
 
-		const first = compactor.streamStoppedTargetArtifact(RUN_ID, firstSource, "exact", {
+		const first = streamClosedArtifact(compactor, RUN_ID, firstSource, "exact", {
 			deadlineMs: Date.now() + 1_000,
 			byteBudget: 1,
 		});
@@ -546,7 +618,7 @@ describe("incident compactor survival bounds", () => {
 		expect(afterFirst.reservedStorageBytes).toBeGreaterThan(600 * 1024);
 		expect(afterFirst.accountedStorageBytes + afterFirst.reservedStorageBytes).toBeLessThanOrEqual(ceiling);
 
-		const second = compactor.streamStoppedTargetArtifact(RUN_ID, secondSource, "exact", {
+		const second = streamClosedArtifact(compactor, RUN_ID, secondSource, "exact", {
 			deadlineMs: Date.now() + 1_000,
 			byteBudget: 1,
 		});
@@ -556,7 +628,7 @@ describe("incident compactor survival bounds", () => {
 		expect(afterSecond.reservedStorageBytes).toBe(afterFirst.reservedStorageBytes);
 		expect(afterSecond.accountedStorageBytes + afterSecond.reservedStorageBytes).toBeLessThanOrEqual(ceiling);
 
-		const completed = compactor.streamStoppedTargetArtifact(RUN_ID, firstSource, "exact", {
+		const completed = streamClosedArtifact(compactor, RUN_ID, firstSource, "exact", {
 			deadlineMs: Date.now() + 1_000,
 			byteBudget: 1024 * 1024,
 		});
@@ -581,7 +653,7 @@ describe("incident compactor survival bounds", () => {
 			const source = join(target.root, `source-${index}.bin`);
 			writeFileSync(source, Buffer.from([index]), { mode: 0o600 });
 			expect(
-				compactor.streamStoppedTargetArtifact(`${RUN_ID}-${index}`, source, "exact", {
+				streamClosedArtifact(compactor, `${RUN_ID}-${index}`, source, "exact", {
 					deadlineMs: Date.now() + 1_000,
 					byteBudget: 0,
 				}),
@@ -596,7 +668,7 @@ describe("incident compactor survival bounds", () => {
 		writeFileSync(rejectedSource, "rejected", { mode: 0o600 });
 		const beforeRejected = compactor.survivalSnapshot();
 		expect(
-			compactor.streamStoppedTargetArtifact("ninth", rejectedSource, "exact", {
+			streamClosedArtifact(compactor, "ninth", rejectedSource, "exact", {
 				deadlineMs: Date.now() + 1_000,
 				byteBudget: 0,
 			}),
@@ -628,7 +700,7 @@ describe("incident compactor survival bounds", () => {
 		});
 		finishStorageDiscovery(compactor);
 		expect(
-			compactor.streamStoppedTargetArtifact(RUN_ID, source, "exact", {
+			streamClosedArtifact(compactor, RUN_ID, source, "exact", {
 				deadlineMs: Date.now() + 1_000,
 				byteBudget: 1,
 			}),
@@ -658,7 +730,7 @@ describe("incident compactor survival bounds", () => {
 			["mutated", errorSource],
 		] as const) {
 			expect(
-				compactor.streamStoppedTargetArtifact(runId, source, "exact", {
+				streamClosedArtifact(compactor, runId, source, "exact", {
 					deadlineMs: Date.now() + 1_000,
 					byteBudget: 32 * 1024,
 				}),
@@ -669,7 +741,7 @@ describe("incident compactor survival bounds", () => {
 		const beforeError = compactor.survivalSnapshot();
 		writeFileSync(errorSource, Buffer.alloc(64 * 1024, 0x77), { mode: 0o600 });
 		expect(
-			compactor.streamStoppedTargetArtifact("mutated", errorSource, "exact", {
+			streamClosedArtifact(compactor, "mutated", errorSource, "exact", {
 				deadlineMs: Date.now() + 1_000,
 				byteBudget: 128 * 1024,
 			}),
@@ -680,7 +752,7 @@ describe("incident compactor survival bounds", () => {
 		expect(afterError.reservedStorageBytes).toBeGreaterThan(0);
 		expect(afterError.accountedStorageBytes + afterError.reservedStorageBytes).toBeLessThanOrEqual(ceiling);
 		expect(
-			compactor.streamStoppedTargetArtifact(RUN_ID, successSource, "exact", {
+			streamClosedArtifact(compactor, RUN_ID, successSource, "exact", {
 				deadlineMs: Date.now() + 1_000,
 				byteBudget: 128 * 1024,
 			}),

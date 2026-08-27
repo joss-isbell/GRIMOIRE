@@ -687,6 +687,60 @@ export type StoppedTargetArtifactAdmission =
 	| { state: "complete"; artifact: StoppedTargetArtifactReference }
 	| { state: "error"; reason: string };
 
+export interface StoppedTargetArtifactClosePublication {
+	schemaVersion: 1;
+	state: "closed";
+	proof: "target_process_stopped" | "provider_published_closed";
+	source: {
+		path: string;
+		dev: string;
+		ino: string;
+		bytes: number;
+		mtimeMs: number;
+		ctimeMs: number;
+	};
+}
+
+interface VerifiedStoppedTargetArtifactClosePublication {
+	publication: StoppedTargetArtifactClosePublication;
+	sha256: string;
+}
+
+function readStoppedTargetArtifactClosePublication(
+	publicationPath: string,
+	sourcePath: string,
+): VerifiedStoppedTargetArtifactClosePublication {
+	const metadata = lstatSync(publicationPath);
+	if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size > 64 * 1024)
+		throw new Error("artifact_close_publication_invalid");
+	const bytes = readFileSync(publicationPath);
+	let value: unknown;
+	try {
+		value = JSON.parse(bytes.toString("utf8")) as unknown;
+	} catch {
+		throw new Error("artifact_close_publication_invalid");
+	}
+	if (!value || typeof value !== "object" || Array.isArray(value))
+		throw new Error("artifact_close_publication_invalid");
+	const publication = value as StoppedTargetArtifactClosePublication;
+	const source = publication.source;
+	if (
+		publication.schemaVersion !== 1 ||
+		publication.state !== "closed" ||
+		!(["target_process_stopped", "provider_published_closed"] as const).includes(publication.proof) ||
+		!source ||
+		source.path !== sourcePath ||
+		!/^\d+$/.test(source.dev) ||
+		!/^\d+$/.test(source.ino) ||
+		!Number.isSafeInteger(source.bytes) ||
+		source.bytes < 0 ||
+		!Number.isFinite(source.mtimeMs) ||
+		!Number.isFinite(source.ctimeMs)
+	)
+		throw new Error("artifact_close_publication_invalid");
+	return { publication, sha256: sha256(bytes) };
+}
+
 interface StoppedStorageReservation {
 	reservationBytes: number;
 }
@@ -694,6 +748,8 @@ interface StoppedStorageReservation {
 interface StoppedTargetArtifactStream extends StoppedStorageReservation {
 	sourcePath: string;
 	encoding: string;
+	closePublicationPath: string;
+	closePublicationSha256: string;
 	source: number;
 	target: number;
 	temporary: string;
@@ -1539,23 +1595,48 @@ export class IncidentRecorderCompactor {
 		runId: string,
 		sourcePath: string,
 		encoding: string,
+		closePublicationPath: string,
 		work: { deadlineMs: number; byteBudget: number },
 	): StoppedTargetArtifactAdmission {
 		if (this.disposed) return { state: "error", reason: "compactor_disposed" };
-		const key = sha256(`${runId}\0${sourcePath}\0${encoding}`);
+		const key = sha256(`${runId}\0${sourcePath}\0${encoding}\0${closePublicationPath}`);
 		let state = this.stoppedTargetStreams.get(key);
 		if (state?.error) return { state: "error", reason: state.error };
 		if (!state) {
 			if (this.stoppedTargetStreams.size >= 8)
 				return { state: "pending", reason: "work_budget", copiedBytes: 0, totalBytes: 0 };
 			if (this.diskPaused) return { state: "pending", reason: "storage_paused", copiedBytes: 0, totalBytes: 0 };
+			let closed: VerifiedStoppedTargetArtifactClosePublication;
+			try {
+				closed = readStoppedTargetArtifactClosePublication(closePublicationPath, sourcePath);
+			} catch (error) {
+				return {
+					state: "error",
+					reason:
+						(error as NodeJS.ErrnoException).code === "ENOENT"
+							? "artifact_close_publication_required"
+							: error instanceof Error
+								? error.message
+								: String(error),
+				};
+			}
 			let metadata: BigIntStats;
 			try {
 				metadata = lstatSync(sourcePath, { bigint: true });
 			} catch (error) {
 				return { state: "error", reason: error instanceof Error ? error.message : String(error) };
 			}
-			if (!metadata.isFile()) return { state: "error", reason: "artifact_source_not_regular_file" };
+			if (!metadata.isFile() || metadata.isSymbolicLink())
+				return { state: "error", reason: "artifact_source_not_regular_file" };
+			const published = closed.publication.source;
+			if (
+				metadata.dev.toString() !== published.dev ||
+				metadata.ino.toString() !== published.ino ||
+				Number(metadata.size) !== published.bytes ||
+				Number(metadata.mtimeMs) !== published.mtimeMs ||
+				Number(metadata.ctimeMs) !== published.ctimeMs
+			)
+				return { state: "error", reason: "artifact_source_does_not_match_close_publication" };
 			const totalBytes = Number(metadata.size);
 			if (!Number.isSafeInteger(totalBytes))
 				return { state: "error", reason: "artifact_source_size_exceeds_numeric_bound" };
@@ -1599,6 +1680,8 @@ export class IncidentRecorderCompactor {
 				state = {
 					sourcePath,
 					encoding,
+					closePublicationPath,
+					closePublicationSha256: closed.sha256,
 					source,
 					target,
 					temporary,
@@ -1639,6 +1722,12 @@ export class IncidentRecorderCompactor {
 							totalBytes: state.totalBytes,
 						};
 					try {
+						const currentPublication = readStoppedTargetArtifactClosePublication(
+							state.closePublicationPath,
+							state.sourcePath,
+						);
+						if (currentPublication.sha256 !== state.closePublicationSha256)
+							throw new Error("artifact_close_publication_changed_during_capture");
 						const currentPath = lstatSync(state.sourcePath, { bigint: true });
 						const currentFd = fstatSync(state.source, { bigint: true });
 						if (

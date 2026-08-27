@@ -7,6 +7,7 @@ import {
 	readdirSync,
 	readlinkSync,
 	rmSync,
+	statSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -24,6 +25,40 @@ import {
 
 const roots: string[] = [];
 const RUN_ID = "11111111-1111-4111-8111-111111111111";
+
+function streamClosedArtifact(
+	compactor: IncidentRecorderCompactor,
+	runId: string,
+	sourcePath: string,
+	encoding: string,
+	work: { deadlineMs: number; byteBudget: number },
+) {
+	const publicationPath = `${sourcePath}.closed-publication.json`;
+	if (!existsSync(publicationPath)) {
+		try {
+			const source = statSync(sourcePath, { bigint: true });
+			writeFileSync(
+				publicationPath,
+				`${JSON.stringify({
+					schemaVersion: 1,
+					state: "closed",
+					proof: "target_process_stopped",
+					source: {
+						path: sourcePath,
+						dev: source.dev.toString(),
+						ino: source.ino.toString(),
+						bytes: Number(source.size),
+						mtimeMs: Number(source.mtimeMs),
+						ctimeMs: Number(source.ctimeMs),
+					},
+				})}
+`,
+				{ mode: 0o600 },
+			);
+		} catch {}
+	}
+	return compactor.streamStoppedTargetArtifact(runId, sourcePath, encoding, publicationPath, work);
+}
 
 type LifecycleEvent = IncidentRecorderCompactorRetainedResource & { action: "open" | "close" };
 
@@ -190,7 +225,7 @@ describe("incident recorder retained-resource lifecycle", () => {
 			const stopped = new IncidentRecorderCompactor(lifecycleOptions(stoppedTarget.agentDir, stoppedEvents));
 			finishStorageDiscovery(stopped);
 			expect(
-				stopped.streamStoppedTargetArtifact(RUN_ID, stoppedSource, "exact", {
+				streamClosedArtifact(stopped, RUN_ID, stoppedSource, "exact", {
 					deadlineMs: Date.now() + 1_000,
 					byteBudget: 1,
 				}),
@@ -280,7 +315,7 @@ describe("incident recorder retained-resource lifecycle", () => {
 				"Incident recorder compactor is disposed",
 			);
 			expect(
-				storage.streamStoppedTargetArtifact(RUN_ID, stoppedSource, "exact", {
+				streamClosedArtifact(storage, RUN_ID, stoppedSource, "exact", {
 					deadlineMs: Date.now() + 1_000,
 					byteBudget: 1,
 				}),
@@ -318,12 +353,12 @@ describe("incident recorder retained-resource lifecycle", () => {
 		const stoppedEvents: LifecycleEvent[] = [];
 		const stopped = new IncidentRecorderCompactor(lifecycleOptions(stoppedTarget.agentDir, stoppedEvents));
 		finishStorageDiscovery(stopped);
-		let stoppedResult = stopped.streamStoppedTargetArtifact(RUN_ID, stoppedSource, "exact", {
+		let stoppedResult = streamClosedArtifact(stopped, RUN_ID, stoppedSource, "exact", {
 			deadlineMs: Date.now() + 1_000,
 			byteBudget: 64 * 1024,
 		});
 		for (let call = 0; call < 8 && stoppedResult.state === "pending"; call += 1) {
-			stoppedResult = stopped.streamStoppedTargetArtifact(RUN_ID, stoppedSource, "exact", {
+			stoppedResult = streamClosedArtifact(stopped, RUN_ID, stoppedSource, "exact", {
 				deadlineMs: Date.now() + 1_000,
 				byteBudget: 64 * 1024,
 			});
@@ -480,7 +515,7 @@ describe("incident recorder retained-resource lifecycle", () => {
 			"stopped-source",
 			(compactor, target) => {
 				expect(
-					compactor.streamStoppedTargetArtifact(RUN_ID, join(target.root, "source"), "exact", {
+					streamClosedArtifact(compactor, RUN_ID, join(target.root, "source"), "exact", {
 						deadlineMs: Date.now() + 1_000,
 						byteBudget: 1,
 					}),
@@ -519,7 +554,7 @@ describe("incident recorder retained-resource lifecycle", () => {
 		});
 		finishStorageDiscovery(compactor);
 		expect(
-			compactor.streamStoppedTargetArtifact(RUN_ID, source, "exact", {
+			streamClosedArtifact(compactor, RUN_ID, source, "exact", {
 				deadlineMs: Date.now() + 1_000,
 				byteBudget: 1,
 			}),
