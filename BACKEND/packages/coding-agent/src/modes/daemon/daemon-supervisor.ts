@@ -126,6 +126,24 @@ import {
 	SESSION_LEASE_OWNER_ID_ENV,
 	SESSION_LEASES_ENABLED_ENV,
 } from "./daemon-worker-protocol.js";
+import {
+	appendSupervisorDiagnosticBytes,
+	appendSupervisorDiagnosticEvent,
+	flushSupervisorDiagnosticCapture,
+	installSupervisorDiagnosticHooks,
+} from "./incident-recorder.js";
+import {
+	INCIDENT_RECORDER_CHILD_ENV,
+	INCIDENT_RECORDER_RUN_DIR_ENV,
+	INCIDENT_RECORDER_SOCKET_ENV,
+} from "./incident-recorder-env.js";
+import { INCIDENT_RECORDER_RUN_ID_ENV, INCIDENT_RECORDER_RUN_TOKEN_ENV } from "./incident-recorder-protocol.js";
+import {
+	INCIDENT_RECORDER_CAPTURE_FD_ENV,
+	INCIDENT_RECORDER_CAPTURE_OWNER_PID_ENV,
+	INCIDENT_RECORDER_CAPTURE_OWNER_START_ID_ENV,
+	INCIDENT_RECORDER_ROOT_FD_ENV,
+} from "./incident-recorder-writer.js";
 import { MutationDrainLatch } from "./mutation-drain-latch.js";
 import { createRlmLedgerRegistrySeedSource, RlmSpawnLedger } from "./rlm-ledger.js";
 import { serializeSavedSessionInfo } from "./saved-session-info.js";
@@ -602,8 +620,15 @@ function mergeSessionLists(active: readonly SessionSummary[], saved: readonly Se
 
 export async function runDaemonSupervisorMode(options: DaemonSupervisorOptions): Promise<never> {
 	const socketPath = normalizeSocketPath(options.socketPath ?? defaultDaemonSocketPath());
+	const removeDiagnosticHooks = installSupervisorDiagnosticHooks(socketPath);
 	const supervisor = new DaemonSupervisor(socketPath, options);
-	await supervisor.start();
+	try {
+		await supervisor.start();
+	} catch (error) {
+		appendSupervisorDiagnosticEvent("supervisor_start_error", { error, socketPath });
+		removeDiagnosticHooks();
+		throw error;
+	}
 	return new Promise(() => {});
 }
 
@@ -707,6 +732,22 @@ export class DaemonSupervisor {
 			}
 			this.ownsSocketPath = true;
 			restrictDaemonSocketPath(this.socketPath);
+			appendSupervisorDiagnosticEvent("supervisor_ready", {
+				socketPath: this.socketPath,
+				socketIdentity: this.socketIdentity,
+				generation: this.generation,
+				descriptorDir: this.descriptorDir,
+				supervisorConfigPath: this.supervisorConfigPath,
+				daemonLogPath: getDaemonLogPath(this.socketPath),
+				appVersion: VERSION,
+			});
+			for (const [source, path] of [
+				["daemon_descriptor_directory", this.descriptorDir],
+				["supervisor_config", this.supervisorConfigPath],
+				["daemon_log", getDaemonLogPath(this.socketPath)],
+			] as const) {
+				appendSupervisorDiagnosticEvent("application_source_reference", { source, path });
+			}
 
 			this.registerSignalHandlers();
 			const ownedSessionFiles = new Set(
@@ -773,9 +814,28 @@ export class DaemonSupervisor {
 	}
 
 	private log(message: string): void {
+		const daemonLogPath = getDaemonLogPath(this.socketPath);
+		const rawLogLine = `[${new Date().toISOString()}] supervisor: ${message}`;
+		appendSupervisorDiagnosticEvent("supervisor_log_record", {
+			message,
+			rawLogLine,
+			explicitEncoding: "utf8-line-with-line-feed-on-write",
+			socketPath: this.socketPath,
+			generation: this.generation,
+			daemonLogPath,
+		});
 		console.error(message);
 		structuredLog.warn(message, { socketPath: this.socketPath });
-		appendRotatingLog(getDaemonLogPath(this.socketPath), `[${new Date().toISOString()}] supervisor: ${message}`);
+		appendRotatingLog(daemonLogPath, rawLogLine);
+	}
+
+	private captureApplicationFile(path: string, source: string, context: Record<string, unknown> = {}): void {
+		appendSupervisorDiagnosticEvent("application_source_reference", {
+			...context,
+			source,
+			path,
+			captureDeferredToExternalWriter: true,
+		});
 	}
 
 	private clearIdleEvictionTimer(): void {
@@ -1021,6 +1081,7 @@ export class DaemonSupervisor {
 		writeFileSync(tempPath, `${JSON.stringify(persisted, null, 2)}\n`, { mode: 0o600 });
 		chmodSync(tempPath, 0o600);
 		renameSync(tempPath, this.supervisorConfigPath);
+		this.captureApplicationFile(this.supervisorConfigPath, "supervisor_config", { socketPath: this.socketPath });
 	}
 
 	private hasPersistedWorkerDescriptors(): boolean {
@@ -1036,10 +1097,22 @@ export class DaemonSupervisor {
 		writeFileSync(tempPath, `${JSON.stringify(persisted, null, 2)}\n`, { mode: 0o600 });
 		chmodSync(tempPath, 0o600);
 		renameSync(tempPath, worker.descriptorPath);
+		this.captureApplicationFile(worker.descriptorPath, "worker_descriptor", {
+			workerId: worker.descriptor.workerId,
+			workerPid: worker.descriptor.pid,
+			workerProcessStartId: worker.descriptor.processStartId,
+		});
 	}
 
 	private deleteWorkerDescriptor(worker: ResidentWorker): void {
 		try {
+			for (const [source, path] of [
+				["worker_descriptor_before_delete", worker.descriptorPath],
+				["worker_recovery_journal_before_delete", worker.descriptor.recoveryJournalPath],
+				["worker_orphan_journal_before_delete", worker.descriptor.orphanProcessJournalPath],
+			] as const) {
+				if (path) this.captureApplicationFile(path, source, { workerId: worker.descriptor.workerId });
+			}
 			rmSync(worker.descriptorPath, { force: true });
 			rmSync(worker.descriptor.recoveryJournalPath, { force: true });
 			if (worker.descriptor.orphanProcessJournalPath) {
@@ -1067,6 +1140,24 @@ export class DaemonSupervisor {
 		this.sessionInputPauseEpochs.set(client, 0);
 		this.detachingInputPauseSessions.set(client, new Set());
 		this.clients.add(client);
+		appendSupervisorDiagnosticEvent("daemon_socket_connected", {
+			connectionId: this.connectionIds.get(client),
+			clientId: client.id,
+			socketPath: this.socketPath,
+			localAddress: socket.localAddress,
+			localPort: socket.localPort,
+			remoteAddress: socket.remoteAddress,
+			remotePort: socket.remotePort,
+			remoteFamily: socket.remoteFamily,
+		});
+		socket.on("data", (chunk: Buffer) =>
+			appendSupervisorDiagnosticBytes("daemon_socket_inbound", chunk, {
+				connectionId: this.connectionIds.get(client),
+				clientId: client.id,
+				protocolClientId: this.protocolClientIds.get(client),
+				socketPath: this.socketPath,
+			}),
+		);
 		void this.ready.then(
 			() => {
 				if (!client.socket.destroyed && this.clients.has(client)) {
@@ -1112,8 +1203,24 @@ export class DaemonSupervisor {
 			}
 			this.scheduleOwnedWorkerCleanupForClient(this.protocolClientId(client));
 		};
-		socket.on("close", cleanup);
-		socket.on("error", cleanup);
+		socket.on("close", (hadError) => {
+			appendSupervisorDiagnosticEvent("daemon_socket_closed", {
+				connectionId: this.connectionIds.get(client),
+				clientId: client.id,
+				protocolClientId: this.protocolClientIds.get(client),
+				hadError,
+			});
+			cleanup();
+		});
+		socket.on("error", (error) => {
+			appendSupervisorDiagnosticEvent("daemon_socket_error", {
+				connectionId: this.connectionIds.get(client),
+				clientId: client.id,
+				protocolClientId: this.protocolClientIds.get(client),
+				error,
+			});
+			cleanup();
+		});
 		socket.on("drain", () => {
 			client.backpressured = false;
 			if (!client.snapshotStreaming) {
@@ -1347,10 +1454,17 @@ export class DaemonSupervisor {
 	}
 
 	private async handleLine(client: DaemonSocketClient, line: string): Promise<void> {
+		const diagnosticStarted = process.hrtime.bigint();
 		let preParsed: ReturnType<DaemonSupervisor["parseCommandAndRegisterPromptAdmission"]>;
 		try {
 			preParsed = this.parseCommandAndRegisterPromptAdmission(client, line);
 		} catch (error) {
+			appendSupervisorDiagnosticEvent("daemon_command_parse_error", {
+				error,
+				salvagedCommandId: salvageDaemonCommandId(line),
+				connectionId: this.connectionIds.get(client),
+				clientId: client.id,
+			});
 			this.write(client, failure(salvageDaemonCommandId(line), "parse", error));
 			return;
 		}
@@ -1469,8 +1583,31 @@ export class DaemonSupervisor {
 		// the race, attach fails cleanly with "Session worker is not connected" and
 		// the client retries through the saved-session path instead of mutating state.
 		if (mutation) this.mutationDrain.begin();
+		let diagnosticOutcome = "success";
+		let diagnosticError: unknown;
+		appendSupervisorDiagnosticEvent("command_accepted", {
+			commandId: command.id,
+			commandType: command.type,
+			protocolVersion: preParsed.protocolVersion,
+			envelopeClientId,
+			connectionId: this.connectionIds.get(client),
+			clientId: client.id,
+			protocolClientId: this.protocolClientIds.get(client),
+			journalIdentity,
+			admission: parsedAdmission
+				? {
+						activeSessionId: parsedAdmission.activeSessionId,
+						publicAdmissionId: parsedAdmission.publicAdmissionId,
+						workerAdmissionId: parsedAdmission.workerAdmissionId,
+						status: parsedAdmission.status,
+						workerId: parsedAdmission.worker?.descriptor.workerId,
+						workerActiveSessionId: parsedAdmission.workerActiveSessionId,
+					}
+				: undefined,
+		});
 		try {
 			const response = await this.handleCommand(client, command, cancellationAdmission);
+			diagnosticOutcome = response?.success === false ? "failure" : "success";
 			if (response) {
 				if (journalIdentity) {
 					await this.assertCurrentOwnership();
@@ -1479,6 +1616,8 @@ export class DaemonSupervisor {
 				this.write(client, response);
 			}
 		} catch (error) {
+			diagnosticOutcome = "error";
+			diagnosticError = error;
 			this.log(`Supervisor command ${command.type} failed: ${error instanceof Error ? error.stack : String(error)}`);
 			let response = failure(command.id, command.type, error, serializeDaemonError(error));
 			if (journalIdentity && !isSupervisorGenerationStale(error)) {
@@ -1486,11 +1625,33 @@ export class DaemonSupervisor {
 					await this.assertCurrentOwnership();
 					this.commandJournal.recordResult(journalIdentity.clientId, journalIdentity.commandId, response);
 				} catch (ownershipError) {
+					diagnosticError = { commandError: error, ownershipError };
 					response = failure(command.id, command.type, ownershipError, serializeDaemonError(ownershipError));
 				}
 			}
 			this.write(client, response);
 		} finally {
+			const durationMs = Number(process.hrtime.bigint() - diagnosticStarted) / 1_000_000;
+			const diagnosticContext = {
+				commandId: command.id,
+				commandType: command.type,
+				durationMs,
+				outcome: diagnosticOutcome,
+				error: diagnosticError,
+				journalIdentity,
+				connectionId: this.connectionIds.get(client),
+				clientId: client.id,
+				protocolClientId: this.protocolClientIds.get(client),
+			};
+			appendSupervisorDiagnosticEvent("command_completed", diagnosticContext);
+			if (command.type === "list" || command.type === "get_state" || command.type === "get_connection_state") {
+				appendSupervisorDiagnosticEvent("list_status_sampling_trigger", {
+					...diagnosticContext,
+					requestId: String(command.id),
+					runId: process.env[INCIDENT_RECORDER_RUN_ID_ENV] ?? "unavailable",
+					thresholdMs: 250,
+				});
+			}
 			if (mutation) this.mutationDrain.end();
 		}
 	}
@@ -2437,13 +2598,52 @@ export class DaemonSupervisor {
 			[SESSION_LEASE_OWNER_ID_ENV]: rootActiveSessionId,
 		});
 		delete workerEnvironment.RLM_DEPTH;
+		delete workerEnvironment[INCIDENT_RECORDER_CHILD_ENV];
+		delete workerEnvironment[INCIDENT_RECORDER_RUN_DIR_ENV];
+		delete workerEnvironment[INCIDENT_RECORDER_SOCKET_ENV];
+		delete workerEnvironment[INCIDENT_RECORDER_CAPTURE_FD_ENV];
+		delete workerEnvironment[INCIDENT_RECORDER_ROOT_FD_ENV];
+		delete workerEnvironment[INCIDENT_RECORDER_CAPTURE_OWNER_PID_ENV];
+		delete workerEnvironment[INCIDENT_RECORDER_CAPTURE_OWNER_START_ID_ENV];
+		delete workerEnvironment[INCIDENT_RECORDER_RUN_ID_ENV];
+		delete workerEnvironment[INCIDENT_RECORDER_RUN_TOKEN_ENV];
 		await this.assertRecoveryAllowed();
+		const workerCwd = createCommand.config?.cwd ?? process.cwd();
+		appendSupervisorDiagnosticEvent("worker_launch", {
+			workerId,
+			rootActiveSessionId,
+			socketPath,
+			recoveryJournalPath,
+			orphanProcessJournalPath,
+			command: launch.command,
+			argv: [...launch.args],
+			cwd: workerCwd,
+			environment: workerEnvironment,
+			createCommand,
+			ownerClientId,
+			recoveryStopRevision,
+		});
 		const child: ChildProcess = spawn(launch.command, launch.args, {
-			cwd: createCommand.config?.cwd ?? process.cwd(),
+			cwd: workerCwd,
 			detached: true,
 			env: workerEnvironment,
-			stdio: ["ignore", "ignore", "pipe", "pipe"],
+			// fd4/fd5 belong exclusively to the supervisor capture owner.
+			stdio: ["ignore", "ignore", "pipe", "pipe", "ignore", "ignore"],
 		});
+		appendSupervisorDiagnosticEvent("worker_stdout_source_unavailable", {
+			source: "worker-stdout",
+			reason: "product-intentionally-ignores-worker-stdout",
+			streamSemanticsPreserved: true,
+			workerId,
+		});
+		child.stderr?.on("data", (chunk: Buffer) =>
+			appendSupervisorDiagnosticBytes("worker_stderr", chunk, {
+				workerId,
+				rootActiveSessionId,
+				socketPath,
+				childPid: child.pid,
+			}),
+		);
 		const detachWorkerStderr = child.stderr
 			? attachJsonlLineReader(child.stderr, (line) => this.log(`Session worker ${workerId} stderr: ${line}`), {
 					maxLineLength: 64 * 1024,
@@ -2453,6 +2653,13 @@ export class DaemonSupervisor {
 		child.once("close", detachWorkerStderr);
 		const childClosed = new Promise<void>((resolveClose) => child.once("close", () => resolveClose()));
 		child.on("error", (error) => {
+			appendSupervisorDiagnosticEvent("worker_process_error", {
+				error,
+				workerId,
+				rootActiveSessionId,
+				socketPath,
+				childPid: child.pid,
+			});
 			this.log(
 				`Session worker ${workerId} process error: ${error instanceof Error ? error.message : String(error)}`,
 			);
@@ -2473,6 +2680,16 @@ export class DaemonSupervisor {
 			}
 			childPid = child.pid;
 			childProcessStartId = getProcessStartId(childPid);
+			appendSupervisorDiagnosticEvent("worker_process_spawned", {
+				workerId,
+				rootActiveSessionId,
+				socketPath,
+				childPid,
+				childProcessStartId,
+				command: launch.command,
+				argv: [...launch.args],
+				cwd: workerCwd,
+			});
 			await this.assertRecoveryAllowed();
 
 			const descriptor: DaemonWorkerDescriptor = {
@@ -2646,7 +2863,14 @@ export class DaemonSupervisor {
 		let lastError: unknown;
 		while (Date.now() < deadline) {
 			await this.assertRecoveryAllowed();
-			const client = new DaemonWorkerClient(worker.descriptor.socketPath);
+			const client = new DaemonWorkerClient(worker.descriptor.socketPath, {
+				workerId: worker.descriptor.workerId,
+				workerPid: worker.descriptor.pid,
+				workerProcessStartId: worker.descriptor.processStartId,
+				rootActiveSessionId: worker.descriptor.rootActiveSessionId,
+				supervisorGeneration: this.generation,
+				supervisorSocketPath: this.socketPath,
+			});
 			try {
 				await client.connect(Math.min(500, Math.max(50, deadline - Date.now())));
 				await client.waitForHello(1000);
@@ -3247,14 +3471,18 @@ export class DaemonSupervisor {
 		);
 	}
 
-	private async refreshWorkerSummaries(worker: ResidentWorker, recovery = false): Promise<void> {
+	private async refreshWorkerSummaries(
+		worker: ResidentWorker,
+		recovery = false,
+		diagnosticCause: Record<string, unknown> = { causeKind: "supervisor_internal" },
+	): Promise<void> {
 		if (this.isWorkerStopping(worker)) {
 			throw new Error("Session worker is stopping");
 		}
 		if (!worker.client) {
 			throw new Error("Session worker is not connected");
 		}
-		const response = await worker.client.request({ type: "list" }, 5000);
+		const response = await worker.client.request({ type: "list" }, 5000, diagnosticCause);
 		const summaries = sessionSummariesFromResponse(response);
 		worker.summaries = new Map(summaries.map((summary) => [summary.activeSessionId ?? summary.id, summary]));
 		for (const summary of summaries) {
@@ -3425,7 +3653,9 @@ export class DaemonSupervisor {
 		);
 	}
 
-	private syncAgentPeers(): Promise<void> {
+	private syncAgentPeers(
+		diagnosticCause: Record<string, unknown> = { causeKind: "supervisor_internal" },
+	): Promise<void> {
 		const sync = this.agentPeerSyncQueue
 			.catch(() => undefined)
 			.then(async () => {
@@ -3443,7 +3673,11 @@ export class DaemonSupervisor {
 									return root ? [this.agentPeerSummary(root)] : [];
 								}),
 						];
-						const response = await worker.client.requestWorker({ type: "worker_sync_agent_peers", peers }, 5000);
+						const response = await worker.client.requestWorker(
+							{ type: "worker_sync_agent_peers", peers },
+							5000,
+							diagnosticCause,
+						);
 						if (!response.success) {
 							throw new Error(response.error);
 						}
@@ -4556,17 +4790,22 @@ export class DaemonSupervisor {
 			}
 			this.writeSerialized(client, publicPayload);
 		}
-		if (outboundType === "session_replaced" || outboundType === "session_closed") {
-			void this.refreshWorkerSummaries(worker)
-				.then(() => this.syncAgentPeers())
-				.catch(() => undefined);
-		} else if (
+		if (
+			outboundType === "session_replaced" ||
+			outboundType === "session_closed" ||
 			sessionEventType === "turn_start" ||
 			sessionEventType === "turn_end" ||
 			sessionEventType === "rlm_child_update"
 		) {
-			void this.refreshWorkerSummaries(worker)
-				.then(() => this.syncAgentPeers())
+			const diagnosticCause = {
+				causeKind: "worker_outbound_frame",
+				causeWorkerId: worker.descriptor.workerId,
+				causeActiveSessionId: activeSessionId,
+				causeOutboundType: outboundType,
+				causeSessionEventType: sessionEventType,
+			};
+			void this.refreshWorkerSummaries(worker, false, diagnosticCause)
+				.then(() => this.syncAgentPeers({ ...diagnosticCause, causeStage: "post_summary_refresh" }))
 				.catch(() => undefined);
 		}
 		if (
@@ -5307,14 +5546,44 @@ export class DaemonSupervisor {
 	}
 
 	private writeSerialized(client: DaemonSocketClient, line: string | Uint8Array): boolean {
+		const bytes =
+			typeof line === "string"
+				? Buffer.from(line, "utf8")
+				: Buffer.isBuffer(line)
+					? line
+					: Buffer.from(line.buffer, line.byteOffset, line.byteLength);
+		appendSupervisorDiagnosticBytes("daemon_socket_outbound_attempt", bytes, {
+			connectionId: this.connectionIds.get(client),
+			clientId: client.id,
+			protocolClientId: this.protocolClientIds.get(client),
+			socketPath: this.socketPath,
+			socketDestroyed: client.socket.destroyed,
+		});
 		if (client.socket.destroyed) {
 			return false;
 		}
-		const accepted = client.socket.write(line);
-		if (!accepted) {
+		const acceptedForBuffering = client.socket.write(bytes, (error) => {
+			appendSupervisorDiagnosticEvent("daemon_socket_outbound_write_outcome", {
+				connectionId: this.connectionIds.get(client),
+				clientId: client.id,
+				protocolClientId: this.protocolClientIds.get(client),
+				socketPath: this.socketPath,
+				outcome: error ? "write-error" : "written",
+				attemptedBytes: bytes.length,
+			});
+		});
+		appendSupervisorDiagnosticEvent("daemon_socket_outbound_attempt_result", {
+			connectionId: this.connectionIds.get(client),
+			clientId: client.id,
+			protocolClientId: this.protocolClientIds.get(client),
+			socketPath: this.socketPath,
+			acceptedForBuffering,
+			attemptedBytes: bytes.length,
+		});
+		if (!acceptedForBuffering) {
 			client.backpressured = true;
 		}
-		return accepted;
+		return acceptedForBuffering;
 	}
 
 	private registerSignalHandlers(): void {
@@ -5323,7 +5592,10 @@ export class DaemonSupervisor {
 			signals.push("SIGHUP");
 		}
 		for (const signal of signals) {
-			const handler = () => void this.shutdown(signal === "SIGINT" ? 130 : signal === "SIGHUP" ? 129 : 143, false);
+			const handler = () => {
+				appendSupervisorDiagnosticEvent("signal_received", { signal });
+				void this.shutdown(signal === "SIGINT" ? 130 : signal === "SIGHUP" ? 129 : 143, false);
+			};
 			process.on(signal, handler);
 			this.signalCleanupHandlers.push(() => process.off(signal, handler));
 		}
@@ -5505,6 +5777,13 @@ export class DaemonSupervisor {
 		if (relaunch) {
 			const launch = createCliSubprocessLaunchSpec(["--mode", "daemon", "--daemon-socket", this.socketPath]);
 			const environment = createCliSubprocessEnv();
+			delete environment[INCIDENT_RECORDER_CHILD_ENV];
+			delete environment[INCIDENT_RECORDER_RUN_DIR_ENV];
+			delete environment[INCIDENT_RECORDER_SOCKET_ENV];
+			delete environment[INCIDENT_RECORDER_CAPTURE_FD_ENV];
+			delete environment[INCIDENT_RECORDER_ROOT_FD_ENV];
+			delete environment[INCIDENT_RECORDER_CAPTURE_OWNER_PID_ENV];
+			delete environment[INCIDENT_RECORDER_CAPTURE_OWNER_START_ID_ENV];
 			delete environment[DAEMON_CATALOG_ROLE_ENV];
 			delete environment[DAEMON_WORKER_ROLE_ENV];
 			delete environment[DAEMON_WORKER_TOKEN_ENV];
@@ -5514,14 +5793,30 @@ export class DaemonSupervisor {
 			delete environment[ORPHAN_PROCESS_JOURNAL_ENV];
 			delete environment[SESSION_LEASES_ENABLED_ENV];
 			delete environment[SESSION_LEASE_OWNER_ID_ENV];
+			const replacementCwd = this.defaultSessionConfig.cwd ?? process.cwd();
+			appendSupervisorDiagnosticEvent("supervisor_relaunch", {
+				command: launch.command,
+				argv: [...launch.args],
+				cwd: replacementCwd,
+				environment,
+				previousGeneration: this.generation,
+				socketPath: this.socketPath,
+			});
 			const replacement = spawn(launch.command, launch.args, {
-				cwd: this.defaultSessionConfig.cwd ?? process.cwd(),
+				cwd: replacementCwd,
 				detached: true,
 				env: environment,
 				stdio: "ignore",
 			});
 			replacement.unref();
 		}
+		appendSupervisorDiagnosticEvent("supervisor_exit", {
+			exitCode,
+			relaunch,
+			generation: this.generation,
+			socketPath: this.socketPath,
+		});
+		await flushSupervisorDiagnosticCapture();
 		process.exit(exitCode);
 	}
 }

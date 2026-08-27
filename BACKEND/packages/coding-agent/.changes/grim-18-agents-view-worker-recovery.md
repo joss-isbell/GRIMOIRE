@@ -1,0 +1,1 @@
+- Fixed saved sessions failing to recover when opened from the Agents view.

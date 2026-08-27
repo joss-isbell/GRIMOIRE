@@ -122,7 +122,11 @@ describe("agents view reply on inactive sessions", () => {
 		await invoke("sendReply", self, target, "wake up");
 
 		expect(request).toHaveBeenCalledWith(
-			expect.objectContaining({ type: "create", sessionPath: savedSummary.sessionFile }),
+			expect.objectContaining({
+				type: "create",
+				sessionPath: savedSummary.sessionFile,
+				launchEnv: expect.any(Object),
+			}),
 		);
 		expect(self.sendPrompt).toHaveBeenCalledWith("active-9", "wake up", "steer");
 		expect(self.selectSummary).toHaveBeenCalledWith(expect.objectContaining({ activeSessionId: "active-9" }));

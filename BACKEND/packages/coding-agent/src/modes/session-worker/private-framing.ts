@@ -120,6 +120,13 @@ export class PrivateFrameDecoder<THeader extends object> {
 
 export type PrivateFrameListener<THeader extends object> = (frame: PrivateFrame<THeader>) => void;
 
+export interface PrivateFrameByteObservers {
+	onInboundBytes?: (bytes: Buffer) => void;
+	/** Called before the product transport attempts the write. */
+	onOutboundBytes?: (bytes: Buffer) => void;
+	onOutboundWriteOutcome?: (bytes: Buffer, outcome: "written" | "write-error") => void;
+}
+
 export class PrivateFramedChannel<THeader extends object> {
 	private readonly decoder: PrivateFrameDecoder<THeader>;
 	private readonly listeners = new Set<PrivateFrameListener<THeader>>();
@@ -129,6 +136,7 @@ export class PrivateFramedChannel<THeader extends object> {
 		private readonly stream: Duplex,
 		validateHeader: PrivateFrameHeaderValidator<THeader>,
 		private readonly limits: PrivateFrameLimits = DEFAULT_PRIVATE_FRAME_LIMITS,
+		private readonly byteObservers: PrivateFrameByteObservers = {},
 	) {
 		this.decoder = new PrivateFrameDecoder(validateHeader, limits);
 		stream.on("data", this.handleData);
@@ -146,13 +154,20 @@ export class PrivateFramedChannel<THeader extends object> {
 			throw new Error("Private frame channel is closed");
 		}
 		const frame = encodePrivateFrame(header, payload, this.limits);
+		try {
+			this.byteObservers.onOutboundBytes?.(frame);
+		} catch {
+			// Diagnostic observers must not affect product transport.
+		}
 		await new Promise<void>((resolve, reject) => {
 			this.stream.write(frame, (error?: Error | null) => {
-				if (error) {
-					reject(error);
-				} else {
-					resolve();
+				try {
+					this.byteObservers.onOutboundWriteOutcome?.(frame, error ? "write-error" : "written");
+				} catch {
+					// Diagnostic observers must not affect product transport.
 				}
+				if (error) reject(error);
+				else resolve();
 			});
 		});
 	}
@@ -168,6 +183,11 @@ export class PrivateFramedChannel<THeader extends object> {
 
 	private readonly handleData = (chunk: Buffer): void => {
 		try {
+			try {
+				this.byteObservers.onInboundBytes?.(chunk);
+			} catch {
+				// Diagnostic observers must not affect product transport.
+			}
 			for (const frame of this.decoder.push(chunk)) {
 				for (const listener of this.listeners) {
 					listener(frame);

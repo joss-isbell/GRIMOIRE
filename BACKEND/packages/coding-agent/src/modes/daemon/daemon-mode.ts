@@ -192,6 +192,11 @@ import {
 	SESSION_LEASE_OWNER_ID_ENV,
 	SESSION_LEASES_ENABLED_ENV,
 } from "./daemon-worker-protocol.js";
+import {
+	INCIDENT_RECORDER_CHILD_ENV,
+	INCIDENT_RECORDER_RUN_DIR_ENV,
+	INCIDENT_RECORDER_SOCKET_ENV,
+} from "./incident-recorder-env.js";
 import { MutationDrainLatch } from "./mutation-drain-latch.js";
 import {
 	createRlmLedgerRegistrySeedSource,
@@ -854,6 +859,9 @@ export class AgentDaemon {
 			}
 			const launch = createCliSubprocessLaunchSpec(["--mode", "daemon", "--daemon-socket", supervisorSocketPath]);
 			const environment = createCliSubprocessEnv();
+			delete environment[INCIDENT_RECORDER_CHILD_ENV];
+			delete environment[INCIDENT_RECORDER_RUN_DIR_ENV];
+			delete environment[INCIDENT_RECORDER_SOCKET_ENV];
 			delete environment[DAEMON_WORKER_ROLE_ENV];
 			delete environment[DAEMON_WORKER_TOKEN_ENV];
 			delete environment[DAEMON_WORKER_ACTIVE_SESSION_ID_ENV];

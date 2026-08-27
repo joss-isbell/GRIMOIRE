@@ -23,6 +23,11 @@ import {
 	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
 	DAEMON_WORKER_TOKEN_ENV,
 } from "../modes/daemon/daemon-worker-protocol.js";
+import {
+	INCIDENT_RECORDER_CHILD_ENV,
+	INCIDENT_RECORDER_RUN_DIR_ENV,
+	INCIDENT_RECORDER_SOCKET_ENV,
+} from "../modes/daemon/incident-recorder-env.js";
 import { isHelpCommandRequest, PUBLIC_COMMAND_NAMES, REMOVED_COMMAND_NAMES } from "./command-registry.js";
 import { createCliSubprocessEnv, formatCurrentCliCommand } from "./subprocess-launch.js";
 
@@ -358,6 +363,9 @@ async function ensureDaemonRunning(socketPath: string, spawnCwd?: string): Promi
 	// Agent daemon) would launch the supervisor in worker mode, which listens
 	// on the socket but never sends the daemon_hello handshake.
 	const env = createCliSubprocessEnv();
+	delete env[INCIDENT_RECORDER_CHILD_ENV];
+	delete env[INCIDENT_RECORDER_RUN_DIR_ENV];
+	delete env[INCIDENT_RECORDER_SOCKET_ENV];
 	delete env[DAEMON_WORKER_ROLE_ENV];
 	delete env[DAEMON_WORKER_TOKEN_ENV];
 	delete env[DAEMON_WORKER_ACTIVE_SESSION_ID_ENV];

@@ -83,6 +83,11 @@ import {
 	waitForDaemonWorkerStartupGate,
 } from "./modes/daemon/daemon-worker-protocol.js";
 import {
+	runIncidentRecorderService,
+	runRecordedSupervisor,
+	shouldRecordSupervisorLaunch,
+} from "./modes/daemon/incident-recorder.js";
+import {
 	type AgentConnection,
 	type AgentsViewScopeKey,
 	ClientPromptStashStore,
@@ -1041,6 +1046,20 @@ export interface MainOptions {
 }
 
 export async function main(args: string[], options?: MainOptions) {
+	const serviceIndex = args.indexOf("--incident-recorder-service");
+	if (serviceIndex !== -1) {
+		const agentDirIndex = args.indexOf("--agent-dir", serviceIndex + 1);
+		await runIncidentRecorderService(
+			agentDirIndex === -1 ? getAgentDir() : resolve(args[agentDirIndex + 1] ?? getAgentDir()),
+		);
+	}
+	if (shouldRecordSupervisorLaunch(args, process.env, isDaemonWorkerProcess())) {
+		const socketIndex = args.indexOf("--daemon-socket");
+		await runRecordedSupervisor(
+			args,
+			socketIndex === -1 ? defaultDaemonSocketPath() : (args[socketIndex + 1] ?? defaultDaemonSocketPath()),
+		);
+	}
 	resetTimings();
 	if (isDaemonWorkerProcess()) {
 		waitForDaemonWorkerStartupGate();

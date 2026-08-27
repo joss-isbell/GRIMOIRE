@@ -31,6 +31,7 @@ import type { AgentConnectionHeartbeat, AgentConnectionSavedSessionInfo } from "
 import { DaemonClient, getDaemonSocketCloseReason } from "../daemon/daemon-client.js";
 import {
 	collectDaemonClientEnv,
+	collectDaemonLaunchEnv,
 	type DaemonClosingReason,
 	type DaemonCommand,
 	type DaemonResponse,
@@ -384,6 +385,7 @@ async function resumeSavedAgentsViewSession(
 		type: "create",
 		config: createAgentsViewResumeConfig(config, overrideCwd),
 		sessionPath: summary.sessionFile,
+		launchEnv: collectDaemonLaunchEnv(),
 	});
 	const createdSummary = expectSessionSummary(requireDaemonData(response));
 	return {

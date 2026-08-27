@@ -1,0 +1,2 @@
+- Added automatic private diagnostic incident recording for daemon supervisor and worker failures.
+- Retains diagnostic runs, finalized incident bundles, references, CAS blobs, journal evidence, atop data, and Sysdig incident pins for three days, with bounded fail-closed cleanup.
