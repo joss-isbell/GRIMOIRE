@@ -661,11 +661,14 @@ export class BoundedFrameEmitter {
 			this.disableInvalidOwner();
 			return;
 		}
+		// A scheduled retry is the sole pending checkpoint owner. Letting pump race
+		// that timer can create duplicate attempts when a fast checkpoint write fails.
 		if (
 			this.stopped ||
 			this.terminalQueued ||
 			(this.stopping && !internalDuringStop) ||
 			this.lossCheckpointQueued ||
+			(!internalDuringStop && this.lossCheckpointRetry) ||
 			this.counters.droppedRecords === this.reportedLostRecords
 		)
 			return;
