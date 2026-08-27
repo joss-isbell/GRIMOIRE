@@ -769,13 +769,17 @@ describe("three-day diagnostic retention", () => {
 		);
 		expect(statSync(join(incident, "journal-pin-manifest.json")).size).toBeGreaterThan(1024 * 1024);
 		const compactor = new IncidentRecorderCompactor({ agentDir: target.agentDir, freeReserveBytes: 0 });
-		for (let pass = 0; pass < 400 && !existsSync(join(incident, "journal-pin-retention-proof.json")); pass += 1)
-			compactor.processPendingPins(NOW);
-		const proof = JSON.parse(readFileSync(join(incident, "journal-pin-retention-proof.json"), "utf8")) as Record<
-			string,
-			unknown
-		>;
-		expect(proof).toMatchObject({ state: "producer_verified_complete", occurrenceCount: 8192, runId });
+		try {
+			for (let pass = 0; pass < 400 && !existsSync(join(incident, "journal-pin-retention-proof.json")); pass += 1)
+				compactor.processPendingPins(NOW);
+			const proof = JSON.parse(readFileSync(join(incident, "journal-pin-retention-proof.json"), "utf8")) as Record<
+				string,
+				unknown
+			>;
+			expect(proof).toMatchObject({ state: "producer_verified_complete", occurrenceCount: 8192, runId });
+		} finally {
+			compactor.dispose();
+		}
 	});
 
 	it("rejects proofless manifests that are truncated or have missing, wrong-content, or wrong-path pins", () => {
