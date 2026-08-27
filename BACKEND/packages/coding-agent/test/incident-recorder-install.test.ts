@@ -30,6 +30,9 @@ describe("incident recorder systemd user service", () => {
 			'ExecStart="/stable/node" "/stable/prime agent/cli.js" "--incident-recorder-service" "--agent-dir" "/private/agent"',
 		);
 		expect(unit).toContain("KillMode=control-group");
+		expect(unit).toContain("MemoryHigh=768M");
+		expect(unit).toContain("MemoryMax=1G");
+		expect(unit).toContain("MemorySwapMax=0");
 		expect(unit).toContain("UMask=0077");
 		expect(unit).not.toContain('--mode" "daemon');
 	});

@@ -4104,8 +4104,10 @@ export function renderIncidentRecorderSystemdUnit(options: RenderServiceOptions)
 	}
 	const args = [options.nodePath, options.entrypointPath, "--incident-recorder-service"];
 	if (options.agentDir) args.push("--agent-dir", options.agentDir);
-	const memoryMax = options.memoryMax ?? "256M";
-	const memoryHigh = options.memoryHigh ?? "192M";
+	// 192M/256M caused sustained cgroup reclaim and severe WSL latency in the
+	// isolated recorder trial. These are the measured stable staged limits.
+	const memoryMax = options.memoryMax ?? "1G";
+	const memoryHigh = options.memoryHigh ?? "768M";
 	const memorySwapMax = options.memorySwapMax ?? "0";
 	const cpuQuota = options.cpuQuota ?? "25%";
 	const ioWeight = options.ioWeight ?? 25;
