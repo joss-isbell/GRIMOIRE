@@ -679,7 +679,7 @@ describe("daemon supervisor passive subagent topology", () => {
 		supervisor.workers.set("second", second);
 
 		await supervisor.refreshWorkerSummaries(first);
-		expect(first.client.request).toHaveBeenCalledWith({ type: "list" }, 5000);
+		expect(first.client.request).toHaveBeenCalledWith({ type: "list" }, 5000, { causeKind: "supervisor_internal" });
 		expect(first.summaries.get("passive-session")).toMatchObject({
 			sessionFile: passive.sessionFile,
 			runtimeKind: "subagent",

@@ -416,7 +416,9 @@ describe("daemon supervisor whole-tree eviction", () => {
 		).rejects.toThrow("Unknown active session: missing-target");
 		expect(source.client?.requestWorker).not.toHaveBeenCalled();
 		expect(source.client?.request).toHaveBeenCalledOnce();
-		expect(source.client?.request).toHaveBeenCalledWith({ type: "list" }, 5000);
+		expect(source.client?.request).toHaveBeenCalledWith({ type: "list" }, 5000, {
+			causeKind: "supervisor_internal",
+		});
 	});
 
 	it("propagates an ambiguous saved-session selector during a2a wake", async () => {
