@@ -279,6 +279,12 @@ interface StorageDiscovery {
 	error?: string;
 }
 
+type RetainedDirectoryKind = "storage-discovery" | "incident-discovery" | "sysdig-discovery" | "pin-traversal";
+type RetainedDescriptorKind = "journal-manifest" | "journal-pin" | "stopped-source" | "stopped-target";
+export type IncidentRecorderCompactorRetainedResource =
+	| { resource: "directory"; kind: RetainedDirectoryKind; path: string }
+	| { resource: "descriptor"; kind: RetainedDescriptorKind; path: string };
+
 export interface IncidentRecorderCompactorSurvivalSnapshot {
 	pendingEntries: number;
 	pendingEntryBytes: number;
@@ -296,6 +302,9 @@ export interface IncidentRecorderCompactorSurvivalSnapshot {
 	incidentDiscoverySliceEntries: number;
 	sysdigDiscoverySliceEntries: number;
 	sysdigDiscoveryCandidates: number;
+	retainedDirectories: number;
+	retainedFileDescriptors: number;
+	disposed: boolean;
 	storageDiscoveryError?: string;
 }
 
@@ -773,6 +782,11 @@ export interface IncidentRecorderCompactorOptions {
 	sysdigRingBasePath?: string;
 	/** Test-only deterministic storage-topology mutation seam. */
 	storageDiscoveryEntryHook?: (path: string, canonicalPath: string | undefined) => void;
+	/** Test-only retained-resource observation and read-failure seam. */
+	resourceLifecycleHooks?: {
+		observe?: (event: IncidentRecorderCompactorRetainedResource & { action: "open" | "close" }) => void;
+		beforeRead?: (resource: IncidentRecorderCompactorRetainedResource) => void;
+	};
 }
 
 export class IncidentRecorderCompactor {
@@ -793,10 +807,15 @@ export class IncidentRecorderCompactor {
 	private incidentDiscoverySliceEntries = 0;
 	private sysdigRingDiscovery?: SysdigRingDiscovery;
 	private sysdigDiscoverySliceEntries = 0;
-	private readonly activePinScans = new Set<string>();
+	private readonly activePinScans = new Map<string, () => void>();
 	private activePinTraversal?: PinTraversal;
 	private journalManifestValidation?: JournalManifestValidation;
 	private readonly stoppedTargetStreams = new Map<string, StoppedTargetArtifactStream>();
+	private readonly retainedDirectories = new Map<Dir, { kind: RetainedDirectoryKind; path: string }>();
+	private readonly retainedDescriptors = new Map<number, { kind: RetainedDescriptorKind; path: string }>();
+	private readonly disposalWaiters = new Set<() => void>();
+	private activeReaderTermination?: () => void;
+	private disposed = false;
 
 	constructor(private readonly options: IncidentRecorderCompactorOptions) {
 		this.root = join(options.agentDir, "incident-recorder");
@@ -824,6 +843,149 @@ export class IncidentRecorderCompactor {
 					this.producerSequences.set(key, BigInt(parsed.producerSequences[key]));
 			}
 		} catch {}
+	}
+
+	private disposedError(): Error {
+		return new Error("Incident recorder compactor is disposed");
+	}
+
+	private assertActive(): void {
+		if (this.disposed) throw this.disposedError();
+	}
+
+	private observeResource(resource: IncidentRecorderCompactorRetainedResource, action: "open" | "close"): void {
+		try {
+			this.options.resourceLifecycleHooks?.observe?.({ ...resource, action });
+		} catch {}
+	}
+
+	private openRetainedDirectory(path: string, kind: RetainedDirectoryKind): Dir {
+		this.assertActive();
+		const directory = opendirSync(path);
+		const resource = { resource: "directory" as const, kind, path };
+		this.retainedDirectories.set(directory, { kind, path });
+		this.observeResource(resource, "open");
+		return directory;
+	}
+
+	private readRetainedDirectory(directory: Dir): Dirent | null {
+		const retained = this.retainedDirectories.get(directory);
+		if (!retained) throw new Error("Incident recorder compactor directory is not retained");
+		this.options.resourceLifecycleHooks?.beforeRead?.({ resource: "directory", ...retained });
+		return directory.readSync();
+	}
+
+	private closeRetainedDirectory(directory: Dir): boolean {
+		const retained = this.retainedDirectories.get(directory);
+		if (!retained) return true;
+		this.retainedDirectories.delete(directory);
+		let closed = true;
+		try {
+			directory.closeSync();
+		} catch {
+			closed = false;
+		} finally {
+			this.observeResource({ resource: "directory", ...retained }, "close");
+		}
+		return closed;
+	}
+
+	private retainDescriptor(descriptor: number, path: string, kind: RetainedDescriptorKind): number {
+		this.assertActive();
+		const resource = { resource: "descriptor" as const, kind, path };
+		this.retainedDescriptors.set(descriptor, { kind, path });
+		this.observeResource(resource, "open");
+		return descriptor;
+	}
+
+	private openRetainedDescriptor(path: string, flags: number, kind: RetainedDescriptorKind): number {
+		this.assertActive();
+		return this.retainDescriptor(openSync(path, flags), path, kind);
+	}
+
+	private beforeRetainedDescriptorRead(descriptor: number): void {
+		const retained = this.retainedDescriptors.get(descriptor);
+		if (!retained) throw new Error("Incident recorder compactor file descriptor is not retained");
+		this.options.resourceLifecycleHooks?.beforeRead?.({ resource: "descriptor", ...retained });
+	}
+
+	private closeRetainedDescriptor(descriptor: number): void {
+		const retained = this.retainedDescriptors.get(descriptor);
+		if (!retained) return;
+		this.retainedDescriptors.delete(descriptor);
+		try {
+			closeSync(descriptor);
+		} catch {
+		} finally {
+			this.observeResource({ resource: "descriptor", ...retained }, "close");
+		}
+	}
+
+	private async waitForWorkDelay(delayMs: number): Promise<void> {
+		this.assertActive();
+		await new Promise<void>((resolveDelay) => {
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const wake = (): void => {
+				if (timer) clearTimeout(timer);
+				this.disposalWaiters.delete(wake);
+				resolveDelay();
+			};
+			this.disposalWaiters.add(wake);
+			timer = setTimeout(wake, Math.max(0, delayMs));
+		});
+		this.assertActive();
+	}
+
+	/** Explicit bounded shutdown for retained scan, validation, and stream resources. */
+	dispose(): void {
+		if (this.disposed) return;
+		this.disposed = true;
+		for (const wake of [...this.disposalWaiters]) wake();
+		this.disposalWaiters.clear();
+		const terminateReader = this.activeReaderTermination;
+		this.activeReaderTermination = undefined;
+		terminateReader?.();
+		for (const terminate of [...this.activePinScans.values()]) terminate();
+		this.activePinScans.clear();
+		for (const directory of [...this.retainedDirectories.keys()]) this.closeRetainedDirectory(directory);
+		for (const descriptor of [...this.retainedDescriptors.keys()]) this.closeRetainedDescriptor(descriptor);
+		this.storageDiscovery.stack.splice(0);
+		this.storageDiscovery.error ??= "compactor_disposed";
+		this.incidentDiscovery = undefined;
+		if (this.sysdigRingDiscovery) {
+			this.sysdigRingDiscovery.candidates.length = 0;
+			this.sysdigRingDiscovery.issues.length = 0;
+		}
+		this.sysdigRingDiscovery = undefined;
+		if (this.activePinTraversal) {
+			this.activePinTraversal.directory = undefined;
+			this.activePinTraversal.matches.length = 0;
+			this.activePinTraversal.linked.clear();
+			this.activePinTraversal.scannedCursors.clear();
+		}
+		this.activePinTraversal = undefined;
+		if (this.journalManifestValidation) {
+			this.journalManifestValidation.pinValidation?.hash.destroy();
+			this.journalManifestValidation.pinValidation = undefined;
+			this.journalManifestValidation.pendingOccurrence = undefined;
+			this.journalManifestValidation.textBuffer = "";
+			this.journalManifestValidation.objectText = "";
+			this.journalManifestValidation.verifiedPins.clear();
+		}
+		this.journalManifestValidation = undefined;
+		for (const state of this.stoppedTargetStreams.values()) {
+			state.hash.destroy();
+			try {
+				rmSync(state.temporary, { force: true });
+			} catch {}
+		}
+		this.stoppedTargetStreams.clear();
+		for (const assembly of this.assemblies.values()) clearTimeout(assembly.timer);
+		this.assemblies.clear();
+		this.assemblyBytes = 0;
+		this.pendingEntries.length = 0;
+		this.pendingEntryHead = 0;
+		this.pendingEntryBytes = 0;
 	}
 
 	private canonicalStoragePathForLink(path: string): string | undefined {
@@ -945,6 +1107,7 @@ export class IncidentRecorderCompactor {
 		entryBudget = STORAGE_DISCOVERY_ENTRY_BUDGET,
 		deadlineMs = Date.now() + STORAGE_DISCOVERY_SLICE_MS,
 	): boolean {
+		this.assertActive();
 		const state = this.storageDiscovery;
 		state.lastSliceEntries = 0;
 		if (state.complete || state.error) return state.complete;
@@ -952,11 +1115,7 @@ export class IncidentRecorderCompactor {
 		const fail = (reason: string): false => {
 			state.error = reason;
 			state.lastSliceEntries = worked;
-			for (const frame of state.stack.splice(0)) {
-				try {
-					frame.directory.closeSync();
-				} catch {}
-			}
+			for (const frame of state.stack.splice(0)) this.closeRetainedDirectory(frame.directory);
 			return false;
 		};
 		const observe = (path: string, stat: BigIntStats): boolean => {
@@ -1024,18 +1183,17 @@ export class IncidentRecorderCompactor {
 				if (!observe(root, rootStat)) return false;
 				if (!rootStat.isDirectory()) continue;
 				if (rootStat.isSymbolicLink()) return fail("storage_discovery_symbolic_directory_rejected");
-				let directory: Dir;
+				let directory: Dir | undefined;
 				let openedStat: BigIntStats;
 				try {
-					directory = opendirSync(root);
+					directory = this.openRetainedDirectory(root, "storage-discovery");
 					openedStat = lstatSync(root, { bigint: true });
 				} catch {
+					if (directory) this.closeRetainedDirectory(directory);
 					return fail("storage_discovery_directory_open_failed");
 				}
 				if (!sameStorageTopology(storageTopologySignature(rootStat), storageTopologySignature(openedStat))) {
-					try {
-						directory.closeSync();
-					} catch {}
+					this.closeRetainedDirectory(directory);
 					return fail("storage_discovery_directory_changed_before_open");
 				}
 				state.stack.push({
@@ -1049,7 +1207,7 @@ export class IncidentRecorderCompactor {
 			if (!frame) continue;
 			let entry: Dirent | null;
 			try {
-				entry = frame.directory.readSync();
+				entry = this.readRetainedDirectory(frame.directory);
 			} catch {
 				return fail("storage_discovery_directory_read_failed");
 			}
@@ -1063,9 +1221,7 @@ export class IncidentRecorderCompactor {
 				if (!sameStorageTopology(frame.topology, storageTopologySignature(after))) {
 					return fail("storage_discovery_directory_changed_during_scan");
 				}
-				try {
-					frame.directory.closeSync();
-				} catch {
+				if (!this.closeRetainedDirectory(frame.directory)) {
 					return fail("storage_discovery_directory_close_failed");
 				}
 				state.stack.pop();
@@ -1082,18 +1238,17 @@ export class IncidentRecorderCompactor {
 			if (!stat.isDirectory()) continue;
 			if (stat.isSymbolicLink()) return fail("storage_discovery_symbolic_directory_rejected");
 			if (frame.depth + 1 > STORAGE_DISCOVERY_MAX_DEPTH) return fail("storage_discovery_depth_bound_exceeded");
-			let directory: Dir;
+			let directory: Dir | undefined;
 			let openedStat: BigIntStats;
 			try {
-				directory = opendirSync(path);
+				directory = this.openRetainedDirectory(path, "storage-discovery");
 				openedStat = lstatSync(path, { bigint: true });
 			} catch {
+				if (directory) this.closeRetainedDirectory(directory);
 				return fail("storage_discovery_directory_open_failed");
 			}
 			if (!sameStorageTopology(storageTopologySignature(stat), storageTopologySignature(openedStat))) {
-				try {
-					directory.closeSync();
-				} catch {}
+				this.closeRetainedDirectory(directory);
 				return fail("storage_discovery_directory_changed_before_open");
 			}
 			state.stack.push({
@@ -1183,6 +1338,7 @@ export class IncidentRecorderCompactor {
 	}
 
 	private ensureDiskAdmission(worstCase: number): void {
+		this.assertActive();
 		if (!Number.isSafeInteger(worstCase) || worstCase < 0)
 			throw new Error("Invalid incident compactor disk reservation");
 		if (!this.advanceStorageDiscovery()) {
@@ -1236,7 +1392,7 @@ export class IncidentRecorderCompactor {
 	}
 
 	get diskPaused(): boolean {
-		return Date.now() < this.pausedUntilMs;
+		return this.disposed || Date.now() < this.pausedUntilMs;
 	}
 	get accountedStorageBytes(): number {
 		return this.storageBytes;
@@ -1261,17 +1417,21 @@ export class IncidentRecorderCompactor {
 			incidentDiscoverySliceEntries: this.incidentDiscoverySliceEntries,
 			sysdigDiscoverySliceEntries: this.sysdigDiscoverySliceEntries,
 			sysdigDiscoveryCandidates: this.sysdigRingDiscovery?.candidates.length ?? 0,
+			retainedDirectories: this.retainedDirectories.size,
+			retainedFileDescriptors: this.retainedDescriptors.size,
+			disposed: this.disposed,
 			...(this.storageDiscovery.error ? { storageDiscoveryError: this.storageDiscovery.error } : {}),
 		};
 	}
 
 	/** @internal Advances one fixed storage-discovery slice without opening journalctl. */
 	advanceBoundedDiscovery(): boolean {
+		this.assertActive();
 		return this.advanceStorageDiscovery();
 	}
 
 	admitObservation(worstCaseBytes = 256 * 1024): boolean {
-		if (this.diskPaused) return false;
+		if (this.disposed || this.diskPaused) return false;
 		try {
 			this.ensureDiskAdmission(worstCaseBytes);
 			return true;
@@ -1287,6 +1447,7 @@ export class IncidentRecorderCompactor {
 		encoding: string,
 		work: { deadlineMs: number; byteBudget: number },
 	): StoppedTargetArtifactAdmission {
+		if (this.disposed) return { state: "error", reason: "compactor_disposed" };
 		const key = sha256(`${runId}\0${sourcePath}\0${encoding}`);
 		let state = this.stoppedTargetStreams.get(key);
 		if (state?.error) return { state: "error", reason: state.error };
@@ -1314,7 +1475,11 @@ export class IncidentRecorderCompactor {
 			let source: number | undefined;
 			let target: number | undefined;
 			try {
-				source = openSync(sourcePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+				source = this.openRetainedDescriptor(
+					sourcePath,
+					fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
+					"stopped-source",
+				);
 				const openedSource = fstatSync(source, { bigint: true });
 				if (
 					openedSource.dev !== metadata.dev ||
@@ -1324,7 +1489,9 @@ export class IncidentRecorderCompactor {
 					openedSource.ctimeMs !== metadata.ctimeMs
 				)
 					throw new Error("artifact_source_identity_changed_before_capture");
-				target = this.withOwnedDirectoryMutation(directory, 1, () => openSync(temporary, "wx", 0o600));
+				target = this.withOwnedDirectoryMutation(directory, 1, () =>
+					this.retainDescriptor(openSync(temporary, "wx", 0o600), temporary, "stopped-target"),
+				);
 				state = {
 					sourcePath,
 					encoding,
@@ -1341,14 +1508,8 @@ export class IncidentRecorderCompactor {
 				};
 				this.stoppedTargetStreams.set(key, state);
 			} catch (error) {
-				if (source !== undefined)
-					try {
-						closeSync(source);
-					} catch {}
-				if (target !== undefined)
-					try {
-						closeSync(target);
-					} catch {}
+				if (source !== undefined) this.closeRetainedDescriptor(source);
+				if (target !== undefined) this.closeRetainedDescriptor(target);
 				try {
 					rmSync(temporary, { force: true });
 				} catch {}
@@ -1366,6 +1527,7 @@ export class IncidentRecorderCompactor {
 		const buffer = Buffer.allocUnsafe(64 * 1024);
 		try {
 			while (remaining > 0 && Date.now() < work.deadlineMs) {
+				this.beforeRetainedDescriptorRead(state.source);
 				const count = readSync(state.source, buffer, 0, Math.min(buffer.length, remaining), null);
 				if (count === 0) {
 					const transaction = acquireIncidentCasTransaction(this.root);
@@ -1394,8 +1556,8 @@ export class IncidentRecorderCompactor {
 							throw new Error("artifact_source_changed_during_capture");
 						}
 						fsyncSync(state.target);
-						closeSync(state.source);
-						closeSync(state.target);
+						this.closeRetainedDescriptor(state.source);
+						this.closeRetainedDescriptor(state.target);
 						const digest = state.hash.digest("hex");
 						const path = join(this.root, "cas", "sha256", digest.slice(0, 2), `${digest}.blob`);
 						this.ensureOwnedDirectory(dirname(path));
@@ -1444,30 +1606,36 @@ export class IncidentRecorderCompactor {
 			};
 		} catch (error) {
 			state.error = error instanceof Error ? error.message : String(error);
-			try {
-				closeSync(state.source);
-			} catch {}
-			try {
-				closeSync(state.target);
-			} catch {}
+			this.closeRetainedDescriptor(state.source);
+			this.closeRetainedDescriptor(state.target);
 			try {
 				rmSync(state.temporary, { force: true });
 			} catch {}
+			state.hash.destroy();
 			this.stoppedTargetStreams.delete(key);
 			return { state: "error", reason: state.error };
 		}
 	}
 
 	async run(): Promise<never> {
+		this.assertActive();
+		try {
+			return await this.runLoop();
+		} finally {
+			this.dispose();
+		}
+	}
+
+	private async runLoop(): Promise<never> {
 		while (!this.advanceStorageDiscovery()) {
 			if (this.storageDiscovery.error) throw new Error(this.storageDiscovery.error);
-			await new Promise<void>((resolve) => setImmediate(resolve));
+			await this.waitForWorkDelay(0);
 		}
 		this.ensureDiskAdmission(256 * 1024);
 		this.ensureOwnedDirectory(this.root);
 		for (;;) {
-			if (this.diskPaused)
-				await new Promise<void>((resolve) => setTimeout(resolve, Math.max(1, this.pausedUntilMs - Date.now())));
+			this.assertActive();
+			if (this.diskPaused) await this.waitForWorkDelay(Math.max(1, this.pausedUntilMs - Date.now()));
 			const args = [
 				`--namespace=${INCIDENT_RECORDER_JOURNAL_NAMESPACE}`,
 				`--identifier=${INCIDENT_RECORDER_JOURNAL_IDENTIFIER}`,
@@ -1491,7 +1659,11 @@ export class IncidentRecorderCompactor {
 				}, 250);
 				readerKillTimer.unref();
 			};
-			const parser = new JournalExportParser((fields) => this.acceptEntry(fields));
+			this.activeReaderTermination = terminateReader;
+			const parser = new JournalExportParser((fields) => {
+				this.assertActive();
+				this.acceptEntry(fields);
+			});
 			let parserError: Error | undefined;
 			child.stdout?.on("data", (chunk: Buffer) => {
 				try {
@@ -1512,6 +1684,9 @@ export class IncidentRecorderCompactor {
 				},
 			);
 			if (readerKillTimer) clearTimeout(readerKillTimer);
+			if (!result.error && this.activeReaderTermination === terminateReader)
+				this.activeReaderTermination = undefined;
+			this.assertActive();
 			try {
 				parser.finish();
 			} catch (error) {
@@ -2207,9 +2382,9 @@ export class IncidentRecorderCompactor {
 		incidentDir: string,
 		request: { runId: string; fromWallTimeMs: number; throughWallTimeMs: number },
 	): void {
+		this.assertActive();
 		const proofPath = join(incidentDir, "journal-pin-scan-proof.json");
 		if (existsSync(proofPath) || this.activePinScans.has(incidentDir) || this.activePinScans.size >= 1) return;
-		this.activePinScans.add(incidentDir);
 		const child = spawn(
 			this.options.journalctlPath ?? "journalctl",
 			[
@@ -2226,6 +2401,7 @@ export class IncidentRecorderCompactor {
 		const cursors = new Set<string>();
 		let cursorBytes = 0;
 		const parser = new JournalExportParser((fields) => {
+			if (this.disposed) return;
 			const cursor = optionalText(fields, "__CURSOR");
 			let parsed: unknown;
 			try {
@@ -2242,7 +2418,12 @@ export class IncidentRecorderCompactor {
 		let error: Error | undefined;
 		let bytes = 0;
 		let killTimer: ReturnType<typeof setTimeout> | undefined;
+		let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
 		const terminate = (): void => {
+			if (deadlineTimer) {
+				clearTimeout(deadlineTimer);
+				deadlineTimer = undefined;
+			}
 			try {
 				child.kill("SIGTERM");
 			} catch {}
@@ -2254,12 +2435,14 @@ export class IncidentRecorderCompactor {
 			}, 250);
 			killTimer.unref();
 		};
-		const deadlineTimer = setTimeout(() => {
+		this.activePinScans.set(incidentDir, terminate);
+		deadlineTimer = setTimeout(() => {
 			error ??= new Error("Pin range scan exceeded its process deadline");
 			terminate();
 		}, PIN_SCAN_DEADLINE_MS);
 		deadlineTimer.unref();
 		child.stdout?.on("data", (chunk: Buffer) => {
+			if (this.disposed) return;
 			bytes += chunk.length;
 			if (bytes > PENDING_ENTRY_MAX_BYTES) {
 				error = new Error("Pin range scan exceeded its byte bound");
@@ -2277,9 +2460,10 @@ export class IncidentRecorderCompactor {
 			error = caught;
 		});
 		child.once("close", (code) => {
-			clearTimeout(deadlineTimer);
+			if (deadlineTimer) clearTimeout(deadlineTimer);
 			if (killTimer) clearTimeout(killTimer);
 			this.activePinScans.delete(incidentDir);
+			if (this.disposed) return;
 			try {
 				parser.finish();
 			} catch (caught) {
@@ -2591,9 +2775,7 @@ export class IncidentRecorderCompactor {
 	}
 
 	private finishSysdigRingDiscovery(state: SysdigRingDiscovery): string[] {
-		try {
-			state.directory.closeSync();
-		} catch {}
+		this.closeRetainedDirectory(state.directory);
 		if (this.sysdigRingDiscovery === state) this.sysdigRingDiscovery = undefined;
 		if (state.candidateCount > SYSDIG_RING_EXPECTED_SEGMENTS)
 			this.addSysdigDiscoveryIssue(state, "ring_has_more_than_configured_12_segments");
@@ -2648,7 +2830,7 @@ export class IncidentRecorderCompactor {
 		for (let discovered = 0; discovered < SYSDIG_DISCOVERY_BATCH_COUNT; discovered += 1) {
 			let entry: Dirent | null;
 			try {
-				entry = state.directory.readSync();
+				entry = this.readRetainedDirectory(state.directory);
 			} catch {
 				this.addSysdigDiscoveryIssue(state, "ring_directory_read_failed");
 				return { complete: true, issues: this.finishSysdigRingDiscovery(state) };
@@ -2692,7 +2874,7 @@ export class IncidentRecorderCompactor {
 		if (this.sysdigRingDiscovery) return { complete: false, issues: [] };
 		let directory: Dir;
 		try {
-			directory = opendirSync(dirname(request.ringBasePath));
+			directory = this.openRetainedDirectory(dirname(request.ringBasePath), "sysdig-discovery");
 		} catch {
 			return { complete: true, issues: ["ring_directory_unavailable"] };
 		}
@@ -2835,6 +3017,7 @@ export class IncidentRecorderCompactor {
 	}
 
 	requestPin(runId: string, incidentDir: string, anchorWallTimeMs: number): void {
+		this.assertActive();
 		const sysdigRequest: SysdigPinRequest = {
 			version: 1,
 			runId,
@@ -2911,7 +3094,7 @@ export class IncidentRecorderCompactor {
 			const before = lstatSync(manifestPath);
 			if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1 || before.size > PENDING_ENTRY_MAX_BYTES)
 				throw new Error("manifest_metadata_invalid");
-			descriptor = openSync(manifestPath, "r");
+			descriptor = this.openRetainedDescriptor(manifestPath, fsConstants.O_RDONLY, "journal-manifest");
 			const opened = fstatSync(descriptor);
 			if (opened.dev !== before.dev || opened.ino !== before.ino || opened.size !== before.size)
 				throw new Error("manifest_identity_changed");
@@ -2945,10 +3128,7 @@ export class IncidentRecorderCompactor {
 			};
 			descriptor = undefined;
 		} catch (error) {
-			if (descriptor !== undefined)
-				try {
-					closeSync(descriptor);
-				} catch {}
+			if (descriptor !== undefined) this.closeRetainedDescriptor(descriptor);
 			try {
 				this.writeOwnedJson(join(incidentDir, "journal-pin-manifest-invalid.json"), {
 					version: 1,
@@ -2961,13 +3141,16 @@ export class IncidentRecorderCompactor {
 	}
 
 	private failJournalManifestValidation(state: JournalManifestValidation, reason: string): void {
-		try {
-			closeSync(state.descriptor);
-		} catch {}
-		if (state.pinValidation)
-			try {
-				closeSync(state.pinValidation.descriptor);
-			} catch {}
+		this.closeRetainedDescriptor(state.descriptor);
+		if (state.pinValidation) {
+			this.closeRetainedDescriptor(state.pinValidation.descriptor);
+			state.pinValidation.hash.destroy();
+		}
+		state.pinValidation = undefined;
+		state.pendingOccurrence = undefined;
+		state.textBuffer = "";
+		state.objectText = "";
+		state.verifiedPins.clear();
 		this.journalManifestValidation = undefined;
 		try {
 			this.writeOwnedJson(join(state.incidentDir, "journal-pin-manifest-invalid.json"), {
@@ -3120,23 +3303,31 @@ export class IncidentRecorderCompactor {
 		) {
 			throw new Error("manifest_pin_identity_or_size_invalid");
 		}
-		const descriptor = openSync(occurrence.pinnedCasPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-		const opened = fstatSync(descriptor);
-		if (opened.dev !== pinned.dev || opened.ino !== pinned.ino || opened.size !== pinned.size) {
-			closeSync(descriptor);
-			throw new Error("manifest_pin_changed_before_hash");
+		const descriptor = this.openRetainedDescriptor(
+			occurrence.pinnedCasPath,
+			fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
+			"journal-pin",
+		);
+		try {
+			const opened = fstatSync(descriptor);
+			if (opened.dev !== pinned.dev || opened.ino !== pinned.ino || opened.size !== pinned.size) {
+				throw new Error("manifest_pin_changed_before_hash");
+			}
+			state.pinValidation = {
+				descriptor,
+				digest: occurrence.cas.digest,
+				bytes: occurrence.cas.bytes,
+				pinnedPath: occurrence.pinnedCasPath,
+				offset: 0,
+				hash: createHash("sha256"),
+				dev: opened.dev,
+				ino: opened.ino,
+				mtimeMs: opened.mtimeMs,
+			};
+		} catch (error) {
+			this.closeRetainedDescriptor(descriptor);
+			throw error;
 		}
-		state.pinValidation = {
-			descriptor,
-			digest: occurrence.cas.digest,
-			bytes: occurrence.cas.bytes,
-			pinnedPath: occurrence.pinnedCasPath,
-			offset: 0,
-			hash: createHash("sha256"),
-			dev: opened.dev,
-			ino: opened.ino,
-			mtimeMs: opened.mtimeMs,
-		};
 		state.pendingOccurrence = undefined;
 	}
 
@@ -3144,6 +3335,7 @@ export class IncidentRecorderCompactor {
 		const pin = state.pinValidation;
 		if (!pin) return;
 		const buffer = Buffer.allocUnsafe(64 * 1024);
+		this.beforeRetainedDescriptorRead(pin.descriptor);
 		const count = readSync(pin.descriptor, buffer, 0, Math.min(buffer.length, pin.bytes - pin.offset), pin.offset);
 		if (count > 0) {
 			pin.hash.update(buffer.subarray(0, count));
@@ -3151,7 +3343,7 @@ export class IncidentRecorderCompactor {
 			return;
 		}
 		const after = fstatSync(pin.descriptor);
-		closeSync(pin.descriptor);
+		this.closeRetainedDescriptor(pin.descriptor);
 		state.pinValidation = undefined;
 		if (
 			pin.offset !== pin.bytes ||
@@ -3167,7 +3359,7 @@ export class IncidentRecorderCompactor {
 
 	private completeJournalManifestValidation(state: JournalManifestValidation): void {
 		const after = fstatSync(state.descriptor);
-		closeSync(state.descriptor);
+		this.closeRetainedDescriptor(state.descriptor);
 		this.journalManifestValidation = undefined;
 		if (
 			after.dev !== state.dev ||
@@ -3234,6 +3426,7 @@ export class IncidentRecorderCompactor {
 				}
 				if (state.fileEnded) throw new Error("manifest_truncated");
 				if (byteChunks >= 4) return;
+				this.beforeRetainedDescriptorRead(state.descriptor);
 				const count = readSync(state.descriptor, buffer, 0, buffer.length, state.offset);
 				byteChunks += 1;
 				if (count === 0) {
@@ -3250,6 +3443,7 @@ export class IncidentRecorderCompactor {
 	}
 
 	processPendingPins(nowMs = Date.now()): void {
+		this.assertActive();
 		this.incidentDiscoverySliceEntries = 0;
 		this.sysdigDiscoverySliceEntries = 0;
 		if (this.sysdigRingDiscovery) {
@@ -3269,7 +3463,7 @@ export class IncidentRecorderCompactor {
 		const incidentRoot = join(this.options.agentDir, "incidents");
 		if (!this.incidentDiscovery) {
 			try {
-				this.incidentDiscovery = opendirSync(incidentRoot);
+				this.incidentDiscovery = this.openRetainedDirectory(incidentRoot, "incident-discovery");
 			} catch {
 				return;
 			}
@@ -3278,18 +3472,14 @@ export class IncidentRecorderCompactor {
 		for (let discovered = 0; discovered < INCIDENT_DISCOVERY_BATCH_COUNT; discovered += 1) {
 			let entry: Dirent | null;
 			try {
-				entry = directory.readSync();
+				entry = this.readRetainedDirectory(directory);
 			} catch {
-				try {
-					directory.closeSync();
-				} catch {}
+				this.closeRetainedDirectory(directory);
 				this.incidentDiscovery = undefined;
 				return;
 			}
 			if (!entry) {
-				try {
-					directory.closeSync();
-				} catch {}
+				this.closeRetainedDirectory(directory);
 				this.incidentDiscovery = undefined;
 				return;
 			}
@@ -3328,7 +3518,8 @@ export class IncidentRecorderCompactor {
 				if (this.retentionProofMatchesRequest(retentionProofPath, "journal", request)) continue;
 				this.startJournalManifestValidation(incidentDir, manifestPath, request);
 				if (this.journalManifestValidation) this.advanceJournalManifestValidation();
-				return;
+				if (this.journalManifestValidation) return;
+				continue;
 			}
 			if (nowMs < request.resolveAfterWallTimeMs) continue;
 			const proofPath = join(incidentDir, "journal-pin-scan-proof.json");
@@ -3382,7 +3573,10 @@ export class IncidentRecorderCompactor {
 			}
 			if (!valid) continue;
 			try {
-				const directory = opendirSync(join(this.root, "refs", "runs", sha256(request.runId)));
+				const directory = this.openRetainedDirectory(
+					join(this.root, "refs", "runs", sha256(request.runId)),
+					"pin-traversal",
+				);
 				this.activePinTraversal = {
 					incidentDir,
 					request,
@@ -3409,7 +3603,23 @@ export class IncidentRecorderCompactor {
 			}
 			let complete = false;
 			for (let count = 0; count < PIN_REFERENCE_BATCH_COUNT; count += 1) {
-				const entry = directory.readSync();
+				let entry: Dirent | null;
+				try {
+					entry = this.readRetainedDirectory(directory);
+				} catch (error) {
+					this.closeRetainedDirectory(directory);
+					state.directory = undefined;
+					this.activePinTraversal = undefined;
+					try {
+						this.writeOwnedJson(join(state.incidentDir, "journal-pin-incomplete.json"), {
+							version: 1,
+							state: "pending_or_incomplete",
+							reason: error instanceof Error ? error.message : String(error),
+							runId: state.request.runId,
+						});
+					} catch {}
+					return;
+				}
 				if (!entry) {
 					complete = true;
 					break;
@@ -3471,9 +3681,8 @@ export class IncidentRecorderCompactor {
 					state.memoryBytes += added;
 				} catch (error) {
 					if (error instanceof Error && error.message.includes("heap bound")) {
-						try {
-							directory.closeSync();
-						} catch {}
+						this.closeRetainedDirectory(directory);
+						state.directory = undefined;
 						this.activePinTraversal = undefined;
 						this.writeOwnedJson(join(state.incidentDir, "journal-pin-incomplete.json"), {
 							version: 1,
@@ -3486,9 +3695,7 @@ export class IncidentRecorderCompactor {
 				}
 			}
 			if (!complete) return;
-			try {
-				directory.closeSync();
-			} catch {}
+			this.closeRetainedDirectory(directory);
 			state.directory = undefined;
 			state.phase = "linking";
 			state.pinCasDir = join(state.incidentDir, "journal-pins", "cas");
