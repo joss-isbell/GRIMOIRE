@@ -1,4 +1,5 @@
 import {
+	chmodSync,
 	existsSync,
 	linkSync,
 	lstatSync,
@@ -16,6 +17,8 @@ import { basename, dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	IncidentRecorderCompactor,
+	incidentJournalReaderArguments,
+	incidentJournalReaderRangeArguments,
 	incidentJournalReaderResumeDelayMs,
 	incidentJournalReaderSinceArgument,
 	incidentJournalReplayFenceDisposition,
@@ -132,7 +135,36 @@ describe("incident compactor survival bounds", () => {
 	it("bounds journal replay to retained time and paces provider reads", () => {
 		const nowMs = 3 * 24 * 60 * 60 * 1_000 + 10_000;
 		expect(incidentJournalReaderSinceArgument(undefined, nowMs)).toBe("--since=@10.000000");
+		expect(incidentJournalReaderRangeArguments(undefined, nowMs)).toMatchObject({
+			sinceArgument: "--since=@10.000000",
+			untilArgument: "--until=@12.000000",
+			reachesLiveEdge: false,
+			seeksCheckpoint: false,
+		});
+		expect(incidentJournalReaderRangeArguments(undefined, nowMs, undefined, 30_000_000n)).toMatchObject({
+			sinceArgument: "--since=@10.000000",
+			untilArgument: "--until=@40.000000",
+		});
+		expect(() => incidentJournalReaderRangeArguments(undefined, nowMs, undefined, 30_000_001n)).toThrow(
+			"Invalid incident journal reader wall time",
+		);
+		const invocation = incidentJournalReaderArguments(undefined, nowMs);
+		expect(invocation.args).toContain("--since=@10.000000");
+		expect(invocation.args).toContain("--until=@12.000000");
+		expect(invocation.args).not.toContain("--follow");
+		expect(invocation.args).not.toContain("--no-tail");
 		expect(incidentJournalReaderSinceArgument({ lastRealtimeUs: "20000000" }, nowMs)).toBe("--since=@19.000000");
+		expect(incidentJournalReaderRangeArguments({ lastRealtimeUs: "20000000" }, nowMs)).toMatchObject({
+			sinceArgument: "--since=@19.000000",
+			untilArgument: "--until=@21.000000",
+			reachesLiveEdge: false,
+			seeksCheckpoint: true,
+		});
+		expect(incidentJournalReaderRangeArguments({ lastRealtimeUs: "20000000" }, nowMs, 25_000_000n)).toMatchObject({
+			sinceArgument: "--since=@25.000000",
+			untilArgument: "--until=@27.000000",
+			seeksCheckpoint: false,
+		});
 		expect(
 			incidentJournalReaderSinceArgument({ lastRealtimeUs: String((nowMs + 6 * 60 * 1_000) * 1_000) }, nowMs),
 		).toBe("--since=@10.000000");
@@ -148,6 +180,45 @@ describe("incident compactor survival bounds", () => {
 		expect(
 			incidentJournalReplayFenceDisposition({ cursor: "durable-cursor", lastRealtimeUs: "invalid" }, "other", "1"),
 		).toBe("missing");
+	});
+
+	it("invokes only finite journal windows and replays the durable cursor overlap", async () => {
+		const target = fixture("finite-journal-windows");
+		mkdirSync(target.agentDir, { recursive: true, mode: 0o700 });
+		const journalctl = join(target.root, "fake-journalctl.sh");
+		const argumentsLog = join(target.root, "arguments.log");
+		const realtimeUs = String(Date.now() * 1_000);
+		writeFileSync(
+			journalctl,
+			`#!/bin/sh
+printf '%s\n' "$*" >> '${argumentsLog}'
+printf '%s\n' '__CURSOR=fake-cursor' '_MACHINE_ID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' '_BOOT_ID=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' '_STREAM_ID=cccccccccccccccccccccccccccccccc' '__REALTIME_TIMESTAMP=${realtimeUs}' '__MONOTONIC_TIMESTAMP=1' 'SYSLOG_IDENTIFIER=prime-agent-capture' '_TRANSPORT=stdout' '_UID=1000' '_PID=1' 'MESSAGE={}' ''
+`,
+			{ mode: 0o700 },
+		);
+		chmodSync(journalctl, 0o700);
+		const compactor = createCompactor({ agentDir: target.agentDir, freeReserveBytes: 0, journalctlPath: journalctl });
+		const running = compactor.run();
+		for (let attempt = 0; attempt < 100; attempt += 1) {
+			if (existsSync(argumentsLog) && readFileSync(argumentsLog, "utf8").trim().split("\n").length >= 2) break;
+			await new Promise((resolve) => setTimeout(resolve, 10));
+		}
+		const invocations = readFileSync(argumentsLog, "utf8").trim().split("\n");
+		expect(invocations.length).toBeGreaterThanOrEqual(2);
+		for (const invocation of invocations) {
+			expect(invocation).toContain("--since=@");
+			expect(invocation).toContain("--until=@");
+			expect(invocation).not.toContain("--follow");
+			expect(invocation).not.toContain("--no-tail");
+		}
+		const replaySinceUs = BigInt(realtimeUs) - 1_000_000n;
+		const replaySince = `--since=@${replaySinceUs / 1_000_000n}.${(replaySinceUs % 1_000_000n)
+			.toString()
+			.padStart(6, "0")}`;
+		expect(invocations[1]).toContain(replaySince);
+		expect(readdirSync(join(target.agentDir, "incident-recorder", "refs", "gaps"))).toHaveLength(1);
+		compactor.dispose();
+		await expect(running).rejects.toThrow("Incident recorder compactor is disposed");
 	});
 
 	it("discovers a scaled CAS backlog in fixed slices and counts each regular hard-linked inode once", () => {

@@ -52,6 +52,10 @@ const CHECKPOINT_BATCH_ENTRIES = 64;
 const CHECKPOINT_MAX_DELAY_MS = 1_000;
 const JOURNAL_READER_BYTES_PER_SECOND = 256 * 1024;
 const JOURNAL_READER_REPLAY_OVERLAP_US = 1_000_000n;
+const JOURNAL_READER_WINDOW_US = 2_000_000n;
+const JOURNAL_READER_EMPTY_WINDOW_MAX_US = 30_000_000n;
+const JOURNAL_READER_HISTORICAL_YIELD_MS = 10;
+const JOURNAL_READER_LIVE_EDGE_DELAY_MS = 500;
 const ASSEMBLY_DEADLINE_MS = 5_000;
 const ASSEMBLY_MAX_COUNT = 256;
 const ASSEMBLY_MAX_BYTES = 8 * 1024 * 1024;
@@ -274,22 +278,81 @@ export function incidentJournalReaderResumeDelayMs(
 	return Math.max(0, Math.ceil((chunkBytes * 1_000) / bytesPerSecond) - Math.floor(processingMs));
 }
 
-export function incidentJournalReaderSinceArgument(
+interface IncidentJournalReaderRange {
+	sinceArgument: string;
+	untilArgument: string;
+	sinceRealtimeUs: bigint;
+	untilRealtimeUs: bigint;
+	reachesLiveEdge: boolean;
+	seeksCheckpoint: boolean;
+}
+
+function incidentJournalRealtimeArgument(kind: "since" | "until", realtimeUs: bigint): string {
+	const seconds = realtimeUs / 1_000_000n;
+	const micros = (realtimeUs % 1_000_000n).toString().padStart(6, "0");
+	return `--${kind}=@${seconds}.${micros}`;
+}
+
+export function incidentJournalReaderRangeArguments(
 	checkpoint: Pick<CursorCheckpoint, "lastRealtimeUs"> | undefined,
 	nowMs = Date.now(),
-): string {
-	if (!Number.isFinite(nowMs)) throw new Error("Invalid incident journal reader wall time");
+	minimumSinceUs?: bigint,
+	windowUs = JOURNAL_READER_WINDOW_US,
+): IncidentJournalReaderRange {
+	if (
+		!Number.isFinite(nowMs) ||
+		(minimumSinceUs !== undefined && minimumSinceUs < 0n) ||
+		windowUs < 1n ||
+		windowUs > JOURNAL_READER_EMPTY_WINDOW_MAX_US
+	)
+		throw new Error("Invalid incident journal reader wall time");
 	const nowUs = BigInt(Math.max(0, Math.trunc(nowMs))) * 1_000n;
 	let sinceUs = BigInt(Math.max(0, Math.trunc(nowMs - INCIDENT_DIAGNOSTIC_RETENTION_MS))) * 1_000n;
+	let checkpointUs: bigint | undefined;
 	if (checkpoint && /^[0-9]+$/.test(checkpoint.lastRealtimeUs)) {
-		const checkpointUs = BigInt(checkpoint.lastRealtimeUs);
+		checkpointUs = BigInt(checkpoint.lastRealtimeUs);
 		const replayFromUs =
 			checkpointUs > JOURNAL_READER_REPLAY_OVERLAP_US ? checkpointUs - JOURNAL_READER_REPLAY_OVERLAP_US : 0n;
 		if (checkpointUs <= nowUs + 5n * 60n * 1_000_000n && replayFromUs > sinceUs) sinceUs = replayFromUs;
 	}
-	const seconds = sinceUs / 1_000_000n;
-	const micros = (sinceUs % 1_000_000n).toString().padStart(6, "0");
-	return `--since=@${seconds}.${micros}`;
+	if (minimumSinceUs !== undefined && minimumSinceUs > sinceUs) sinceUs = minimumSinceUs;
+	if (sinceUs > nowUs) sinceUs = nowUs;
+	const untilUs = sinceUs + windowUs < nowUs ? sinceUs + windowUs : nowUs;
+	return {
+		sinceArgument: incidentJournalRealtimeArgument("since", sinceUs),
+		untilArgument: incidentJournalRealtimeArgument("until", untilUs),
+		sinceRealtimeUs: sinceUs,
+		untilRealtimeUs: untilUs,
+		reachesLiveEdge: untilUs === nowUs,
+		seeksCheckpoint: checkpointUs !== undefined && sinceUs <= checkpointUs,
+	};
+}
+
+export function incidentJournalReaderSinceArgument(
+	checkpoint: Pick<CursorCheckpoint, "lastRealtimeUs"> | undefined,
+	nowMs = Date.now(),
+): string {
+	return incidentJournalReaderRangeArguments(checkpoint, nowMs).sinceArgument;
+}
+
+export function incidentJournalReaderArguments(
+	checkpoint: Pick<CursorCheckpoint, "lastRealtimeUs"> | undefined,
+	nowMs = Date.now(),
+	minimumSinceUs?: bigint,
+	windowUs = JOURNAL_READER_WINDOW_US,
+): IncidentJournalReaderRange & { args: string[] } {
+	const range = incidentJournalReaderRangeArguments(checkpoint, nowMs, minimumSinceUs, windowUs);
+	return {
+		...range,
+		args: [
+			`--namespace=${INCIDENT_RECORDER_JOURNAL_NAMESPACE}`,
+			`--identifier=${INCIDENT_RECORDER_JOURNAL_IDENTIFIER}`,
+			"--output=export",
+			"--all",
+			range.sinceArgument,
+			range.untilArgument,
+		],
+	};
 }
 
 interface JournalReplayFence {
@@ -957,6 +1020,9 @@ export class IncidentRecorderCompactor {
 	private readonly retainedDescriptors = new Map<number, { kind: RetainedDescriptorKind; path: string }>();
 	private readonly disposalWaiters = new Set<() => void>();
 	private activeReaderTermination?: () => void;
+	private journalReadFrontier?: Pick<CursorCheckpoint, "cursor" | "lastRealtimeUs">;
+	private journalScanFrontierUs?: bigint;
+	private journalWindowUs = JOURNAL_READER_WINDOW_US;
 	private disposed = false;
 
 	constructor(private readonly options: IncidentRecorderCompactorOptions) {
@@ -1981,18 +2047,41 @@ export class IncidentRecorderCompactor {
 			this.assertActive();
 			this.throwCheckpointPersistenceError();
 			if (this.diskPaused) await this.waitForWorkDelay(Math.max(1, this.pausedUntilMs - Date.now()));
-			const args = [
-				`--namespace=${INCIDENT_RECORDER_JOURNAL_NAMESPACE}`,
-				`--identifier=${INCIDENT_RECORDER_JOURNAL_IDENTIFIER}`,
-				"--output=export",
-				"--all",
-				"--follow",
-				"--no-tail",
-				incidentJournalReaderSinceArgument(this.checkpoint),
-			];
-			let replayFence: JournalReplayFence | undefined = this.checkpoint
-				? { cursor: this.checkpoint.cursor, lastRealtimeUs: this.checkpoint.lastRealtimeUs }
-				: undefined;
+			const rangeSource = this.journalReadFrontier ?? this.checkpoint;
+			const range = incidentJournalReaderArguments(
+				rangeSource,
+				Date.now(),
+				this.journalScanFrontierUs,
+				this.journalWindowUs,
+			);
+			const args = range.args;
+			let replayFence: JournalReplayFence | undefined =
+				range.seeksCheckpoint && rangeSource
+					? { cursor: rangeSource.cursor, lastRealtimeUs: rangeSource.lastRealtimeUs }
+					: undefined;
+			const abandonReplayFence = (observedCursor?: string | null, observedRealtimeUs?: string | null): void => {
+				if (!replayFence) return;
+				this.flushAllIncomplete("journal_cursor_removed_before_occurrence_completion");
+				this.writeGap({
+					reason: "journal_cursor_not_found_inside_retained_overlap",
+					removedCursor: replayFence.cursor,
+					lastRealtimeUs: replayFence.lastRealtimeUs,
+					observedCursor,
+					observedRealtimeUs,
+				});
+				this.checkpoint = undefined;
+				this.journalReadFrontier = undefined;
+				this.discardPendingCheckpoint();
+				this.wrapperSequences.clear();
+				this.producerSequences.clear();
+				this.pendingEntries.length = 0;
+				this.pendingEntryHead = 0;
+				this.pendingEntryBytes = 0;
+				rmSync(this.checkpointPath, { force: true });
+				fsyncDirectory(dirname(this.checkpointPath));
+				replayFence = undefined;
+			};
+			let acceptedEntries = 0;
 			const child = spawn(this.options.journalctlPath ?? "journalctl", args, { stdio: ["ignore", "pipe", "pipe"] });
 			let readerKillTimer: ReturnType<typeof setTimeout> | undefined;
 			let readerResumeTimer: ReturnType<typeof setTimeout> | undefined;
@@ -2013,9 +2102,9 @@ export class IncidentRecorderCompactor {
 			this.activeReaderTermination = terminateReader;
 			const parser = new JournalExportParser((fields) => {
 				this.assertActive();
+				const observedCursor = optionalText(fields, "__CURSOR");
+				const observedRealtimeUs = optionalText(fields, "__REALTIME_TIMESTAMP");
 				if (replayFence) {
-					const observedCursor = optionalText(fields, "__CURSOR");
-					const observedRealtimeUs = optionalText(fields, "__REALTIME_TIMESTAMP");
 					const disposition = incidentJournalReplayFenceDisposition(
 						replayFence,
 						observedCursor,
@@ -2026,25 +2115,13 @@ export class IncidentRecorderCompactor {
 						replayFence = undefined;
 						return;
 					}
-					this.writeGap({
-						reason: "journal_cursor_not_found_inside_retained_overlap",
-						removedCursor: replayFence.cursor,
-						lastRealtimeUs: replayFence.lastRealtimeUs,
-						observedCursor,
-						observedRealtimeUs,
-					});
-					this.checkpoint = undefined;
-					this.discardPendingCheckpoint();
-					this.wrapperSequences.clear();
-					this.producerSequences.clear();
-					this.pendingEntries.length = 0;
-					this.pendingEntryHead = 0;
-					this.pendingEntryBytes = 0;
-					rmSync(this.checkpointPath, { force: true });
-					fsyncDirectory(dirname(this.checkpointPath));
-					replayFence = undefined;
+					abandonReplayFence(observedCursor, observedRealtimeUs);
 				}
 				this.acceptEntry(fields);
+				if (observedCursor && observedRealtimeUs && /^[0-9]+$/.test(observedRealtimeUs)) {
+					this.journalReadFrontier = { cursor: observedCursor, lastRealtimeUs: observedRealtimeUs };
+				}
+				acceptedEntries += 1;
 			});
 			let parserError: Error | undefined;
 			child.stdout?.on("data", (chunk: Buffer) => {
@@ -2085,9 +2162,17 @@ export class IncidentRecorderCompactor {
 			} catch (error) {
 				parserError ??= error instanceof Error ? error : new Error(String(error));
 			}
-			this.flushAllIncomplete("journal_stream_disconnected_before_occurrence_completion");
+			if (
+				!parserError &&
+				replayFence &&
+				/^[0-9]+$/.test(replayFence.lastRealtimeUs) &&
+				range.untilRealtimeUs >= BigInt(replayFence.lastRealtimeUs) + JOURNAL_READER_REPLAY_OVERLAP_US
+			) {
+				abandonReplayFence();
+			}
 			this.flushPendingCheckpoint();
 			if (parserError) {
+				this.flushAllIncomplete("journal_stream_disconnected_before_occurrence_completion");
 				const poison = parser.poisonFields();
 				const poisonCursor = optionalText(poison, "__CURSOR");
 				const poisonMachine = optionalText(poison, "_MACHINE_ID");
@@ -2104,11 +2189,26 @@ export class IncidentRecorderCompactor {
 				if ((parserError as NodeJS.ErrnoException).code === "ENOSPC" || this.diskPaused) continue;
 				if (poisonCursor && poisonMachine && poisonBoot && poisonRealtime) {
 					this.commitCursor(poisonCursor, poisonMachine, poisonBoot, poisonInvocation, poisonRealtime);
+					this.journalReadFrontier = { cursor: poisonCursor, lastRealtimeUs: poisonRealtime };
 					this.flushPendingCheckpoint();
 					continue;
 				}
 				throw parserError;
 			}
+			if (!result.error && result.code === 0) {
+				this.journalScanFrontierUs = acceptedEntries === 0 ? range.untilRealtimeUs : undefined;
+				this.journalWindowUs =
+					acceptedEntries === 0
+						? this.journalWindowUs * 2n < JOURNAL_READER_EMPTY_WINDOW_MAX_US
+							? this.journalWindowUs * 2n
+							: JOURNAL_READER_EMPTY_WINDOW_MAX_US
+						: JOURNAL_READER_WINDOW_US;
+				await this.waitForWorkDelay(
+					range.reachesLiveEdge ? JOURNAL_READER_LIVE_EDGE_DELAY_MS : JOURNAL_READER_HISTORICAL_YIELD_MS,
+				);
+				continue;
+			}
+			this.flushAllIncomplete("journal_stream_disconnected_before_occurrence_completion");
 			if (
 				this.checkpoint?.cursor &&
 				result.code !== 0 &&
@@ -2124,6 +2224,7 @@ export class IncidentRecorderCompactor {
 					journalctl: stderr,
 				});
 				this.checkpoint = undefined;
+				this.journalReadFrontier = undefined;
 				this.discardPendingCheckpoint();
 				this.wrapperSequences.clear();
 				this.producerSequences.clear();
