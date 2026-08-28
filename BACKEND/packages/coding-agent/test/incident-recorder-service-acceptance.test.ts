@@ -230,16 +230,11 @@ describe("isolated automatic causal recorder service", () => {
 		expect(service).toBeDefined();
 		if (!service) throw new Error("private service was not started");
 		expect(getProcessStartId(service.pid)).toBe(service.processStartId);
-		const cmdline = readFileSync(`/proc/${service.pid}/cmdline`, "utf8").split("\0").filter(Boolean);
-		const expectedLaunchCmdline = [nodePath, entrypointPath, "--incident-recorder-service", "--agent-dir", agentDir];
-		const launchedWithServiceArgs =
-			cmdline.length === expectedLaunchCmdline.length &&
-			cmdline.every((arg, index) => arg === expectedLaunchCmdline[index]);
-		const titleRewritten = cmdline.length === 1 && cmdline[0] === "pi";
-		expect(launchedWithServiceArgs || titleRewritten).toBe(true);
 		const completionPath = join(runDir, ".service-finalization-complete");
 		expect(await waitFor(() => existsSync(completionPath), 40, 50)).toBe(true);
 		expect(JSON.parse(readFileSync(completionPath, "utf8"))).toMatchObject({ classification: "normal" });
+		const cmdline = readFileSync(`/proc/${service.pid}/cmdline`, "utf8").split("\0").filter(Boolean);
+		expect(cmdline).toEqual(["prime-agent"]);
 		const servicePid = service.pid;
 		await stopOwnedService();
 		expect(getProcessStartId(servicePid)).toBeUndefined();
