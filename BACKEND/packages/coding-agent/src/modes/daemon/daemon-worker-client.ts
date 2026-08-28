@@ -19,7 +19,10 @@ type DaemonWorkerWireCommand = DaemonCommand | DaemonWorkerCommand;
 type DaemonWorkerAuthentication = Omit<Extract<DaemonWorkerCommand, { type: "worker_auth" }>, "id" | "type" | "token">;
 
 export type DaemonWorkerFrameListener = (frame: PrivateFrame<DaemonWorkerFrameHeader>) => void;
-export type DaemonWorkerCloseListener = (error: Error) => void;
+export type DaemonWorkerRecoveryTriggerContext =
+	| { readonly triggerRequestId: string; readonly triggerUnavailableReason?: never }
+	| { readonly triggerRequestId?: never; readonly triggerUnavailableReason: "none" | "multiple" };
+export type DaemonWorkerCloseListener = (error: Error, trigger: DaemonWorkerRecoveryTriggerContext) => void;
 type DaemonHello = Extract<DaemonOutbound, { type: "daemon_hello" }>;
 type WorkerRequestOutcome =
 	| "success"
@@ -370,6 +373,11 @@ export class DaemonWorkerClient {
 		this.socket = undefined;
 		this.channel = undefined;
 		this.clientGeneration = undefined;
+		const pendingRequestIds = [...this.pending.keys()];
+		const trigger: DaemonWorkerRecoveryTriggerContext =
+			pendingRequestIds.length === 1
+				? { triggerRequestId: pendingRequestIds[0] }
+				: { triggerUnavailableReason: pendingRequestIds.length === 0 ? "none" : "multiple" };
 		for (const pending of this.pending.values()) {
 			pending.diagnostic.terminalOutcome = "socket_closed";
 			appendSupervisorDiagnosticEvent("worker_request_socket_closed", {
@@ -384,12 +392,13 @@ export class DaemonWorkerClient {
 			clientGeneration,
 			socketPath: this.socketPath,
 			error,
-			pendingRequestIds: [...this.pending.keys()],
+			pendingRequestIds,
+			...trigger,
 			helloWaiterCount: this.helloWaiters.size,
 		});
 		this.rejectAll(error);
 		for (const listener of [...this.closeListeners]) {
-			listener(error);
+			listener(error, trigger);
 		}
 	}
 }

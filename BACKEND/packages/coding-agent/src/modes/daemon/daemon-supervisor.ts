@@ -108,7 +108,7 @@ import {
 	isDaemonShutdownAdmissionActive,
 	waitForDaemonStartupFence,
 } from "./daemon-supervisor-ownership.js";
-import { DaemonWorkerClient } from "./daemon-worker-client.js";
+import { DaemonWorkerClient, type DaemonWorkerRecoveryTriggerContext } from "./daemon-worker-client.js";
 import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
 	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
@@ -329,6 +329,8 @@ interface ResidentWorker {
 	snapshotLoads: Map<string, Promise<DaemonAttachResult>>;
 	recovery?: Promise<void>;
 	deferredRecovery?: Promise<void>;
+	recoveryEpisode?: WorkerRecoveryEpisodeContext;
+	recoveryEpisodeSource?: Readonly<Record<string, string>>;
 	intentionalStop: boolean;
 	stopRevision: number;
 	launchEnv?: Record<string, string>;
@@ -338,6 +340,19 @@ interface ResidentWorker {
 	promotedOwnerClientId?: string;
 	updateRestartPrepareClient?: DaemonWorkerClient;
 	eventSummaryRefresh?: WorkerEventSummaryRefreshState;
+}
+
+type WorkerRecoveryTriggerUnavailableReason =
+	| DaemonWorkerRecoveryTriggerContext["triggerUnavailableReason"]
+	| "supervisor_startup"
+	| "attach_request"
+	| "supervisor_internal_close"
+	| "supervisor_internal_recovery";
+
+interface WorkerRecoveryEpisodeContext {
+	readonly recoveryId: string;
+	readonly triggerRequestId?: string;
+	readonly triggerUnavailableReason?: WorkerRecoveryTriggerUnavailableReason;
 }
 
 interface SnapshotDuplicateValidation {
@@ -1256,6 +1271,46 @@ export class DaemonSupervisor {
 			sourceOperationType: command.type,
 			sourceClientId: this.protocolClientId(client),
 		};
+	}
+
+	private beginWorkerRecoveryEpisode(
+		worker: ResidentWorker,
+		trigger:
+			| DaemonWorkerRecoveryTriggerContext
+			| { readonly triggerUnavailableReason: Exclude<WorkerRecoveryTriggerUnavailableReason, undefined> },
+		source: Record<string, unknown> = {},
+	): WorkerRecoveryEpisodeContext {
+		if (worker.recoveryEpisode) {
+			return worker.recoveryEpisode;
+		}
+		const episode: WorkerRecoveryEpisodeContext = { recoveryId: randomUUID(), ...trigger };
+		const episodeSource = {
+			...(typeof source.sourceOperation === "string" ? { sourceOperation: source.sourceOperation } : {}),
+			...(typeof source.sourceOperationType === "string" ? { sourceOperationType: source.sourceOperationType } : {}),
+			...(typeof source.sourceClientId === "string" ? { sourceClientId: source.sourceClientId } : {}),
+		};
+		worker.recoveryEpisode = episode;
+		worker.recoveryEpisodeSource = episodeSource;
+		appendSupervisorDiagnosticEvent("worker_recovery_episode_started", {
+			workerId: worker.descriptor.workerId,
+			workerPid: worker.descriptor.pid,
+			workerProcessStartId: worker.descriptor.processStartId,
+			rootActiveSessionId: worker.descriptor.rootActiveSessionId,
+			...episodeSource,
+			...episode,
+		});
+		return episode;
+	}
+
+	private workerRecoveryDiagnosticCause(worker: ResidentWorker): Record<string, unknown> {
+		return worker.recoveryEpisode ? { ...worker.recoveryEpisode } : {};
+	}
+
+	private clearWorkerRecoveryEpisode(worker: ResidentWorker, episode: WorkerRecoveryEpisodeContext): void {
+		if (worker.recoveryEpisode === episode) {
+			worker.recoveryEpisode = undefined;
+			worker.recoveryEpisodeSource = undefined;
+		}
 	}
 
 	private async releaseClientSessionInputPauses(
@@ -2887,6 +2942,7 @@ export class DaemonSupervisor {
 				rootActiveSessionId: worker.descriptor.rootActiveSessionId,
 				supervisorGeneration: this.generation,
 				supervisorSocketPath: this.socketPath,
+				...this.workerRecoveryDiagnosticCause(worker),
 			});
 			try {
 				await client.connect(Math.min(500, Math.max(50, deadline - Date.now())));
@@ -2898,7 +2954,7 @@ export class DaemonSupervisor {
 				);
 				await this.assertRecoveryAllowed();
 				client.onFrame((frame) => this.handleWorkerFrame(worker, frame));
-				client.onClose((error) => void this.handleWorkerClose(worker, client, error));
+				client.onClose((error, trigger) => void this.handleWorkerClose(worker, client, error, trigger));
 				worker.client?.close();
 				worker.client = client;
 				return client;
@@ -2935,7 +2991,7 @@ export class DaemonSupervisor {
 				supportsExtensionUi,
 			},
 			30_000,
-			diagnosticCause,
+			{ ...diagnosticCause, ...this.workerRecoveryDiagnosticCause(worker) },
 		);
 		if (!response.success) {
 			throw new Error(response.error);
@@ -2999,11 +3055,19 @@ export class DaemonSupervisor {
 				return;
 			}
 			this.log(`Could not adopt worker ${worker.descriptor.workerId}: ${String(error)}`);
-			await this.recoverWorker(worker);
+			const recoveryEpisode = this.beginWorkerRecoveryEpisode(worker, {
+				triggerUnavailableReason: "supervisor_startup",
+			});
+			await this.recoverWorker(worker, recoveryEpisode);
 		}
 	}
 
-	private async handleWorkerClose(worker: ResidentWorker, client: DaemonWorkerClient, error: Error): Promise<void> {
+	private async handleWorkerClose(
+		worker: ResidentWorker,
+		client: DaemonWorkerClient,
+		error: Error,
+		trigger: DaemonWorkerRecoveryTriggerContext = { triggerUnavailableReason: "none" },
+	): Promise<void> {
 		if (worker.client !== client) {
 			return;
 		}
@@ -3040,22 +3104,31 @@ export class DaemonSupervisor {
 		if (this.shuttingDown || worker.intentionalStop) {
 			return;
 		}
+		const existingRecoveryEpisode = worker.recoveryEpisode;
+		const recoveryEpisode = this.beginWorkerRecoveryEpisode(worker, trigger);
+		const createdRecoveryEpisode =
+			existingRecoveryEpisode === undefined && worker.recoveryEpisode === recoveryEpisode;
 		try {
 			await this.assertRecoveryAllowed();
 		} catch (recoveryError) {
 			if (!isSupervisorGenerationStale(recoveryError)) {
-				this.deferWorkerRecovery(worker, error);
+				this.deferWorkerRecovery(worker, error, recoveryEpisode);
+			} else if (createdRecoveryEpisode) {
+				this.clearWorkerRecoveryEpisode(worker, recoveryEpisode);
 			}
 			return;
 		}
 		if (!this.isWorkerRecoveryEligible(worker)) {
+			if (createdRecoveryEpisode) {
+				this.clearWorkerRecoveryEpisode(worker, recoveryEpisode);
+			}
 			return;
 		}
 		worker.descriptor.lifecycle = "recovering";
 		worker.descriptor.lastError = error.message;
 		this.persistWorker(worker);
 		void this.syncAgentPeers().catch(() => undefined);
-		void this.recoverWorker(worker);
+		void this.recoverWorker(worker, recoveryEpisode);
 	}
 
 	private isWorkerRecoveryEligible(worker: ResidentWorker): boolean {
@@ -3072,16 +3145,31 @@ export class DaemonSupervisor {
 		);
 	}
 
-	private deferWorkerRecovery(worker: ResidentWorker, disconnectError: Error): void {
+	private deferWorkerRecovery(
+		worker: ResidentWorker,
+		disconnectError: Error,
+		recoveryEpisode = this.beginWorkerRecoveryEpisode(worker, {
+			triggerUnavailableReason: "supervisor_internal_close",
+		}),
+	): void {
 		if (worker.deferredRecovery) {
 			return;
 		}
-		worker.deferredRecovery = this.resumeDeferredWorkerRecovery(worker, disconnectError).finally(() => {
-			worker.deferredRecovery = undefined;
-		});
+		worker.deferredRecovery = this.resumeDeferredWorkerRecovery(worker, disconnectError, recoveryEpisode).finally(
+			() => {
+				worker.deferredRecovery = undefined;
+				if (!worker.recovery) {
+					this.clearWorkerRecoveryEpisode(worker, recoveryEpisode);
+				}
+			},
+		);
 	}
 
-	private async resumeDeferredWorkerRecovery(worker: ResidentWorker, disconnectError: Error): Promise<void> {
+	private async resumeDeferredWorkerRecovery(
+		worker: ResidentWorker,
+		disconnectError: Error,
+		recoveryEpisode: WorkerRecoveryEpisodeContext,
+	): Promise<void> {
 		while (true) {
 			await unrefDelay(DEFERRED_RECOVERY_RECHECK_MS);
 			if (!this.isWorkerRecoveryCandidate(worker)) {
@@ -3108,7 +3196,7 @@ export class DaemonSupervisor {
 			worker.descriptor.lastError = disconnectError.message;
 			this.persistWorker(worker);
 			void this.syncAgentPeers().catch(() => undefined);
-			void this.recoverWorker(worker);
+			void this.recoverWorker(worker, recoveryEpisode);
 			return;
 		}
 	}
@@ -3294,14 +3382,21 @@ export class DaemonSupervisor {
 		}
 	}
 
-	private async recoverWorker(worker: ResidentWorker): Promise<void> {
+	private async recoverWorker(
+		worker: ResidentWorker,
+		recoveryEpisode = this.beginWorkerRecoveryEpisode(worker, {
+			triggerUnavailableReason: "supervisor_internal_recovery",
+		}),
+	): Promise<void> {
 		if (this.isWorkerRecoveryCancelled(worker)) {
+			this.clearWorkerRecoveryEpisode(worker, recoveryEpisode);
 			return;
 		}
 		if (worker.descriptor.ownerClientId && !worker.launchEnv && !isProcessAlive(worker.descriptor.pid)) {
 			worker.descriptor.lifecycle = "failed";
 			worker.descriptor.lastError = "Waiting for the owning client to reconnect";
 			this.persistWorker(worker);
+			this.clearWorkerRecoveryEpisode(worker, recoveryEpisode);
 			return;
 		}
 		if (worker.recovery) {
@@ -3407,6 +3502,7 @@ export class DaemonSupervisor {
 			this.log(`Worker ${worker.descriptor.workerId} failed after three recovery attempts`);
 		})().finally(() => {
 			worker.recovery = undefined;
+			this.clearWorkerRecoveryEpisode(worker, recoveryEpisode);
 		});
 		return worker.recovery;
 	}
@@ -3734,11 +3830,10 @@ export class DaemonSupervisor {
 		};
 		const previousRoot = worker.summaries.get(worker.descriptor.rootActiveSessionId);
 		const previousPeerProjection = previousRoot ? this.agentPeerSummary(previousRoot) : undefined;
-		const response = await capturedClient.request(
-			{ type: "list" },
-			WORKER_EVENT_SUMMARY_REFRESH_INTERVAL_MS,
-			diagnosticCause,
-		);
+		const response = await capturedClient.request({ type: "list" }, WORKER_EVENT_SUMMARY_REFRESH_INTERVAL_MS, {
+			...diagnosticCause,
+			...this.workerRecoveryDiagnosticCause(worker),
+		});
 		assertCurrent();
 		const summaries = sessionSummariesFromResponse(response);
 		const candidateSummaries = new Map(summaries.map((summary) => [summary.activeSessionId ?? summary.id, summary]));
@@ -4296,7 +4391,12 @@ export class DaemonSupervisor {
 				ownedWorker.descriptor.lifecycle = "recovering";
 				ownedWorker.descriptor.consecutiveFailures = 0;
 				this.persistWorker(ownedWorker);
-				await this.recoverWorker(ownedWorker);
+				const recoveryEpisode = this.beginWorkerRecoveryEpisode(
+					ownedWorker,
+					{ triggerUnavailableReason: "attach_request" },
+					diagnosticCause,
+				);
+				await this.recoverWorker(ownedWorker, recoveryEpisode);
 			}
 		}
 		const match = await this.findWorkerForClient(client, command.activeSessionId);

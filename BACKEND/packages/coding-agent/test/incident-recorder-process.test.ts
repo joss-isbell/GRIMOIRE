@@ -389,11 +389,58 @@ child.once("close", (code, signal) => {
 		expect(result.classification).toBe("signal_sigkill");
 	});
 
+	it("bounds unavailable worker close triggers for zero and multiple pending requests", async () => {
+		const target = fixture("process.exit(0)");
+		const workerSocket = join(target.root, "worker-trigger.sock");
+		const sockets = new Set<Socket>();
+		let connectionNumber = 0;
+		const server = createServer((socket) => {
+			sockets.add(socket);
+			socket.once("close", () => sockets.delete(socket));
+			const currentConnection = ++connectionNumber;
+			if (currentConnection === 1) {
+				setImmediate(() => socket.destroy());
+				return;
+			}
+			let requestCount = 0;
+			const decoder = new PrivateFrameDecoder(isDaemonWorkerFrameHeader);
+			socket.on("data", (chunk: Buffer) => {
+				for (const frame of decoder.push(chunk)) {
+					if (frame.header.kind !== "command") continue;
+					requestCount += 1;
+					if (requestCount === 2) socket.destroy();
+				}
+			});
+		});
+		await new Promise<void>((resolveListen, rejectListen) => {
+			server.once("error", rejectListen);
+			server.listen(workerSocket, resolveListen);
+		});
+		const client = new DaemonWorkerClient(workerSocket);
+		const triggers: Array<{ triggerRequestId?: string; triggerUnavailableReason?: string }> = [];
+		client.onClose((_error, trigger) => triggers.push(trigger));
+		try {
+			await client.connect();
+			await new Promise<void>((resolveClose) => {
+				const check = () => (triggers.length === 1 ? resolveClose() : setImmediate(check));
+				check();
+			});
+			await client.connect();
+			await Promise.allSettled([client.request({ type: "list" }, 250), client.request({ type: "list" }, 250)]);
+		} finally {
+			client.close();
+			for (const socket of sockets) socket.destroy();
+			await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+		}
+		expect(triggers).toEqual([{ triggerUnavailableReason: "none" }, { triggerUnavailableReason: "multiple" }]);
+	});
+
 	it("keeps one worker request identity through success, timeout, socket close, and reconnect", async () => {
 		const target = fixture("process.exit(0)");
 		const workerSocket = join(target.root, "worker.sock");
 		const sockets = new Set<Socket>();
 		const wireRequestIds: string[] = [];
+		const closeTriggers: Array<{ triggerRequestId?: string; triggerUnavailableReason?: string }> = [];
 		let connectionNumber = 0;
 		const server = createServer((socket) => {
 			sockets.add(socket);
@@ -457,6 +504,7 @@ child.once("close", (code, signal) => {
 			sourceClientId: "fixture-client-1",
 		};
 		const client = new DaemonWorkerClient(workerSocket, diagnosticContext);
+		client.onClose((_error, trigger) => closeTriggers.push(trigger));
 		try {
 			expect(configureIncidentCaptureEmitter()).toBe(true);
 			await client.connect();
@@ -525,6 +573,10 @@ child.once("close", (code, signal) => {
 		});
 		expect(socketClosed?.durationMs).toEqual(expect.any(Number));
 		expect(events.indexOf(socketClosed!)).toBeLessThan(events.indexOf(ends[2]));
+		expect(closeTriggers).toEqual([{ triggerRequestId: requestIds[2] }]);
+		const socketClose = events.find((event) => event.type === "worker_socket_closed");
+		expect(socketClose).toMatchObject({ triggerRequestId: requestIds[2] });
+		expect(socketClose).not.toHaveProperty("triggerUnavailableReason");
 	});
 
 	it("finalizes a live worker response hang from a structured timeout event without recovering the process", async () => {

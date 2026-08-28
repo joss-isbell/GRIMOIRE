@@ -32,6 +32,10 @@ import type { PrivateFrame } from "../src/modes/session-worker/private-framing.j
 import * as childProcessModule from "../src/utils/child-process.js";
 import { createDeferred } from "./suite/scheduling.js";
 
+const supervisorDiagnosticTestState = vi.hoisted(() => ({
+	events: [] as Array<{ type: string; fields: Record<string, unknown> }>,
+}));
+
 const workerLaunchTestState = vi.hoisted(() => ({
 	capture: false,
 	forceMissingProcessStartId: false,
@@ -54,6 +58,19 @@ vi.mock("node:child_process", async (importOriginal) => {
 				workerLaunchTestState.spawned.push({ child, args });
 			}
 			return child;
+		},
+	};
+});
+
+vi.mock("../src/modes/daemon/incident-recorder.js", async (importOriginal) => {
+	const actual = (await importOriginal()) as Record<string, unknown> & {
+		appendSupervisorDiagnosticEvent(type: string, fields: Record<string, unknown>): unknown;
+	};
+	return {
+		...actual,
+		appendSupervisorDiagnosticEvent(type: string, fields: Record<string, unknown>) {
+			supervisorDiagnosticTestState.events.push({ type, fields: sanitizeIncidentCausalFields(fields) });
+			return actual.appendSupervisorDiagnosticEvent(type, fields);
 		},
 	};
 });
@@ -147,6 +164,11 @@ interface DeferredRecoveryWorker {
 	snapshotTransferFrames: Map<string, never>;
 	recovery?: Promise<void>;
 	deferredRecovery?: Promise<void>;
+	recoveryEpisode?: {
+		recoveryId: string;
+		triggerRequestId?: string;
+		triggerUnavailableReason?: string;
+	};
 	intentionalStop: boolean;
 	stopRevision: number;
 }
@@ -158,7 +180,12 @@ interface DeferredRecoveryHarness {
 	persistWorker: ReturnType<typeof vi.fn>;
 	syncAgentPeers: ReturnType<typeof vi.fn>;
 	recoverWorker: ReturnType<typeof vi.fn>;
-	handleWorkerClose(worker: DeferredRecoveryWorker, client: object, error: Error): Promise<void>;
+	handleWorkerClose(
+		worker: DeferredRecoveryWorker,
+		client: object,
+		error: Error,
+		trigger?: { triggerRequestId: string } | { triggerUnavailableReason: "none" | "multiple" },
+	): Promise<void>;
 	deferWorkerRecovery(worker: DeferredRecoveryWorker, error: Error): void;
 }
 
@@ -291,6 +318,7 @@ describe("daemon worker supervisor monitoring", () => {
 		workerLaunchTestState.tsxCliPath = "";
 		workerLaunchTestState.cliEntrypoint = "";
 		workerLaunchTestState.spawned.length = 0;
+		supervisorDiagnosticTestState.events.length = 0;
 		vi.useRealTimers();
 		for (const registryDir of supervisorRegistryDirs) {
 			rmSync(registryDir, { recursive: true, force: true });
@@ -1092,7 +1120,124 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(daemon.canConnectToSupervisor).toHaveBeenCalledOnce();
 	});
 
-	it("recovers exactly once after shutdown admission clears", async () => {
+	it("drops only a close episode created by an eligibility race", async () => {
+		for (const preExistingRecoveryId of [undefined, "existing-recovery-id"] as const) {
+			const client = {};
+			const worker: DeferredRecoveryWorker = {
+				descriptor: {
+					workerId: `worker-eligibility-race-${preExistingRecoveryId ?? "new"}`,
+					pid: process.pid,
+					rootActiveSessionId: "active-eligibility-race",
+					lifecycle: "ready",
+				},
+				client,
+				snapshotCache: new Map(),
+				incomingTranscriptActiveSessionIds: new Set(),
+				transcriptCaches: new Map(),
+				duplicateIncomingTranscriptChunkIndexes: new Map(),
+				snapshotTransferFrames: new Map<string, never>(),
+				...(preExistingRecoveryId
+					? {
+							recoveryEpisode: {
+								recoveryId: preExistingRecoveryId,
+								triggerUnavailableReason: "supervisor_startup",
+							},
+						}
+					: {}),
+				intentionalStop: false,
+				stopRevision: 0,
+			};
+			const gate = createDeferred<void>();
+			const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+				...createSupervisorSnapshotState(),
+				workers: new Map([[worker.descriptor.workerId, worker]]),
+				shuttingDown: false,
+				assertRecoveryAllowed: vi.fn(() => gate.promise),
+				persistWorker: vi.fn(),
+				syncAgentPeers: vi.fn(async () => undefined),
+				recoverWorker: vi.fn(async () => undefined),
+			}) as DeferredRecoveryHarness;
+
+			const close = supervisor.handleWorkerClose(worker, client, new Error("worker disconnected"), {
+				triggerRequestId: "close-request-id",
+			});
+			worker.intentionalStop = true;
+			gate.resolve();
+			await close;
+
+			const starts = supervisorDiagnosticTestState.events.filter(
+				(event) =>
+					event.type === "worker_recovery_episode_started" && event.fields.workerId === worker.descriptor.workerId,
+			);
+			if (preExistingRecoveryId) {
+				expect(starts).toEqual([]);
+				expect(worker.recoveryEpisode?.recoveryId).toBe(preExistingRecoveryId);
+			} else {
+				expect(starts).toHaveLength(1);
+				expect(starts[0]?.fields).toMatchObject({
+					recoveryId: expect.any(String),
+					triggerRequestId: "close-request-id",
+				});
+				expect(worker.recoveryEpisode).toBeUndefined();
+			}
+		}
+	});
+
+	test.each(["supervisor_generation_stale" as const, "supervisor_recovery_cancelled" as const])(
+		"preserves baseline close gating for %s",
+		async (code) => {
+			const client = {};
+			const worker: DeferredRecoveryWorker = {
+				descriptor: {
+					workerId: `worker-close-gate-${code}`,
+					pid: process.pid,
+					rootActiveSessionId: "active-close-gate",
+					lifecycle: "ready",
+				},
+				client,
+				snapshotCache: new Map(),
+				incomingTranscriptActiveSessionIds: new Set(),
+				transcriptCaches: new Map(),
+				duplicateIncomingTranscriptChunkIndexes: new Map(),
+				snapshotTransferFrames: new Map<string, never>(),
+				intentionalStop: false,
+				stopRevision: 0,
+			};
+			const deferWorkerRecovery = vi.fn();
+			const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+				...createSupervisorSnapshotState(),
+				workers: new Map([[worker.descriptor.workerId, worker]]),
+				shuttingDown: false,
+				assertRecoveryAllowed: vi.fn(async () => {
+					throw recoveryDeniedError(code);
+				}),
+				deferWorkerRecovery,
+			}) as DeferredRecoveryHarness;
+
+			await supervisor.handleWorkerClose(worker, client, new Error("worker disconnected"), {
+				triggerUnavailableReason: "none",
+			});
+
+			expect(supervisor.assertRecoveryAllowed).toHaveBeenCalledOnce();
+			const start = supervisorDiagnosticTestState.events.find(
+				(event) =>
+					event.type === "worker_recovery_episode_started" && event.fields.workerId === worker.descriptor.workerId,
+			);
+			expect(start?.fields.recoveryId).toEqual(expect.any(String));
+			if (code === "supervisor_recovery_cancelled") {
+				expect(deferWorkerRecovery).toHaveBeenCalledWith(
+					worker,
+					expect.objectContaining({ message: "worker disconnected" }),
+					expect.objectContaining({ recoveryId: start?.fields.recoveryId }),
+				);
+			} else {
+				expect(deferWorkerRecovery).not.toHaveBeenCalled();
+				expect(worker.recoveryEpisode).toBeUndefined();
+			}
+		},
+	);
+
+	test("recovers exactly once after shutdown admission clears", async () => {
 		vi.useFakeTimers();
 		const client = {};
 		const worker: DeferredRecoveryWorker = {
@@ -1129,9 +1274,19 @@ describe("daemon worker supervisor monitoring", () => {
 			recoverWorker,
 		}) as DeferredRecoveryHarness;
 
-		await supervisor.handleWorkerClose(worker, client, new Error("worker disconnected"));
+		await supervisor.handleWorkerClose(worker, client, new Error("worker disconnected"), {
+			triggerRequestId: "worker-generation-7-request-3",
+		});
 		const deferredRecovery = worker.deferredRecovery;
+		const episodeStart = supervisorDiagnosticTestState.events.find(
+			(event) =>
+				event.type === "worker_recovery_episode_started" && event.fields.workerId === worker.descriptor.workerId,
+		);
 		expect(deferredRecovery).toBeDefined();
+		expect(episodeStart?.fields).toMatchObject({
+			recoveryId: expect.any(String),
+			triggerRequestId: "worker-generation-7-request-3",
+		});
 		supervisor.deferWorkerRecovery(worker, new Error("duplicate close"));
 		expect(worker.deferredRecovery).toBe(deferredRecovery);
 		expect(worker.descriptor.lifecycle).toBe("ready");
@@ -1151,7 +1306,7 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(recoverWorker).toHaveBeenCalledOnce();
 	});
 
-	it("resumes deferred recovery after a concurrent recovery is denied", async () => {
+	test("resumes deferred recovery after a concurrent recovery is denied", async () => {
 		vi.useFakeTimers();
 		const client = {};
 		const worker: DeferredRecoveryWorker = {
@@ -1188,9 +1343,19 @@ describe("daemon worker supervisor monitoring", () => {
 			recoverWorker,
 		}) as DeferredRecoveryHarness;
 
-		await supervisor.handleWorkerClose(worker, client, new Error("worker disconnected"));
+		await supervisor.handleWorkerClose(worker, client, new Error("worker disconnected"), {
+			triggerRequestId: "worker-generation-7-request-3",
+		});
 		const deferredRecovery = worker.deferredRecovery;
+		const episodeStart = supervisorDiagnosticTestState.events.find(
+			(event) =>
+				event.type === "worker_recovery_episode_started" && event.fields.workerId === worker.descriptor.workerId,
+		);
 		expect(deferredRecovery).toBeDefined();
+		expect(episodeStart?.fields).toMatchObject({
+			recoveryId: expect.any(String),
+			triggerRequestId: "worker-generation-7-request-3",
+		});
 		let startConcurrentRecovery: () => void = () => undefined;
 		const concurrentRecoveryBarrier = new Promise<void>((resolve) => {
 			startConcurrentRecovery = resolve;
@@ -1221,6 +1386,10 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(worker.descriptor.lastError).toBe("worker disconnected");
 		expect(persistWorker).toHaveBeenCalledOnce();
 		expect(recoverWorker).toHaveBeenCalledOnce();
+		expect(recoverWorker).toHaveBeenCalledWith(
+			worker,
+			expect.objectContaining({ recoveryId: episodeStart?.fields.recoveryId }),
+		);
 		expect(worker.deferredRecovery).toBeUndefined();
 	});
 
@@ -1953,6 +2122,40 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(sessions.map((session) => [session.activeSessionId ?? session.id, session.workerState]).sort()).toEqual([
 			["worker-live-active", "ready"],
 			["worker-stopping-active", "stopping"],
+		]);
+	});
+
+	it("keeps one supervisor-startup episode through repeated adoption fallback", async () => {
+		const worker = {
+			descriptor: {
+				workerId: "worker-startup-fallback",
+				pid: 999_999_999,
+				rootActiveSessionId: "active-startup-fallback",
+			},
+		};
+		const recoverWorker = vi.fn(async () => undefined);
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			assertRecoveryAllowed: vi.fn(async () => undefined),
+			recoverWorker,
+			log: vi.fn(),
+		}) as { adoptOrRecoverWorker(target: object): Promise<void> };
+
+		await supervisor.adoptOrRecoverWorker(worker);
+		await supervisor.adoptOrRecoverWorker(worker);
+
+		expect(recoverWorker).toHaveBeenCalledTimes(2);
+		const starts = supervisorDiagnosticTestState.events.filter(
+			(event) =>
+				event.type === "worker_recovery_episode_started" && event.fields.workerId === worker.descriptor.workerId,
+		);
+		expect(starts).toHaveLength(1);
+		expect(starts[0]?.fields).toMatchObject({
+			recoveryId: expect.any(String),
+			triggerUnavailableReason: "supervisor_startup",
+		});
+		expect(recoverWorker.mock.calls.map((call) => call[1])).toEqual([
+			expect.objectContaining({ recoveryId: starts[0]?.fields.recoveryId }),
+			expect.objectContaining({ recoveryId: starts[0]?.fields.recoveryId }),
 		]);
 	});
 
@@ -3335,17 +3538,22 @@ describe("daemon worker supervisor monitoring", () => {
 					launchEnv: Record<string, string>;
 					env: Record<string, string>;
 				},
+				diagnosticCause: Record<string, unknown>,
 			): Promise<unknown>;
 		};
 
 		await expect(
-			supervisor.attachClient(client, {
-				type: "attach",
-				activeSessionId,
-				recoveryConfig: { cwd: "/tmp/fresh-owner" },
-				launchEnv: { OWNER_SECRET: "fresh" },
-				env: { HERDR_PANE_ID: "pane-1" },
-			}),
+			supervisor.attachClient(
+				client,
+				{
+					type: "attach",
+					activeSessionId,
+					recoveryConfig: { cwd: "/tmp/fresh-owner" },
+					launchEnv: { OWNER_SECRET: "fresh" },
+					env: { HERDR_PANE_ID: "pane-1" },
+				},
+				{ sourceOperation: "attach-command-1", sourceOperationType: "attach", sourceClientId: "client-1" },
+			),
 		).rejects.toThrow("stop after reconstruction");
 		expect(worker.transientCreateCommand).toEqual({
 			type: "create",
@@ -3356,7 +3564,20 @@ describe("daemon worker supervisor monitoring", () => {
 			lifecycle: "client_owned",
 		});
 		expect(worker.launchEnv).toEqual({ OWNER_SECRET: "fresh" });
-		expect(recoverWorker).toHaveBeenCalledWith(worker);
+		const episodeStart = supervisorDiagnosticTestState.events.find(
+			(event) =>
+				event.type === "worker_recovery_episode_started" && event.fields.workerId === worker.descriptor.workerId,
+		);
+		expect(episodeStart?.fields).toMatchObject({
+			recoveryId: expect.any(String),
+			triggerUnavailableReason: "attach_request",
+			sourceOperationType: "attach",
+			sourceClientId: "client-1",
+		});
+		expect(recoverWorker).toHaveBeenCalledWith(
+			worker,
+			expect.objectContaining({ recoveryId: episodeStart?.fields.recoveryId }),
+		);
 	});
 
 	it("rejects an opted-out attach to a telemetry-enabled worker", async () => {

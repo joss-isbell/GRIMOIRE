@@ -63,6 +63,7 @@ const STRING_FIELDS = new Set([
 	"toolCallId",
 	"trigger",
 	"triggerRequestId",
+	"triggerUnavailableReason",
 	"workerId",
 	"workerProcessStartId",
 ]);
