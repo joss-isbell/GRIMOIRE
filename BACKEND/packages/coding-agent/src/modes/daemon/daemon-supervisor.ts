@@ -1248,7 +1248,7 @@ export class DaemonSupervisor {
 	private publicCommandDiagnosticCause(
 		client: DaemonSocketClient,
 		command: Pick<DaemonCommand, "id" | "type">,
-		callerCategory: "public_list" | "public_heartbeats_list",
+		callerCategory: "public_attach" | "public_heartbeats_list" | "public_list" | "public_reattach",
 	): Record<string, unknown> {
 		return {
 			callerCategory,
@@ -1736,7 +1736,11 @@ export class DaemonSupervisor {
 				return success(command.id, "create", this.publicSummary(worker, summary));
 			}
 			case "attach": {
-				const attached = await this.attachClient(client, command);
+				const attached = await this.attachClient(
+					client,
+					command,
+					this.publicCommandDiagnosticCause(client, command, "public_attach"),
+				);
 				if (client.capabilities.has("chunked_snapshot")) {
 					const transcript = attached.transcript;
 					if (!transcript) {
@@ -1780,11 +1784,15 @@ export class DaemonSupervisor {
 				let releaseTranscript: (() => void) | undefined;
 				client.attachedActiveSessionIds.add(targetActiveSessionId);
 				try {
-					const attached = await this.attachClient(client, {
-						...command,
-						type: "attach",
-						activeSessionId: targetActiveSessionId,
-					});
+					const attached = await this.attachClient(
+						client,
+						{
+							...command,
+							type: "attach",
+							activeSessionId: targetActiveSessionId,
+						},
+						this.publicCommandDiagnosticCause(client, command, "public_reattach"),
+					);
 					const detachingSessions = this.detachingInputPauseSessions?.get(client);
 					detachingSessions?.delete(command.activeSessionId);
 					detachingSessions?.delete(command.targetActiveSessionId);
@@ -2784,7 +2792,9 @@ export class DaemonSupervisor {
 			worker.summaries.set(rootActiveSessionId, summary);
 			worker.descriptor.rootSessionId = summary.sessionId;
 			worker.descriptor.sessionFile = summary.sessionFile;
-			await this.subscribeWorker(worker, rootActiveSessionId);
+			await this.subscribeWorker(worker, rootActiveSessionId, {
+				callerCategory: existing ? "recovery_resubscribe" : "initial_worker_startup",
+			});
 			await this.refreshWorkerSummaries(worker, true, {
 				callerCategory: existing ? "recovery_validation" : "worker_startup_validation",
 			});
@@ -2904,21 +2914,29 @@ export class DaemonSupervisor {
 		throw new Error(`Timed out connecting to daemon session worker: ${String(lastError)}`);
 	}
 
-	private async subscribeWorker(worker: ResidentWorker, activeSessionId: string): Promise<void> {
+	private async subscribeWorker(
+		worker: ResidentWorker,
+		activeSessionId: string,
+		diagnosticCause: Record<string, unknown>,
+	): Promise<void> {
 		if (!worker.client) {
 			throw new Error("Session worker is not connected");
 		}
 		const supportsExtensionUi = [...this.clients].some(
 			(client) => client.attachedActiveSessionIds.has(activeSessionId) && client.supportsExtensionUi,
 		);
-		const response = await worker.client.requestWorker({
-			type: "worker_subscribe",
-			activeSessionId,
-			capabilities: supportsExtensionUi
-				? ["attach_snapshot", "event_sequence", "extension_ui", "slim_attach", "chunked_snapshot"]
-				: ["attach_snapshot", "event_sequence", "slim_attach", "chunked_snapshot"],
-			supportsExtensionUi,
-		});
+		const response = await worker.client.requestWorker(
+			{
+				type: "worker_subscribe",
+				activeSessionId,
+				capabilities: supportsExtensionUi
+					? ["attach_snapshot", "event_sequence", "extension_ui", "slim_attach", "chunked_snapshot"]
+					: ["attach_snapshot", "event_sequence", "slim_attach", "chunked_snapshot"],
+				supportsExtensionUi,
+			},
+			30_000,
+			diagnosticCause,
+		);
 		if (!response.success) {
 			throw new Error(response.error);
 		}
@@ -2964,7 +2982,9 @@ export class DaemonSupervisor {
 			}
 			const observedProcessStartId = getProcessStartId(worker.descriptor.pid);
 			await this.connectWorker(worker, 2000);
-			await this.subscribeWorker(worker, worker.descriptor.rootActiveSessionId);
+			await this.subscribeWorker(worker, worker.descriptor.rootActiveSessionId, {
+				callerCategory: "startup_adoption",
+			});
 			await this.refreshWorkerSummaries(worker, true, { callerCategory: "startup_adoption" });
 			if (worker.descriptor.processStartId === undefined && observedProcessStartId) {
 				worker.descriptor.processStartId = observedProcessStartId;
@@ -3303,7 +3323,9 @@ export class DaemonSupervisor {
 					if (processAlive && processIdentityMatches) {
 						try {
 							await this.connectWorker(worker, 1500);
-							await this.subscribeWorker(worker, worker.descriptor.rootActiveSessionId);
+							await this.subscribeWorker(worker, worker.descriptor.rootActiveSessionId, {
+								callerCategory: "recovery_resubscribe",
+							});
 							await this.refreshWorkerSummaries(worker, true, { callerCategory: "recovery_validation" });
 							if (this.isWorkerRecoveryCancelled(worker)) {
 								return;
@@ -4238,6 +4260,7 @@ export class DaemonSupervisor {
 	private async attachClient(
 		client: DaemonSocketClient,
 		command: Extract<DaemonCommand, { type: "attach" }>,
+		diagnosticCause: Record<string, unknown>,
 	): Promise<WorkerAttachData> {
 		const ownedWorker = [...this.workers.values()].find(
 			(worker) =>
@@ -4309,15 +4332,19 @@ export class DaemonSupervisor {
 						match.worker.snapshotCache.get(activeSessionId)?.snapshotStream?.id;
 					loading = (async () => {
 						const workerClient = this.requireAvailableWorkerClient(match.worker);
-						const response = await workerClient.request({
-							type: "attach",
-							activeSessionId,
-							capabilities: client.capabilities.has("chunked_snapshot")
-								? ["attach_snapshot", "event_sequence", "slim_attach", "chunked_snapshot"]
-								: ["attach_snapshot", "event_sequence", "slim_attach"],
-							supportsExtensionUi: false,
-							env: command.env ?? collectDaemonClientEnv(),
-						});
+						const response = await workerClient.request(
+							{
+								type: "attach",
+								activeSessionId,
+								capabilities: client.capabilities.has("chunked_snapshot")
+									? ["attach_snapshot", "event_sequence", "slim_attach", "chunked_snapshot"]
+									: ["attach_snapshot", "event_sequence", "slim_attach"],
+								supportsExtensionUi: false,
+								env: command.env ?? collectDaemonClientEnv(),
+							},
+							30_000,
+							diagnosticCause,
+						);
 						const loaded = attachResultFromResponse(response);
 						if (match.worker.snapshotLoads.get(snapshotLoadKey) !== loading) {
 							throw new SnapshotLoadInvalidatedError("Session snapshot changed during attach");
@@ -4719,9 +4746,9 @@ export class DaemonSupervisor {
 		if (!match?.worker.client) {
 			return;
 		}
-		await this.subscribeWorker(match.worker, match.summary.activeSessionId ?? match.summary.id).catch(
-			() => undefined,
-		);
+		await this.subscribeWorker(match.worker, match.summary.activeSessionId ?? match.summary.id, {
+			callerCategory: "extension_ui_capability_refresh",
+		}).catch(() => undefined);
 	}
 
 	private handleWorkerFrame(worker: ResidentWorker, frame: PrivateFrame<DaemonWorkerFrameHeader>): void {
@@ -5251,12 +5278,16 @@ export class DaemonSupervisor {
 			const { activeSessionId, purpose } = pending[index]!;
 			let releaseTranscript: (() => void) | undefined;
 			try {
-				const attached = await this.attachClient(client, {
-					type: "attach",
-					activeSessionId,
-					capabilities: [...client.capabilities],
-					supportsExtensionUi: client.supportsExtensionUi,
-				});
+				const attached = await this.attachClient(
+					client,
+					{
+						type: "attach",
+						activeSessionId,
+						capabilities: [...client.capabilities],
+						supportsExtensionUi: client.supportsExtensionUi,
+					},
+					{ callerCategory: "internal_catchup_resync", catchupPurpose: purpose },
+				);
 				releaseTranscript = attached.releaseTranscript;
 				if (client.capabilities.has("chunked_snapshot")) {
 					const transcript = attached.transcript;

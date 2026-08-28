@@ -25,6 +25,7 @@ import {
 	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
 	type DaemonWorkerFrameHeader,
 } from "../src/modes/daemon/daemon-worker-protocol.js";
+import { sanitizeIncidentCausalFields } from "../src/modes/daemon/incident-recorder-writer.js";
 import { MutationDrainLatch } from "../src/modes/daemon/mutation-drain-latch.js";
 import { WorkerRecoveryJournal } from "../src/modes/daemon/worker-recovery-journal.js";
 import type { PrivateFrame } from "../src/modes/session-worker/private-framing.js";
@@ -3492,35 +3493,24 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(catchUpClient).not.toHaveBeenCalled();
 	});
 
-	it("subscribes to worker updates with chunked snapshots", async () => {
-		type SubscriptionWorker = {
-			client: { requestWorker: (command: unknown) => Promise<{ success: boolean }> };
-		};
-		const requestWorker = vi.fn(async () => ({ success: true }));
-		const worker: SubscriptionWorker = { client: { requestWorker } };
-		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
-			clients: new Set(),
-		}) as {
-			subscribeWorker(worker: SubscriptionWorker, activeSessionId: string): Promise<void>;
-		};
+	it("asserts diagnostic causes at each worker subscription call site", () => {
+		const source = readFileSync(new URL("../src/modes/daemon/daemon-supervisor.ts", import.meta.url), "utf8");
 
-		await supervisor.subscribeWorker(worker, "active-1");
-
-		expect(requestWorker).toHaveBeenCalledWith({
-			type: "worker_subscribe",
-			activeSessionId: "active-1",
-			capabilities: ["attach_snapshot", "event_sequence", "slim_attach", "chunked_snapshot"],
-			supportsExtensionUi: false,
-		});
+		expect(source).toMatch(
+			/await this\.subscribeWorker\(worker, rootActiveSessionId, \{\s*callerCategory: existing \? "recovery_resubscribe" : "initial_worker_startup",\s*\}\);/,
+		);
+		expect(source).toMatch(
+			/await this\.subscribeWorker\(worker, worker\.descriptor\.rootActiveSessionId, \{\s*callerCategory: "startup_adoption",\s*\}\);/,
+		);
+		expect(source).toMatch(
+			/await this\.connectWorker\(worker, 1500\);\s*await this\.subscribeWorker\(worker, worker\.descriptor\.rootActiveSessionId, \{\s*callerCategory: "recovery_resubscribe",\s*\}\);/,
+		);
+		expect(source).toMatch(
+			/await this\.subscribeWorker\(match\.worker, match\.summary\.activeSessionId \?\? match\.summary\.id, \{\s*callerCategory: "extension_ui_capability_refresh",\s*\}\)/,
+		);
 	});
 
-	it("does not retain an attachment when snapshot loading fails", async () => {
-		type AttachClient = {
-			id: string;
-			capabilities: Set<string>;
-			supportsExtensionUi: boolean;
-			attachedActiveSessionIds: Set<string>;
-		};
+	it("forwards public attach command identity from command ingress to the worker request", async () => {
 		const activeSessionId = "active-failed-attach";
 		const summary = {
 			id: activeSessionId,
@@ -3536,13 +3526,12 @@ describe("daemon worker supervisor monitoring", () => {
 			messageCount: 0,
 			sessionActions: { queuedCount: 0, steering: [], followUps: [] },
 		} satisfies SessionSummary;
+		const request = vi.fn(async () => {
+			throw new Error("snapshot failed");
+		});
 		const worker = {
 			descriptor: { workerId: "worker-1", lifecycle: "ready", pid: 1234 },
-			client: {
-				request: vi.fn(async () => {
-					throw new Error("snapshot failed");
-				}),
-			},
+			client: { request },
 			summaries: new Map([[activeSessionId, summary]]),
 			snapshotCache: new Map(),
 			transcriptCaches: new Map(),
@@ -3550,23 +3539,181 @@ describe("daemon worker supervisor monitoring", () => {
 			snapshotTransferFrames: new Map(),
 			snapshotLoads: new Map(),
 		};
-		const client: AttachClient = {
-			id: "client-1",
+		const client = {
+			id: "socket-client-1",
 			capabilities: new Set<string>(),
 			supportsExtensionUi: false,
 			attachedActiveSessionIds: new Set<string>(),
-		};
+		} as unknown as DaemonSocketClient;
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			workers: new Map([[worker.descriptor.workerId, worker]]),
 			clients: new Set([client]),
-		}) as {
-			attachClient(client: AttachClient, command: { type: "attach"; activeSessionId: string }): Promise<unknown>;
-		};
+			protocolClientIds: new WeakMap([[client, "protocol-client-1"]]),
+		}) as { handleCommand(target: DaemonSocketClient, command: object): Promise<unknown> };
 
-		await expect(supervisor.attachClient(client, { type: "attach", activeSessionId })).rejects.toThrow(
-			"snapshot failed",
-		);
+		await expect(
+			supervisor.handleCommand(client, { type: "attach", id: "attach-command-1", activeSessionId }),
+		).rejects.toThrow("snapshot failed");
+
+		expect(request).toHaveBeenCalledWith(expect.objectContaining({ type: "attach", activeSessionId }), 30_000, {
+			callerCategory: "public_attach",
+			sourceOperation: "attach-command-1",
+			sourceOperationType: "attach",
+			sourceClientId: "protocol-client-1",
+		});
 		expect(client.attachedActiveSessionIds).toEqual(new Set());
+	});
+
+	it("forwards public reattach command identity from command ingress to the worker request", async () => {
+		const sourceActiveSessionId = "active-source";
+		const targetActiveSessionId = "active-target";
+		const makeSummary = (activeSessionId: string): SessionSummary => ({
+			id: activeSessionId,
+			activeSessionId,
+			lifecycle: "live",
+			activity: "idle",
+			isSessionActive: false,
+			sessionId: `session-${activeSessionId}`,
+			cwd: "/tmp/project",
+			isStreaming: false,
+			isCompacting: false,
+			attachedClients: 0,
+			messageCount: 0,
+			sessionActions: { queuedCount: 0, steering: [], followUps: [] },
+		});
+		const targetSummary = makeSummary(targetActiveSessionId);
+		const attachResult = {
+			activeSessionId: targetActiveSessionId,
+			snapshot: {
+				activeSessionId: targetActiveSessionId,
+				summary: targetSummary,
+				state: {},
+				messages: [],
+				lastEventSequence: 0,
+			},
+			replay: {},
+			lastEventSequence: 0,
+			client: { id: "worker-client", capabilities: [] },
+		} as unknown as DaemonAttachResult;
+		const request = vi.fn(async () => success("worker-attach", "attach", attachResult));
+		const worker = {
+			descriptor: { workerId: "worker-1", lifecycle: "ready", pid: 1234 },
+			client: { request },
+			summaries: new Map([
+				[sourceActiveSessionId, makeSummary(sourceActiveSessionId)],
+				[targetActiveSessionId, targetSummary],
+			]),
+			snapshotCache: new Map(),
+			transcriptCaches: new Map(),
+			incomingTranscriptActiveSessionIds: new Set(),
+			snapshotTransferFrames: new Map(),
+			snapshotLoads: new Map(),
+		};
+		const client = {
+			id: "socket-client-1",
+			capabilities: new Set<string>(),
+			supportsExtensionUi: false,
+			attachedActiveSessionIds: new Set([sourceActiveSessionId]),
+		} as unknown as DaemonSocketClient;
+		const write = vi.fn(() => true);
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			clients: new Set([client]),
+			protocolClientIds: new WeakMap([[client, "protocol-client-1"]]),
+			write,
+			syncWorkerExtensionUi: vi.fn(async () => undefined),
+		}) as { handleCommand(target: DaemonSocketClient, command: object): Promise<unknown> };
+
+		await supervisor.handleCommand(client, {
+			type: "reattach",
+			id: "reattach-command-1",
+			activeSessionId: sourceActiveSessionId,
+			targetActiveSessionId,
+		});
+
+		expect(request).toHaveBeenCalledWith(
+			expect.objectContaining({ type: "attach", activeSessionId: targetActiveSessionId }),
+			30_000,
+			{
+				callerCategory: "public_reattach",
+				sourceOperation: "reattach-command-1",
+				sourceOperationType: "reattach",
+				sourceClientId: "protocol-client-1",
+			},
+		);
+	});
+
+	it("retains each sanitized catchup purpose through a real catchup attach request", async () => {
+		const activeSessionIds = ["active-replacement", "active-resync"] as const;
+		const makeSummary = (activeSessionId: string): SessionSummary => ({
+			id: activeSessionId,
+			activeSessionId,
+			lifecycle: "live",
+			activity: "idle",
+			isSessionActive: false,
+			sessionId: `session-${activeSessionId}`,
+			cwd: "/tmp/project",
+			isStreaming: false,
+			isCompacting: false,
+			attachedClients: 0,
+			messageCount: 0,
+			sessionActions: { queuedCount: 0, steering: [], followUps: [] },
+		});
+		const request = vi.fn(async (command: { activeSessionId: string }) => {
+			const summary = makeSummary(command.activeSessionId);
+			return success("worker-attach", "attach", {
+				activeSessionId: command.activeSessionId,
+				snapshot: {
+					activeSessionId: command.activeSessionId,
+					summary,
+					state: {},
+					messages: [],
+					lastEventSequence: 0,
+				},
+				replay: {},
+				lastEventSequence: 0,
+				client: { id: "worker-client", capabilities: [] },
+			} as unknown as DaemonAttachResult);
+		});
+		const worker = {
+			descriptor: { workerId: "worker-1", lifecycle: "ready", pid: 1234 },
+			client: { request },
+			summaries: new Map(activeSessionIds.map((id) => [id, makeSummary(id)])),
+			snapshotCache: new Map(),
+			transcriptCaches: new Map(),
+			incomingTranscriptActiveSessionIds: new Set(),
+			snapshotTransferFrames: new Map(),
+			snapshotLoads: new Map(),
+		};
+		const client = {
+			id: "socket-client-1",
+			socket: { destroyed: false },
+			capabilities: new Set<string>(),
+			supportsExtensionUi: false,
+			attachedActiveSessionIds: new Set<string>(),
+			catchupActiveSessionIds: new Set(activeSessionIds),
+			catchupPurposes: new Map([
+				[activeSessionIds[0], "replacement"],
+				[activeSessionIds[1], "resync"],
+			]),
+		} as unknown as DaemonSocketClient;
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			clients: new Set([client]),
+			write: vi.fn(() => true),
+			log: vi.fn(),
+			syncWorkerExtensionUi: vi.fn(async () => undefined),
+		}) as { drainClientCatchups(target: DaemonSocketClient): Promise<void> };
+
+		await supervisor.drainClientCatchups(client);
+
+		expect(request).toHaveBeenCalledTimes(2);
+		expect(
+			request.mock.calls.map((call) => sanitizeIncidentCausalFields(call[2] as Record<string, unknown>)),
+		).toEqual([
+			{ callerCategory: "internal_catchup_resync", catchupPurpose: "replacement" },
+			{ callerCategory: "internal_catchup_resync", catchupPurpose: "resync" },
+		]);
 	});
 
 	it("marks each busy worker session interrupted independently", async () => {

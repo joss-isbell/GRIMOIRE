@@ -25,6 +25,7 @@ const STRING_FIELDS = new Set([
 	"activeSessionId",
 	"arch",
 	"callerCategory",
+	"catchupPurpose",
 	"classification",
 	"clientGeneration",
 	"code",
