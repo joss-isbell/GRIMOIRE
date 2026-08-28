@@ -20,25 +20,13 @@ const MONITOR_FILE = "linux-causal-monitor.json";
 const MAX_FILE_BYTES = 256 * 1024;
 const MAX_SAMPLES = 32;
 
-export interface LinuxRawSourceOccurrence {
-	source: "procfs" | "cgroupfs" | "kernel-tracing" | "system-journal-export" | "journal-query-error";
-	sourcePath: string;
-	bytes: Buffer;
-	encoding: string;
-	phase: "baseline" | "periodic" | "anomaly" | "incident-pin" | "service" | "final";
-	wallTime: string;
-	monotonicNs: string;
-	identity?: Record<string, unknown>;
-	bounds?: Record<string, unknown>;
-}
-
 export interface LinuxPressureValues {
 	some?: { avg10: number; avg60: number; avg300: number; total: number };
 	full?: { avg10: number; avg60: number; avg300: number; total: number };
 }
 
 export interface LinuxMemorySample {
-	phase: "baseline" | "periodic" | "service" | "anomaly" | "final";
+	phase: "baseline" | "periodic" | "anomaly" | "final";
 	wallTime: string;
 	monotonicNs: string;
 	current?: number;
@@ -78,7 +66,6 @@ export interface LinuxIncidentCollectorDependencies {
 	platform?: NodeJS.Platform;
 	now?: () => Date;
 	getProcessStartId?: (pid: number) => string | undefined;
-	recordRawSource?: (occurrence: LinuxRawSourceOccurrence) => unknown;
 }
 
 export interface LinuxIncidentTargetOptions {
@@ -88,12 +75,10 @@ export interface LinuxIncidentTargetOptions {
 	dependencies?: LinuxIncidentCollectorDependencies;
 }
 
-export type LinuxMemorySamplePhase = "baseline" | "periodic" | "service" | "anomaly" | "final";
+export type LinuxMemorySamplePhase = "baseline" | "periodic" | "anomaly" | "final";
 export interface LinuxIncidentSampleOptions {
 	runDir: string;
 	phase: LinuxMemorySamplePhase;
-	captureBroadRaw?: boolean;
-	skipMemorySample?: boolean;
 	dependencies?: LinuxIncidentCollectorDependencies;
 }
 
@@ -300,7 +285,7 @@ export function sampleLinuxIncidentEvidence(options: LinuxIncidentSampleOptions)
 	const summaryPath = join(options.runDir, SUMMARY_FILE);
 	const summary = readJson<LinuxMemorySummary>(summaryPath);
 	const monitor = readJson<Monitor>(join(options.runDir, MONITOR_FILE));
-	if (!summary || !monitor || options.skipMemorySample) return summary;
+	if (!summary || !monitor) return summary;
 	const next = sample(monitor, options.phase, options.dependencies?.now?.() ?? new Date());
 	if (!next) return summary;
 	summary.latest = next;

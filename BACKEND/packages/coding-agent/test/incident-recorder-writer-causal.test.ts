@@ -1,13 +1,15 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
-import { recordIncidentRecorderCausalEvent } from "../src/modes/daemon/incident-recorder.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+	installSupervisorDiagnosticHooks,
+	recordIncidentRecorderCausalEvent,
+} from "../src/modes/daemon/incident-recorder.js";
 import { INCIDENT_RECORDER_RUN_DIR_ENV } from "../src/modes/daemon/incident-recorder-env.js";
 import {
 	configureIncidentCaptureEmitter,
 	emitIncidentDerived,
-	IncidentRecorderWriter,
 	stopIncidentCaptureEmitter,
 } from "../src/modes/daemon/incident-recorder-writer.js";
 
@@ -15,6 +17,7 @@ const roots: string[] = [];
 const originalRunDir = process.env[INCIDENT_RECORDER_RUN_DIR_ENV];
 
 afterEach(async () => {
+	vi.useRealTimers();
 	await stopIncidentCaptureEmitter();
 	if (originalRunDir === undefined) delete process.env[INCIDENT_RECORDER_RUN_DIR_ENV];
 	else process.env[INCIDENT_RECORDER_RUN_DIR_ENV] = originalRunDir;
@@ -29,12 +32,21 @@ function fixture(): string {
 }
 
 function timeline(root: string): Array<Record<string, unknown>> {
-	const path = join(root, "timeline.jsonl");
-	if (!existsSync(path)) return [];
-	return readFileSync(path, "utf8")
-		.split("\n")
-		.filter(Boolean)
-		.map((line) => JSON.parse(line) as Record<string, unknown>);
+	const events: Array<Record<string, unknown>> = [];
+	for (const name of [
+		"timeline.previous.jsonl",
+		"timeline.jsonl",
+		"supervisor-timeline.previous.jsonl",
+		"supervisor-timeline.jsonl",
+	]) {
+		const path = join(root, name);
+		if (!existsSync(path)) continue;
+		for (const line of readFileSync(path, "utf8").split("\n").filter(Boolean))
+			try {
+				events.push(JSON.parse(line) as Record<string, unknown>);
+			} catch {}
+	}
+	return events;
 }
 
 describe("bounded causal event writer", () => {
@@ -84,7 +96,7 @@ describe("bounded causal event writer", () => {
 			false,
 		);
 		await stopIncidentCaptureEmitter();
-		const text = readFileSync(join(root, "timeline.jsonl"), "utf8");
+		const text = JSON.stringify(timeline(root));
 		expect(getterCalls).toBe(0);
 		expect(text).not.toContain("secret-in-innocent-field");
 		expect(text).not.toContain("secret-token");
@@ -103,8 +115,7 @@ describe("bounded causal event writer", () => {
 			Array.from({ length: 64 }, (_, index) => [`counter${index}`, Array.from({ length: 32 }, () => index)]),
 		);
 		expect(
-			recordIncidentRecorderCausalEvent(root, "supervisor_exit", {
-				...largeFields,
+			recordIncidentRecorderCausalEvent(root, "supervisor_exit", largeFields, {
 				occurrenceId,
 				source: "supervisor-events",
 			}),
@@ -136,23 +147,51 @@ describe("bounded causal event writer", () => {
 		);
 	});
 
-	it("fails open when the durable wrapper sink rejects or throws", () => {
-		const rejectedWriter = new IncidentRecorderWriter({
-			runDir: "/not-used",
-			onStructuredEvent: () => false,
-		});
-		expect(rejectedWriter.recordDerived("recorder-events", "supervisor_exit", { signal: "SIGKILL" }).accepted).toBe(
-			false,
+	it("rotates each direct producer timeline before its one-megabyte bound", async () => {
+		const root = fixture();
+		writeFileSync(join(root, "timeline.jsonl"), Buffer.alloc(1024 * 1024, 0x20), { mode: 0o600 });
+		expect(recordIncidentRecorderCausalEvent(root, "supervisor_exit", { signal: "SIGKILL" })).toBe(true);
+		expect(existsSync(join(root, "timeline.previous.jsonl"))).toBe(true);
+		expect(readFileSync(join(root, "timeline.jsonl"), "utf8")).toContain("supervisor_exit");
+
+		writeFileSync(join(root, "supervisor-timeline.jsonl"), Buffer.alloc(1024 * 1024, 0x20), { mode: 0o600 });
+		expect(configureIncidentCaptureEmitter()).toBe(true);
+		expect(emitIncidentDerived("supervisor-events", "supervisor_heartbeat", { socketExists: true }).accepted).toBe(
+			true,
 		);
-		const throwingWriter = new IncidentRecorderWriter({
-			runDir: "/not-used",
-			onStructuredEvent: () => {
-				throw new Error("sink unavailable");
-			},
-		});
-		expect(throwingWriter.recordDerived("recorder-events", "supervisor_exit", {}).accepted).toBe(false);
-		expect(
-			throwingWriter.recordExactBytes("recorder-events", "raw", Buffer.from("secret"), "binary", {}).accepted,
-		).toBe(false);
+		await stopIncidentCaptureEmitter();
+		expect(existsSync(join(root, "supervisor-timeline.previous.jsonl"))).toBe(true);
+		expect(readFileSync(join(root, "supervisor-timeline.jsonl"), "utf8")).toContain("supervisor_heartbeat");
+	});
+
+	it("records real heartbeat socket presence through the production hook", async () => {
+		const root = fixture();
+		const socketPath = join(root, "isolated.sock");
+		writeFileSync(socketPath, "present", { mode: 0o600 });
+		vi.useFakeTimers();
+		const uninstall = installSupervisorDiagnosticHooks(socketPath);
+		await vi.advanceTimersByTimeAsync(1_000);
+		rmSync(socketPath, { force: true });
+		await vi.advanceTimersByTimeAsync(1_000);
+		uninstall();
+		await stopIncidentCaptureEmitter();
+		const heartbeats = timeline(root).filter((event) => event.type === "supervisor_heartbeat");
+		expect(heartbeats).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ socketExists: true }),
+				expect.objectContaining({ socketExists: false }),
+			]),
+		);
+	});
+
+	it("fails open when the direct durable sink is unavailable or fields are adversarial", () => {
+		expect(recordIncidentRecorderCausalEvent("/missing/incident-run", "supervisor_exit", {})).toBe(false);
+		const root = fixture();
+		const circular: Record<string, unknown> = { outcome: "timeout" };
+		circular.self = circular;
+		expect(recordIncidentRecorderCausalEvent(root, "worker_request_end", circular)).toBe(true);
+		expect(timeline(root)).toContainEqual(
+			expect.objectContaining({ type: "worker_request_end", outcome: "timeout" }),
+		);
 	});
 });

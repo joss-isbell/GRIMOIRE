@@ -1,7 +1,6 @@
 import { type ChildProcess, type SpawnSyncReturns, spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
-	appendFile,
 	chmodSync,
 	closeSync,
 	type Dir,
@@ -16,12 +15,10 @@ import {
 	openSync,
 	readdirSync,
 	readFileSync,
-	readlinkSync,
 	readSync,
 	renameSync,
 	rmSync,
 	statSync,
-	writeFile,
 	writeFileSync,
 	writeSync,
 } from "node:fs";
@@ -32,7 +29,7 @@ import {
 	createCliSubprocessEnv,
 	createCliSubprocessLaunchSpec,
 } from "../../cli/subprocess-launch.js";
-import { getAgentDir, getDaemonLogPath, VERSION } from "../../config.js";
+import { getAgentDir, VERSION } from "../../config.js";
 import { getProcessStartId } from "../../core/session-lease.js";
 import {
 	INCIDENT_RECORDER_CHILD_ENV,
@@ -44,15 +41,9 @@ import {
 	baselineLinuxIncidentEvidence,
 	hasPositiveLinuxCgroupOomKillDelta,
 	type LinuxMemorySummary,
-	type LinuxRawSourceOccurrence,
 	readLinuxIncidentEvidenceCorrelation,
 	sampleLinuxIncidentEvidence,
 } from "./incident-recorder-linux.js";
-import {
-	INCIDENT_RECORDER_RUN_ID_ENV,
-	INCIDENT_RECORDER_RUN_TOKEN_ENV,
-	newIncidentRecorderToken,
-} from "./incident-recorder-protocol.js";
 import {
 	INCIDENT_DIAGNOSTIC_RETENTION_MS,
 	INCIDENT_RETENTION_SERVICE_BUDGET,
@@ -61,7 +52,8 @@ import {
 import {
 	configureIncidentCaptureEmitter,
 	emitIncidentDerived,
-	IncidentRecorderWriter,
+	type IncidentRecorderAdmission,
+	sanitizeIncidentCausalFields,
 	stopIncidentCaptureEmitter,
 	stopIncidentCaptureEmitterOnExit,
 } from "./incident-recorder-writer.js";
@@ -74,17 +66,20 @@ export {
 };
 
 const EVENT_FILE_NAME = "timeline.jsonl";
-const RAW_APPLICATION_DIR_NAME = "raw-application";
+const SERVICE_EVENT_FILE_NAME = "service-timeline.jsonl";
+const SUPERVISOR_EVENT_FILE_NAME = "supervisor-timeline.jsonl";
+const CAUSAL_TIMELINE_FILES = [
+	"timeline.previous.jsonl",
+	EVENT_FILE_NAME,
+	"service-timeline.previous.jsonl",
+	SERVICE_EVENT_FILE_NAME,
+	"supervisor-timeline.previous.jsonl",
+	SUPERVISOR_EVENT_FILE_NAME,
+] as const;
 const ACTIVE_MARKER_FILE_NAME = ".recorder-active";
 const FINALIZER_CLAIM_FILE_NAME = ".incident-finalizer-claim";
 const HEARTBEAT_INTERVAL_MS = 1_000;
 const STALL_THRESHOLD_MS = 10_000;
-const EVENT_FLUSH_INTERVAL_MS = 50;
-const RAW_MANIFEST_CHECKPOINT_MS = 5_000;
-const RAW_SEGMENT_ROTATION_MS = 5 * 60 * 1_000;
-const EVENT_BUFFER_BYTES = 64 * 1024;
-const RAW_RECORD_SCHEMA_VERSION = 3;
-const RAW_FRAME_PAYLOAD_BYTES = 32 * 1024;
 
 const LINUX_BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id";
 
@@ -108,32 +103,14 @@ function linuxMachineId(): string | undefined {
 	}
 }
 
-type RawApplicationSource =
-	| "recorder-events"
-	| "supervisor-events"
-	| "supervisor-stdout"
-	| "supervisor-stderr"
-	| "worker-stdout"
-	| "worker-stderr"
-	| "worker-transport"
-	| "loss-accounting"
-	| "linux-raw-source"
-	| "linux-journal-source"
-	| "provider-evidence"
-	| "provider-manifest";
+type CausalEventSource = "recorder-events" | "supervisor-events" | "loss-accounting";
 
-/** Segment size is a rotation boundary, not a retention or semantic filtering policy. */
 export const INCIDENT_RECORDER_LIMITS = {
-	rawSegmentBytes: 64 * 1024 * 1024,
 	eventFileBytes: 1024 * 1024,
-	eventRecordBytes: 8 * 1024,
 	evidenceFileBytes: 256 * 1024,
-	nodeReportInputBytes: 2 * 1024 * 1024,
 	nodeReportFileBytes: 128 * 1024,
-	perRunBytes: 8 * 1024 * 1024,
 	perBundleBytes: 8 * 1024 * 1024,
 	retentionAgeMs: INCIDENT_DIAGNOSTIC_RETENTION_MS,
-	maxReportsPerRun: 4,
 	maxDirectoryEntries: 256,
 } as const;
 
@@ -164,101 +141,6 @@ export interface RecordProcessOptions {
 interface BoundedRead {
 	value: Buffer;
 	truncated: boolean;
-}
-
-interface RawSegmentState {
-	runDir: string;
-	source: RawApplicationSource;
-	directory: string;
-	segmentIndex: number;
-	segmentBytes: number;
-	segmentOpenedMs: number;
-	lastManifestCheckpointMs: number;
-	manifestTimer?: ReturnType<typeof setTimeout>;
-	manifestWriting: boolean;
-	manifestDirty: boolean;
-	manifestWaiters: Array<() => void>;
-}
-
-interface BufferedEventState {
-	runDir: string;
-	source: RawApplicationSource;
-	pending: string[];
-	pendingBytes: number;
-	writing: boolean;
-	inFlight?: string[];
-	timer?: ReturnType<typeof setTimeout>;
-	waiters: Array<() => void>;
-}
-
-interface RawRecordFrame {
-	schemaVersion: number;
-	recordId: string;
-	chunkIndex: number;
-	chunkCount: number;
-	encoding: "base64";
-	payload: string;
-}
-
-const rawSegmentStates = new Map<string, RawSegmentState>();
-const bufferedApplicationStreams = new Map<string, BufferedEventState>();
-let rawRecordSequence = 0;
-let providerOccurrenceSequence = 0;
-let activeOrderedWriter: { runDir: string; writer: IncidentRecorderWriter } | undefined;
-interface ServiceRecorderRuntime {
-	writer: IncidentRecorderWriter;
-}
-let activeServiceRecorder: ServiceRecorderRuntime | undefined;
-
-function orderedWriterForRun(runDir: string): IncidentRecorderWriter | undefined {
-	return activeOrderedWriter?.runDir === runDir ? activeOrderedWriter.writer : undefined;
-}
-
-const serviceRunIdentityCache = new Map<
-	string,
-	{ runId: string; runToken: string; targetPid?: number; targetProcessStartId?: string }
->();
-
-function serviceRunIdentity(
-	runDir: string,
-): { runId: string; runToken: string; targetPid?: number; targetProcessStartId?: string } | undefined {
-	const cached = serviceRunIdentityCache.get(runDir);
-	if (cached) return cached;
-	const processIdentity = readSmallJson<{ runToken?: unknown; pid?: unknown; processStartId?: unknown }>(
-		join(runDir, "process.json"),
-	);
-	const expectation = readSmallJson<{ runToken?: unknown }>(join(runDir, "finalization-barrier-expectation.json"));
-	const runId = basename(runDir).slice(-36);
-	const runToken = typeof processIdentity?.runToken === "string" ? processIdentity.runToken : expectation?.runToken;
-	if (!/^[0-9a-f-]{36}$/i.test(runId) || typeof runToken !== "string" || !/^[0-9a-f-]{36}$/i.test(runToken))
-		return undefined;
-	const identity = {
-		runId,
-		runToken,
-		targetPid: typeof processIdentity?.pid === "number" ? processIdentity.pid : undefined,
-		targetProcessStartId:
-			typeof processIdentity?.processStartId === "string" ? processIdentity.processStartId : undefined,
-	};
-	serviceRunIdentityCache.set(runDir, identity);
-	while (serviceRunIdentityCache.size > 4096)
-		serviceRunIdentityCache.delete(serviceRunIdentityCache.keys().next().value as string);
-	return identity;
-}
-
-function serviceRecordDerived(
-	runDir: string,
-	source: RawApplicationSource,
-	type: string,
-	fields: Record<string, unknown>,
-): boolean {
-	const runtime = activeServiceRecorder;
-	const identity = serviceRunIdentity(runDir);
-	if (!runtime || !identity) return false;
-	return runtime.writer.recordDerivedForRun(identity, source, type, {
-		...fields,
-		targetPid: identity.targetPid,
-		targetProcessStartId: identity.targetProcessStartId,
-	}).accepted;
 }
 
 function nowFields(): Pick<IncidentRecorderEvent, "wallTime" | "monotonicNs"> {
@@ -307,23 +189,52 @@ function writePrivateJson(path: string, value: unknown, _limit = INCIDENT_RECORD
 	chmodSync(path, 0o600);
 }
 
+function fsyncPrivateDirectory(path: string): void {
+	let descriptor: number | undefined;
+	try {
+		descriptor = openSync(path, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+		fsyncSync(descriptor);
+	} finally {
+		if (descriptor !== undefined) closeSync(descriptor);
+	}
+}
+
 function writePrivateJsonAtomicSync(path: string, value: unknown): void {
-	mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+	const directory = dirname(path);
+	mkdirSync(directory, { recursive: true, mode: 0o700 });
 	const temporary = `${path}.tmp-${process.pid}-${randomUUID()}`;
 	let descriptor: number | undefined;
 	try {
 		descriptor = openSync(temporary, "wx", 0o600);
-		writeSync(descriptor, `${JSON.stringify(value, null, 2)}\n`);
+		const bytes = Buffer.from(`${JSON.stringify(value, null, 2)}\n`, "utf8");
+		let offset = 0;
+		while (offset < bytes.length) {
+			const written = writeSync(descriptor, bytes, offset, bytes.length - offset);
+			if (written <= 0) throw new Error("Private JSON write made no progress");
+			offset += written;
+		}
 		fsyncSync(descriptor);
 		closeSync(descriptor);
 		descriptor = undefined;
 		renameSync(temporary, path);
 		chmodSync(path, 0o600);
+		fsyncPrivateDirectory(directory);
 	} finally {
 		if (descriptor !== undefined) closeSync(descriptor);
 		try {
 			rmSync(temporary, { force: true });
 		} catch {}
+	}
+}
+
+function publishTerminalDisposition(runDir: string, value: Record<string, unknown>): boolean {
+	try {
+		writePrivateJsonAtomicSync(join(runDir, ".retention-terminal.json"), value);
+		rmSync(join(runDir, ACTIVE_MARKER_FILE_NAME), { force: true });
+		fsyncPrivateDirectory(runDir);
+		return true;
+	} catch {
+		return false;
 	}
 }
 
@@ -423,445 +334,23 @@ function encodeDiagnosticValue(value: unknown, seen = new Map<object, number>())
 	};
 }
 
-function decodeDiagnosticValue(value: unknown, references = new Map<number, unknown>()): unknown {
-	if (!value || typeof value !== "object") return value;
-	const encoded = value as Record<string, unknown>;
-	const type = encoded.$diagnosticType;
-	if (type === "undefined") return undefined;
-	if (type === "bigint") return typeof encoded.value === "string" ? BigInt(encoded.value) : undefined;
-	if (type === "number") return Number(encoded.value);
-	if (type === "buffer" || type === "uint8array") {
-		return typeof encoded.value === "string" ? Buffer.from(encoded.value, "base64") : Buffer.alloc(0);
-	}
-	if (type === "date") return encoded.value;
-	if (type === "regexp" || type === "function" || type === "symbol") return encoded;
-	if (type === "reference") return typeof encoded.id === "number" ? references.get(encoded.id) : undefined;
-	if (type === "error") {
-		const decoded = {
-			name: encoded.name,
-			message: encoded.message,
-			stack: encoded.stack,
-			cause: decodeDiagnosticValue(encoded.cause, references),
-			ownProperties: decodeDiagnosticValue(encoded.ownProperties, references),
-		};
-		if (typeof encoded.id === "number") references.set(encoded.id, decoded);
-		return decoded;
-	}
-	if (type !== "object" && type !== "array" && type !== "map" && type !== "set") {
-		const result: Record<string, unknown> = {};
-		for (const [key, child] of Object.entries(encoded)) result[key] = decodeDiagnosticValue(child, references);
-		return result;
-	}
-	if (type === "map") {
-		const result: unknown[] = [];
-		if (typeof encoded.id === "number") references.set(encoded.id, result);
-		for (const entry of Array.isArray(encoded.entries) ? encoded.entries : []) {
-			if (Array.isArray(entry)) result.push(entry.map((child) => decodeDiagnosticValue(child, references)));
-		}
-		return result;
-	}
-	if (type === "set") {
-		const result: unknown[] = [];
-		if (typeof encoded.id === "number") references.set(encoded.id, result);
-		for (const child of Array.isArray(encoded.values) ? encoded.values : []) {
-			result.push(decodeDiagnosticValue(child, references));
-		}
-		return result;
-	}
-	const result: Record<string, unknown> | unknown[] = type === "array" ? [] : {};
-	if (typeof encoded.id === "number") references.set(encoded.id, result);
-	for (const property of Array.isArray(encoded.properties) ? encoded.properties : []) {
-		if (!property || typeof property !== "object") continue;
-		const item = property as Record<string, unknown>;
-		const key = item.key as { type?: unknown; value?: unknown } | undefined;
-		if (key?.type !== "string" || typeof key.value !== "string" || !("value" in item)) continue;
-		(result as Record<string, unknown>)[key.value] = decodeDiagnosticValue(item.value, references);
-	}
-	return result;
+function causalTimelineFileName(): string {
+	return process.env[INCIDENT_RECORDER_SERVICE_ENV] === "1" ? SERVICE_EVENT_FILE_NAME : EVENT_FILE_NAME;
 }
 
-function rawSourceDirectory(runDir: string, source: RawApplicationSource): string {
-	return join(runDir, RAW_APPLICATION_DIR_NAME, source);
-}
-
-function rawSegmentPath(state: RawSegmentState): string {
-	return join(state.directory, `segment-${String(state.segmentIndex).padStart(8, "0")}.jsonl`);
-}
-
-function loadRawSegmentState(runDir: string, source: RawApplicationSource): RawSegmentState {
-	const key = `${runDir}\0${source}`;
-	const existing = rawSegmentStates.get(key);
-	if (existing) return existing;
-	const directory = rawSourceDirectory(runDir, source);
-	mkdirSync(directory, { recursive: true, mode: 0o700 });
-	chmodSync(directory, 0o700);
-	const indexes = readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
-		const match = entry.isFile() ? entry.name.match(/^segment-(\d{8})\.jsonl$/) : undefined;
-		return match ? [Number(match[1])] : [];
-	});
-	const segmentIndex = indexes.length > 0 ? Math.max(...indexes) : 0;
-	let segmentBytes = 0;
-	let segmentOpenedMs = Date.now();
+function rotateCausalTimelineIfNeeded(runDir: string, fileName: string, incomingBytes: number): boolean {
+	const path = join(runDir, fileName);
 	try {
-		const stat = statSync(join(directory, `segment-${String(segmentIndex).padStart(8, "0")}.jsonl`));
-		segmentBytes = stat.size;
-		segmentOpenedMs = stat.birthtimeMs || stat.mtimeMs;
-	} catch {}
-	const state: RawSegmentState = {
-		runDir,
-		source,
-		directory,
-		segmentIndex,
-		segmentBytes,
-		segmentOpenedMs,
-		lastManifestCheckpointMs: 0,
-		manifestWriting: false,
-		manifestDirty: false,
-		manifestWaiters: [],
-	};
-	rawSegmentStates.set(key, state);
-	return state;
-}
-
-function finishRawSegmentManifestWrite(state: RawSegmentState): void {
-	state.manifestWriting = false;
-	if (state.manifestDirty) {
-		writeRawSegmentManifest(state, true);
-		return;
-	}
-	for (const resolveWaiter of state.manifestWaiters.splice(0)) resolveWaiter();
-}
-
-function writeRawSegmentManifest(state: RawSegmentState, force = false): void {
-	const elapsed = Date.now() - state.lastManifestCheckpointMs;
-	if (!force && elapsed < RAW_MANIFEST_CHECKPOINT_MS) {
-		if (!state.manifestTimer) {
-			state.manifestTimer = setTimeout(() => {
-				state.manifestTimer = undefined;
-				writeRawSegmentManifest(state, true);
-			}, RAW_MANIFEST_CHECKPOINT_MS - elapsed);
-			state.manifestTimer.unref();
-		}
-		return;
-	}
-	if (state.manifestWriting) {
-		state.manifestDirty = true;
-		return;
-	}
-	try {
-		const segments = readdirSync(state.directory, { withFileTypes: true })
-			.filter((entry) => entry.isFile() && /^segment-\d{8}\.jsonl$/.test(entry.name))
-			.map((entry) => {
-				const stat = statSync(join(state.directory, entry.name));
-				return { file: entry.name, bytes: stat.size, mode: stat.mode & 0o777, mtimeMs: stat.mtimeMs };
-			});
-		const manifestPath = join(state.directory, "manifest.json");
-		const temporary = `${manifestPath}.tmp-${process.pid}-${randomUUID()}`;
-		const serialized = `${JSON.stringify(
-			{
-				schemaVersion: 1,
-				source: state.source,
-				canonical: false,
-				encoding: "json-lines/base64-chunked-utf8-json",
-				rotation: { bytes: INCIDENT_RECORDER_LIMITS.rawSegmentBytes, milliseconds: RAW_SEGMENT_ROTATION_MS },
-				checkpointMilliseconds: RAW_MANIFEST_CHECKPOINT_MS,
-				segments,
-				updated: nowFields(),
-			},
-			null,
-			2,
-		)}\n`;
-		state.lastManifestCheckpointMs = Date.now();
-		state.manifestDirty = false;
-		state.manifestWriting = true;
-		writeFile(temporary, serialized, { mode: 0o600 }, (error) => {
-			if (error) {
-				recordRawLoss(state.runDir, state.source, error, Buffer.byteLength(serialized));
-				finishRawSegmentManifestWrite(state);
-				return;
-			}
-			try {
-				const descriptor = openSync(temporary, "r");
-				try {
-					fsyncSync(descriptor);
-				} finally {
-					closeSync(descriptor);
-				}
-				renameSync(temporary, manifestPath);
-				chmodSync(manifestPath, 0o600);
-			} catch (renameError) {
-				recordRawLoss(state.runDir, state.source, renameError, Buffer.byteLength(serialized));
-				try {
-					rmSync(temporary, { force: true });
-				} catch {}
-			}
-			finishRawSegmentManifestWrite(state);
-		});
+		const stat = lstatSync(path);
+		if (!stat.isFile() || stat.isSymbolicLink()) return false;
+		if (stat.size + incomingBytes <= INCIDENT_RECORDER_LIMITS.eventFileBytes) return true;
+		const previous = join(runDir, fileName.replace(/\.jsonl$/, ".previous.jsonl"));
+		rmSync(previous, { force: true });
+		renameSync(path, previous);
+		fsyncPrivateDirectory(runDir);
+		return true;
 	} catch (error) {
-		recordRawLoss(state.runDir, state.source, error, 0);
-		state.manifestDirty = false;
-		finishRawSegmentManifestWrite(state);
-	}
-}
-
-function rotateRawSegmentIfNeeded(state: RawSegmentState, bytes: number): string {
-	if (
-		state.segmentBytes > 0 &&
-		(state.segmentBytes + bytes > INCIDENT_RECORDER_LIMITS.rawSegmentBytes ||
-			Date.now() - state.segmentOpenedMs >= RAW_SEGMENT_ROTATION_MS)
-	) {
-		state.segmentIndex += 1;
-		state.segmentBytes = 0;
-		state.segmentOpenedMs = Date.now();
-		writeRawSegmentManifest(state, true);
-	}
-	const path = rawSegmentPath(state);
-	state.segmentBytes += bytes;
-	return path;
-}
-
-interface RawBlobReference {
-	algorithm: "sha256" | "journald-occurrence";
-	digest?: string;
-	bytes: number;
-	path: string;
-	collisionFallbackPath?: string;
-	encoding: string;
-	compression?: "gzip";
-	storedBytes?: number;
-	rootRelativePath?: string;
-	referenceKind?: "cas" | "ordered-occurrence-admission" | "bounded-causal-evidence";
-	producerOccurrenceId?: string;
-	pending?: boolean;
-	admissionDisposition?: "locally_admitted" | "rejected";
-	durability?: "pending_compactor_cas_resolution" | "not_admitted" | "fsynced-local-file";
-}
-
-function recordLinuxRawSource(
-	runDir: string,
-	occurrence: LinuxRawSourceOccurrence,
-	_durable = false,
-): RawBlobReference {
-	const maximumBytes = INCIDENT_RECORDER_LIMITS.evidenceFileBytes;
-	const bytes = occurrence.bytes.subarray(0, maximumBytes);
-	const digest = createHash("sha256").update(bytes).digest("hex");
-	const directory = join(runDir, "evidence", "linux");
-	const path = join(directory, `${digest}.bin`);
-	try {
-		mkdirSync(directory, { recursive: true, mode: 0o700 });
-		if (!existsSync(path)) {
-			const descriptor = openSync(path, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
-			try {
-				writeSync(descriptor, bytes);
-				fsyncSync(descriptor);
-			} finally {
-				closeSync(descriptor);
-			}
-		}
-		appendStructuredCausalEvent(runDir, "recorder-events", "linux_evidence_captured", {
-			source: occurrence.source,
-			sourcePath: occurrence.sourcePath,
-			phase: occurrence.phase,
-			observedWallTime: occurrence.wallTime,
-			observedMonotonicNs: occurrence.monotonicNs,
-			identity: occurrence.identity,
-			bounds: occurrence.bounds,
-			evidence: { path, sha256: digest, bytes: bytes.length, truncated: occurrence.bytes.length > bytes.length },
-		});
-	} catch (error) {
-		recordRawLoss(runDir, "linux-raw-source", error, occurrence.bytes.length);
-	}
-	return {
-		algorithm: "sha256",
-		digest,
-		bytes: bytes.length,
-		path,
-		encoding: occurrence.encoding,
-		referenceKind: "bounded-causal-evidence",
-		durability: "fsynced-local-file",
-	};
-}
-
-function serializeRawRecord(
-	_runDir: string,
-	source: RawApplicationSource,
-	type: string,
-	fields: Record<string, unknown>,
-	_durable = false,
-): string[] {
-	const timestamp = nowFields();
-	const sequence = ++rawRecordSequence;
-	const recordId = `${process.pid}:${sequence}:${randomUUID()}`;
-	const envelope = {
-		schemaVersion: 3,
-		recordId,
-		sequence,
-		...timestamp,
-		pid: process.pid,
-		processStartId: getProcessStartId(process.pid),
-		type,
-		fields: encodeDiagnosticValue(fields),
-		provenance: {
-			source,
-			capture: "private-local-causal-diagnostic",
-			executable: process.execPath,
-		},
-	};
-	const serialized = Buffer.from(JSON.stringify(envelope), "utf8");
-	const chunkCount = Math.max(1, Math.ceil(serialized.length / RAW_FRAME_PAYLOAD_BYTES));
-	const lines: string[] = [];
-	for (let chunkIndex = 0; chunkIndex < chunkCount; chunkIndex += 1) {
-		const frame: RawRecordFrame = {
-			schemaVersion: 1,
-			recordId,
-			chunkIndex,
-			chunkCount,
-			encoding: "base64",
-			payload: serialized
-				.subarray(chunkIndex * RAW_FRAME_PAYLOAD_BYTES, (chunkIndex + 1) * RAW_FRAME_PAYLOAD_BYTES)
-				.toString("base64"),
-		};
-		lines.push(`${JSON.stringify(frame)}
-`);
-	}
-	return lines;
-}
-
-function recordRawLoss(runDir: string, source: RawApplicationSource, error: unknown, attemptedBytes: number): void {
-	if (source === "loss-accounting") return;
-	const orderedWriter = orderedWriterForRun(runDir);
-	if (orderedWriter) {
-		orderedWriter.recordDerived("loss-accounting", "raw_capture_loss", {
-			source,
-			attemptedBytes,
-			error: serializeError(error),
-		});
-		return;
-	}
-	if (activeServiceRecorder) {
-		serviceRecordDerived(runDir, "loss-accounting", "raw_capture_loss", {
-			source,
-			attemptedBytes,
-			error: serializeError(error),
-		});
-		return;
-	}
-	if (runHasLiveWriter(runDir)) return;
-	try {
-		writeRawLinesSync(
-			loadRawSegmentState(runDir, "loss-accounting"),
-			serializeRawRecord(runDir, "loss-accounting", "raw_capture_loss", {
-				source,
-				attemptedBytes,
-				error: serializeError(error),
-			}),
-		);
-	} catch {
-		// The loss counter itself is best effort when the storage path is unavailable.
-	}
-}
-
-function writeRawLinesSync(state: RawSegmentState, lines: readonly string[]): void {
-	for (const line of lines) {
-		const bytes = Buffer.byteLength(line);
-		try {
-			const path = rotateRawSegmentIfNeeded(state, bytes);
-			const descriptor = openSync(path, "a", 0o600);
-			try {
-				writeSync(descriptor, line);
-				fsyncSync(descriptor);
-			} finally {
-				closeSync(descriptor);
-			}
-			chmodSync(path, 0o600);
-		} catch (error) {
-			recordRawLoss(state.runDir, state.source, error, bytes);
-		}
-	}
-	writeRawSegmentManifest(state);
-}
-
-function planRawWrites(state: RawSegmentState, lines: readonly string[]): Array<{ path: string; payload: string }> {
-	const writes: Array<{ path: string; payload: string }> = [];
-	for (const line of lines) {
-		const path = rotateRawSegmentIfNeeded(state, Buffer.byteLength(line));
-		const previous = writes.at(-1);
-		if (previous?.path === path) previous.payload += line;
-		else writes.push({ path, payload: line });
-	}
-	return writes;
-}
-
-function writeRawLinesAsync(state: RawSegmentState, lines: readonly string[], complete: () => void): void {
-	let writes: Array<{ path: string; payload: string }>;
-	try {
-		writes = planRawWrites(state, lines);
-	} catch (error) {
-		recordRawLoss(
-			state.runDir,
-			state.source,
-			error,
-			lines.reduce((total, line) => total + Buffer.byteLength(line), 0),
-		);
-		complete();
-		return;
-	}
-	let index = 0;
-	const next = () => {
-		const write = writes[index++];
-		if (!write) {
-			writeRawSegmentManifest(state);
-			complete();
-			return;
-		}
-		appendFile(write.path, write.payload, { mode: 0o600 }, (error) => {
-			if (error) recordRawLoss(state.runDir, state.source, error, Buffer.byteLength(write.payload));
-			else {
-				try {
-					chmodSync(write.path, 0o600);
-				} catch (chmodError) {
-					recordRawLoss(state.runDir, state.source, chmodError, Buffer.byteLength(write.payload));
-				}
-			}
-			next();
-		});
-	};
-	next();
-}
-
-const IMMEDIATE_DURABLE_EVENT_TYPES = new Set([
-	"recorder_spawn_error",
-	"recorder_child_error",
-	"supervisor_exit",
-	"signal_received",
-	"fatal_exception",
-	"unhandled_rejection",
-	"socket_lost",
-	"supervisor_generation_changed",
-	"supervisor_ready",
-	"supervisor_relaunch",
-	"node_report_captured",
-]);
-
-function appendStructuredCausalEvent(
-	runDir: string,
-	source: string,
-	type: string,
-	fields: Record<string, unknown>,
-): void {
-	const causalSource: RawApplicationSource =
-		source === "supervisor-events"
-			? "supervisor-events"
-			: source === "loss-accounting"
-				? "loss-accounting"
-				: "recorder-events";
-	try {
-		writeRawLinesSync(
-			loadRawSegmentState(runDir, causalSource),
-			serializeRawRecord(runDir, causalSource, type, fields, IMMEDIATE_DURABLE_EVENT_TYPES.has(type)),
-		);
-	} catch (error) {
-		recordRawLoss(runDir, causalSource, error, 0);
+		return Boolean((error as NodeJS.ErrnoException).code === "ENOENT");
 	}
 }
 
@@ -869,40 +358,42 @@ export function recordIncidentRecorderCausalEvent(
 	runDir: string,
 	type: string,
 	fields: Record<string, unknown> = {},
+	trusted: { source?: CausalEventSource; occurrenceId?: string } = {},
 ): boolean {
 	if (!/^[a-z][a-z0-9_]{0,79}$/.test(type)) return false;
 	let descriptor: number | undefined;
 	try {
 		const observed = nowFields();
-		const source =
-			fields.source === "supervisor-events"
+		const source: CausalEventSource =
+			trusted.source === "supervisor-events"
 				? "supervisor-events"
-				: fields.source === "loss-accounting"
+				: trusted.source === "loss-accounting"
 					? "loss-accounting"
 					: "recorder-events";
-		const producerPid =
-			typeof fields.producerPid === "number" && Number.isSafeInteger(fields.producerPid)
-				? fields.producerPid
-				: process.pid;
-		const producerProcessStartId =
-			typeof fields.producerProcessStartId === "string"
-				? fields.producerProcessStartId
-				: getProcessStartId(producerPid);
+		const occurrenceId =
+			typeof trusted.occurrenceId === "string" &&
+			/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(trusted.occurrenceId)
+				? trusted.occurrenceId
+				: randomUUID();
+		const producerPid = process.pid;
 		const trustedEnvelope = {
 			type,
 			...observed,
-			pid: process.pid,
+			pid: producerPid,
 			source,
+			occurrenceId,
 			producerPid,
-			producerProcessStartId,
-			...(typeof fields.occurrenceId === "string" ? { occurrenceId: fields.occurrenceId } : {}),
+			producerProcessStartId: getProcessStartId(producerPid),
 		};
-		let bytes = Buffer.from(`${JSON.stringify({ ...fields, ...trustedEnvelope })}\n`, "utf8");
+		const safeFields = sanitizeIncidentCausalFields(fields);
+		let bytes = Buffer.from(`${JSON.stringify({ ...safeFields, ...trustedEnvelope })}\n`, "utf8");
 		if (bytes.length > 3584)
 			bytes = Buffer.from(`${JSON.stringify({ ...trustedEnvelope, fieldsTruncated: true })}\n`, "utf8");
 		if (bytes.length > 3584) return false;
+		const fileName = causalTimelineFileName();
+		if (!rotateCausalTimelineIfNeeded(runDir, fileName, bytes.length)) return false;
 		descriptor = openSync(
-			join(runDir, EVENT_FILE_NAME),
+			join(runDir, fileName),
 			fsConstants.O_WRONLY | fsConstants.O_APPEND | fsConstants.O_CREAT | fsConstants.O_NOFOLLOW,
 			0o600,
 		);
@@ -919,140 +410,33 @@ export function recordIncidentRecorderCausalEvent(
 	}
 }
 
+function appendCausalRunEvent(
+	runDir: string,
+	source: CausalEventSource,
+	type: string,
+	fields: Record<string, unknown> = {},
+): IncidentRecorderAdmission {
+	const occurrenceId = randomUUID();
+	const accepted = recordIncidentRecorderCausalEvent(runDir, type, sanitizeIncidentCausalFields(fields), {
+		source,
+		occurrenceId,
+	});
+	return accepted
+		? { accepted: true, occurrenceId }
+		: { accepted: false, occurrenceId, reason: "durable_sink_unavailable" };
+}
+
 function appendRunEvent(runDir: string, event: { type: string; [key: string]: unknown }): void {
 	const { type, ...fields } = event;
-	const orderedWriter = orderedWriterForRun(runDir);
-	if (orderedWriter) {
-		orderedWriter.recordDerived("recorder-events", type, fields);
-		return;
-	}
-	if (activeServiceRecorder) {
-		serviceRecordDerived(runDir, "recorder-events", type, fields);
-		return;
-	}
-	try {
-		const key = `${runDir}\0recorder-events`;
-		let state = bufferedApplicationStreams.get(key);
-		if (!state) {
-			state = {
-				runDir,
-				source: "recorder-events",
-				pending: [],
-				pendingBytes: 0,
-				writing: false,
-				waiters: [],
-			};
-			bufferedApplicationStreams.set(key, state);
-		}
-		if (IMMEDIATE_DURABLE_EVENT_TYPES.has(type)) {
-			if (!state.writing && state.pending.length > 0) {
-				const pending = state.pending;
-				state.pending = [];
-				state.pendingBytes = 0;
-				writeRawLinesSync(loadRawSegmentState(runDir, state.source), pending);
-			}
-			writeRawLinesSync(
-				loadRawSegmentState(runDir, "recorder-events"),
-				serializeRawRecord(runDir, "recorder-events", type, fields, true),
-			);
-			return;
-		}
-		const lines = serializeRawRecord(runDir, "recorder-events", type, fields);
-		for (const line of lines) {
-			state.pending.push(line);
-			state.pendingBytes += Buffer.byteLength(line);
-		}
-		if (state.pendingBytes >= EVENT_BUFFER_BYTES) flushSupervisorEvents(state);
-		else scheduleSupervisorEventFlush(state);
-	} catch (error) {
-		recordRawLoss(runDir, "recorder-events", error, 0);
-	}
-}
-
-function scheduleSupervisorEventFlush(state: BufferedEventState): void {
-	if (state.timer || state.writing || state.pending.length === 0) return;
-	state.timer = setTimeout(() => {
-		state.timer = undefined;
-		flushSupervisorEvents(state);
-	}, EVENT_FLUSH_INTERVAL_MS);
-	state.timer.unref();
-}
-
-function flushSupervisorEvents(state: BufferedEventState): void {
-	if (state.writing || state.pending.length === 0) return;
-	const lines = state.pending;
-	state.pending = [];
-	state.pendingBytes = 0;
-	state.writing = true;
-	state.inFlight = lines;
-	writeRawLinesAsync(loadRawSegmentState(state.runDir, state.source), lines, () => {
-		if (state.inFlight === lines) state.inFlight = undefined;
-		state.writing = false;
-		scheduleSupervisorEventFlush(state);
-		if (state.pending.length === 0) {
-			for (const resolveWaiter of state.waiters.splice(0)) resolveWaiter();
-		}
-	});
+	appendCausalRunEvent(runDir, "recorder-events", type, fields);
 }
 
 export function appendSupervisorDiagnosticEvent(type: string, fields: Record<string, unknown> = {}): void {
 	emitIncidentDerived("supervisor-events", type, fields);
 }
 
-export function appendSupervisorDiagnosticBytes(
-	type: string,
-	value: Uint8Array,
-	fields: Record<string, unknown> = {},
-): void {
-	// Payload bytes can contain prompts, credentials, terminal output, or protocol
-	// content unrelated to causal attribution. Structured lifecycle/request events
-	// carry the causal fields, so the automatic recorder intentionally ignores them.
-	void type;
-	void value;
-	void fields;
-}
-
 export async function flushSupervisorDiagnosticCapture(): Promise<void> {
 	await stopIncidentCaptureEmitter();
-}
-
-async function flushRawSegmentManifests(runDir: string): Promise<void> {
-	const states = [...rawSegmentStates.values()].filter((state) => state.runDir === runDir);
-	await Promise.all(
-		states.map(
-			(state) =>
-				new Promise<void>((resolveManifest) => {
-					if (state.manifestTimer) {
-						clearTimeout(state.manifestTimer);
-						state.manifestTimer = undefined;
-					}
-					state.manifestWaiters.push(resolveManifest);
-					writeRawSegmentManifest(state, true);
-				}),
-		),
-	);
-}
-
-async function flushRecordedProcessBytes(runDir: string): Promise<void> {
-	const states = [...bufferedApplicationStreams.values()].filter((state) => state.runDir === runDir);
-	await Promise.all(
-		states.map(
-			(state) =>
-				new Promise<void>((resolveFlush) => {
-					if (state.timer) {
-						clearTimeout(state.timer);
-						state.timer = undefined;
-					}
-					if (!state.writing && state.pending.length === 0) {
-						resolveFlush();
-						return;
-					}
-					state.waiters.push(resolveFlush);
-					flushSupervisorEvents(state);
-				}),
-		),
-	);
-	await flushRawSegmentManifests(runDir);
 }
 
 export function installSupervisorDiagnosticHooks(socketPath: string): () => void {
@@ -1073,6 +457,7 @@ export function installSupervisorDiagnosticHooks(socketPath: string): () => void
 		appendSupervisorDiagnosticEvent("supervisor_heartbeat", {
 			memory: process.memoryUsage(),
 			uptimeSeconds: process.uptime(),
+			socketExists: existsSync(socketPath),
 		});
 	}, HEARTBEAT_INTERVAL_MS);
 	heartbeat.unref();
@@ -1183,12 +568,6 @@ export function summarizeIncidentCommandLine(args: readonly string[], nulSeparat
 	};
 }
 
-function summarizeProcCommandLine(value: Buffer): IncidentCommandSummary {
-	const nulSeparated = value.includes(0);
-	const args = nulSeparated ? value.toString("utf8").split("\0").filter(Boolean) : [value.toString("utf8")];
-	return summarizeIncidentCommandLine(args, nulSeparated);
-}
-
 function provenNodeLaunch(launch: CliSubprocessLaunchSpec): boolean {
 	return (
 		process.release.name === "node" &&
@@ -1198,539 +577,47 @@ function provenNodeLaunch(launch: CliSubprocessLaunchSpec): boolean {
 	);
 }
 
-function parseProcStatus(value: string): Record<string, number | string> {
-	const result: Record<string, number | string> = {};
-	const numericKeys = new Set([
-		"FDSize",
-		"Threads",
-		"VmPeak",
-		"VmSize",
-		"VmLck",
-		"VmPin",
-		"VmHWM",
-		"VmRSS",
-		"RssAnon",
-		"RssFile",
-		"RssShmem",
-		"VmData",
-		"VmStk",
-		"VmExe",
-		"VmLib",
-		"VmPTE",
-		"VmSwap",
-		"voluntary_ctxt_switches",
-		"nonvoluntary_ctxt_switches",
-	]);
-	for (const line of value.split("\n")) {
-		const separator = line.indexOf(":");
-		if (separator === -1) continue;
-		const key = line.slice(0, separator);
-		const raw = line.slice(separator + 1).trim();
-		if (key === "State") {
-			const state = raw.match(/^[A-Za-z]/)?.[0];
-			if (state) result.State = state;
-		} else if (numericKeys.has(key)) {
-			const numeric = Number(raw.match(/^\d+/)?.[0]);
-			if (Number.isFinite(numeric)) result[key] = numeric;
-		}
-	}
-	return result;
-}
-
-function parseProcStat(value: string): Record<string, number | string> {
-	const commandEnd = value.lastIndexOf(")");
-	if (commandEnd === -1) return {};
-	const fields = value
-		.slice(commandEnd + 2)
-		.trim()
-		.split(/\s+/);
-	const result: Record<string, number | string> = {};
-	if (/^[A-Za-z]$/.test(fields[0] ?? "")) result.state = fields[0];
-	for (const [name, index] of [
-		["parentPid", 1],
-		["processGroup", 2],
-		["session", 3],
-		["userTicks", 11],
-		["systemTicks", 12],
-		["numThreads", 17],
-		["processStartTicks", 19],
-		["virtualBytes", 20],
-		["rssPages", 21],
-	] as const) {
-		const numeric = Number(fields[index]);
-		if (Number.isFinite(numeric)) result[name] = numeric;
-	}
-	return result;
-}
-
-function parseNumericLines(value: string): Record<string, number> {
-	const result: Record<string, number> = {};
-	for (const line of value.split("\n").slice(0, 128)) {
-		const match = line.match(/^([A-Za-z][A-Za-z0-9_() -]{0,63}):?\s+(\d+)/);
-		if (!match) continue;
-		result[match[1].trim().replaceAll(" ", "_")] = Number(match[2]);
-	}
-	return result;
-}
-
-function parseCgroup(value: string): Array<{ hierarchy: number; controllers: string[]; path: string }> {
-	return value
-		.split("\n")
-		.slice(0, 64)
-		.flatMap((line) => {
-			const match = line.match(/^(\d+):([A-Za-z0-9_,.-]*):(.*)$/);
-			if (!match) return [];
-			return [
-				{
-					hierarchy: Number(match[1]),
-					controllers: match[2]
-						.split(",")
-						.filter(Boolean)
-						.map((item) => safeToken(item)),
-					path: match[3],
-				},
-			];
-		});
-}
-
-function readProc(path: string): BoundedRead | undefined {
-	return readBoundedPrefix(path, INCIDENT_RECORDER_LIMITS.evidenceFileBytes);
-}
-
-function readProcessTree(
-	rootPid: number,
-): Array<{ pid: number; processStartId?: string; status?: Record<string, unknown> }> {
-	const result: Array<{ pid: number; processStartId?: string; status?: Record<string, unknown> }> = [];
-	const pending = [rootPid];
-	const seen = new Set<number>();
-	while (pending.length > 0) {
-		const pid = pending.shift();
-		if (!pid || seen.has(pid)) continue;
-		seen.add(pid);
-		const status = readProc(`/proc/${pid}/status`);
-		result.push({
-			pid,
-			processStartId: getProcessStartId(pid),
-			status: status && !status.truncated ? parseProcStatus(status.value.toString("utf8")) : undefined,
-		});
-		const children = readProc(`/proc/${pid}/task/${pid}/children`);
-		if (!children || children.truncated) continue;
-		pending.push(
-			...children.value
-				.toString("utf8")
-				.trim()
-				.split(/\s+/)
-				.map(Number)
-				.filter((childPid) => Number.isInteger(childPid) && childPid > 0),
-		);
-	}
-	return result;
-}
-
 function hasMatchingProcessIdentity(pid: number, processStartId: string | undefined): processStartId is string {
 	return Boolean(processStartId) && getProcessStartId(pid) === processStartId;
 }
 
-type ProcRawRecorder = (sourcePath: string, value: Buffer) => unknown;
-
-function captureRawProcFile(
-	runDir: string,
-	pid: number,
-	processStartId: string,
-	name: string,
-	recorder?: ProcRawRecorder,
-): Buffer | undefined {
-	if (!hasMatchingProcessIdentity(pid, processStartId)) return undefined;
-	const sourcePath = `/proc/${pid}/${name}`;
-	try {
-		const value = readFileSync(sourcePath);
-		if (!hasMatchingProcessIdentity(pid, processStartId)) return undefined;
-		const sha256 = createHash("sha256").update(value).digest("hex");
-		const orderedWriter = orderedWriterForRun(runDir);
-		if (orderedWriter && !recorder) {
-			orderedWriter.recordExactBytes("linux-raw-source", "proc_source_snapshot", value, "exact-file-bytes", {
-				sourcePath,
-				pid,
-				processStartId,
-				sha256,
-			});
-		} else {
-			appendRunEvent(runDir, {
-				type: "proc_source_snapshot",
-				sourcePath,
-				pid,
-				processStartId,
-				sha256,
-				payloadBlob:
-					recorder?.(sourcePath, value) ??
-					recordLinuxRawSource(runDir, {
-						source: "procfs",
-						sourcePath,
-						bytes: value,
-						encoding: "exact-file-bytes",
-						phase: "incident-pin",
-						...nowFields(),
-						identity: { targetPid: pid, targetProcessStartId: processStartId },
-					}),
-			});
-		}
-		return value;
-	} catch (error) {
-		appendRunEvent(runDir, { type: "proc_source_read_error", sourcePath, pid, processStartId, error });
-		return undefined;
-	}
-}
-
-function captureRawFileDescriptors(runDir: string, pid: number, processStartId: string): void {
-	if (!hasMatchingProcessIdentity(pid, processStartId)) return;
-	const directory = `/proc/${pid}/fd`;
-	try {
-		const descriptors = readdirSync(directory).map((name) => {
-			try {
-				return { descriptor: name, target: readlinkSync(join(directory, name)) };
-			} catch (error) {
-				return { descriptor: name, error: serializeError(error) };
-			}
-		});
-		if (!hasMatchingProcessIdentity(pid, processStartId)) return;
-		const encoded = Buffer.from(JSON.stringify(encodeDiagnosticValue(descriptors)), "utf8");
-		const sha256 = createHash("sha256").update(encoded).digest("hex");
-
-		appendRunEvent(runDir, {
-			type: "process_descriptor_snapshot",
-			sourcePath: directory,
-			pid,
-			processStartId,
-			sha256,
-			descriptors,
-		});
-	} catch (error) {
-		appendRunEvent(runDir, {
-			type: "process_descriptor_read_error",
-			sourcePath: directory,
-			pid,
-			processStartId,
-			error,
-		});
-	}
-}
-
-function captureRawProcessTree(
-	runDir: string,
-	rootPid: number,
-	rootProcessStartId: string,
-	recorder?: ProcRawRecorder,
-): void {
-	const pending = [rootPid];
-	const seen = new Set<number>();
-	while (pending.length > 0) {
-		const pid = pending.shift();
-		if (!pid || seen.has(pid)) continue;
-		seen.add(pid);
-		const processStartId = pid === rootPid ? rootProcessStartId : getProcessStartId(pid);
-		if (!processStartId || !hasMatchingProcessIdentity(pid, processStartId)) continue;
-		const children = captureRawProcFile(runDir, pid, processStartId, `task/${pid}/children`, recorder);
-		if (pid !== rootPid) {
-			for (const name of ["status", "stat", "io", "limits", "smaps_rollup", "cgroup", "cmdline", "environ"]) {
-				captureRawProcFile(runDir, pid, processStartId, name, recorder);
-			}
-			captureRawFileDescriptors(runDir, pid, processStartId);
-		}
-		if (!children) continue;
-		pending.push(
-			...children
-				.toString("utf8")
-				.trim()
-				.split(/\s+/)
-				.map(Number)
-				.filter((childPid) => Number.isInteger(childPid) && childPid > 0),
-		);
-	}
-}
-
-function captureProc(
-	runDir: string,
-	pid: number,
-	processStartId: string | undefined,
-	recorder?: ProcRawRecorder,
-): void {
-	if (process.platform !== "linux" || !hasMatchingProcessIdentity(pid, processStartId)) return;
-	const procDir = join(runDir, "proc");
-	mkdirSync(procDir, { recursive: true, mode: 0o700 });
-	const status = captureRawProcFile(runDir, pid, processStartId, "status", recorder);
-	if (status) writePrivateJson(join(procDir, "status.json"), parseProcStatus(status.toString("utf8")));
-	const stat = captureRawProcFile(runDir, pid, processStartId, "stat", recorder);
-	if (stat) writePrivateJson(join(procDir, "stat.json"), parseProcStat(stat.toString("utf8")));
-	for (const name of ["io", "limits", "smaps_rollup"]) {
-		const value = captureRawProcFile(runDir, pid, processStartId, name, recorder);
-		if (value) writePrivateJson(join(procDir, `${name}.json`), parseNumericLines(value.toString("utf8")));
-	}
-	const cgroup = captureRawProcFile(runDir, pid, processStartId, "cgroup", recorder);
-	if (cgroup) writePrivateJson(join(procDir, "cgroup.json"), parseCgroup(cgroup.toString("utf8")));
-	const cmdline = captureRawProcFile(runDir, pid, processStartId, "cmdline", recorder);
-	if (cmdline) writePrivateJson(join(procDir, "cmdline.json"), summarizeProcCommandLine(cmdline));
-	captureRawProcFile(runDir, pid, processStartId, "environ", recorder);
-	captureRawFileDescriptors(runDir, pid, processStartId);
-	captureRawProcessTree(runDir, pid, processStartId, recorder);
-	writePrivateJson(join(procDir, "process-tree.json"), readProcessTree(pid));
-}
-
-function captureProcSafely(
-	runDir: string,
-	pid: number,
-	processStartId: string | undefined,
-	recorder?: ProcRawRecorder,
-): void {
-	try {
-		captureProc(runDir, pid, processStartId, recorder);
-	} catch (error) {
-		recordRawLoss(runDir, "linux-raw-source", error, 0);
-	}
-}
-
-function readRawEventSource(runDir: string, source: "recorder-events" | "supervisor-events"): IncidentRecorderEvent[] {
-	const directory = rawSourceDirectory(runDir, source);
-	let names: string[];
-	try {
-		names = readdirSync(directory)
-			.filter((name) => /^segment-\d{8}\.jsonl$/.test(name))
-			.sort();
-	} catch {
-		return [];
-	}
-	const frames = new Map<string, { chunkCount: number; chunks: Map<number, Buffer> }>();
-	for (const name of names) {
-		let value: string;
-		try {
-			value = readFileSync(join(directory, name), "utf8");
-		} catch {
-			continue;
-		}
-		for (const line of value.split("\n").filter(Boolean)) {
-			try {
-				const frame = JSON.parse(line) as Partial<RawRecordFrame>;
-				if (
-					typeof frame.recordId !== "string" ||
-					typeof frame.chunkIndex !== "number" ||
-					typeof frame.chunkCount !== "number" ||
-					frame.encoding !== "base64" ||
-					typeof frame.payload !== "string"
-				) {
-					continue;
-				}
-				const record = frames.get(frame.recordId) ?? { chunkCount: frame.chunkCount, chunks: new Map() };
-				record.chunks.set(frame.chunkIndex, Buffer.from(frame.payload, "base64"));
-				frames.set(frame.recordId, record);
-			} catch {
-				// Loss is represented by the finalized manifest and explicit loss records when writable.
-			}
-		}
-	}
-	const events: IncidentRecorderEvent[] = [];
-	for (const record of frames.values()) {
-		if (record.chunks.size !== record.chunkCount) continue;
-		try {
-			const chunks = Array.from({ length: record.chunkCount }, (_, index) => record.chunks.get(index));
-			if (chunks.some((chunk) => chunk === undefined)) continue;
-			const envelope = JSON.parse(Buffer.concat(chunks as Buffer[]).toString("utf8")) as Record<string, unknown>;
-			let encodedFields = envelope.fields;
-			if (envelope.payloadBlob && typeof envelope.payloadBlob === "object") {
-				const reference = envelope.payloadBlob as Partial<RawBlobReference>;
-				const candidates = [reference.path, reference.collisionFallbackPath].filter(
-					(path): path is string => typeof path === "string",
-				);
-				for (const path of candidates) {
-					try {
-						const payload = readFileSync(path);
-						if (
-							typeof reference.digest === "string" &&
-							createHash("sha256").update(payload).digest("hex") === reference.digest &&
-							(typeof reference.bytes !== "number" || payload.length === reference.bytes)
-						) {
-							encodedFields = JSON.parse(payload.toString("utf8")) as unknown;
-							break;
-						}
-					} catch {}
-				}
-			}
-			const decoded = decodeDiagnosticValue(encodedFields);
-			const fields = decoded && typeof decoded === "object" && !Array.isArray(decoded) ? decoded : {};
-			if (
-				typeof envelope.type === "string" &&
-				typeof envelope.wallTime === "string" &&
-				typeof envelope.monotonicNs === "string" &&
-				typeof envelope.pid === "number"
-			) {
-				events.push({
-					...(fields as Record<string, unknown>),
-					type: envelope.type,
-					wallTime: envelope.wallTime,
-					monotonicNs: envelope.monotonicNs,
-					pid: envelope.pid,
-					recorderProvenance: {
-						processStartId: envelope.processStartId,
-						sequence: envelope.sequence,
-						payloadBlob: envelope.payloadBlob,
-						provenance: envelope.provenance,
-					},
-				});
-			}
-		} catch {
-			// A malformed record is noncanonical analysis input; raw segment bytes remain available.
-		}
-	}
-	return events;
-}
-
-interface OrderedEventCache {
-	seen: Set<string>;
-	events: Map<string, IncidentRecorderEvent & { wrapperSequence?: string }>;
-	references: Map<string, Record<string, unknown>>;
-	directory?: Dir;
-}
-const orderedEventCaches = new Map<string, OrderedEventCache>();
-
-function readOrderedEvents(runDir: string): IncidentRecorderEvent[] {
-	const runId = basename(runDir).slice(-36);
-	const runReferenceDirectory = join(
-		dirname(dirname(runDir)),
-		"refs",
-		"runs",
-		createHash("sha256").update(runId).digest("hex"),
-	);
-	let cache = orderedEventCaches.get(runDir);
-	if (!cache) {
-		cache = { seen: new Set(), events: new Map(), references: new Map() };
-		orderedEventCaches.set(runDir, cache);
-		while (orderedEventCaches.size > 4096) {
-			const oldest = orderedEventCaches.keys().next().value as string;
-			try {
-				orderedEventCaches.get(oldest)?.directory?.closeSync();
-			} catch {}
-			orderedEventCaches.delete(oldest);
-		}
-	}
-	if (!cache.directory) {
-		try {
-			cache.directory = opendirSync(runReferenceDirectory);
-		} catch {
-			return [...cache.events.values()];
-		}
-	}
-	const deadline = Date.now() + 5;
-	let files = 0;
-	let bytes = 0;
-	while (files < 8 && bytes < 128 * 1024 && Date.now() < deadline) {
-		let entry: Dirent | null;
-		try {
-			entry = cache.directory.readSync();
-		} catch {
-			entry = null;
-		}
-		if (!entry) {
-			try {
-				cache.directory.closeSync();
-			} catch {}
-			cache.directory = undefined;
-			break;
-		}
-		if (!entry.isFile() || !/^seq-[A-Za-z0-9-]{1,180}\.json$/.test(entry.name) || cache.seen.has(entry.name))
-			continue;
-		files += 1;
-		try {
-			const path = join(runReferenceDirectory, entry.name);
-			const stat = statSync(path);
-			if (stat.size > 64 * 1024 || bytes + stat.size > 128 * 1024) continue;
-			cache.seen.add(entry.name);
-			while (cache.seen.size > 4096) cache.seen.delete(cache.seen.values().next().value as string);
-			bytes += stat.size;
-			const reference = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
-			cache.references.set(entry.name, reference);
-			while (cache.references.size > 4096) cache.references.delete(cache.references.keys().next().value as string);
-			const identity = reference.identity;
-			if (!identity || typeof identity !== "object" || Array.isArray(identity)) continue;
-			const identityFields = identity as Record<string, unknown>;
-			if (
-				identityFields.runId !== runId ||
-				!["derived-scalar", "loss", "control"].includes(String(reference.payloadKind)) ||
-				typeof reference.type !== "string" ||
-				typeof reference.eventWallTimeMs !== "string" ||
-				typeof reference.eventMonotonicNs !== "string" ||
-				!reference.metadata ||
-				typeof reference.metadata !== "object" ||
-				Array.isArray(reference.metadata)
-			)
-				continue;
-			const metadata = reference.metadata as Record<string, unknown>;
-			const wrapperOrder =
-				Array.isArray(reference.wrapperOrder) && typeof reference.wrapperOrder[0] === "string"
-					? reference.wrapperOrder[0]
-					: undefined;
-			cache.events.set(entry.name, {
-				...metadata,
-				type: reference.type,
-				wallTime: new Date(Number(reference.eventWallTimeMs)).toISOString(),
-				monotonicNs: reference.eventMonotonicNs,
-				pid: typeof metadata.producerPid === "number" ? metadata.producerPid : 0,
-				wrapperSequence: wrapperOrder,
-				recorderProvenance: { occurrenceId: identityFields.occurrenceId, compactorCommitted: true },
-			});
-			while (cache.events.size > 4096) cache.events.delete(cache.events.keys().next().value as string);
-		} catch {}
-	}
-	return [...cache.events.values()].sort((left, right) => {
-		try {
-			return left.wrapperSequence && right.wrapperSequence
-				? Number(BigInt(left.wrapperSequence) - BigInt(right.wrapperSequence))
-				: 0;
-		} catch {
-			return 0;
-		}
-	});
-}
 function hasDurableFinalizationBarrier(runDir: string): boolean {
 	if (existsSync(join(runDir, ACTIVE_MARKER_FILE_NAME))) return false;
 	const terminal = readSmallJson<{
-		completed?: unknown;
+		completed?: { wallTime?: unknown; monotonicNs?: unknown };
 		exitCode?: unknown;
 		exitSignal?: unknown;
-		disposition?: unknown;
 	}>(join(runDir, ".retention-terminal.json"));
-	if (!terminal || !terminal.completed || typeof terminal.completed !== "object") return false;
+	if (
+		!terminal?.completed ||
+		typeof terminal.completed.wallTime !== "string" ||
+		!Number.isFinite(Date.parse(terminal.completed.wallTime)) ||
+		typeof terminal.completed.monotonicNs !== "string" ||
+		!/^\d+$/.test(terminal.completed.monotonicNs)
+	)
+		return false;
 	return (
 		Object.hasOwn(terminal, "exitCode") &&
 		Object.hasOwn(terminal, "exitSignal") &&
 		(terminal.exitCode === null || Number.isSafeInteger(terminal.exitCode)) &&
-		(terminal.exitSignal === null || typeof terminal.exitSignal === "string")
+		(terminal.exitSignal === null ||
+			(typeof terminal.exitSignal === "string" && /^SIG[A-Z0-9]+$/.test(terminal.exitSignal)))
 	);
 }
 
 function readExpectedExitDisposition(runDir: string): { code: number | null; signal: NodeJS.Signals | null } {
-	try {
-		const value = JSON.parse(readFileSync(join(runDir, "finalization-barrier-expectation.json"), "utf8")) as {
-			exitCode?: unknown;
-			exitSignal?: unknown;
-		};
-		return {
-			code: typeof value.exitCode === "number" ? value.exitCode : null,
-			signal:
-				typeof value.exitSignal === "string" && value.exitSignal !== "unavailable"
-					? (value.exitSignal as NodeJS.Signals)
-					: null,
-		};
-	} catch {
-		return { code: null, signal: null };
-	}
+	const value = readSmallJson<{ exitCode?: unknown; exitSignal?: unknown }>(join(runDir, ".retention-terminal.json"));
+	return {
+		code: typeof value?.exitCode === "number" ? value.exitCode : null,
+		signal: typeof value?.exitSignal === "string" ? (value.exitSignal as NodeJS.Signals) : null,
+	};
 }
 
 function readEvents(runDir: string): IncidentRecorderEvent[] {
-	const candidates = [
-		...readOrderedEvents(runDir),
-		...readRawEventSource(runDir, "recorder-events"),
-		...readRawEventSource(runDir, "supervisor-events"),
-	];
-	const bounded = readBoundedPrefix(join(runDir, EVENT_FILE_NAME), INCIDENT_RECORDER_LIMITS.eventFileBytes);
-	if (bounded) {
+	const candidates: IncidentRecorderEvent[] = [];
+	for (const fileName of CAUSAL_TIMELINE_FILES) {
+		const bounded = readBoundedPrefix(join(runDir, fileName), INCIDENT_RECORDER_LIMITS.eventFileBytes);
+		if (!bounded || bounded.truncated) continue;
 		for (const line of bounded.value.toString("utf8").split("\n").filter(Boolean)) {
 			try {
 				candidates.push(JSON.parse(line) as IncidentRecorderEvent);
@@ -1974,12 +861,6 @@ async function sanitizeNodeReports(runDir: string, _removeRawDirectory = false):
 	return state.discoveryComplete && state.pending.length === 0 ? "complete" : "pending";
 }
 
-function captureStoppedProviderArtifacts(_runDir: string): "complete" {
-	// Causal provider observations are already stored as bounded structured events.
-	// Do not copy or content-address arbitrary provider files in the automatic path.
-	return "complete";
-}
-
 function readJsonValue(value: Buffer): unknown {
 	try {
 		return JSON.parse(value.toString("utf8")) as unknown;
@@ -2050,12 +931,11 @@ function copyBoundedFile(source: string, target: string, relative: string, budge
 	try {
 		sourceDescriptor = openSync(source, "r");
 		const size = fstatSync(sourceDescriptor).size;
-		const configuredFileLimit =
-			relative === EVENT_FILE_NAME
-				? INCIDENT_RECORDER_LIMITS.eventFileBytes
-				: relative === "reports" || relative.startsWith("reports/") || relative.startsWith("reports\\")
-					? INCIDENT_RECORDER_LIMITS.nodeReportFileBytes
-					: INCIDENT_RECORDER_LIMITS.evidenceFileBytes;
+		const configuredFileLimit = CAUSAL_TIMELINE_FILES.some((name) => name === relative)
+			? INCIDENT_RECORDER_LIMITS.eventFileBytes
+			: relative === "reports" || relative.startsWith("reports/") || relative.startsWith("reports\\")
+				? INCIDENT_RECORDER_LIMITS.nodeReportFileBytes
+				: INCIDENT_RECORDER_LIMITS.evidenceFileBytes;
 		const fileLimit = Math.min(configuredFileLimit, budget.remaining);
 		if (size > fileLimit) return;
 		mkdirSync(dirname(target), { recursive: true, mode: 0o700 });
@@ -2065,7 +945,12 @@ function copyBoundedFile(source: string, target: string, relative: string, budge
 			const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, size - copied));
 			const count = readSync(sourceDescriptor, chunk, 0, chunk.length, copied);
 			if (count === 0) break;
-			writeSync(targetDescriptor, chunk, 0, count);
+			let written = 0;
+			while (written < count) {
+				const progress = writeSync(targetDescriptor, chunk, written, count - written);
+				if (progress <= 0) throw new Error("Incident bundle copy made no progress");
+				written += progress;
+			}
 			copied += count;
 		}
 		if (copied !== size) {
@@ -2102,205 +987,6 @@ function copyEvidenceTree(source: string, target: string, relative: string, budg
 		else if (entry.isFile()) copyBoundedFile(childSource, childTarget, childRelative, budget);
 		if (budget.remaining <= 0) return;
 	}
-}
-
-interface RawFileMetadata {
-	path: string;
-	relativePath?: string;
-	bytes?: number;
-	sha256?: string;
-	mode?: number;
-	dev?: number;
-	ino?: number;
-	mtimeMs?: number;
-	stableDuringHash?: boolean;
-	unavailable?: ReturnType<typeof serializeError>;
-}
-
-function hashFileMetadata(path: string, relativeRoot?: string): RawFileMetadata {
-	let descriptor: number | undefined;
-	try {
-		descriptor = openSync(path, "r");
-		const before = fstatSync(descriptor);
-		const hash = createHash("sha256");
-		let position = 0;
-		for (;;) {
-			const chunk = Buffer.allocUnsafe(256 * 1024);
-			const count = readSync(descriptor, chunk, 0, chunk.length, position);
-			if (count === 0) break;
-			hash.update(chunk.subarray(0, count));
-			position += count;
-		}
-		const after = fstatSync(descriptor);
-		return {
-			path,
-			...(relativeRoot ? { relativePath: path.slice(relativeRoot.length).replace(/^[/\\]/, "") } : {}),
-			bytes: position,
-			sha256: hash.digest("hex"),
-			mode: after.mode & 0o777,
-			dev: after.dev,
-			ino: after.ino,
-			mtimeMs: after.mtimeMs,
-			stableDuringHash:
-				before.dev === after.dev &&
-				before.ino === after.ino &&
-				before.size === after.size &&
-				before.mtimeMs === after.mtimeMs &&
-				position === after.size,
-		};
-	} catch (error) {
-		return {
-			path,
-			...(relativeRoot ? { relativePath: path.slice(relativeRoot.length).replace(/^[/\\]/, "") } : {}),
-			unavailable: serializeError(error),
-		};
-	} finally {
-		if (descriptor !== undefined) closeSync(descriptor);
-	}
-}
-
-function hashSourceTree(path: string): RawFileMetadata[] {
-	let stat: ReturnType<typeof statSync>;
-	try {
-		stat = statSync(path);
-	} catch (error) {
-		return [{ path, unavailable: serializeError(error) }];
-	}
-	if (stat.isFile()) return [hashFileMetadata(path, dirname(path))];
-	if (!stat.isDirectory()) return [{ path, unavailable: { reason: "not_a_regular_file_or_directory" } }];
-	const files: RawFileMetadata[] = [];
-	const pending = [path];
-	while (pending.length > 0) {
-		const directory = pending.pop();
-		if (!directory) continue;
-		let entries: Dirent[];
-		try {
-			entries = readdirSync(directory, { withFileTypes: true });
-		} catch (error) {
-			files.push({ path: directory, unavailable: serializeError(error) });
-			continue;
-		}
-		for (const entry of entries) {
-			const child = join(directory, entry.name);
-			if (entry.isDirectory()) pending.push(child);
-			else if (entry.isFile()) files.push(hashFileMetadata(child, path));
-		}
-	}
-	return files.sort((left, right) => (left.relativePath ?? left.path).localeCompare(right.relativePath ?? right.path));
-}
-
-function createRawApplicationManifest(
-	options: RecordProcessOptions,
-	runDir: string,
-	events: readonly IncidentRecorderEvent[],
-	incidentPaths?: { partialDir: string; incidentDir: string },
-): Record<string, unknown> {
-	const processIdentity = readSmallJson<Record<string, unknown>>(join(runDir, "process.json"));
-	const launch = readSmallJson<Record<string, unknown>>(join(runDir, "launch.json"));
-	const referencedPaths = new Map<string, Record<string, unknown>>();
-	for (const event of events) {
-		if (event.type === "application_source_reference" && typeof event.path === "string") {
-			referencedPaths.set(event.path, event);
-		}
-		if (event.type === "supervisor_ready") {
-			for (const key of ["descriptorDir", "supervisorConfigPath", "daemonLogPath"] as const) {
-				const path = event[key];
-				if (typeof path === "string") referencedPaths.set(path, { source: key, path });
-			}
-		}
-	}
-	const daemonLogPath = getDaemonLogPath(options.socketPath);
-	referencedPaths.set(daemonLogPath, { source: "daemon-rotating-log", socketPath: options.socketPath });
-	referencedPaths.set(`${daemonLogPath}.old`, {
-		source: "daemon-rotating-log-previous-segment",
-		socketPath: options.socketPath,
-	});
-	const sourceBounds: Record<
-		string,
-		Record<
-			string,
-			{
-				processStartId?: unknown;
-				start: { wallTime: string; monotonicNs: string };
-				end: { wallTime: string; monotonicNs: string };
-			}
-		>
-	> = {};
-	for (const event of events) {
-		const recorder =
-			event.recorderProvenance && typeof event.recorderProvenance === "object"
-				? (event.recorderProvenance as Record<string, unknown>)
-				: undefined;
-		const provenance =
-			recorder?.provenance && typeof recorder.provenance === "object"
-				? (recorder.provenance as Record<string, unknown>)
-				: undefined;
-		const source = typeof provenance?.source === "string" ? provenance.source : "legacy";
-		const pid = String(event.pid);
-		const bounds = sourceBounds[source] ?? {};
-		sourceBounds[source] = bounds;
-		const point = { wallTime: event.wallTime, monotonicNs: event.monotonicNs };
-		const current = bounds[pid];
-		if (!current) bounds[pid] = { processStartId: recorder?.processStartId, start: point, end: point };
-		else current.end = point;
-	}
-	const rawRoots = [join(runDir, RAW_APPLICATION_DIR_NAME), join(runDir, "raw-reports")];
-	return {
-		schemaVersion: 1,
-		canonical: false,
-		purpose: "content-bound-index-of-private-local-raw-application-sources",
-		generated: nowFields(),
-		retentionPolicy: "3-days-time-expiry-with-bounded-reference-safe-gc",
-		journalTransport: {
-			namespace: "grimoire",
-			identifier: "prime-agent-raw-v1",
-			retention: "3d",
-			occurrenceOrder: "wrapper-sequence-independent-of-journal-receive-time",
-			streamSubmissionDurability: "uncertain",
-			valueEncoding: "base64-exact-bytes-or-derived-scalar",
-		},
-		runtimeIdentity: {
-			process: processIdentity,
-			launch,
-			finalizer: {
-				pid: process.pid,
-				processStartId: getProcessStartId(process.pid),
-				executable: process.execPath,
-				argv: process.argv,
-				versions: process.versions,
-			},
-		},
-		sourceVersion: RAW_RECORD_SCHEMA_VERSION,
-		sourceBounds,
-		timeBounds: {
-			start: events.at(0) ? { wallTime: events[0].wallTime, monotonicNs: events[0].monotonicNs } : undefined,
-			end: events.at(-1)
-				? { wallTime: events.at(-1)?.wallTime, monotonicNs: events.at(-1)?.monotonicNs }
-				: undefined,
-		},
-		rawSources: rawRoots.map((path) => ({ path, files: hashSourceTree(path) })),
-		referenceRoots: {
-			globalCas: join(dirname(dirname(runDir)), "cas", "sha256"),
-			occurrences: join(dirname(dirname(runDir)), "refs", "occurrences", "sha256"),
-			journalRecords: join(dirname(dirname(runDir)), "refs", "journal"),
-			exactByteDeduplicationOnly: true,
-		},
-		incidentPinnedRawSources: incidentPaths
-			? [
-					{
-						incidentPath: incidentPaths.incidentDir,
-						manifest: join(incidentPaths.incidentDir, "journal-pin-manifest.json"),
-						state: "pending-through-plus-15m-window",
-						globalCasRoot: join(dirname(dirname(runDir)), "cas", "sha256"),
-					},
-				]
-			: [],
-		contentBoundReferences: [...referencedPaths.entries()].map(([path, provenance]) => ({
-			path,
-			provenance,
-			files: hashSourceTree(path),
-		})),
-	};
 }
 
 type IncidentCauseLayer = "application" | "environment" | "mixed" | "unknown";
@@ -2402,11 +1088,24 @@ function finalizeIncident(
 		rmSync(partialDir, { recursive: true, force: true });
 		mkdirSync(partialDir, { mode: 0o700 });
 		const events = readEvents(runDir);
+		const causalResourceName = "linux-causal-resource.json";
+		const causalResourceSource = join(runDir, causalResourceName);
+		const causalResourceExisted = existsSync(causalResourceSource);
+		const causalResourceBudget: CopyBudget = {
+			remaining: INCIDENT_RECORDER_LIMITS.evidenceFileBytes,
+			copied: [],
+		};
+		copyBoundedFile(
+			causalResourceSource,
+			join(partialDir, causalResourceName),
+			causalResourceName,
+			causalResourceBudget,
+		);
 		const budget: CopyBudget = {
 			remaining: INCIDENT_RECORDER_LIMITS.perBundleBytes - INCIDENT_RECORDER_LIMITS.evidenceFileBytes,
 			copied: [],
 		};
-		for (const name of [EVENT_FILE_NAME, "proc", "reports", "evidence"]) {
+		for (const name of [...CAUSAL_TIMELINE_FILES, "reports"]) {
 			const source = join(runDir, name);
 			try {
 				if (statSync(source).isDirectory()) copyEvidenceTree(source, join(partialDir, name), name, budget);
@@ -2418,10 +1117,6 @@ function finalizeIncident(
 		const linuxEvidence = readLinuxIncidentEvidenceCorrelation(runDir);
 		writePrivateJson(join(partialDir, "launch.json"), launch);
 		writePrivateJson(join(partialDir, "process.json"), processIdentity);
-		writePrivateJson(
-			join(partialDir, "raw-manifest.json"),
-			createRawApplicationManifest(options, runDir, events, { partialDir, incidentDir }),
-		);
 		writePrivateJson(join(partialDir, "summary.json"), {
 			schemaVersion: 1,
 			incidentId,
@@ -2440,7 +1135,12 @@ function finalizeIncident(
 					? { wallTime: events.at(-1)?.wallTime, monotonicNs: events.at(-1)?.monotonicNs }
 					: undefined,
 			},
-			evidence: budget.copied,
+			evidence: [...causalResourceBudget.copied, ...budget.copied],
+			causalResourceEvidence: causalResourceBudget.copied.includes(causalResourceName)
+				? "copied"
+				: causalResourceExisted
+					? "copy_failed_or_oversized"
+					: "source_missing",
 			finalized: nowFields(),
 		});
 		renameSync(partialDir, incidentDir);
@@ -2467,29 +1167,13 @@ function causalEnvironmentSummary(environment: NodeJS.ProcessEnv): Record<string
 
 export async function recordSupervisorProcess(options: RecordProcessOptions): Promise<RecordedProcessResult> {
 	const runDir = createRunDir(options.agentDir);
-	const runId = basename(runDir).slice(-36);
-	const runToken = newIncidentRecorderToken();
 	const bootId = linuxBootId();
-	const wrapperStartId = getProcessStartId(process.pid);
-	const orderedWriter = new IncidentRecorderWriter({
-		runDir,
-		runId,
-		runToken,
-		bootId,
-		wrapperStartId,
-		onStructuredEvent: (source, type, fields) =>
-			recordIncidentRecorderCausalEvent(runDir, type, { source, ...fields }),
-	});
-	await orderedWriter.start();
-	activeOrderedWriter = { runDir, writer: orderedWriter };
 	const nodeFatalReportsEnabled = provenNodeLaunch(options.launch);
 	const environment = createCliSubprocessEnv({
 		...options.environment,
 		[INCIDENT_RECORDER_CHILD_ENV]: "1",
 		[INCIDENT_RECORDER_RUN_DIR_ENV]: runDir,
 		[INCIDENT_RECORDER_SOCKET_ENV]: options.socketPath,
-		[INCIDENT_RECORDER_RUN_ID_ENV]: runId,
-		[INCIDENT_RECORDER_RUN_TOKEN_ENV]: runToken,
 		...(nodeFatalReportsEnabled ? { NODE_REPORT_DIRECTORY: join(runDir, "raw-reports") } : {}),
 	});
 	const launch = nodeFatalReportsEnabled
@@ -2525,7 +1209,7 @@ export async function recordSupervisorProcess(options: RecordProcessOptions): Pr
 		commandSummary: summarizeIncidentCommandLine(launch.args),
 	};
 	writePrivateJson(join(runDir, "launch.json"), launchSummary);
-	orderedWriter.recordDerived("recorder-events", "recorder_launch", launchSummary);
+	appendCausalRunEvent(runDir, "recorder-events", "recorder_launch", launchSummary);
 	let child: ChildProcess;
 	try {
 		child = spawn(launch.command, launch.args, {
@@ -2535,15 +1219,13 @@ export async function recordSupervisorProcess(options: RecordProcessOptions): Pr
 		});
 	} catch (error) {
 		appendRunEvent(runDir, { type: "recorder_spawn_error", error });
-		await orderedWriter.stop().catch(() => undefined);
-		activeOrderedWriter = undefined;
-		writePrivateJson(join(runDir, ".retention-terminal.json"), {
+		publishTerminalDisposition(runDir, {
 			completed: nowFields(),
 			disposition: "spawn_failed_before_target_identity",
 			exitCode: null,
 			exitSignal: null,
+			structuredExit: { durable: false, reason: "target_not_spawned" },
 		});
-		rmSync(join(runDir, ACTIVE_MARKER_FILE_NAME), { force: true });
 		throw error;
 	}
 
@@ -2553,32 +1235,23 @@ export async function recordSupervisorProcess(options: RecordProcessOptions): Pr
 		// ever existed. Consume that diagnostic event; this branch owns the
 		// terminal disposition and no live process can be hidden by it.
 		const spawnErrorPromise = new Promise<Error>((resolve) => child.once("error", resolve));
-		await orderedWriter.stop().catch(() => undefined);
 		const spawnError = await spawnErrorPromise;
-		activeOrderedWriter = undefined;
-		writePrivateJson(join(runDir, ".retention-terminal.json"), {
+		publishTerminalDisposition(runDir, {
 			completed: nowFields(),
 			disposition: "spawn_failed_before_target_identity",
 			exitCode: null,
 			exitSignal: null,
 			spawnError: serializeError(spawnError),
+			structuredExit: { durable: false, reason: "target_not_spawned" },
 		});
-		rmSync(join(runDir, ACTIVE_MARKER_FILE_NAME), { force: true });
 		throw new Error("Incident recorder could not obtain supervisor PID");
 	}
 	const processStartId = getProcessStartId(pid);
-	await orderedWriter.setSourceIdentity({
-		bootId: bootId ?? "",
-		pid,
-		processStartId: processStartId ?? "",
-		socketPath: options.socketPath,
-	});
-	orderedWriter.recordDerived("recorder-events", "supervisor_stdio_source_unavailable", {
+	appendCausalRunEvent(runDir, "recorder-events", "supervisor_stdio_source_unavailable", {
 		stdout: "inherited-to-preserve-original-stream-and-tty-semantics",
 		stderr: "inherited-to-preserve-original-stream-and-tty-semantics",
 	});
 	writePrivateJson(join(runDir, "process.json"), {
-		runToken,
 		machineId: linuxMachineId(),
 		bootId,
 		systemdInvocationId: process.env.INVOCATION_ID ?? null,
@@ -2591,11 +1264,6 @@ export async function recordSupervisorProcess(options: RecordProcessOptions): Pr
 		wrapperDeathSignalsSupervisor: false,
 	});
 	appendRunEvent(runDir, { type: "supervisor_spawned", childPid: pid, processStartId, nodeFatalReportsEnabled });
-	orderedWriter.recordDerived("recorder-control", "service_sampling_owner", {
-		owner: "incident-recorder-causal-sampler",
-		targetPid: pid,
-		targetProcessStartId: processStartId ?? "",
-	});
 	let exit: { code: number | null; signal: NodeJS.Signals | null };
 	try {
 		exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolveExit, rejectExit) => {
@@ -2604,36 +1272,20 @@ export async function recordSupervisorProcess(options: RecordProcessOptions): Pr
 		});
 	} catch (error) {
 		appendRunEvent(runDir, { type: "recorder_child_error", error, childPid: pid, processStartId });
-		await orderedWriter.stop().catch(() => undefined);
-		activeOrderedWriter = undefined;
-		try {
-			rmSync(join(runDir, ACTIVE_MARKER_FILE_NAME), { force: true });
-		} catch {}
 		throw error;
 	}
-	const exitAdmission = orderedWriter.recordDerived("recorder-events", "supervisor_exit", {
+	const exitAdmission = appendCausalRunEvent(runDir, "recorder-events", "supervisor_exit", {
 		childPid: pid,
 		code: exit.code,
 		signal: exit.signal,
 	});
-	await orderedWriter.stop().catch(() => undefined);
-	if (exitAdmission.accepted) {
-		const expectation = orderedWriter.finalizationExpectation(exitAdmission.occurrenceId);
-		writePrivateJson(join(runDir, "finalization-barrier-expectation.json"), {
-			version: 1,
-			...expectation,
-			exitCode: exit.code ?? "unavailable",
-			exitSignal: exit.signal ?? "unavailable",
-		});
-	}
-	activeOrderedWriter = undefined;
-	try {
-		rmSync(join(runDir, ACTIVE_MARKER_FILE_NAME), { force: true });
-	} catch {}
-	writePrivateJson(join(runDir, ".retention-terminal.json"), {
+	publishTerminalDisposition(runDir, {
 		completed: nowFields(),
 		exitCode: exit.code,
 		exitSignal: exit.signal,
+		structuredExit: exitAdmission.accepted
+			? { durable: true, occurrenceId: exitAdmission.occurrenceId }
+			: { durable: false, occurrenceId: exitAdmission.occurrenceId, reason: exitAdmission.reason },
 	});
 	const classification =
 		exit.signal === "SIGABRT"
@@ -2665,191 +1317,13 @@ export async function runRecordedSupervisor(args: readonly string[], socketPath:
 	process.exit(result.code ?? 1);
 }
 
-export type IncidentEvidenceProvider = "audit" | "cgroup" | "ebpf" | "kernel" | "signal";
-
-export type IncidentEvidenceCategory =
-	| "oom"
-	| "process_exit"
-	| "resource_pressure"
-	| "signal"
-	| "audit"
-	| "cgroup"
-	| "kernel"
-	| "ebpf";
-export type IncidentEvidenceOutcome =
-	| "observed"
-	| "matched"
-	| "not_matched"
-	| "unavailable"
-	| "error"
-	| "sent"
-	| "not_sent";
-
-export interface IncidentProviderEvidenceBase {
-	category: IncidentEvidenceCategory;
-	outcome: IncidentEvidenceOutcome;
-	reason?: string;
-	signal?: string;
-	pid?: number;
-	targetPid?: number;
-	targetTid?: number;
-	senderPid?: number;
-	senderUid?: number;
-	senderPpid?: number;
-	count?: number;
-	bytes?: number;
-	durationMs?: number;
-	code?: number;
-	oomKillDelta?: number;
-	processStartId?: string;
-	senderProcessStartId?: string;
-	identifier?: string;
-	attribution?: "dedicated" | "shared" | "unknown" | "target_cgroup_only";
-	executable?: string;
-	lineageExecutables?: readonly string[];
-	[key: string]: unknown;
-}
-
-export interface IncidentAuditProviderEvidence extends IncidentProviderEvidenceBase {
-	category: "audit" | "signal";
-}
-
-export interface IncidentCgroupProviderEvidence extends IncidentProviderEvidenceBase {
-	category: "cgroup" | "oom" | "resource_pressure";
-}
-
-export interface IncidentEbpfProviderEvidence extends IncidentProviderEvidenceBase {
-	category: "ebpf" | "process_exit" | "signal";
-}
-
-export interface IncidentKernelProviderEvidence extends IncidentProviderEvidenceBase {
-	category: "kernel" | "oom" | "resource_pressure";
-}
-
-export interface IncidentSignalProviderEvidence extends IncidentProviderEvidenceBase {
-	category: "signal";
-}
-
-export interface IncidentProviderEvidenceMap {
-	audit: IncidentAuditProviderEvidence;
-	cgroup: IncidentCgroupProviderEvidence;
-	ebpf: IncidentEbpfProviderEvidence;
-	kernel: IncidentKernelProviderEvidence;
-	signal: IncidentSignalProviderEvidence;
-}
-
-export type IncidentProviderArtifactSource = "atop" | "sysdig" | "lttng";
-
-export interface IncidentProviderSourceManifest {
-	provider: IncidentProviderArtifactSource;
-	artifacts: ReadonlyArray<{
-		path: string;
-		format?: string;
-		dev?: number;
-		ino?: number;
-		bytes?: number;
-		sha256?: string;
-		[key: string]: unknown;
-	}>;
-	configuration?: unknown;
-	version?: unknown;
-	clocks?: unknown;
-	lossCounters?: unknown;
-	[key: string]: unknown;
-}
-
-function safeProcessStartId(value: unknown): string | undefined {
-	return typeof value === "string" &&
-		(/^(?:proc|win):\d+$/.test(value) ||
-			/^ps:[A-Z][a-z]{2} [A-Z][a-z]{2} \d{1,2} \d{2}:\d{2}:\d{2} \d{4}$/.test(value))
-		? value
-		: undefined;
-}
-
-function evidenceTarget(runDir: string): Record<string, unknown> | undefined {
-	const target = readSmallJson<{ pid?: unknown; processStartId?: unknown }>(join(runDir, "process.json"));
-	const pid = finiteNumber(target?.pid);
-	const processStartId = safeProcessStartId(target?.processStartId);
-	return pid !== undefined && Number.isSafeInteger(pid) && pid > 0 && processStartId
-		? { pid, processStartId }
-		: { identityUnavailable: true, reason: "target_identity_unavailable" };
-}
-
-export function ingestIncidentRecorderEvidence<P extends IncidentEvidenceProvider>(
-	runDir: string,
-	provider: P,
-	evidence: IncidentProviderEvidenceMap[P] | Uint8Array,
-): void {
-	try {
-		const sequence = ++providerOccurrenceSequence;
-		const directory = join(runDir, "evidence", "providers");
-		mkdirSync(directory, { recursive: true, mode: 0o700 });
-		const base = `${String(sequence).padStart(8, "0")}-${safeToken(provider)}`;
-		let reference: Record<string, unknown>;
-		if (evidence instanceof Uint8Array) {
-			const bytes = Buffer.from(evidence).subarray(0, INCIDENT_RECORDER_LIMITS.evidenceFileBytes);
-			const digest = createHash("sha256").update(bytes).digest("hex");
-			const path = join(directory, `${base}.bin`);
-			writeFileSync(path, bytes, { flag: "wx", mode: 0o600 });
-			reference = { path, sha256: digest, bytes: bytes.length, truncated: evidence.byteLength > bytes.length };
-		} else {
-			const path = join(directory, `${base}.json`);
-			writePrivateJson(path, {
-				version: 1,
-				provider,
-				target: evidenceTarget(runDir),
-				evidence: encodeDiagnosticValue(evidence),
-				observed: nowFields(),
-			});
-			reference = { path, encoding: "private-causal-json" };
-		}
-		appendStructuredCausalEvent(runDir, "recorder-events", "external_causal_evidence_ingested", {
-			provider,
-			target: evidenceTarget(runDir),
-			reference,
-		});
-	} catch (error) {
-		recordRawLoss(runDir, "provider-evidence", error, 0);
-	}
-}
-
-export function registerIncidentProviderSourceManifest(runDir: string, manifest: IncidentProviderSourceManifest): void {
-	try {
-		const sequence = ++providerOccurrenceSequence;
-		const directory = join(runDir, "evidence", "provider-manifests");
-		mkdirSync(directory, { recursive: true, mode: 0o700 });
-		const path = join(directory, `${String(sequence).padStart(8, "0")}-${safeToken(manifest.provider)}.json`);
-		writePrivateJson(path, {
-			version: 1,
-			provider: manifest.provider,
-			configuration: encodeDiagnosticValue(manifest.configuration),
-			clocks: encodeDiagnosticValue(manifest.clocks),
-			lossCounters: encodeDiagnosticValue(manifest.lossCounters),
-			artifacts: manifest.artifacts.slice(0, 64).map((artifact) => ({
-				path: artifact.path,
-				format: artifact.format,
-				bytes: artifact.bytes,
-				sha256: artifact.sha256,
-			})),
-			observed: nowFields(),
-		});
-		appendStructuredCausalEvent(runDir, "recorder-events", "provider_source_manifest_registered", {
-			provider: manifest.provider,
-			reference: { path, encoding: "private-causal-json" },
-			artifactBytesCopied: false,
-		});
-	} catch (error) {
-		recordRawLoss(runDir, "provider-manifest", error, 0);
-	}
-}
-
 interface ActiveRun {
 	runDir: string;
 	machineId: string;
 	bootId: string;
+	socketPath: string;
 	pid: number;
 	processStartId: string;
-	socketPath: string;
 }
 
 function isMatchingLiveProcess(run: ActiveRun): boolean {
@@ -2883,11 +1357,6 @@ function loadActiveRun(runDir: string): ActiveRun | undefined {
 		pid: identity.pid,
 		processStartId: identity.processStartId,
 	};
-}
-
-function runHasLiveWriter(runDir: string): boolean {
-	const run = loadActiveRun(runDir);
-	return run !== undefined && (runHasLiveProxy(runDir) || isMatchingLiveProcess(run));
 }
 
 function runHasLiveProxy(runDir: string): boolean {
@@ -2927,14 +1396,10 @@ interface ServiceSamplingState {
 	lastLatencyTriggerOccurrence?: string;
 	diskPauseMarked: boolean;
 	liveHangClassification?: string;
-	stoppedBroadCaptured?: boolean;
+	finalSampleCaptured?: boolean;
 	nodeReportPendingMarked?: boolean;
 }
 const serviceSamplingRuns = new Map<string, ServiceSamplingState>();
-interface DisposableIncidentRecorderCompactor {
-	dispose(): void;
-}
-let activeIncidentCompactor: DisposableIncidentRecorderCompactor | undefined;
 let serviceRunsDirectory: Dir | undefined;
 let serviceRunsDirectoryPath: string | undefined;
 const serviceRunPaths = new Map<string, string>();
@@ -2965,19 +1430,6 @@ function closeServiceRunsDirectory(): void {
 }
 
 /** @internal Replaces or releases the service-owned compactor and retained run scan. */
-export function replaceIncidentRecorderServiceCompactor(
-	replacement: DisposableIncidentRecorderCompactor | undefined,
-): void {
-	const previous = activeIncidentCompactor;
-	if (previous === replacement) {
-		if (!replacement) closeServiceRunsDirectory();
-		return;
-	}
-	activeIncidentCompactor = replacement;
-	closeServiceRunsDirectory();
-	previous?.dispose();
-}
-
 export async function inspectIncidentRecorderRuns(agentDir: string, nowMs = Date.now()): Promise<string[]> {
 	const runsRoot = join(agentDir, "incident-recorder", "runs");
 	if (serviceRunsDirectoryPath !== undefined && serviceRunsDirectoryPath !== runsRoot) closeServiceRunsDirectory();
@@ -3048,16 +1500,13 @@ export async function inspectIncidentRecorderRuns(agentDir: string, nowMs = Date
 						runDir: run.runDir,
 						pid: run.pid,
 						processStartId: run.processStartId,
-						dependencies: { recordRawSource: (occurrence) => recordLinuxRawSource(run.runDir, occurrence) },
 					});
 				}
 				const latencyTrigger = [...events]
 					.reverse()
 					.find((event) => event.type === "list_status_sampling_trigger" && typeof event.requestId === "string");
 				const triggerOccurrence =
-					latencyTrigger?.recorderProvenance && typeof latencyTrigger.recorderProvenance === "object"
-						? String((latencyTrigger.recorderProvenance as Record<string, unknown>).occurrenceId ?? "")
-						: undefined;
+					typeof latencyTrigger?.occurrenceId === "string" ? latencyTrigger.occurrenceId : undefined;
 				if (latencyTrigger && triggerOccurrence && triggerOccurrence !== sampling.lastLatencyTriggerOccurrence) {
 					sampling.lastLatencyTriggerOccurrence = triggerOccurrence;
 					sampling.latencyBurstUntilMs = Math.max(sampling.latencyBurstUntilMs, nowMs + 15_000);
@@ -3068,7 +1517,6 @@ export async function inspectIncidentRecorderRuns(agentDir: string, nowMs = Date
 					const current = sampleLinuxIncidentEvidence({
 						runDir: run.runDir,
 						phase: inAnomalyBurst ? "anomaly" : "periodic",
-						dependencies: { recordRawSource: (occurrence) => recordLinuxRawSource(run.runDir, occurrence) },
 					});
 					if (linuxCountersAdvanced(sampling.previous, current)) {
 						sampling.anomalyBurstUntilMs = Math.max(sampling.anomalyBurstUntilMs, nowMs + 60_000);
@@ -3113,34 +1561,12 @@ export async function inspectIncidentRecorderRuns(agentDir: string, nowMs = Date
 				while (serviceSamplingRuns.size > 4096)
 					serviceSamplingRuns.delete(serviceSamplingRuns.keys().next().value as string);
 			}
-			if (!stoppedState.stoppedBroadCaptured)
+			if (!stoppedState.finalSampleCaptured)
 				try {
-					sampleLinuxIncidentEvidence({
-						runDir: run.runDir,
-						phase: "final",
-						captureBroadRaw: true,
-						dependencies: { recordRawSource: (occurrence) => recordLinuxRawSource(run.runDir, occurrence) },
-					});
-					if (getProcessStartId(run.pid) !== run.processStartId)
-						appendRunEvent(run.runDir, {
-							type: "stopped_target_proc_capture_unavailable_after_exit",
-							childPid: run.pid,
-							reason: "proc_identity_no_longer_present",
-						});
-					captureProcSafely(run.runDir, run.pid, run.processStartId, (sourcePath, value) =>
-						recordLinuxRawSource(run.runDir, {
-							source: "procfs",
-							sourcePath,
-							bytes: value,
-							encoding: "exact-file-bytes",
-							phase: "incident-pin",
-							...nowFields(),
-							identity: { targetPid: run.pid, targetProcessStartId: run.processStartId },
-						}),
-					);
-					stoppedState.stoppedBroadCaptured = true;
+					sampleLinuxIncidentEvidence({ runDir: run.runDir, phase: "final" });
+					stoppedState.finalSampleCaptured = true;
 				} catch (error) {
-					stoppedState.stoppedBroadCaptured = true;
+					stoppedState.finalSampleCaptured = true;
 					appendRunEvent(run.runDir, { type: "linux_evidence_unavailable", phase: "service-final", error });
 				}
 			const reportCapture = await sanitizeNodeReports(run.runDir, true);
@@ -3151,8 +1577,6 @@ export async function inspectIncidentRecorderRuns(agentDir: string, nowMs = Date
 				}
 				continue;
 			}
-			if (captureStoppedProviderArtifacts(run.runDir) !== "complete") continue;
-			await flushRecordedProcessBytes(run.runDir);
 			const expectedExit = readExpectedExitDisposition(run.runDir);
 			const code = typeof exitEvent?.code === "number" ? exitEvent.code : expectedExit.code;
 			const signal =
@@ -3183,8 +1607,6 @@ export async function inspectIncidentRecorderRuns(agentDir: string, nowMs = Date
 					classification,
 					completed: nowFields(),
 				});
-				const completedIdentity = serviceRunIdentity(run.runDir);
-				if (completedIdentity) activeServiceRecorder?.writer.releaseRunIdentity(completedIdentity);
 				serviceSamplingRuns.delete(run.runDir);
 				nodeReportCaptureStates.delete(run.runDir);
 			}
@@ -3211,12 +1633,7 @@ export async function inspectIncidentRecorderRuns(agentDir: string, nowMs = Date
 				: detected === "socket_loss"
 					? "socket_lost"
 					: "worker_hang_detected";
-		recordIncidentRecorderCausalEvent(run.runDir, detectionType, { childPid: run.pid });
-		recordIncidentRecorderCausalEvent(run.runDir, "broad_proc_capture_deferred_target_live", {
-			childPid: run.pid,
-			reason: "stopped_target_identity_required",
-			state: "deferred_or_unavailable",
-		});
+		appendCausalRunEvent(run.runDir, "recorder-events", detectionType, { childPid: run.pid });
 	}
 	return finalized;
 }

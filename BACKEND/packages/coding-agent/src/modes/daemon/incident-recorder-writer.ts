@@ -1,18 +1,22 @@
 import { randomUUID } from "node:crypto";
-import { closeSync, constants as fsConstants, fstatSync, lstatSync, openSync, write } from "node:fs";
+import {
+	closeSync,
+	constants as fsConstants,
+	fstatSync,
+	fsyncSync,
+	lstatSync,
+	openSync,
+	renameSync,
+	rmSync,
+	write,
+} from "node:fs";
 import { join } from "node:path";
-import type { Readable } from "node:stream";
 import { getProcessStartId } from "../../core/session-lease.js";
 import { INCIDENT_RECORDER_RUN_DIR_ENV } from "./incident-recorder-env.js";
 
-export const INCIDENT_RECORDER_CAPTURE_FD_ENV = "PRIME_INCIDENT_RECORDER_CAPTURE_FD";
-export const INCIDENT_RECORDER_CAPTURE_OWNER_PID_ENV = "PRIME_INCIDENT_RECORDER_CAPTURE_OWNER_PID";
-export const INCIDENT_RECORDER_CAPTURE_OWNER_START_ID_ENV = "PRIME_INCIDENT_RECORDER_CAPTURE_OWNER_START_ID";
-export const INCIDENT_RECORDER_CAPTURE_FD = 4;
-export const INCIDENT_RECORDER_ROOT_FD_ENV = "PRIME_INCIDENT_RECORDER_ROOT_FD";
-export const INCIDENT_RECORDER_ROOT_FD = 5;
-
-const EVENT_FILE_NAME = "timeline.jsonl";
+const EVENT_FILE_NAME = "supervisor-timeline.jsonl";
+const PREVIOUS_EVENT_FILE_NAME = "supervisor-timeline.previous.jsonl";
+const MAX_EVENT_FILE_BYTES = 1024 * 1024;
 const MAX_EVENT_BYTES = 3584;
 const MAX_QUEUE_EVENTS = 64;
 const SENSITIVE_KEY =
@@ -63,11 +67,6 @@ export type IncidentRecorderAdmission =
 	| { accepted: true; occurrenceId: string }
 	| { accepted: false; occurrenceId: string; reason: string };
 
-export interface IncidentRecorderFinalizationExpectation {
-	supervisorExitOccurrenceId: string;
-	durableStructuredCapture: true;
-}
-
 function safeValue(key: string, value: unknown, depth = 0): unknown {
 	if (value === null || typeof value === "boolean") return value;
 	if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
@@ -92,7 +91,7 @@ function safeValue(key: string, value: unknown, depth = 0): unknown {
 	return result;
 }
 
-function safeFields(fields: Record<string, unknown>): Record<string, unknown> {
+export function sanitizeIncidentCausalFields(fields: Record<string, unknown>): Record<string, unknown> {
 	try {
 		const value = safeValue("fields", fields);
 		return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
@@ -112,6 +111,8 @@ interface EmitterState {
 	generation: number;
 	phase: EmitterPhase;
 	descriptor?: number;
+	runDir?: string;
+	eventPath?: string;
 	queue: Buffer[];
 	writing: boolean;
 	stopPromise?: Promise<void>;
@@ -146,6 +147,36 @@ function failEmitter(generation: number): void {
 	settleEmitterStop();
 }
 
+function rotateEmitterSinkIfNeeded(nextBytes: number): boolean {
+	const descriptor = emitter.descriptor;
+	const runDir = emitter.runDir;
+	const eventPath = emitter.eventPath;
+	if (descriptor === undefined || !runDir || !eventPath) return false;
+	try {
+		const stat = fstatSync(descriptor);
+		if (stat.size + nextBytes <= MAX_EVENT_FILE_BYTES) return true;
+		fsyncSync(descriptor);
+		closeSync(descriptor);
+		emitter.descriptor = undefined;
+		rmSync(join(runDir, PREVIOUS_EVENT_FILE_NAME), { force: true });
+		renameSync(eventPath, join(runDir, PREVIOUS_EVENT_FILE_NAME));
+		const replacement = openSync(
+			eventPath,
+			fsConstants.O_WRONLY | fsConstants.O_APPEND | fsConstants.O_CREAT | fsConstants.O_NOFOLLOW,
+			0o600,
+		);
+		const replacementStat = fstatSync(replacement);
+		if (!replacementStat.isFile() || replacementStat.nlink !== 1 || (replacementStat.mode & 0o077) !== 0) {
+			closeSync(replacement);
+			return false;
+		}
+		emitter.descriptor = replacement;
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 function pumpEmitter(): void {
 	if (emitter.writing || emitter.descriptor === undefined) return;
 	if (emitter.phase !== "running" && emitter.phase !== "stopping") return;
@@ -155,6 +186,10 @@ function pumpEmitter(): void {
 		return;
 	}
 	const generation = emitter.generation;
+	if (!rotateEmitterSinkIfNeeded(next.length) || emitter.descriptor === undefined) {
+		failEmitter(generation);
+		return;
+	}
 	const descriptor = emitter.descriptor;
 	emitter.writing = true;
 	try {
@@ -191,13 +226,14 @@ export function configureIncidentCaptureEmitter(): boolean {
 	if (!runDir || !processStartId) return false;
 	let descriptor: number | undefined;
 	try {
+		const eventPath = join(runDir, EVENT_FILE_NAME);
 		const runStat = lstatSync(runDir);
 		if (!runStat.isDirectory() || runStat.isSymbolicLink() || (runStat.mode & 0o077) !== 0)
 			throw new Error("causal run directory is not private");
 		if (typeof process.getuid === "function" && runStat.uid !== process.getuid())
 			throw new Error("causal run directory owner mismatch");
 		descriptor = openSync(
-			join(runDir, EVENT_FILE_NAME),
+			eventPath,
 			fsConstants.O_WRONLY | fsConstants.O_APPEND | fsConstants.O_CREAT | fsConstants.O_NOFOLLOW,
 			0o600,
 		);
@@ -209,15 +245,13 @@ export function configureIncidentCaptureEmitter(): boolean {
 		emitter.generation += 1;
 		emitter.phase = "running";
 		emitter.descriptor = descriptor;
+		emitter.runDir = runDir;
+		emitter.eventPath = eventPath;
 		emitter.queue = [];
 		emitter.writing = false;
 		emitter.stopPromise = undefined;
 		emitter.resolveStop = undefined;
 		emitter.stopTimer = undefined;
-		delete process.env[INCIDENT_RECORDER_CAPTURE_FD_ENV];
-		delete process.env[INCIDENT_RECORDER_CAPTURE_OWNER_PID_ENV];
-		delete process.env[INCIDENT_RECORDER_CAPTURE_OWNER_START_ID_ENV];
-		delete process.env[INCIDENT_RECORDER_ROOT_FD_ENV];
 		return true;
 	} catch {
 		if (descriptor !== undefined)
@@ -242,7 +276,7 @@ export function emitIncidentDerived(
 		const processStartId = getProcessStartId(process.pid);
 		if (!processStartId) return rejected("producer_identity_unavailable", occurrenceId);
 		const event = {
-			...safeFields(fields),
+			...sanitizeIncidentCausalFields(fields),
 			type,
 			wallTime: new Date().toISOString(),
 			monotonicNs: process.hrtime.bigint().toString(),
@@ -311,88 +345,4 @@ export function stopIncidentCaptureEmitterOnExit(): void {
 	emitter.phase = "stopped";
 	emitter.queue.length = 0;
 	if (!emitter.writing) closeEmitterDescriptor();
-}
-
-export interface IncidentRecorderWriterOptions {
-	runDir: string;
-	runId?: string;
-	runToken?: string;
-	bootId?: string;
-	wrapperStartId?: string;
-	serviceSink?: boolean;
-	onStructuredEvent?: (source: string, type: string, fields: Record<string, unknown>) => boolean | undefined;
-}
-
-export class IncidentRecorderWriter {
-	private readonly onStructuredEvent?: (
-		source: string,
-		type: string,
-		fields: Record<string, unknown>,
-	) => boolean | undefined;
-	private stopped = false;
-
-	constructor(options: IncidentRecorderWriterOptions) {
-		this.onStructuredEvent = options.onStructuredEvent;
-	}
-
-	async start(): Promise<void> {}
-
-	async setSourceIdentity(_identity: Record<string, unknown>): Promise<IncidentRecorderAdmission> {
-		return this.stopped ? rejected("writer_stopped") : accepted();
-	}
-
-	attachCaptureStream(stream: Readable): void {
-		stream.resume();
-	}
-
-	recordDerived(source: CaptureSource, type: string, fields: Record<string, unknown>): IncidentRecorderAdmission {
-		const occurrenceId = randomUUID();
-		if (this.stopped) return rejected("writer_stopped", occurrenceId);
-		try {
-			const result = this.onStructuredEvent?.(source, type, { ...safeFields(fields), occurrenceId });
-			return result === false ? rejected("durable_sink_unavailable", occurrenceId) : accepted(occurrenceId);
-		} catch {
-			return rejected("durable_sink_failed_open", occurrenceId);
-		}
-	}
-
-	recordExactBytes(
-		_source: CaptureSource,
-		_type: string,
-		_value: Uint8Array,
-		_encoding: string,
-		_fields: Record<string, unknown>,
-	): IncidentRecorderAdmission {
-		return rejected("raw_bytes_not_causal");
-	}
-
-	recordDerivedForRun(
-		_identity: { runId: string; runToken: string },
-		source: CaptureSource,
-		type: string,
-		fields: Record<string, unknown>,
-	): IncidentRecorderAdmission {
-		return this.recordDerived(source, type, fields);
-	}
-
-	recordExactBytesForRun(
-		_identity: { runId: string; runToken: string },
-		_source: CaptureSource,
-		_type: string,
-		_value: Uint8Array,
-		_encoding: string,
-		_fields: Record<string, unknown>,
-	): IncidentRecorderAdmission {
-		return rejected("raw_bytes_not_causal");
-	}
-
-	releaseRunIdentity(_identity: { runId: string; runToken: string }): void {}
-
-	async stop(_deadlineMs = 1_000): Promise<void> {
-		this.stopped = true;
-	}
-
-	finalizationExpectation(supervisorExitOccurrenceId: string): IncidentRecorderFinalizationExpectation {
-		return { supervisorExitOccurrenceId, durableStructuredCapture: true };
-	}
 }

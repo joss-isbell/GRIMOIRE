@@ -127,7 +127,6 @@ import {
 	SESSION_LEASES_ENABLED_ENV,
 } from "./daemon-worker-protocol.js";
 import {
-	appendSupervisorDiagnosticBytes,
 	appendSupervisorDiagnosticEvent,
 	flushSupervisorDiagnosticCapture,
 	installSupervisorDiagnosticHooks,
@@ -137,13 +136,6 @@ import {
 	INCIDENT_RECORDER_RUN_DIR_ENV,
 	INCIDENT_RECORDER_SOCKET_ENV,
 } from "./incident-recorder-env.js";
-import { INCIDENT_RECORDER_RUN_ID_ENV, INCIDENT_RECORDER_RUN_TOKEN_ENV } from "./incident-recorder-protocol.js";
-import {
-	INCIDENT_RECORDER_CAPTURE_FD_ENV,
-	INCIDENT_RECORDER_CAPTURE_OWNER_PID_ENV,
-	INCIDENT_RECORDER_CAPTURE_OWNER_START_ID_ENV,
-	INCIDENT_RECORDER_ROOT_FD_ENV,
-} from "./incident-recorder-writer.js";
 import { MutationDrainLatch } from "./mutation-drain-latch.js";
 import { createRlmLedgerRegistrySeedSource, RlmSpawnLedger } from "./rlm-ledger.js";
 import { serializeSavedSessionInfo } from "./saved-session-info.js";
@@ -781,13 +773,6 @@ export class DaemonSupervisor {
 				daemonLogPath: getDaemonLogPath(this.socketPath),
 				appVersion: VERSION,
 			});
-			for (const [source, path] of [
-				["daemon_descriptor_directory", this.descriptorDir],
-				["supervisor_config", this.supervisorConfigPath],
-				["daemon_log", getDaemonLogPath(this.socketPath)],
-			] as const) {
-				appendSupervisorDiagnosticEvent("application_source_reference", { source, path });
-			}
 
 			this.registerSignalHandlers();
 			const ownedSessionFiles = new Set(
@@ -856,26 +841,9 @@ export class DaemonSupervisor {
 	private log(message: string): void {
 		const daemonLogPath = getDaemonLogPath(this.socketPath);
 		const rawLogLine = `[${new Date().toISOString()}] supervisor: ${message}`;
-		appendSupervisorDiagnosticEvent("supervisor_log_record", {
-			message,
-			rawLogLine,
-			explicitEncoding: "utf8-line-with-line-feed-on-write",
-			socketPath: this.socketPath,
-			generation: this.generation,
-			daemonLogPath,
-		});
 		console.error(message);
 		structuredLog.warn(message, { socketPath: this.socketPath });
 		appendRotatingLog(daemonLogPath, rawLogLine);
-	}
-
-	private captureApplicationFile(path: string, source: string, context: Record<string, unknown> = {}): void {
-		appendSupervisorDiagnosticEvent("application_source_reference", {
-			...context,
-			source,
-			path,
-			captureDeferredToExternalWriter: true,
-		});
 	}
 
 	private clearIdleEvictionTimer(): void {
@@ -1121,7 +1089,6 @@ export class DaemonSupervisor {
 		writeFileSync(tempPath, `${JSON.stringify(persisted, null, 2)}\n`, { mode: 0o600 });
 		chmodSync(tempPath, 0o600);
 		renameSync(tempPath, this.supervisorConfigPath);
-		this.captureApplicationFile(this.supervisorConfigPath, "supervisor_config", { socketPath: this.socketPath });
 	}
 
 	private hasPersistedWorkerDescriptors(): boolean {
@@ -1137,22 +1104,10 @@ export class DaemonSupervisor {
 		writeFileSync(tempPath, `${JSON.stringify(persisted, null, 2)}\n`, { mode: 0o600 });
 		chmodSync(tempPath, 0o600);
 		renameSync(tempPath, worker.descriptorPath);
-		this.captureApplicationFile(worker.descriptorPath, "worker_descriptor", {
-			workerId: worker.descriptor.workerId,
-			workerPid: worker.descriptor.pid,
-			workerProcessStartId: worker.descriptor.processStartId,
-		});
 	}
 
 	private deleteWorkerDescriptor(worker: ResidentWorker): void {
 		try {
-			for (const [source, path] of [
-				["worker_descriptor_before_delete", worker.descriptorPath],
-				["worker_recovery_journal_before_delete", worker.descriptor.recoveryJournalPath],
-				["worker_orphan_journal_before_delete", worker.descriptor.orphanProcessJournalPath],
-			] as const) {
-				if (path) this.captureApplicationFile(path, source, { workerId: worker.descriptor.workerId });
-			}
 			rmSync(worker.descriptorPath, { force: true });
 			rmSync(worker.descriptor.recoveryJournalPath, { force: true });
 			if (worker.descriptor.orphanProcessJournalPath) {
@@ -1190,14 +1145,6 @@ export class DaemonSupervisor {
 			remotePort: socket.remotePort,
 			remoteFamily: socket.remoteFamily,
 		});
-		socket.on("data", (chunk: Buffer) =>
-			appendSupervisorDiagnosticBytes("daemon_socket_inbound", chunk, {
-				connectionId: this.connectionIds.get(client),
-				clientId: client.id,
-				protocolClientId: this.protocolClientIds.get(client),
-				socketPath: this.socketPath,
-			}),
-		);
 		void this.ready.then(
 			() => {
 				if (!client.socket.destroyed && this.clients.has(client)) {
@@ -1688,7 +1635,6 @@ export class DaemonSupervisor {
 				appendSupervisorDiagnosticEvent("list_status_sampling_trigger", {
 					...diagnosticContext,
 					requestId: String(command.id),
-					runId: process.env[INCIDENT_RECORDER_RUN_ID_ENV] ?? "unavailable",
 					thresholdMs: 250,
 				});
 			}
@@ -2656,12 +2602,6 @@ export class DaemonSupervisor {
 		delete workerEnvironment[INCIDENT_RECORDER_CHILD_ENV];
 		delete workerEnvironment[INCIDENT_RECORDER_RUN_DIR_ENV];
 		delete workerEnvironment[INCIDENT_RECORDER_SOCKET_ENV];
-		delete workerEnvironment[INCIDENT_RECORDER_CAPTURE_FD_ENV];
-		delete workerEnvironment[INCIDENT_RECORDER_ROOT_FD_ENV];
-		delete workerEnvironment[INCIDENT_RECORDER_CAPTURE_OWNER_PID_ENV];
-		delete workerEnvironment[INCIDENT_RECORDER_CAPTURE_OWNER_START_ID_ENV];
-		delete workerEnvironment[INCIDENT_RECORDER_RUN_ID_ENV];
-		delete workerEnvironment[INCIDENT_RECORDER_RUN_TOKEN_ENV];
 		await this.assertRecoveryAllowed();
 		const workerCwd = createCommand.config?.cwd ?? process.cwd();
 		appendSupervisorDiagnosticEvent("worker_launch", {
@@ -2691,14 +2631,6 @@ export class DaemonSupervisor {
 			streamSemanticsPreserved: true,
 			workerId,
 		});
-		child.stderr?.on("data", (chunk: Buffer) =>
-			appendSupervisorDiagnosticBytes("worker_stderr", chunk, {
-				workerId,
-				rootActiveSessionId,
-				socketPath,
-				childPid: child.pid,
-			}),
-		);
 		const detachWorkerStderr = child.stderr
 			? attachJsonlLineReader(child.stderr, (line) => this.log(`Session worker ${workerId} stderr: ${line}`), {
 					maxLineLength: 64 * 1024,
@@ -5917,34 +5849,10 @@ export class DaemonSupervisor {
 				: Buffer.isBuffer(line)
 					? line
 					: Buffer.from(line.buffer, line.byteOffset, line.byteLength);
-		appendSupervisorDiagnosticBytes("daemon_socket_outbound_attempt", bytes, {
-			connectionId: this.connectionIds.get(client),
-			clientId: client.id,
-			protocolClientId: this.protocolClientIds.get(client),
-			socketPath: this.socketPath,
-			socketDestroyed: client.socket.destroyed,
-		});
 		if (client.socket.destroyed) {
 			return false;
 		}
-		const acceptedForBuffering = client.socket.write(bytes, (error) => {
-			appendSupervisorDiagnosticEvent("daemon_socket_outbound_write_outcome", {
-				connectionId: this.connectionIds.get(client),
-				clientId: client.id,
-				protocolClientId: this.protocolClientIds.get(client),
-				socketPath: this.socketPath,
-				outcome: error ? "write-error" : "written",
-				attemptedBytes: bytes.length,
-			});
-		});
-		appendSupervisorDiagnosticEvent("daemon_socket_outbound_attempt_result", {
-			connectionId: this.connectionIds.get(client),
-			clientId: client.id,
-			protocolClientId: this.protocolClientIds.get(client),
-			socketPath: this.socketPath,
-			acceptedForBuffering,
-			attemptedBytes: bytes.length,
-		});
+		const acceptedForBuffering = client.socket.write(bytes);
 		if (!acceptedForBuffering) {
 			client.backpressured = true;
 		}
@@ -6154,10 +6062,6 @@ export class DaemonSupervisor {
 			delete environment[INCIDENT_RECORDER_CHILD_ENV];
 			delete environment[INCIDENT_RECORDER_RUN_DIR_ENV];
 			delete environment[INCIDENT_RECORDER_SOCKET_ENV];
-			delete environment[INCIDENT_RECORDER_CAPTURE_FD_ENV];
-			delete environment[INCIDENT_RECORDER_ROOT_FD_ENV];
-			delete environment[INCIDENT_RECORDER_CAPTURE_OWNER_PID_ENV];
-			delete environment[INCIDENT_RECORDER_CAPTURE_OWNER_START_ID_ENV];
 			delete environment[DAEMON_CATALOG_ROLE_ENV];
 			delete environment[DAEMON_WORKER_ROLE_ENV];
 			delete environment[DAEMON_WORKER_TOKEN_ENV];

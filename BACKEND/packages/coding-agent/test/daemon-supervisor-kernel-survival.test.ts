@@ -55,8 +55,6 @@ function waitForExit(child: ChildProcess): Promise<void> {
 
 function spawnKernelWorker(root: string) {
 	const environment = { ...process.env };
-	delete environment.PRIME_INCIDENT_RECORDER_CAPTURE_FD;
-	delete environment.PRIME_INCIDENT_RECORDER_ROOT_FD;
 	environment.PRIME_AGENT_DIR = join(root, "agent");
 	environment.PRIME_AGENT_KERNEL_FORKSERVER = "1";
 	environment.TSX_TSCONFIG_PATH = resolve(__dirname, "../../../tsconfig.json");

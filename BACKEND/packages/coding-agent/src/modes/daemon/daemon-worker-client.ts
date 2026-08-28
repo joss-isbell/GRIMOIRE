@@ -8,7 +8,7 @@ import {
 	type DaemonWorkerFrameHeader,
 	isDaemonWorkerFrameHeader,
 } from "./daemon-worker-protocol.js";
-import { appendSupervisorDiagnosticBytes, appendSupervisorDiagnosticEvent } from "./incident-recorder.js";
+import { appendSupervisorDiagnosticEvent } from "./incident-recorder.js";
 
 type DistributiveOmit<T, K extends keyof T> = T extends unknown ? Omit<T, K> : never;
 type DaemonCommandBody = DistributiveOmit<DaemonCommand, "id">;
@@ -57,27 +57,7 @@ export class DaemonWorkerClient {
 		});
 		const socket = createConnection(this.socketPath);
 		this.socket = socket;
-		this.channel = new PrivateFramedChannel(socket, isDaemonWorkerFrameHeader, undefined, {
-			onInboundBytes: (bytes) =>
-				appendSupervisorDiagnosticBytes("worker_transport_inbound", bytes, {
-					...this.diagnosticContext,
-					socketPath: this.socketPath,
-					transportFraming: "exact-private-frame-stream-bytes",
-				}),
-			onOutboundBytes: (bytes) =>
-				appendSupervisorDiagnosticBytes("worker_transport_outbound", bytes, {
-					...this.diagnosticContext,
-					socketPath: this.socketPath,
-					transportFraming: "exact-private-frame-stream-bytes",
-				}),
-			onOutboundWriteOutcome: (bytes, outcome) =>
-				appendSupervisorDiagnosticEvent("worker_transport_outbound_write_outcome", {
-					...this.diagnosticContext,
-					socketPath: this.socketPath,
-					outcome,
-					attemptedBytes: bytes.length,
-				}),
-		});
+		this.channel = new PrivateFramedChannel(socket, isDaemonWorkerFrameHeader);
 		this.channel.onFrame((frame) => this.handleFrame(frame));
 
 		await new Promise<void>((resolve, reject) => {
