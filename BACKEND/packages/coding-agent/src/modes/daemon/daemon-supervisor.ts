@@ -316,6 +316,11 @@ interface PendingAgentPeerSync {
 	reject: (error: unknown) => void;
 }
 
+interface WorkerProcessCloseResult {
+	code: number | null;
+	signal: NodeJS.Signals | null;
+}
+
 interface ResidentWorker {
 	descriptor: DaemonWorkerDescriptor;
 	descriptorPath: string;
@@ -2758,9 +2763,34 @@ export class DaemonSupervisor {
 					onLineOverflow: (prefix) => this.log(`Session worker ${workerId} stderr: ${prefix} [truncated]`),
 				})
 			: () => {};
-		child.once("close", detachWorkerStderr);
-		const childClosed = new Promise<void>((resolveClose) => child.once("close", () => resolveClose()));
+		const childPid = child.pid;
+		let childProcessStartId: string | undefined;
+		let worker: ResidentWorker;
+		let terminalWaitUnavailable = false;
+		const childClosed = new Promise<WorkerProcessCloseResult>((resolveClose) =>
+			child.once("close", (code, signal) => {
+				detachWorkerStderr();
+				const result = { code, signal };
+				if (!terminalWaitUnavailable && childPid !== undefined) {
+					appendSupervisorDiagnosticEvent("process_terminal_disposition", {
+						role: "worker",
+						workerId,
+						activeSessionId: rootActiveSessionId,
+						rootActiveSessionId,
+						targetPid: childPid,
+						targetProcessStartId: childProcessStartId,
+						code,
+						signal,
+						intentionalStop: worker?.intentionalStop ?? false,
+					});
+				}
+				resolveClose(result);
+			}),
+		);
 		child.on("error", (error) => {
+			if (childPid === undefined) {
+				terminalWaitUnavailable = true;
+			}
 			appendSupervisorDiagnosticEvent("worker_process_error", {
 				error,
 				workerId,
@@ -2776,17 +2806,13 @@ export class DaemonSupervisor {
 		const previousDescriptor = existing?.descriptor;
 		const previousIntentionalStop = existing?.intentionalStop;
 		let descriptorAssigned = false;
-		let childPid: number;
-		let childProcessStartId: string | undefined;
-		let worker: ResidentWorker;
 		try {
-			if (!child.pid) {
+			if (childPid === undefined) {
 				throw new Error("Failed to obtain daemon session worker pid");
 			}
 			if (!(startupGate instanceof Writable)) {
 				throw new Error("Failed to create daemon session worker startup gate");
 			}
-			childPid = child.pid;
 			childProcessStartId = getProcessStartId(childPid);
 			appendSupervisorDiagnosticEvent("worker_process_spawned", {
 				workerId,
@@ -5821,7 +5847,7 @@ export class DaemonSupervisor {
 		force = false,
 		archiveSession = false,
 		recoveryCleanup = false,
-		directChild?: { child: ChildProcess; closed: Promise<void> },
+		directChild?: { child: ChildProcess; closed: Promise<WorkerProcessCloseResult> },
 	): Promise<void> {
 		const releaseStopOwnership = this.acquireWorkerStopOwnership(worker);
 		try {
@@ -5837,7 +5863,7 @@ export class DaemonSupervisor {
 		force = false,
 		archiveSession = false,
 		recoveryCleanup = false,
-		directChild?: { child: ChildProcess; closed: Promise<void> },
+		directChild?: { child: ChildProcess; closed: Promise<WorkerProcessCloseResult> },
 	): Promise<void> {
 		if (worker.ownerCleanupTimer) {
 			clearTimeout(worker.ownerCleanupTimer);

@@ -50,6 +50,7 @@ const STRING_FIELDS = new Set([
 	"requestId",
 	"requestType",
 	"role",
+	"rootActiveSessionId",
 	"runId",
 	"sessionId",
 	"signal",

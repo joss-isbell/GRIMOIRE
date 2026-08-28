@@ -39,7 +39,13 @@ const supervisorDiagnosticTestState = vi.hoisted(() => ({
 const workerLaunchTestState = vi.hoisted(() => ({
 	capture: false,
 	forceMissingProcessStartId: false,
-	fixtureMode: "worker" as "worker" | "close-gate" | "rollback-gate" | "successful-gate",
+	fixtureMode: "worker" as
+		| "worker"
+		| "close-gate"
+		| "rollback-gate"
+		| "successful-gate"
+		| "terminal-gate"
+		| "spawn-error",
 	gateMarkerPath: "",
 	tsxCliPath: "",
 	cliEntrypoint: "",
@@ -83,6 +89,9 @@ vi.mock("../src/cli/subprocess-launch.js", async (importOriginal) => {
 			if (!workerLaunchTestState.capture) {
 				return (actual.createCliSubprocessLaunchSpec as (args: readonly string[]) => unknown)(args);
 			}
+			if (workerLaunchTestState.fixtureMode === "spawn-error") {
+				return { command: join(tmpdir(), "missing-prime-worker-executable"), args: [] };
+			}
 			if (workerLaunchTestState.fixtureMode === "rollback-gate") {
 				const markerPath = JSON.stringify(workerLaunchTestState.gateMarkerPath);
 				const commitMarker = JSON.stringify(DAEMON_WORKER_STARTUP_GATE_COMMIT);
@@ -102,13 +111,20 @@ vi.mock("../src/cli/subprocess-launch.js", async (importOriginal) => {
 					args: ["--eval", 'require("node:fs").closeSync(3)'],
 				};
 			}
-			if (workerLaunchTestState.fixtureMode === "successful-gate") {
+			if (
+				workerLaunchTestState.fixtureMode === "successful-gate" ||
+				workerLaunchTestState.fixtureMode === "terminal-gate"
+			) {
 				const markerPath = JSON.stringify(workerLaunchTestState.gateMarkerPath);
+				const terminalHandler =
+					workerLaunchTestState.fixtureMode === "terminal-gate"
+						? 'process.on("SIGUSR1", () => process.exit(0)); '
+						: "";
 				return {
 					command: process.execPath,
 					args: [
 						"--eval",
-						`const fs = require("node:fs"); const marker = fs.readFileSync(3, "utf8"); fs.writeFileSync(${markerPath}, marker); setInterval(() => {}, 1000);`,
+						`const fs = require("node:fs"); ${terminalHandler}const marker = fs.readFileSync(3, "utf8"); fs.writeFileSync(${markerPath}, marker); setInterval(() => {}, 1000);`,
 					],
 				};
 			}
@@ -725,6 +741,192 @@ describe("daemon worker supervisor monitoring", () => {
 		const closed = new Promise<void>((resolveClose) => child.once("close", () => resolveClose()));
 		child.kill("SIGKILL");
 		await closed;
+	});
+
+	it.each([
+		{ name: "clean exit", terminate: "SIGUSR1" as const, code: 0, signal: null, intentionalStop: false },
+		{ name: "signal exit", terminate: "SIGTERM" as const, code: null, signal: "SIGTERM", intentionalStop: false },
+		{
+			name: "intentional signal exit",
+			terminate: "SIGTERM" as const,
+			code: null,
+			signal: "SIGTERM",
+			intentionalStop: true,
+		},
+	])("records one exact worker terminal disposition for $name", async (scenario) => {
+		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-terminal-disposition-test-"));
+		const descriptorDir = join(root, "descriptors");
+		const markerPath = join(root, "startup-marker");
+		mkdirSync(descriptorDir, { recursive: true });
+		supervisorRegistryDirs.add(root);
+		workerLaunchTestState.capture = true;
+		workerLaunchTestState.fixtureMode = "terminal-gate";
+		workerLaunchTestState.gateMarkerPath = markerPath;
+		const workers = new Map<string, unknown>();
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			...createSupervisorSnapshotState(),
+			defaultSessionConfig: { cwd: root, agentDir: root },
+			descriptorDir,
+			socketPath: join(root, "supervisor.sock"),
+			workers,
+			shuttingDown: false,
+			assertRecoveryAllowed: vi.fn(async () => undefined),
+			connectWorker: vi.fn(async (worker: { descriptor: { rootActiveSessionId: string } }) => {
+				await waitForFile(markerPath);
+				return {
+					request: vi.fn(async () => ({
+						success: true,
+						data: {
+							id: worker.descriptor.rootActiveSessionId,
+							activeSessionId: worker.descriptor.rootActiveSessionId,
+							sessionId: "terminal-disposition-session",
+							cwd: root,
+						},
+					})),
+				};
+			}),
+			subscribeWorker: vi.fn(async () => undefined),
+			refreshWorkerSummaries: vi.fn(async () => undefined),
+			syncAgentPeers: vi.fn(async () => undefined),
+			log: vi.fn(),
+		}) as {
+			launchWorker(command: { type: "create"; config: { cwd: string; agentDir: string } }): Promise<{
+				descriptor: { workerId: string; rootActiveSessionId: string; processStartId?: string };
+				intentionalStop: boolean;
+			}>;
+		};
+
+		const worker = await supervisor.launchWorker({ type: "create", config: { cwd: root, agentDir: root } });
+		const child = workerLaunchTestState.spawned.at(-1)?.child;
+		if (!child?.pid || !worker.descriptor.processStartId) {
+			throw new Error("Worker child identity was not captured");
+		}
+		const expectedPid = child.pid;
+		const expectedProcessStartId = worker.descriptor.processStartId;
+		worker.intentionalStop = scenario.intentionalStop;
+		const closed = new Promise<void>((resolveClose) => child.once("close", () => resolveClose()));
+		process.kill(expectedPid, scenario.terminate);
+		await closed;
+
+		const dispositions = supervisorDiagnosticTestState.events.filter(
+			(event) => event.type === "process_terminal_disposition",
+		);
+		expect(dispositions).toHaveLength(1);
+		expect(dispositions[0]?.fields).toEqual({
+			role: "worker",
+			workerId: worker.descriptor.workerId,
+			activeSessionId: worker.descriptor.rootActiveSessionId,
+			rootActiveSessionId: worker.descriptor.rootActiveSessionId,
+			targetPid: expectedPid,
+			targetProcessStartId: expectedProcessStartId,
+			code: scenario.code,
+			signal: scenario.signal,
+			intentionalStop: scenario.intentionalStop,
+		});
+	});
+
+	it("preserves an authoritative close after a post-spawn process error", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-post-spawn-error-test-"));
+		const descriptorDir = join(root, "descriptors");
+		const markerPath = join(root, "startup-marker");
+		mkdirSync(descriptorDir, { recursive: true });
+		supervisorRegistryDirs.add(root);
+		workerLaunchTestState.capture = true;
+		workerLaunchTestState.fixtureMode = "terminal-gate";
+		workerLaunchTestState.gateMarkerPath = markerPath;
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			...createSupervisorSnapshotState(),
+			defaultSessionConfig: { cwd: root, agentDir: root },
+			descriptorDir,
+			socketPath: join(root, "supervisor.sock"),
+			workers: new Map<string, unknown>(),
+			shuttingDown: false,
+			assertRecoveryAllowed: vi.fn(async () => undefined),
+			connectWorker: vi.fn(async (worker: { descriptor: { rootActiveSessionId: string } }) => {
+				await waitForFile(markerPath);
+				return {
+					request: vi.fn(async () => ({
+						success: true,
+						data: {
+							id: worker.descriptor.rootActiveSessionId,
+							activeSessionId: worker.descriptor.rootActiveSessionId,
+							sessionId: "post-spawn-error-session",
+							cwd: root,
+						},
+					})),
+				};
+			}),
+			subscribeWorker: vi.fn(async () => undefined),
+			refreshWorkerSummaries: vi.fn(async () => undefined),
+			syncAgentPeers: vi.fn(async () => undefined),
+			log: vi.fn(),
+		}) as {
+			launchWorker(command: { type: "create"; config: { cwd: string; agentDir: string } }): Promise<{
+				descriptor: { workerId: string; rootActiveSessionId: string; processStartId?: string };
+			}>;
+		};
+
+		const worker = await supervisor.launchWorker({ type: "create", config: { cwd: root, agentDir: root } });
+		const child = workerLaunchTestState.spawned.at(-1)?.child;
+		if (!child?.pid || !worker.descriptor.processStartId) {
+			throw new Error("Worker child identity was not captured");
+		}
+		const expectedPid = child.pid;
+		const expectedProcessStartId = worker.descriptor.processStartId;
+		const closed = new Promise<void>((resolveClose) => child.once("close", () => resolveClose()));
+		child.emit("error", new Error("post-spawn process error"));
+		process.kill(expectedPid, "SIGUSR1");
+		await closed;
+
+		expect(
+			supervisorDiagnosticTestState.events.filter((event) => event.type === "worker_process_error"),
+		).toHaveLength(1);
+		const dispositions = supervisorDiagnosticTestState.events.filter(
+			(event) => event.type === "process_terminal_disposition",
+		);
+		expect(dispositions).toHaveLength(1);
+		expect(dispositions[0]?.fields).toEqual({
+			role: "worker",
+			workerId: worker.descriptor.workerId,
+			activeSessionId: worker.descriptor.rootActiveSessionId,
+			rootActiveSessionId: worker.descriptor.rootActiveSessionId,
+			targetPid: expectedPid,
+			targetProcessStartId: expectedProcessStartId,
+			code: 0,
+			signal: null,
+			intentionalStop: false,
+		});
+	});
+
+	it("keeps spawn errors separate from worker terminal disposition", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-spawn-error-test-"));
+		const descriptorDir = join(root, "descriptors");
+		mkdirSync(descriptorDir, { recursive: true });
+		supervisorRegistryDirs.add(root);
+		workerLaunchTestState.capture = true;
+		workerLaunchTestState.fixtureMode = "spawn-error";
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			...createSupervisorSnapshotState(),
+			defaultSessionConfig: { cwd: root, agentDir: root },
+			descriptorDir,
+			socketPath: join(root, "supervisor.sock"),
+			workers: new Map(),
+			shuttingDown: false,
+			assertRecoveryAllowed: vi.fn(async () => undefined),
+			log: vi.fn(),
+		}) as {
+			launchWorker(command: { type: "create"; config: { cwd: string; agentDir: string } }): Promise<unknown>;
+		};
+
+		await expect(
+			supervisor.launchWorker({ type: "create", config: { cwd: root, agentDir: root } }),
+		).rejects.toThrow();
+		expect(
+			supervisorDiagnosticTestState.events.filter((event) => event.type === "worker_process_error"),
+		).toHaveLength(1);
+		expect(
+			supervisorDiagnosticTestState.events.filter((event) => event.type === "process_terminal_disposition"),
+		).toEqual([]);
 	});
 
 	it("rolls back a published worker when shutdown admission and rollback persistence fail", async () => {
