@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { createRequire } from "node:module";
 import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { getProcessStartId } from "../src/core/session-lease.js";
 import { DaemonWorkerClient } from "../src/modes/daemon/daemon-worker-client.js";
@@ -112,6 +112,44 @@ function recordedStructuredTypes(runDir: string): string[] {
 	return recordedStructuredEvents(runDir).flatMap((event) => (typeof event.type === "string" ? [event.type] : []));
 }
 
+async function expectSupervisorDisposition(
+	result: RecordedProcessResult,
+	expected: { code: number | null; signal: NodeJS.Signals | null },
+	expectIncidentSummary: boolean,
+): Promise<void> {
+	const identity = JSON.parse(readFileSync(join(result.runDir, "process.json"), "utf8")) as {
+		pid: number;
+		processStartId: string;
+	};
+	const disposition = {
+		role: "supervisor",
+		targetPid: identity.pid,
+		targetProcessStartId: identity.processStartId,
+		...expected,
+	};
+	const exitEvent = recordedStructuredEvents(result.runDir).find((event) => event.type === "supervisor_exit");
+	expect(exitEvent).toMatchObject({
+		...disposition,
+		processStartId: identity.processStartId,
+	});
+	expect(exitEvent?.processStartId).toBe(exitEvent?.targetProcessStartId);
+	const terminal = JSON.parse(readFileSync(join(result.runDir, ".retention-terminal.json"), "utf8"));
+	expect(terminal).toMatchObject({
+		...disposition,
+		exitCode: expected.code,
+		exitSignal: expected.signal,
+	});
+	if (!expectIncidentSummary) return;
+	const agentDir = dirname(dirname(dirname(result.runDir)));
+	let incidentDir: string | undefined;
+	for (let attempt = 0; attempt < 16 && !incidentDir; attempt += 1) {
+		incidentDir = (await inspectIncidentRecorderRuns(agentDir))[0];
+	}
+	expect(incidentDir).toEqual(expect.any(String));
+	const summary = JSON.parse(readFileSync(join(incidentDir as string, "summary.json"), "utf8"));
+	expect(summary.exit).toEqual(disposition);
+}
+
 async function waitForPid(agentDir: string): Promise<number> {
 	const runsRoot = join(agentDir, "incident-recorder", "runs");
 	for (let attempt = 0; attempt < 200; attempt++) {
@@ -181,6 +219,7 @@ describe("incident recorder isolated fault evidence", () => {
 			environment: { INVOCATION_ID: "a".repeat(32), WSL_DISTRO_NAME: "Ubuntu" },
 			commandSummary: { redactedValueCount: 2 },
 		});
+		await expectSupervisorDisposition(result, { code: 0, signal: null }, false);
 	});
 
 	it("records a terminal spawn failure and expires it after three days", async () => {
@@ -212,6 +251,7 @@ describe("incident recorder isolated fault evidence", () => {
 		const result = await record(fixture('throw new Error("isolated uncaught fault");'));
 		expect(result).toMatchObject({ code: 1, signal: null, classification: "uncaught_exception" });
 		expect(readdirSync(join(result.runDir, "raw-reports")).some((name) => name.endsWith(".json"))).toBe(true);
+		await expectSupervisorDisposition(result, { code: 1, signal: null }, true);
 	});
 
 	it("keeps repeated worker fatal summaries bounded in the supervisor recorder run", async () => {
@@ -349,11 +389,13 @@ child.once("close", (code, signal) => {
 		const source = `${appendEventScript({ type: "ready" })}process.on("SIGTERM",()=>{${appendEventScript({ type: "signal_received", signal: "SIGTERM" })}process.exit(143)});setInterval(()=>{},1000);`;
 		const result = await signalAndWait(fixture(source), "SIGTERM");
 		expect(result).toMatchObject({ code: 143, signal: null, classification: "signal_sigterm" });
+		await expectSupervisorDisposition(result, { code: 143, signal: null }, true);
 	});
 
 	it("preserves an external SIGKILL", async () => {
 		const result = await signalAndWait(fixture("setInterval(()=>{},1000);"), "SIGKILL");
 		expect(result).toMatchObject({ code: null, signal: "SIGKILL", classification: "signal_sigkill" });
+		await expectSupervisorDisposition(result, { code: null, signal: "SIGKILL" }, true);
 	});
 
 	it("detects a live event-loop heartbeat stall from a structured causal heartbeat without recovering the process", async () => {

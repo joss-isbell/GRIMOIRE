@@ -1240,7 +1240,7 @@ function finalizeIncident(
 			} catch {}
 		}
 		const launch = readSmallJson<unknown>(join(runDir, "launch.json"));
-		const processIdentity = readSmallJson<unknown>(join(runDir, "process.json"));
+		const processIdentity = readSmallJson<{ pid?: number; processStartId?: string }>(join(runDir, "process.json"));
 		const linuxEvidence = readLinuxIncidentEvidenceCorrelation(runDir);
 		writePrivateJson(join(partialDir, "launch.json"), launch);
 		writePrivateJson(join(partialDir, "process.json"), processIdentity);
@@ -1251,7 +1251,13 @@ function finalizeIncident(
 			stoppedTargetCaptureComplete: true,
 			causeLayer: incidentCauseLayer(result.classification, linuxEvidence),
 			correlation: linuxEvidence,
-			exit: { code: result.code, signal: result.signal },
+			exit: {
+				role: "supervisor",
+				targetPid: processIdentity?.pid,
+				targetProcessStartId: processIdentity?.processStartId,
+				code: result.code,
+				signal: result.signal,
+			},
 			socketPath: options.socketPath,
 			socketIdentity: [...events].reverse().find((event) => event.type === "supervisor_ready")?.socketIdentity,
 			launch,
@@ -1401,13 +1407,21 @@ export async function recordSupervisorProcess(options: RecordProcessOptions): Pr
 		appendRunEvent(runDir, { type: "recorder_child_error", error, childPid: pid, processStartId });
 		throw error;
 	}
-	const exitAdmission = appendCausalRunEvent(runDir, "recorder-events", "supervisor_exit", {
-		childPid: pid,
+	const supervisorDisposition = {
+		role: "supervisor",
+		targetPid: pid,
+		targetProcessStartId: processStartId,
 		code: exit.code,
 		signal: exit.signal,
+	};
+	const exitAdmission = appendCausalRunEvent(runDir, "recorder-events", "supervisor_exit", {
+		childPid: pid,
+		processStartId,
+		...supervisorDisposition,
 	});
 	publishTerminalDisposition(runDir, {
 		completed: nowFields(),
+		...supervisorDisposition,
 		exitCode: exit.code,
 		exitSignal: exit.signal,
 		structuredExit: exitAdmission.accepted
