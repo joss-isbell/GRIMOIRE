@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { type ChildProcess, spawn } from "node:child_process";
 import { createHmac, randomBytes } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -51,6 +52,12 @@ const KERNEL_ABORT_GRACE_MS = 1000;
 const KERNEL_BUSY_REUSE_WAIT_MS = 5000;
 const KERNEL_BUSY_INTERRUPT_INTERVAL_MS = 500;
 const MAX_LATE_SENT_AGENT_MESSAGE_HANDLERS = 256;
+const KERNEL_CONTEXT_ID_PATTERN = /^[A-Za-z0-9_.:+-]{1,256}$/;
+
+function normalizeKernelContextId(value: string | undefined): string | undefined {
+	return value !== undefined && KERNEL_CONTEXT_ID_PATTERN.test(value) ? value : undefined;
+}
+
 type KernelShutdownReason =
 	| "shutdown"
 	| "restart"
@@ -192,7 +199,10 @@ export interface KernelManagerOptions {
 	python?: string;
 	cwd?: string;
 	env?: Record<string, string>;
+	/** Stable persisted Agent session identity for causal kernel facts. */
 	sessionId?: string;
+	/** Stable active Agent runtime identity for causal kernel facts. */
+	activeSessionId?: string;
 	hostHandlers?: HostRequestHandlers;
 	pythonSkills?: readonly KernelPythonSkill[];
 	/** Persist/revive the user namespace across kernel restarts and session resume. */
@@ -614,7 +624,7 @@ function installSignalHandlersOnce(): void {
 export class KernelManager {
 	private readonly options: Pick<
 		KernelManagerOptions,
-		"python" | "cwd" | "env" | "sessionId" | "hostHandlers" | "pythonSkills" | "snapshot"
+		"python" | "cwd" | "env" | "sessionId" | "activeSessionId" | "hostHandlers" | "pythonSkills" | "snapshot"
 	> &
 		Required<Pick<KernelManagerOptions, "username">>;
 	private readonly session = uuid();
@@ -657,13 +667,16 @@ export class KernelManager {
 	private startPromise?: Promise<void>;
 	/** Pending debounced auto-snapshot, if one has been scheduled. */
 	private snapshotTimer?: ReturnType<typeof globalThis.setTimeout>;
+	private readonly toolCallContext = new AsyncLocalStorage<{ token: symbol; toolCallId?: string }>();
+	private readonly activeToolCallTokens = new Set<symbol>();
 
 	constructor(options: KernelManagerOptions) {
 		this.options = {
 			python: options.python,
 			cwd: options.cwd,
 			env: options.env,
-			sessionId: options.sessionId,
+			sessionId: normalizeKernelContextId(options.sessionId),
+			activeSessionId: normalizeKernelContextId(options.activeSessionId),
 			hostHandlers: options.hostHandlers,
 			pythonSkills: options.pythonSkills,
 			snapshot: options.snapshot,
@@ -673,6 +686,22 @@ export class KernelManager {
 
 	get ownerSessionId(): string | undefined {
 		return this.options.sessionId;
+	}
+
+	/** Keep a real Agent tool-call identity scoped to the operation that owns it. */
+	async withToolCallContext<T>(toolCallId: string, operation: () => Promise<T>): Promise<T> {
+		const token = Symbol("kernel-tool-call-context");
+		this.activeToolCallTokens.add(token);
+		try {
+			return await this.toolCallContext.run({ token, toolCallId: normalizeKernelContextId(toolCallId) }, operation);
+		} finally {
+			this.activeToolCallTokens.delete(token);
+		}
+	}
+
+	private getCurrentToolCallId(): string | undefined {
+		const context = this.toolCallContext.getStore();
+		return context && this.activeToolCallTokens.has(context.token) ? context.toolCallId : undefined;
 	}
 
 	private appendKernelDiagnostic(message: string): void {
@@ -1597,9 +1626,9 @@ export class KernelManager {
 			callerCategory,
 			oldState,
 			newState: "shutdown",
-			sessionId: "unavailable",
-			activeSessionId: "unavailable",
-			toolCallId: "unavailable",
+			sessionId: this.options.sessionId ?? "unavailable",
+			activeSessionId: this.options.activeSessionId ?? "unavailable",
+			toolCallId: this.getCurrentToolCallId() ?? "unavailable",
 			workerPid: process.pid,
 			workerProcessStartId: this.workerProcessStartId ?? "unavailable",
 			workerIdentityLivenessResult: this.workerProcessStartId ? "alive_identity_confirmed" : "identity_unavailable",
