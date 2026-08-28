@@ -136,8 +136,8 @@ describe("incident compactor survival bounds", () => {
 		expect(
 			incidentJournalReaderSinceArgument({ lastRealtimeUs: String((nowMs + 6 * 60 * 1_000) * 1_000) }, nowMs),
 		).toBe("--since=@10.000000");
-		expect(incidentJournalReaderResumeDelayMs(1024 * 1024, 0)).toBe(1_000);
-		expect(incidentJournalReaderResumeDelayMs(64 * 1024, 10)).toBe(53);
+		expect(incidentJournalReaderResumeDelayMs(1024 * 1024, 0)).toBe(4_000);
+		expect(incidentJournalReaderResumeDelayMs(64 * 1024, 10)).toBe(240);
 		expect(incidentJournalReaderResumeDelayMs(64 * 1024, 1_000)).toBe(0);
 		expect(() => incidentJournalReaderResumeDelayMs(-1, 0)).toThrow("Invalid incident journal reader pacing input");
 		const fence = { cursor: "durable-cursor", lastRealtimeUs: "20000000" };

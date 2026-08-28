@@ -33,6 +33,7 @@ describe("incident recorder systemd user service", () => {
 		expect(unit).toContain("MemoryHigh=768M");
 		expect(unit).toContain("MemoryMax=1G");
 		expect(unit).toContain("MemorySwapMax=0");
+		expect(unit).toContain("IOSchedulingClass=idle");
 		expect(unit).toContain("UMask=0077");
 		expect(unit).not.toContain('--mode" "daemon');
 	});

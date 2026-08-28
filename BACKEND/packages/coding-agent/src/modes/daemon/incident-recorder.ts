@@ -4140,7 +4140,7 @@ export function renderIncidentRecorderSystemdUnit(options: RenderServiceOptions)
 		startLimitBurst < 1
 	)
 		throw new Error("Invalid incident recorder service resource controls");
-	return `[Unit]\nDescription=Prime Agent incident compactor, sampler, and finalizer\nStartLimitIntervalSec=${startLimitIntervalSeconds}s\nStartLimitBurst=${startLimitBurst}\n\n[Service]\nType=simple\nKillMode=control-group\nEnvironment=${INCIDENT_RECORDER_SERVICE_ENV}=1\nExecStartPre=/usr/bin/test -S /run/systemd/journal.grimoire/stdout\nExecStart=${args.map(systemdQuote).join(" ")}\nRestart=on-failure\nRestartSec=${restartSeconds}s\nMemoryHigh=${memoryHigh}\nMemoryMax=${memoryMax}\nMemorySwapMax=${memorySwapMax}\nCPUQuota=${cpuQuota}\nIOWeight=${ioWeight}\nNice=10\nTasksMax=${tasksMax}\nLimitNOFILE=${limitNOFILE}\nOOMPolicy=stop\nRuntimeDirectory=prime-agent\nRuntimeDirectoryMode=0700\nUMask=0077\n\n[Install]\nWantedBy=default.target\n`;
+	return `[Unit]\nDescription=Prime Agent incident compactor, sampler, and finalizer\nStartLimitIntervalSec=${startLimitIntervalSeconds}s\nStartLimitBurst=${startLimitBurst}\n\n[Service]\nType=simple\nKillMode=control-group\nEnvironment=${INCIDENT_RECORDER_SERVICE_ENV}=1\nExecStartPre=/usr/bin/test -S /run/systemd/journal.grimoire/stdout\nExecStart=${args.map(systemdQuote).join(" ")}\nRestart=on-failure\nRestartSec=${restartSeconds}s\nMemoryHigh=${memoryHigh}\nMemoryMax=${memoryMax}\nMemorySwapMax=${memorySwapMax}\nCPUQuota=${cpuQuota}\nIOWeight=${ioWeight}\nIOSchedulingClass=idle\nNice=10\nTasksMax=${tasksMax}\nLimitNOFILE=${limitNOFILE}\nOOMPolicy=stop\nRuntimeDirectory=prime-agent\nRuntimeDirectoryMode=0700\nUMask=0077\n\n[Install]\nWantedBy=default.target\n`;
 }
 
 export function renderIncidentRecorderSystemdRequirements(
