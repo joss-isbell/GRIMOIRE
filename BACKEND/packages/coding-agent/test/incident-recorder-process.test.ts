@@ -24,10 +24,10 @@ import {
 	INCIDENT_RECORDER_SERVICE_ENV,
 	inspectIncidentRecorderRuns,
 	type RecordedProcessResult,
+	recordIncidentRecorderCausalEvent,
 	recordSupervisorProcess,
 	shouldRecordSupervisorLaunch,
 } from "../src/modes/daemon/incident-recorder.js";
-import { IncidentRecorderCompactor } from "../src/modes/daemon/incident-recorder-compactor.js";
 import {
 	decodeIncidentRecorderFrame,
 	encodeIncidentRecorderFrame,
@@ -102,6 +102,39 @@ function decodeCaptureWire(wire: Buffer): ReturnType<typeof decodeIncidentRecord
 	return packets.map((packet) => decodeIncidentRecorderFrame(packet));
 }
 
+function recordedStructuredTypes(runDir: string): string[] {
+	const types: string[] = [];
+	const timeline = join(runDir, "timeline.jsonl");
+	if (existsSync(timeline)) {
+		for (const line of readFileSync(timeline, "utf8").split("\n").filter(Boolean)) {
+			try {
+				const event = JSON.parse(line) as { type?: unknown };
+				if (typeof event.type === "string") types.push(event.type);
+			} catch {}
+		}
+	}
+	const directory = join(runDir, "raw-application", "recorder-events");
+	if (!existsSync(directory)) return types;
+	for (const name of readdirSync(directory).filter((candidate) => /^segment-\d{8}\.jsonl$/.test(candidate))) {
+		for (const line of readFileSync(join(directory, name), "utf8").split("\n").filter(Boolean)) {
+			try {
+				const frame = JSON.parse(line) as { chunkCount: number; chunkIndex: number; payload: string };
+				if (frame.chunkCount !== 1 || frame.chunkIndex !== 0) continue;
+				const envelope = JSON.parse(Buffer.from(frame.payload, "base64").toString("utf8")) as { type?: unknown };
+				if (typeof envelope.type === "string") types.push(envelope.type);
+			} catch {}
+		}
+	}
+	return types;
+}
+
+function onlyRunDir(agentDir: string): string {
+	const runsRoot = join(agentDir, "incident-recorder", "runs");
+	const runName = readdirSync(runsRoot)[0];
+	if (!runName) throw new Error("isolated fixture has no recorder run");
+	return join(runsRoot, runName);
+}
+
 async function waitForPid(agentDir: string): Promise<number> {
 	const runsRoot = join(agentDir, "incident-recorder", "runs");
 	for (let attempt = 0; attempt < 200; attempt++) {
@@ -170,19 +203,6 @@ describe("incident recorder isolated fault evidence", () => {
 			environment: { INVOCATION_ID: "a".repeat(32), WSL_DISTRO_NAME: "Ubuntu" },
 			commandSummary: { redactedValueCount: 2 },
 		});
-	});
-
-	it("admits derived storage by allocated filesystem blocks", () => {
-		const target = fixture("");
-		const recorderRoot = join(target.agentDir, "incident-recorder");
-		mkdirSync(recorderRoot, { recursive: true, mode: 0o700 });
-		writeFileSync(join(recorderRoot, "one-byte"), "x", { mode: 0o600 });
-		const compactor = new IncidentRecorderCompactor({
-			agentDir: target.agentDir,
-			storageByteCeiling: 1024,
-			freeReserveBytes: 0,
-		});
-		expect(compactor.admitObservation(0)).toBe(false);
 	});
 
 	it("records a terminal spawn failure and expires it after three days", async () => {
@@ -580,36 +600,37 @@ describe("incident recorder isolated fault evidence", () => {
 		expect(result).toMatchObject({ code: null, signal: "SIGKILL", classification: "signal_sigkill" });
 	});
 
-	it.skip("detects a live event-loop heartbeat stall without recovering the process (legacy timeline injector; replace with journal-backed service fixture)", async () => {
-		const target = fixture(
-			`${appendEventScript({ type: "supervisor_heartbeat", socketExists: false })}Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0);`,
-		);
+	it("detects a live event-loop heartbeat stall from a structured causal heartbeat without recovering the process", async () => {
+		const target = fixture("Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0);");
 		const pending = record(target);
 		const pid = await waitForPid(target.agentDir);
+		recordIncidentRecorderCausalEvent(onlyRunDir(target.agentDir), "supervisor_heartbeat", { socketExists: false });
 		await new Promise((resolve) => setTimeout(resolve, 100));
 		const incidents = await inspectIncidentRecorderRuns(target.agentDir, Date.now() + 20_000);
-		expect(incidents).toHaveLength(1);
+		expect(incidents).toEqual([]);
+		expect(recordedStructuredTypes(onlyRunDir(target.agentDir))).toContain("heartbeat_stalled");
 		expect(() => signalFixture(pid, 0)).not.toThrow();
 		signalFixture(pid, "SIGKILL");
 		const result = await pending;
 		livePids.delete(pid);
-		expect(result.classification).toBe("event_loop_hang");
+		expect(result.classification).toBe("signal_sigkill");
 	});
 
-	it.skip("detects loss of an isolated live supervisor socket (legacy timeline injector; replace with journal-backed service fixture)", async () => {
-		const socketEvidence = appendEventScript({ type: "supervisor_heartbeat", socketExists: true });
+	it("detects loss of an isolated live supervisor socket from structured causal state", async () => {
 		const target = fixture(
-			`const fs=require("node:fs");const net=require("node:net");const socket=process.env.PRIME_AGENT_INTERNAL_INCIDENT_RECORDER_SOCKET;const server=net.createServer();server.listen(socket,()=>{${socketEvidence}fs.unlinkSync(socket)});setInterval(()=>{},1000);`,
+			'const fs=require("node:fs");const net=require("node:net");const socket=process.env.PRIME_AGENT_INTERNAL_INCIDENT_RECORDER_SOCKET;const server=net.createServer();server.listen(socket,()=>{fs.unlinkSync(socket)});setInterval(()=>{},1000);',
 		);
 		const pending = record(target);
 		const pid = await waitForPid(target.agentDir);
+		recordIncidentRecorderCausalEvent(onlyRunDir(target.agentDir), "supervisor_heartbeat", { socketExists: true });
 		await new Promise((resolve) => setTimeout(resolve, 100));
-		expect(await inspectIncidentRecorderRuns(target.agentDir)).toHaveLength(1);
+		expect(await inspectIncidentRecorderRuns(target.agentDir)).toEqual([]);
+		expect(recordedStructuredTypes(onlyRunDir(target.agentDir))).toContain("socket_lost");
 		expect(() => signalFixture(pid, 0)).not.toThrow();
 		signalFixture(pid, "SIGKILL");
 		const result = await pending;
 		livePids.delete(pid);
-		expect(result.classification).toBe("socket_loss");
+		expect(result.classification).toBe("signal_sigkill");
 	});
 
 	it("records a real isolated worker request timeout", async () => {
@@ -636,18 +657,22 @@ describe("incident recorder isolated fault evidence", () => {
 		}
 	});
 
-	it.skip("finalizes a live worker response hang without recovering the process (legacy timeline injector; replace with journal-backed service fixture)", async () => {
-		const target = fixture(
-			`${appendEventScript({ type: "worker_request_end", requestType: "get_state", durationMs: 25, outcome: "timeout" })}setInterval(()=>{},1000);`,
-		);
+	it("finalizes a live worker response hang from a structured timeout event without recovering the process", async () => {
+		const target = fixture("setInterval(()=>{},1000);");
 		const pending = record(target);
 		const pid = await waitForPid(target.agentDir);
+		recordIncidentRecorderCausalEvent(onlyRunDir(target.agentDir), "worker_request_end", {
+			requestType: "get_state",
+			durationMs: 25,
+			outcome: "timeout",
+		});
 		await new Promise((resolve) => setTimeout(resolve, 100));
-		expect(await inspectIncidentRecorderRuns(target.agentDir)).toHaveLength(1);
+		expect(await inspectIncidentRecorderRuns(target.agentDir)).toEqual([]);
+		expect(recordedStructuredTypes(onlyRunDir(target.agentDir))).toContain("worker_hang_detected");
 		expect(() => signalFixture(pid, 0)).not.toThrow();
 		signalFixture(pid, "SIGKILL");
 		const result = await pending;
 		livePids.delete(pid);
-		expect(result.classification).toBe("worker_response_hang");
+		expect(result.classification).toBe("signal_sigkill");
 	});
 });

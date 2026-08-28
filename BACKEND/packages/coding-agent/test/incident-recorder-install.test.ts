@@ -30,18 +30,20 @@ describe("incident recorder systemd user service", () => {
 			'ExecStart="/stable/node" "/stable/prime agent/cli.js" "--incident-recorder-service" "--agent-dir" "/private/agent"',
 		);
 		expect(unit).toContain("KillMode=control-group");
-		expect(unit).toContain("MemoryHigh=768M");
-		expect(unit).toContain("MemoryMax=1G");
+		expect(unit).toContain("MemoryHigh=192M");
+		expect(unit).toContain("MemoryMax=256M");
 		expect(unit).toContain("MemorySwapMax=0");
 		expect(unit).toContain("IOSchedulingClass=idle");
 		expect(unit).toContain("UMask=0077");
 		expect(unit).not.toContain('--mode" "daemon');
+		expect(unit).not.toContain("journal.grimoire");
+		expect(unit).not.toContain("journalctl");
+		expect(unit).not.toContain("systemd-cat");
 	});
 
 	it("installs and activates idempotently with an isolated fake systemctl", () => {
 		const homeDir = tempHome();
 		const calls: Array<{ command: string; args: string[] }> = [];
-		const privilegedFiles = new Map<string, string>();
 		const fakeSystemctl = (command: string, args: readonly string[]) => {
 			calls.push({ command, args: [...args] });
 			return { status: 0, error: undefined, stderr: "" };
@@ -52,20 +54,16 @@ describe("incident recorder systemd user service", () => {
 			homeDir,
 			platform: "linux" as const,
 			spawnSyncImpl: fakeSystemctl,
-			privilegedInstallFile: (path: string, contents: string) => {
-				privilegedFiles.set(path, contents);
-				return { status: 0 };
+			privilegedInstallFile: () => {
+				throw new Error("automatic install must not request root");
 			},
-			privilegedReadFile: (path: string) => privilegedFiles.get(path),
+			privilegedReadFile: () => {
+				throw new Error("automatic install must not inspect root-owned journald configuration");
+			},
 		};
 		const first = installIncidentRecorderSystemdService(options);
 		expect(first.status).toBe("installed");
 		expect(calls).toEqual([
-			{ command: "sudo", args: ["-n", "systemctl", "daemon-reload"] },
-			{ command: "sudo", args: ["-n", "systemctl", "enable", "--now", "systemd-journald@grimoire.socket"] },
-			{ command: "sudo", args: ["-n", "systemctl", "restart", "systemd-journald@grimoire.service"] },
-			{ command: "sudo", args: ["-n", "systemctl", "is-active", "--quiet", "systemd-journald@grimoire.service"] },
-			{ command: "sudo", args: ["-n", "systemctl", "is-active", "--quiet", "systemd-journald@grimoire.socket"] },
 			{ command: "systemctl", args: ["--user", "show-environment"] },
 			{ command: "systemctl", args: ["--user", "daemon-reload"] },
 			{ command: "systemctl", args: ["--user", "enable", "prime-agent-incident-recorder.service"] },
@@ -80,10 +78,6 @@ describe("incident recorder systemd user service", () => {
 		expect(second.status).toBe("unchanged");
 		expect(readFileSync(unitPath, "utf8")).toBe(firstContent);
 		expect(calls).toEqual([
-			{ command: "sudo", args: ["-n", "systemctl", "enable", "--now", "systemd-journald@grimoire.socket"] },
-			{ command: "sudo", args: ["-n", "systemctl", "start", "systemd-journald@grimoire.service"] },
-			{ command: "sudo", args: ["-n", "systemctl", "is-active", "--quiet", "systemd-journald@grimoire.service"] },
-			{ command: "sudo", args: ["-n", "systemctl", "is-active", "--quiet", "systemd-journald@grimoire.socket"] },
 			{ command: "systemctl", args: ["--user", "show-environment"] },
 			{ command: "systemctl", args: ["--user", "enable", "prime-agent-incident-recorder.service"] },
 			{ command: "systemctl", args: ["--user", "start", "prime-agent-incident-recorder.service"] },

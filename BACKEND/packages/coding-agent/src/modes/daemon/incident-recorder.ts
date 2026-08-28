@@ -868,6 +868,26 @@ function appendStructuredCausalEvent(
 	}
 }
 
+export function recordIncidentRecorderCausalEvent(
+	runDir: string,
+	type: string,
+	fields: Record<string, unknown> = {},
+): void {
+	if (!/^[a-z][a-z0-9_]{0,79}$/.test(type)) throw new Error("Invalid causal incident event type");
+	const line = `${JSON.stringify({ type, ...nowFields(), pid: process.pid, ...fields })}\n`;
+	const descriptor = openSync(
+		join(runDir, EVENT_FILE_NAME),
+		fsConstants.O_WRONLY | fsConstants.O_APPEND | fsConstants.O_CREAT | fsConstants.O_NOFOLLOW,
+		0o600,
+	);
+	try {
+		writeSync(descriptor, line);
+		fsyncSync(descriptor);
+	} finally {
+		closeSync(descriptor);
+	}
+}
+
 function appendRunEvent(runDir: string, event: { type: string; [key: string]: unknown }): void {
 	const { type, ...fields } = event;
 	const orderedWriter = orderedWriterForRun(runDir);
@@ -1673,29 +1693,28 @@ function readExpectedExitDisposition(runDir: string): { code: number | null; sig
 }
 
 function readEvents(runDir: string): IncidentRecorderEvent[] {
-	const orderedEvents = readOrderedEvents(runDir);
-	if (orderedEvents.length > 0 || activeServiceRecorder) return orderedEvents;
-	const rawEvents = [
+	const candidates = [
+		...readOrderedEvents(runDir),
 		...readRawEventSource(runDir, "recorder-events"),
 		...readRawEventSource(runDir, "supervisor-events"),
-	].sort((left, right) => {
+	];
+	const bounded = readBoundedPrefix(join(runDir, EVENT_FILE_NAME), INCIDENT_RECORDER_LIMITS.eventFileBytes);
+	if (bounded) {
+		for (const line of bounded.value.toString("utf8").split("\n").filter(Boolean)) {
+			try {
+				candidates.push(JSON.parse(line) as IncidentRecorderEvent);
+			} catch {}
+		}
+	}
+	const unique = new Map<string, IncidentRecorderEvent>();
+	for (const event of candidates) {
+		const key = `${event.type} ${event.wallTime} ${event.monotonicNs} ${event.pid}`;
+		if (!unique.has(key)) unique.set(key, event);
+	}
+	return [...unique.values()].sort((left, right) => {
 		const wall = left.wallTime.localeCompare(right.wallTime);
 		return wall !== 0 ? wall : left.monotonicNs.localeCompare(right.monotonicNs);
 	});
-	if (rawEvents.length > 0) return rawEvents;
-	const bounded = readBoundedPrefix(join(runDir, EVENT_FILE_NAME), INCIDENT_RECORDER_LIMITS.eventFileBytes);
-	if (!bounded) return [];
-	return bounded.value
-		.toString("utf8")
-		.split("\n")
-		.filter(Boolean)
-		.flatMap((line) => {
-			try {
-				return [JSON.parse(line) as IncidentRecorderEvent];
-			} catch {
-				return [];
-			}
-		});
 }
 
 function numericTree(value: unknown, depth = 0): unknown {
@@ -1973,10 +1992,6 @@ function classify(
 	signal: NodeJS.Signals | null,
 	runDir: string,
 ): string {
-	if (events.some((event) => event.type === "worker_request_end" && event.outcome === "timeout"))
-		return "worker_response_hang";
-	if (events.some((event) => event.type === "socket_lost")) return "socket_loss";
-	if (events.some((event) => event.type === "heartbeat_stalled")) return "event_loop_hang";
 	if (events.some((event) => event.type === "native_abort") || signal === "SIGABRT") return "native_abort";
 	if (events.some((event) => event.type === "unhandled_rejection")) return "unhandled_rejection";
 	if (events.some((event) => event.type === "fatal_exception") || reportIndicatesException(runDir))
@@ -1985,6 +2000,10 @@ function classify(
 	const caughtSignal = [...events].reverse().find((event) => event.type === "signal_received")?.signal;
 	if (typeof caughtSignal === "string") return `signal_${caughtSignal.toLowerCase()}`;
 	if (signal) return `signal_${signal.toLowerCase()}`;
+	if (events.some((event) => event.type === "worker_request_end" && event.outcome === "timeout"))
+		return "worker_response_hang";
+	if (events.some((event) => event.type === "socket_lost")) return "socket_loss";
+	if (events.some((event) => event.type === "heartbeat_stalled")) return "event_loop_hang";
 	if (code !== 0) return `exit_${code ?? "unknown"}`;
 	return "normal";
 }
@@ -3179,17 +3198,14 @@ export async function inspectIncidentRecorderRuns(agentDir: string, nowMs = Date
 		const sampling = serviceSamplingRuns.get(run.runDir);
 		if (sampling?.liveHangClassification === detected) continue;
 		if (sampling) sampling.liveHangClassification = detected;
-		appendRunEvent(run.runDir, {
-			type:
-				detected === "event_loop_hang"
-					? "heartbeat_stalled"
-					: detected === "socket_loss"
-						? "socket_lost"
-						: "worker_hang_detected",
-			childPid: run.pid,
-		});
-		appendRunEvent(run.runDir, {
-			type: "broad_proc_capture_deferred_target_live",
+		const detectionType =
+			detected === "event_loop_hang"
+				? "heartbeat_stalled"
+				: detected === "socket_loss"
+					? "socket_lost"
+					: "worker_hang_detected";
+		recordIncidentRecorderCausalEvent(run.runDir, detectionType, { childPid: run.pid });
+		recordIncidentRecorderCausalEvent(run.runDir, "broad_proc_capture_deferred_target_live", {
 			childPid: run.pid,
 			reason: "stopped_target_identity_required",
 			state: "deferred_or_unavailable",
