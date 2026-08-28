@@ -83,14 +83,38 @@ describe("IpythonKernelProvisioner", () => {
 		}
 	});
 
-	it("memoizes concurrent ensure() calls into one startup", async () => {
+	it("memoizes concurrent ensure() calls and resolves active-session context once per manager", async () => {
 		const { python, countRuns } = writeFakePython();
-		const provisioner = new IpythonKernelProvisioner(tempDir, { python });
+		const activeSessionIdProvider = vi.fn(async () => "active-session");
+		const provisioner = new IpythonKernelProvisioner(tempDir, { python, activeSessionIdProvider });
 
 		const [a, b] = await Promise.allSettled([provisioner.ensure(), provisioner.ensure()]);
 		expect(a.status).toBe("rejected");
 		expect(b.status).toBe("rejected");
 		expect(countRuns()).toBe(1);
+		expect(activeSessionIdProvider).toHaveBeenCalledOnce();
+	});
+
+	it("prefers static active-session context and fails open when a provider errors", async () => {
+		const { python } = writeFakePython();
+		const ignoredProvider = vi.fn(async () => "ignored");
+		const staticProvisioner = new IpythonKernelProvisioner(tempDir, {
+			python,
+			activeSessionId: "static-active-session",
+			activeSessionIdProvider: ignoredProvider,
+		});
+		await expect(staticProvisioner.ensure()).rejects.toThrow(/Kernel exited before resolving ports/);
+		expect(ignoredProvider).not.toHaveBeenCalled();
+
+		const failingProvider = vi.fn(async () => {
+			throw new Error("lookup unavailable");
+		});
+		const fallbackProvisioner = new IpythonKernelProvisioner(tempDir, {
+			python,
+			activeSessionIdProvider: failingProvider,
+		});
+		await expect(fallbackProvisioner.ensure()).rejects.toThrow(/Kernel exited before resolving ports/);
+		expect(failingProvider).toHaveBeenCalledOnce();
 	});
 
 	it("retries after a failed startup instead of caching the rejection", async () => {
@@ -240,7 +264,10 @@ describe("IpythonKernelProvisioner", () => {
 
 	it("applies shell settings to bash cells after leading blank lines", async () => {
 		const execute = vi.fn<KernelManager["execute"]>().mockResolvedValueOnce(okExecuteResult());
-		const manager = { execute } as unknown as KernelManager;
+		const withToolCallContext = vi.fn<KernelManager["withToolCallContext"]>(async (_toolCallId, operation) =>
+			operation(),
+		);
+		const manager = { execute, withToolCallContext } as unknown as KernelManager;
 		const ensure = vi.fn(async () => manager);
 		const kill = vi.fn(async () => {});
 		const provisioner = { ensure, kill } as unknown as IpythonKernelProvisioner;
@@ -258,6 +285,7 @@ describe("IpythonKernelProvisioner", () => {
 			{} as ExtensionContext,
 		);
 
+		expect(withToolCallContext).toHaveBeenCalledWith("tool-call", expect.any(Function));
 		expect(execute).toHaveBeenCalledWith(
 			"\n \r\n\t%%script /custom/bash\r\nexport TEST_PREFIX=1\necho body",
 			expect.objectContaining({ signal: undefined, onStream: expect.any(Function) }),
@@ -269,7 +297,10 @@ describe("IpythonKernelProvisioner", () => {
 			.fn<KernelManager["execute"]>()
 			.mockRejectedValueOnce(new KernelBusyAfterInterruptError())
 			.mockResolvedValueOnce(okExecuteResult());
-		const manager = { execute } as unknown as KernelManager;
+		const withToolCallContext = vi.fn<KernelManager["withToolCallContext"]>(async (_toolCallId, operation) =>
+			operation(),
+		);
+		const manager = { execute, withToolCallContext } as unknown as KernelManager;
 		const ensure = vi.fn(async () => manager);
 		const kill = vi.fn(async () => {});
 		const provisioner = { ensure, kill } as unknown as IpythonKernelProvisioner;
@@ -295,11 +326,16 @@ describe("IpythonKernelProvisioner", () => {
 	});
 
 	it("lets the user kill and restart a busy interrupted kernel", async () => {
+		const withToolCallContext = vi.fn<KernelManager["withToolCallContext"]>(async (_toolCallId, operation) =>
+			operation(),
+		);
 		const busyManager = {
 			execute: vi.fn<KernelManager["execute"]>().mockRejectedValueOnce(new KernelBusyAfterInterruptError()),
+			withToolCallContext,
 		} as unknown as KernelManager;
 		const freshManager = {
 			execute: vi.fn<KernelManager["execute"]>().mockResolvedValueOnce(okExecuteResult()),
+			withToolCallContext,
 		} as unknown as KernelManager;
 		const ensure = vi.fn(async () => {
 			return ensure.mock.calls.length === 1 ? busyManager : freshManager;

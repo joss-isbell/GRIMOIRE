@@ -8,8 +8,16 @@ import { type ForkedKernelHandle, ForkServerUnavailable } from "../src/core/kern
 import { KernelManager } from "../src/core/kernel/index.js";
 import { ORPHAN_PROCESS_JOURNAL_ENV } from "../src/core/orphan-process-journal.js";
 
+const incidentRecorder = vi.hoisted(() => ({
+	emitIncidentDerived: vi.fn((_source: string, _type: string, _fields: Record<string, unknown>) => ({
+		accepted: true as const,
+		occurrenceId: "test-occurrence",
+	})),
+}));
 const forkKernelMock = vi.hoisted(() => vi.fn());
 const forkEnabledMock = vi.hoisted(() => vi.fn(() => false));
+
+vi.mock("../src/modes/daemon/incident-recorder-writer.js", () => incidentRecorder);
 
 vi.mock("../src/core/kernel/fork-server.js", async (importOriginal) => {
 	const original = await importOriginal<typeof import("../src/core/kernel/fork-server.js")>();
@@ -51,6 +59,7 @@ function readJournalRecords(path: string): JournalRecord[] {
 describe("kernel parent watchdog", () => {
 	beforeEach(() => {
 		tempDir = mkdtempSync(join(tmpdir(), "prime-agent-kernel-watchdog-"));
+		incidentRecorder.emitIncidentDerived.mockClear();
 	});
 
 	afterEach(() => {
@@ -62,6 +71,214 @@ describe("kernel parent watchdog", () => {
 			rmSync(tempDir, { recursive: true, force: true });
 			tempDir = "";
 		}
+	});
+
+	it("records direct spawn errors and child exits before their existing teardown", async () => {
+		const missingManager = new KernelManager({ python: join(tempDir, "missing-python"), cwd: tempDir });
+		const missingInternals = missingManager as unknown as {
+			state: string;
+			kernel?: unknown;
+			cleanupResources(): void;
+		};
+		const missingCleanup = vi.spyOn(missingInternals, "cleanupResources");
+		incidentRecorder.emitIncidentDerived.mockImplementation((_source, type, fields) => {
+			if (type === "kernel_shutdown_transition" && fields.reason === "direct_spawn_error") {
+				expect(missingInternals.state).toBe("starting");
+				expect(missingInternals.kernel).toBeDefined();
+				expect(missingCleanup).not.toHaveBeenCalled();
+				expect(fields).toMatchObject({
+					callerCategory: "child_process_event",
+					oldState: "starting",
+					newState: "shutdown",
+					startGeneration: 1,
+					requestedKillSignal: "SIGTERM",
+					observedSignal: "unavailable",
+				});
+			}
+			return { accepted: true, occurrenceId: "direct-spawn" };
+		});
+		await expect(missingManager.execute("x")).rejects.toThrow(/Kernel exited before resolving ports/);
+		expect(missingCleanup).toHaveBeenCalled();
+		expect(missingInternals.kernel).toBeUndefined();
+		await missingManager.dispose();
+
+		incidentRecorder.emitIncidentDerived.mockClear();
+		const python = writeFakePython(["#!/bin/sh", "kill -TERM $$", ""]);
+		const exitManager = new KernelManager({ python, cwd: tempDir });
+		const exitInternals = exitManager as unknown as {
+			state: string;
+			kernel?: unknown;
+			cleanupResources(): void;
+		};
+		const exitCleanup = vi.spyOn(exitInternals, "cleanupResources");
+		incidentRecorder.emitIncidentDerived.mockImplementation((_source, type, fields) => {
+			if (type === "kernel_shutdown_transition" && fields.reason === "direct_child_exit") {
+				expect(exitInternals.state).toBe("starting");
+				expect(exitInternals.kernel).toBeDefined();
+				expect(exitCleanup).not.toHaveBeenCalled();
+				expect(fields).toMatchObject({
+					callerCategory: "child_process_event",
+					oldState: "starting",
+					newState: "shutdown",
+					kernelIdentityLivenessResult: "not_live",
+					requestedKillSignal: "SIGTERM",
+					observedSignal: "SIGTERM",
+				});
+				expect(fields.kernelPid).toBeTypeOf("number");
+				expect(fields).toHaveProperty("kernelProcessStartId");
+			}
+			return { accepted: true, occurrenceId: "direct-exit" };
+		});
+		await expect(exitManager.execute("x")).rejects.toThrow(/Kernel exited before resolving ports/);
+		expect(exitCleanup).toHaveBeenCalled();
+		expect(exitInternals.kernel).toBeUndefined();
+		await exitManager.dispose();
+	});
+
+	it("records connection and readiness failures before their existing startup cleanup", async () => {
+		const python = writeFakePython(["#!/bin/sh", "exec sleep 60", ""]);
+		const connectionManager = new KernelManager({ python, cwd: tempDir });
+		const connectionInternals = connectionManager as unknown as {
+			state: string;
+			kernel?: unknown;
+			waitForResolvedConnection(path: string): Promise<never>;
+			cleanupResources(): void;
+		};
+		const connectionCleanup = vi.spyOn(connectionInternals, "cleanupResources");
+		connectionInternals.waitForResolvedConnection = vi.fn(async () => {
+			throw new Error("synthetic connection failure");
+		});
+		incidentRecorder.emitIncidentDerived.mockImplementation((_source, type, fields) => {
+			if (type === "kernel_shutdown_transition" && fields.reason === "connection_resolution_failure") {
+				expect(connectionInternals.state).toBe("starting");
+				expect(connectionInternals.kernel).toBeDefined();
+				expect(connectionCleanup).not.toHaveBeenCalled();
+				expect(fields).toMatchObject({
+					callerCategory: "startup_failure",
+					oldState: "starting",
+					requestedKillSignal: "SIGTERM",
+				});
+			}
+			return { accepted: true, occurrenceId: "connection-failure" };
+		});
+		await expect(connectionManager.start()).rejects.toThrow("synthetic connection failure");
+		expect(connectionCleanup).toHaveBeenCalled();
+		expect(connectionInternals.kernel).toBeUndefined();
+
+		incidentRecorder.emitIncidentDerived.mockClear();
+		const readinessManager = new KernelManager({ python, cwd: tempDir });
+		const readinessInternals = readinessManager as unknown as {
+			state: string;
+			kernel?: unknown;
+			waitForResolvedConnection(path: string): Promise<Record<string, unknown>>;
+			probeReady(): Promise<never>;
+			cleanupResources(): void;
+		};
+		const readinessCleanup = vi.spyOn(readinessInternals, "cleanupResources");
+		readinessInternals.waitForResolvedConnection = vi.fn(async () => ({
+			ip: "127.0.0.1",
+			transport: "tcp",
+			shell_port: 1,
+			iopub_port: 2,
+			stdin_port: 3,
+			control_port: 4,
+			hb_port: 5,
+			signature_scheme: "hmac-sha256",
+			key: "test-key",
+			kernel_name: "python3",
+		}));
+		readinessInternals.probeReady = vi.fn(async () => {
+			throw new Error("synthetic readiness failure");
+		});
+		incidentRecorder.emitIncidentDerived.mockImplementation((_source, type, fields) => {
+			if (type === "kernel_shutdown_transition" && fields.reason === "readiness_failure") {
+				expect(readinessInternals.state).toBe("starting");
+				expect(readinessInternals.kernel).toBeDefined();
+				expect(readinessCleanup).not.toHaveBeenCalled();
+				expect(fields).toMatchObject({
+					callerCategory: "startup_failure",
+					oldState: "starting",
+					requestedKillSignal: "SIGTERM",
+				});
+			}
+			return { accepted: true, occurrenceId: "readiness-failure" };
+		});
+		await expect(readinessManager.start()).rejects.toThrow("synthetic readiness failure");
+		expect(readinessCleanup).toHaveBeenCalled();
+		expect(readinessInternals.kernel).toBeUndefined();
+	});
+
+	it("records forked-kernel liveness death before cleanup", async () => {
+		const kill = vi.fn(async (): Promise<"already-exited"> => "already-exited");
+		const handle: ForkedKernelHandle = { pid: 999999, isAlive: async () => false, kill };
+		const manager = new KernelManager({ python: "/nonexistent/python", cwd: tempDir });
+		const internals = manager as unknown as {
+			state: string;
+			forkedKernel?: ForkedKernelHandle;
+			kernelPid?: number;
+			checkForkedKernelDeath(): Promise<void>;
+		};
+		internals.state = "running";
+		internals.forkedKernel = handle;
+		internals.kernelPid = handle.pid;
+		incidentRecorder.emitIncidentDerived.mockImplementationOnce((_source, _type, fields) => {
+			expect(internals.state).toBe("running");
+			expect(internals.forkedKernel).toBe(handle);
+			expect(fields).toMatchObject({
+				reason: "forked_kernel_liveness_death",
+				callerCategory: "liveness_monitor",
+				kernelPid: handle.pid,
+				kernelIdentityLivenessResult: "not_live",
+				observedSignal: "unavailable",
+			});
+			return { accepted: true, occurrenceId: "liveness" };
+		});
+
+		await internals.checkForkedKernelDeath();
+		expect(internals.state).toBe("shutdown");
+		await vi.waitFor(() => expect(kill).toHaveBeenCalledWith("TERM"));
+	});
+
+	it("classifies non-timeout forkserver loss as bounded unknown without changing teardown", async () => {
+		const kill = vi.fn(async (): Promise<"already-exited"> => "already-exited");
+		const unavailable = new ForkServerUnavailable("synthetic forkserver loss");
+		const handle: ForkedKernelHandle = {
+			pid: 999998,
+			isAlive: async () => {
+				throw unavailable;
+			},
+			kill,
+		};
+		const manager = new KernelManager({ python: "/nonexistent/python", cwd: tempDir });
+		const internals = manager as unknown as {
+			state: string;
+			forkedKernel?: ForkedKernelHandle;
+			kernelPid?: number;
+			cleanupResources(): void;
+			checkForkedKernelDeath(): Promise<void>;
+		};
+		internals.state = "running";
+		internals.forkedKernel = handle;
+		internals.kernelPid = handle.pid;
+		const cleanup = vi.spyOn(internals, "cleanupResources");
+		incidentRecorder.emitIncidentDerived.mockImplementationOnce((_source, _type, fields) => {
+			expect(internals.state).toBe("running");
+			expect(internals.forkedKernel).toBe(handle);
+			expect(cleanup).not.toHaveBeenCalled();
+			expect(fields).toMatchObject({
+				reason: "forked_kernel_liveness_death",
+				callerCategory: "liveness_monitor",
+				kernelPid: handle.pid,
+				kernelIdentityLivenessResult: "unknown_forkserver_unavailable",
+				observedSignal: "unavailable",
+			});
+			return { accepted: true, occurrenceId: "forkserver-unavailable" };
+		});
+
+		await internals.checkForkedKernelDeath();
+		expect(internals.state).toBe("shutdown");
+		expect(cleanup).toHaveBeenCalledTimes(1);
+		await vi.waitFor(() => expect(kill).toHaveBeenCalledWith("TERM"));
 	});
 
 	it("direct spawn sets JPY_PARENT_PID and journals the kernel pid", async () => {

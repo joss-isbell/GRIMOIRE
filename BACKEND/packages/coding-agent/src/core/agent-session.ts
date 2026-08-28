@@ -8957,6 +8957,7 @@ export class AgentSession {
 			this._ipythonKernelProvisioner = new IpythonKernelProvisioner(this._cwd, {
 				env: this._rlmKernelEnv(),
 				sessionId: this.sessionId,
+				activeSessionIdProvider: () => this._currentActiveSessionId(),
 				hostHandlers: this._createKernelHostHandlers(),
 				pythonSkills,
 				snapshotDir: this._ipythonKernelSnapshotDir,

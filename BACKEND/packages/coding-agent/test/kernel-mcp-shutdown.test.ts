@@ -1,9 +1,14 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { KernelManager } from "../src/core/kernel/index.js";
+import { INCIDENT_RECORDER_RUN_DIR_ENV } from "../src/modes/daemon/incident-recorder-env.js";
+import {
+	configureIncidentCaptureEmitter,
+	stopIncidentCaptureEmitter,
+} from "../src/modes/daemon/incident-recorder-writer.js";
 
 const runtimePython = resolve("../../prime-agent-runtime/.venv/bin/python");
 const fallbackPython = join(homedir(), ".prime", "agent", "kernel-venv", "bin", "python");
@@ -55,6 +60,105 @@ async function waitForExit(pid: number, timeoutMs: number): Promise<boolean> {
 	}
 	return !pidExists(pid);
 }
+
+async function captureKernelTransitions(operation: () => Promise<void>): Promise<Array<Record<string, unknown>>> {
+	const root = mkdtempSync(join(tmpdir(), "prime-agent-kernel-context-"));
+	const originalRunDir = process.env[INCIDENT_RECORDER_RUN_DIR_ENV];
+	try {
+		mkdirSync(root, { recursive: true, mode: 0o700 });
+		process.env[INCIDENT_RECORDER_RUN_DIR_ENV] = root;
+		expect(configureIncidentCaptureEmitter()).toBe(true);
+		await operation();
+		await stopIncidentCaptureEmitter();
+		const path = join(root, "supervisor-timeline.jsonl");
+		return readFileSync(path, "utf8")
+			.split("\n")
+			.filter(Boolean)
+			.map((line) => JSON.parse(line) as Record<string, unknown>)
+			.filter((event) => event.type === "kernel_shutdown_transition");
+	} finally {
+		await stopIncidentCaptureEmitter();
+		if (originalRunDir === undefined) delete process.env[INCIDENT_RECORDER_RUN_DIR_ENV];
+		else process.env[INCIDENT_RECORDER_RUN_DIR_ENV] = originalRunDir;
+		rmSync(root, { recursive: true, force: true });
+	}
+}
+
+describe("kernel Agent context lineage", () => {
+	it("keeps stable session context while tool ownership stays async-local and bounded", async () => {
+		const manager = new KernelManager({ sessionId: "agent-session", activeSessionId: "active-session" });
+		let releaseFirst: () => void = () => {};
+		let releaseSecond: () => void = () => {};
+		const firstGate = new Promise<void>((resolveGate) => {
+			releaseFirst = resolveGate;
+		});
+		const secondGate = new Promise<void>((resolveGate) => {
+			releaseSecond = resolveGate;
+		});
+
+		const transitions = await captureKernelTransitions(async () => {
+			const first = manager.withToolCallContext("tool-first", async () => {
+				await firstGate;
+				await manager.kill();
+			});
+			const second = manager.withToolCallContext("tool-second", async () => {
+				await secondGate;
+				await manager.kill();
+			});
+			releaseSecond();
+			await second;
+			releaseFirst();
+			await first;
+
+			await manager.withToolCallContext("tool-success", async () => {});
+			await expect(
+				manager.withToolCallContext("tool-error", async () => {
+					throw new Error("fixture failure");
+				}),
+			).rejects.toThrow("fixture failure");
+			await manager.kill();
+		});
+
+		expect(transitions.map((event) => event.toolCallId)).toEqual(["tool-second", "tool-first", "unavailable"]);
+		for (const event of transitions) {
+			expect(event).toMatchObject({ sessionId: "agent-session", activeSessionId: "active-session" });
+		}
+	});
+
+	it("marks absent, invalid, and detached-later context unavailable", async () => {
+		const manager = new KernelManager({
+			sessionId: "not valid session",
+			activeSessionId: "a".repeat(257),
+		});
+		let releaseDetached: () => void = () => {};
+		const detachedGate = new Promise<void>((resolveGate) => {
+			releaseDetached = resolveGate;
+		});
+		let detached: Promise<void> | undefined;
+
+		const transitions = await captureKernelTransitions(async () => {
+			await manager.withToolCallContext("tool-owned", async () => {
+				detached = (async () => {
+					await detachedGate;
+					await manager.kill();
+				})();
+			});
+			releaseDetached();
+			await detached;
+			await manager.withToolCallContext("not valid tool", () => manager.kill());
+		});
+
+		expect(transitions).toHaveLength(2);
+		expect(transitions[0]?.toolCallId).toBe("unavailable");
+		for (const event of transitions) {
+			expect(event).toMatchObject({
+				sessionId: "unavailable",
+				activeSessionId: "unavailable",
+				toolCallId: "unavailable",
+			});
+		}
+	});
+});
 
 describeIfKernel("real IPython MCP shutdown", { tags: ["kernel-heavy"] }, () => {
 	let dir = "";

@@ -277,6 +277,9 @@ export interface IpythonToolOptions {
 	/** Optional explicit shell path for bare %%bash cells. */
 	shellPath?: string;
 	sessionId?: string;
+	activeSessionId?: string;
+	/** Lazily resolves the active Agent runtime identity once for each new manager. */
+	activeSessionIdProvider?: () => Promise<string | undefined>;
 	/** Typed host request handlers for the kernel↔host bridge (rlm.run, goal.*, …). */
 	hostHandlers?: HostRequestHandlers;
 	pythonSkills?: readonly PythonSkillRuntimeInfo[];
@@ -483,11 +486,20 @@ export class IpythonKernelProvisioner {
 				);
 			}
 			const snapshotDir = this.options?.snapshotDir;
+			let activeSessionId = this.options?.activeSessionId;
+			if (activeSessionId === undefined && this.options?.activeSessionIdProvider) {
+				try {
+					activeSessionId = await this.options.activeSessionIdProvider();
+				} catch {
+					// Causal context is best-effort and must not prevent kernel startup.
+				}
+			}
 			const m = new KernelManager({
 				python: this.options?.python,
 				cwd: this.cwd,
 				env: this.options?.env,
 				sessionId: this.options?.sessionId,
+				activeSessionId,
 				hostHandlers: this.options?.hostHandlers,
 				pythonSkills: this.options?.pythonSkills,
 				// Only persistent sessions (which have an artifact dir) get a revivable snapshot.
@@ -587,13 +599,15 @@ async function executeWithBusyKernelChoice(
 		const m = await provisioner.ensure(reportStartupProgress, signal);
 		try {
 			return {
-				result: await m.execute(code, {
-					signal,
-					onStream,
-					onLateSentAgentMessage: onLateSentAgentMessage
-						? (message) => onLateSentAgentMessage(toolCallId, message)
-						: undefined,
-				}),
+				result: await m.withToolCallContext(toolCallId, () =>
+					m.execute(code, {
+						signal,
+						onStream,
+						onLateSentAgentMessage: onLateSentAgentMessage
+							? (message) => onLateSentAgentMessage(toolCallId, message)
+							: undefined,
+					}),
+				),
 				kernelRestarted,
 			};
 		} catch (error) {
@@ -607,7 +621,7 @@ async function executeWithBusyKernelChoice(
 			}
 			if (action === "kill") {
 				onWorkingMessage("Restarting IPython kernel...");
-				await provisioner.kill();
+				await m.withToolCallContext(toolCallId, () => provisioner.kill());
 				kernelRestarted = true;
 				continue;
 			}

@@ -259,20 +259,21 @@ describe("createAgentSessionFromServices", () => {
 			models: faux.models,
 		});
 
+		const listAgents = vi.fn(() => ({
+			current: { activeSessionId: "current", sessionId: "session-current", runtimeKind: "top-level" as const },
+			agents: [
+				{
+					activeSessionId: "worker",
+					sessionId: "session-worker",
+					runtimeKind: "top-level" as const,
+					cwd: tempDir,
+					isStreaming: false,
+					unfinishedActionCount: 0,
+				},
+			],
+		}));
 		const agentMessageController: AgentSessionMessageController = {
-			listAgents: () => ({
-				current: { activeSessionId: "current", sessionId: "session-current", runtimeKind: "top-level" },
-				agents: [
-					{
-						activeSessionId: "worker",
-						sessionId: "session-worker",
-						runtimeKind: "top-level",
-						cwd: tempDir,
-						isStreaming: false,
-						unfinishedActionCount: 0,
-					},
-				],
-			}),
+			listAgents,
 			sendAgentMessage: async () => {
 				throw new Error("not used");
 			},
@@ -286,6 +287,11 @@ describe("createAgentSessionFromServices", () => {
 		});
 
 		try {
+			const provisioner = Reflect.get(session, "_ipythonKernelProvisioner") as {
+				options?: { activeSessionIdProvider?: () => Promise<string | undefined> };
+			};
+			expect(await provisioner.options?.activeSessionIdProvider?.()).toBe("current");
+			expect(listAgents).toHaveBeenCalledOnce();
 			expect(() => session.handleAgentMessageHostRequest("agent_message.list")).toThrow(
 				"unknown agent message request",
 			);
