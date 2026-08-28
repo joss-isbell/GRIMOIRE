@@ -3984,6 +3984,10 @@ export async function runIncidentRecorderService(agentDir = getAgentDir()): Prom
 	const compactor = new IncidentRecorderCompactor({ agentDir });
 	replaceIncidentRecorderServiceCompactor(compactor);
 	try {
+		// Inspection, finalization, retention, and the service writer all mutate
+		// recorder-owned roots. Freeze exact startup accounting before any of them
+		// starts so the service cannot invalidate its own two-pass proof.
+		await compactor.initializeStorageDiscovery();
 		const serviceWriter = new IncidentRecorderWriter({
 			runDir: join(agentDir, "incident-recorder"),
 			runId: randomUUID(),

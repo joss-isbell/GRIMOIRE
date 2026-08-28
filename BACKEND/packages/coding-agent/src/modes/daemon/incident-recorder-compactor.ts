@@ -55,6 +55,13 @@ const PIN_REFERENCE_BATCH_COUNT = 64;
 const STORAGE_DISCOVERY_ENTRY_BUDGET = 512;
 const STORAGE_DISCOVERY_SLICE_MS = 4;
 const STORAGE_DISCOVERY_MAX_DEPTH = 64;
+const STORAGE_DISCOVERY_TRANSIENT_ERRORS = new Set([
+	"storage_discovery_directory_changed_before_open",
+	"storage_discovery_directory_changed_during_scan",
+	"storage_discovery_directory_disappeared_during_scan",
+	"storage_discovery_entry_disappeared_during_scan",
+	"storage_discovery_topology_changed_between_passes",
+]);
 const INCIDENT_DISCOVERY_BATCH_COUNT = 64;
 const SYSDIG_RING_DEFAULT_BASE_PATH = "/var/log/grimoire/sysdig/ring.scap";
 const SYSDIG_RING_EXPECTED_SEGMENTS = 12;
@@ -300,6 +307,8 @@ export interface IncidentRecorderCompactorSurvivalSnapshot {
 	storageDiscoveryRetainedPaths: number;
 	storageDiscoveryPass: 0 | 1;
 	storageDiscoveryComplete: boolean;
+	storageDiscoveryRetries: number;
+	storageDiscoveryLastTransientError?: string;
 	incidentDiscoverySliceEntries: number;
 	sysdigDiscoverySliceEntries: number;
 	sysdigDiscoveryCandidates: number;
@@ -865,6 +874,8 @@ export class IncidentRecorderCompactor {
 	private storageBytes = 0;
 	private outstandingStorageReservationBytes = 0;
 	private readonly storageDiscovery: StorageDiscovery;
+	private storageDiscoveryRetries = 0;
+	private storageDiscoveryLastTransientError?: string;
 	private incidentDiscovery?: Dir;
 	private incidentDiscoverySliceEntries = 0;
 	private sysdigRingDiscovery?: SysdigRingDiscovery;
@@ -1338,6 +1349,52 @@ export class IncidentRecorderCompactor {
 		return false;
 	}
 
+	private resetStorageDiscoveryAfterTransientFailure(): void {
+		const state = this.storageDiscovery;
+		for (const frame of state.stack.splice(0)) this.closeRetainedDirectory(frame.directory);
+		state.rootIndex = 0;
+		state.lastSliceEntries = 0;
+		state.pass = 0;
+		state.passBytes = 0;
+		state.passEntries = 0;
+		state.passFingerprint = 0n;
+		state.baseline = undefined;
+		state.complete = false;
+		state.error = undefined;
+	}
+
+	/**
+	 * Establishes exact startup accounting before the service starts any task that
+	 * can mutate recorder-owned directories. External producers may still create a
+	 * run while scanning; those expected topology races restart the whole bounded
+	 * two-pass proof instead of crashing the recorder. Unknown hard-link or
+	 * containment failures remain fatal and fail closed.
+	 */
+	async initializeStorageDiscovery(): Promise<void> {
+		this.assertActive();
+		while (!this.advanceStorageDiscovery()) {
+			const reason = this.storageDiscovery.error;
+			if (reason) {
+				if (!STORAGE_DISCOVERY_TRANSIENT_ERRORS.has(reason)) throw new Error(reason);
+				this.storageDiscoveryRetries = Math.min(Number.MAX_SAFE_INTEGER, this.storageDiscoveryRetries + 1);
+				this.storageDiscoveryLastTransientError = reason;
+				this.resetStorageDiscoveryAfterTransientFailure();
+				const delayMs = Math.min(5_000, 250 * 2 ** Math.min(4, this.storageDiscoveryRetries - 1));
+				if (this.storageDiscoveryRetries <= 4 || Number.isInteger(Math.log2(this.storageDiscoveryRetries))) {
+					console.error(
+						`prime-agent: incident recorder storage discovery observed concurrent mutation; retry=${this.storageDiscoveryRetries}; delay_ms=${delayMs}; reason=${reason}`,
+					);
+				}
+				await this.waitForWorkDelay(delayMs);
+				continue;
+			}
+			await this.waitForWorkDelay(0);
+		}
+		console.error(
+			`prime-agent: incident recorder storage discovery complete; entries=${this.storageDiscovery.entries}; retries=${this.storageDiscoveryRetries}; accounted_bytes=${this.storageBytes}`,
+		);
+	}
+
 	private ownedStorageRoot(path: string): string | undefined {
 		for (const root of this.storageDiscovery.roots) if (relativeDescendant(root, path) !== undefined) return root;
 		return undefined;
@@ -1564,6 +1621,10 @@ export class IncidentRecorderCompactor {
 			storageDiscoveryRetainedPaths: this.storageDiscovery.roots.length + this.storageDiscovery.stack.length,
 			storageDiscoveryPass: this.storageDiscovery.pass,
 			storageDiscoveryComplete: this.storageDiscovery.complete,
+			storageDiscoveryRetries: this.storageDiscoveryRetries,
+			...(this.storageDiscoveryLastTransientError
+				? { storageDiscoveryLastTransientError: this.storageDiscoveryLastTransientError }
+				: {}),
 			incidentDiscoverySliceEntries: this.incidentDiscoverySliceEntries,
 			sysdigDiscoverySliceEntries: this.sysdigDiscoverySliceEntries,
 			sysdigDiscoveryCandidates: this.sysdigRingDiscovery?.candidates.length ?? 0,
@@ -1825,10 +1886,7 @@ export class IncidentRecorderCompactor {
 	}
 
 	private async runLoop(): Promise<never> {
-		while (!this.advanceStorageDiscovery()) {
-			if (this.storageDiscovery.error) throw new Error(this.storageDiscovery.error);
-			await this.waitForWorkDelay(0);
-		}
+		await this.initializeStorageDiscovery();
 		this.ensureDiskAdmission(256 * 1024);
 		this.ensureOwnedDirectory(this.root);
 		for (;;) {

@@ -176,6 +176,34 @@ describe("incident compactor survival bounds", () => {
 		expect(compactor.accountedStorageBytes).toBeLessThanOrEqual(ceiling);
 	});
 
+	it("restarts the bounded two-pass proof after a concurrent directory mutation", async () => {
+		const target = fixture("transient-storage-mutation");
+		const recorderRoot = join(target.agentDir, "incident-recorder");
+		mkdirSync(recorderRoot, { recursive: true, mode: 0o700 });
+		writeFileSync(join(recorderRoot, "before.json"), "before", { mode: 0o600 });
+		let mutated = false;
+		const compactor = createCompactor({
+			agentDir: target.agentDir,
+			freeReserveBytes: 0,
+			storageDiscoveryEntryHook(path) {
+				if (!mutated && path === recorderRoot) {
+					mutated = true;
+					writeFileSync(join(recorderRoot, "during.json"), "during", { mode: 0o600 });
+				}
+			},
+		});
+
+		await compactor.initializeStorageDiscovery();
+
+		const snapshot = compactor.survivalSnapshot();
+		expect(mutated).toBe(true);
+		expect(snapshot.storageDiscoveryComplete).toBe(true);
+		expect(snapshot.storageDiscoveryRetries).toBe(1);
+		expect(snapshot.storageDiscoveryLastTransientError).toBe("storage_discovery_directory_changed_before_open");
+		expect(snapshot.storageDiscoveryError).toBeUndefined();
+		expect(compactor.accountedStorageBytes).toBe(uniqueAllocatedBytes([recorderRoot]));
+	});
+
 	it("fails closed when a canonical owner is removed after a sibling was classified mid-scan", () => {
 		const target = fixture("canonical-mutation");
 		const recorderRoot = join(target.agentDir, "incident-recorder");
