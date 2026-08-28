@@ -65,7 +65,6 @@ import {
 } from "./incident-recorder-retention.js";
 import {
 	configureIncidentCaptureEmitter,
-	emitIncidentBytes,
 	emitIncidentDerived,
 	INCIDENT_RECORDER_CAPTURE_FD,
 	INCIDENT_RECORDER_CAPTURE_FD_ENV,
@@ -1156,6 +1155,23 @@ const IMMEDIATE_DURABLE_EVENT_TYPES = new Set([
 	"node_report_captured",
 ]);
 
+function appendStructuredCausalEvent(
+	runDir: string,
+	source: string,
+	type: string,
+	fields: Record<string, unknown>,
+): void {
+	const causalSource: RawApplicationSource = source === "supervisor-events" ? "supervisor-events" : "recorder-events";
+	try {
+		writeRawLinesSync(
+			loadRawSegmentState(runDir, causalSource),
+			serializeRawRecord(runDir, causalSource, type, fields, IMMEDIATE_DURABLE_EVENT_TYPES.has(type)),
+		);
+	} catch (error) {
+		recordRawLoss(runDir, causalSource, error, 0);
+	}
+}
+
 function appendRunEvent(runDir: string, event: { type: string; [key: string]: unknown }): void {
 	const { type, ...fields } = event;
 	const orderedWriter = orderedWriterForRun(runDir);
@@ -1241,15 +1257,12 @@ export function appendSupervisorDiagnosticBytes(
 	value: Uint8Array,
 	fields: Record<string, unknown> = {},
 ): void {
-	const source: RawApplicationSource =
-		type === "worker_stdout"
-			? "worker-stdout"
-			: type === "worker_stderr"
-				? "worker-stderr"
-				: type.startsWith("worker_transport_")
-					? "worker-transport"
-					: "supervisor-events";
-	emitIncidentBytes(source, type, value, fields);
+	// Payload bytes can contain prompts, credentials, terminal output, or protocol
+	// content unrelated to causal attribution. Structured lifecycle/request events
+	// carry the causal fields, so the automatic recorder intentionally ignores them.
+	void type;
+	void value;
+	void fields;
 }
 
 export async function flushSupervisorDiagnosticCapture(): Promise<void> {
@@ -2688,6 +2701,17 @@ function finalizeIncident(
 	}
 }
 
+function causalEnvironmentSummary(environment: NodeJS.ProcessEnv): Record<string, string> {
+	const allowed = ["INVOCATION_ID", "SYSTEMD_EXEC_PID", "WSL_DISTRO_NAME", "WSL_UTF8", "NODE_OPTIONS"] as const;
+	const summary: Record<string, string> = {};
+	for (const key of allowed) {
+		const value = environment[key];
+		if (typeof value !== "string" || value.length === 0) continue;
+		summary[key] = value.replace(/[\r\n\0]/g, " ").slice(0, 256);
+	}
+	return summary;
+}
+
 export async function recordSupervisorProcess(options: RecordProcessOptions): Promise<RecordedProcessResult> {
 	const runDir = createRunDir(options.agentDir);
 	const runId = basename(runDir).slice(-36);
@@ -2700,6 +2724,7 @@ export async function recordSupervisorProcess(options: RecordProcessOptions): Pr
 		runToken,
 		bootId,
 		wrapperStartId,
+		onStructuredEvent: (source, type, fields) => appendStructuredCausalEvent(runDir, source, type, fields),
 	});
 	await orderedWriter.start();
 	activeOrderedWriter = { runDir, writer: orderedWriter };
@@ -2731,62 +2756,28 @@ export async function recordSupervisorProcess(options: RecordProcessOptions): Pr
 			}
 		: options.launch;
 	const cwd = options.cwd ?? process.cwd();
-	const exactLaunch = {
-		version: 3,
-		canonical: false,
-		representation: "derived-diagnostic-json-v1",
-		preservesRuntimeObjectIdentity: false,
+	const launchSummary = {
+		version: 1,
+		purpose: "causal-supervisor-launch",
 		privacy: "private-local-0600",
 		created: nowFields(),
 		parent: {
 			pid: process.pid,
 			processStartId: getProcessStartId(process.pid),
 			executable: process.execPath,
-			argv: [...process.argv],
 			cwd: process.cwd(),
 		},
 		socketPath: options.socketPath,
 		runtimeCategory: nodeFatalReportsEnabled ? "node" : process.versions.bun ? "bun" : "foreign",
 		nodeFatalReportsEnabled,
-		build: { appVersion: VERSION, release: process.release, versions: process.versions },
+		build: { appVersion: VERSION, node: process.versions.node, release: process.release.name },
 		command: launch.command,
-		argv: [...launch.args],
 		cwd,
-		environment,
-		derivedCommandSummary: summarizeIncidentCommandLine(launch.args),
+		environment: causalEnvironmentSummary(options.environment ?? {}),
+		commandSummary: summarizeIncidentCommandLine(launch.args),
 	};
-	const launchBytes = Buffer.from(JSON.stringify(encodeDiagnosticValue(exactLaunch)), "utf8");
-	const launchAdmission = orderedWriter.recordExactBytes(
-		"recorder-events",
-		"recorder_launch_raw_bytes",
-		launchBytes,
-		"derived-diagnostic-json-v1",
-		{ source: "wrapper-launch-observation" },
-	);
-	const launchOccurrenceId = launchAdmission.accepted ? launchAdmission.occurrenceId : undefined;
-	const launchArtifact = {
-		canonical: false,
-		encoding: "derived-diagnostic-json-v1",
-		producerOccurrenceId: launchOccurrenceId,
-		state: launchAdmission.accepted ? "locally-admitted-pending-compactor" : "relay-rejected",
-		orphanPolicy: "fail-open",
-		lifecycleTarget: "real-supervisor-identity",
-	};
-	writePrivateJson(join(runDir, "launch.json"), {
-		version: 2,
-		canonical: false,
-		purpose: "content-addressed-launch-index",
-		socketPath: options.socketPath,
-		runtimeCategory: nodeFatalReportsEnabled ? "node" : process.versions.bun ? "bun" : "foreign",
-		nodeFatalReportsEnabled,
-		launchArtifact,
-		derivedCommandSummary: summarizeIncidentCommandLine(launch.args),
-	});
-	orderedWriter.recordDerived("recorder-events", "recorder_launch", {
-		launchOccurrenceId: launchOccurrenceId ?? null,
-		launchBytes: launchBytes.length,
-		nodeFatalReportsEnabled,
-	});
+	writePrivateJson(join(runDir, "launch.json"), launchSummary);
+	orderedWriter.recordDerived("recorder-events", "recorder_launch", launchSummary);
 	let child: ChildProcess;
 	let recorderRootDescriptor: number | undefined;
 	try {
@@ -2802,7 +2793,7 @@ export async function recordSupervisorProcess(options: RecordProcessOptions): Pr
 		});
 		// fd4 is diagnostic-only. fd5 pins the actual canonical recorder root.
 	} catch (error) {
-		appendRunEvent(runDir, { type: "recorder_spawn_error", error, launchArtifact });
+		appendRunEvent(runDir, { type: "recorder_spawn_error", error });
 		await orderedWriter.stop().catch(() => undefined);
 		activeOrderedWriter = undefined;
 		writePrivateJson(join(runDir, ".retention-terminal.json"), {

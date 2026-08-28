@@ -150,6 +150,28 @@ describe("incident recorder isolated fault evidence", () => {
 		expect(shouldRecordSupervisorLaunch(["--mode", "json"], {}, false)).toBe(false);
 	});
 
+	it("records only a causal environment allowlist", async () => {
+		const target = fixture("process.exit(0);");
+		const result = await recordSupervisorProcess({
+			agentDir: target.agentDir,
+			socketPath: target.socketPath,
+			launch: { command: process.execPath, args: [target.script, "--token", "must-not-be-recorded"] },
+			environment: {
+				SECRET_ACCESS_TOKEN: "must-not-be-recorded",
+				INVOCATION_ID: "a".repeat(32),
+				WSL_DISTRO_NAME: "Ubuntu",
+			},
+			cwd: target.root,
+		});
+		const launchText = readFileSync(join(result.runDir, "launch.json"), "utf8");
+		expect(launchText).not.toContain("must-not-be-recorded");
+		expect(launchText).not.toContain("SECRET_ACCESS_TOKEN");
+		expect(JSON.parse(launchText)).toMatchObject({
+			environment: { INVOCATION_ID: "a".repeat(32), WSL_DISTRO_NAME: "Ubuntu" },
+			commandSummary: { redactedValueCount: 2 },
+		});
+	});
+
 	it("admits derived storage by allocated filesystem blocks", () => {
 		const target = fixture("");
 		const recorderRoot = join(target.agentDir, "incident-recorder");

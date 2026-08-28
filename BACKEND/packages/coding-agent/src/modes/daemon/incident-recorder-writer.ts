@@ -51,7 +51,6 @@ export const INCIDENT_RECORDER_JOURNAL_LINE_MAX_BYTES = 48 * 1024;
 const CONTROL_RESERVE_BYTES = 64 * 1024;
 const JOURNAL_START_DEADLINE_MS = 150;
 const JOURNAL_RECONNECT_MS = 1_000;
-const JOURNAL_RELAY_MAX_BYTES = 8 * 1024 * 1024;
 const SERVICE_EMITTER_MAX_BYTES = 256 * 1024;
 const SERVICE_EMITTER_MAX_IDENTITIES = 32;
 // One tombstone per occurrence that can be admitted inside the producer's bounded
@@ -1274,6 +1273,7 @@ export interface IncidentRecorderWriterOptions {
 	bootId?: string;
 	wrapperStartId?: string;
 	serviceSink?: boolean;
+	onStructuredEvent?: (source: string, type: string, fields: Record<string, unknown>) => void;
 }
 
 export class IncidentRecorderWriter {
@@ -1282,6 +1282,7 @@ export class IncidentRecorderWriter {
 	private readonly wrapperStartId: string | undefined;
 	private readonly bootId: string | undefined;
 	private readonly serviceSink: boolean;
+	private readonly onStructuredEvent?: (source: string, type: string, fields: Record<string, unknown>) => void;
 	private readonly machineId = linuxIdentity("/etc/machine-id", /^[0-9a-f]{32}$/i);
 	private readonly invocationId = process.env.INVOCATION_ID?.match(/^[0-9a-f]{32}$/i)?.[0];
 	private readonly emitter: BoundedFrameEmitter;
@@ -1347,6 +1348,7 @@ export class IncidentRecorderWriter {
 		this.wrapperStartId = options.wrapperStartId ?? linuxProcessStartId(process.pid);
 		this.bootId = options.bootId ?? linuxIdentity("/proc/sys/kernel/random/boot_id", /^[0-9a-f-]{36}$/i);
 		this.serviceSink = options.serviceSink === true;
+		this.onStructuredEvent = options.onStructuredEvent;
 		this.emitter = this.createEmitter({ runId: this.runId, runToken: this.runToken });
 	}
 
@@ -1382,16 +1384,11 @@ export class IncidentRecorderWriter {
 	}
 
 	async start(): Promise<void> {
-		await this.connectJournalWithDeadline();
-		if (!this.relayLossTimer) {
-			this.relayLossTimer = setInterval(() => this.emitRelayLossCheckpoint(), 1_000);
-			this.relayLossTimer.unref();
-		}
-		if (!this.serviceSink)
-			this.emitter.emitControl("journal_stream_start_checkpoint", {
-				wrapperPid: process.pid,
-				wrapperStartId: this.wrapperStartId ?? "unavailable",
-			});
+		if (this.stopped || this.serviceSink) return;
+		this.emitter.emitControl("causal_stream_start", {
+			wrapperPid: process.pid,
+			wrapperStartId: this.wrapperStartId ?? "unavailable",
+		});
 	}
 
 	private async connectJournalWithDeadline(): Promise<void> {
@@ -1719,7 +1716,7 @@ export class IncidentRecorderWriter {
 
 	private enqueueFrames(
 		frames: readonly IncidentRecorderEncodedFrame[],
-		reserved: boolean,
+		_reserved: boolean,
 		prevalidated = false,
 	): { accepted: boolean; reason?: string } {
 		if (frames.length === 0) return { accepted: false, reason: "empty_occurrence" };
@@ -1746,9 +1743,7 @@ export class IncidentRecorderWriter {
 		};
 		const acceptedIdentity =
 			(first.runId === this.runId && first.runToken === this.runToken) ||
-			(this.serviceSink && this.serviceEmitters.has(`${first.runId}\0${first.runToken}`));
-		const relayIdentity =
-			this.serviceSink && acceptedIdentity ? { runId: first.runId, runToken: first.runToken } : undefined;
+			(this.serviceSink && this.serviceEmitters.has(`${first.runId} ${first.runToken}`));
 		if (
 			!acceptedIdentity ||
 			rawBytes > INCIDENT_RECORDER_PROTOCOL_MAX_OCCURRENCE_BYTES ||
@@ -1764,10 +1759,8 @@ export class IncidentRecorderWriter {
 					frame.header.producerSequence !== first.producerSequence + BigInt(index)
 				);
 			})
-		) {
-			this.noteRelayDrop(1, rawBytes, relayIdentity);
+		)
 			return { accepted: false, reason: "invalid_occurrence_contract" };
-		}
 		if (!prevalidated) {
 			const expectedDigest =
 				typeof first.metadata.occurrenceSha256 === "string" ? first.metadata.occurrenceSha256 : undefined;
@@ -1775,20 +1768,19 @@ export class IncidentRecorderWriter {
 				typeof first.metadata.occurrenceRawBytes === "number" ? first.metadata.occurrenceRawBytes : undefined;
 			const actualDigest = createHash("sha256");
 			for (const frame of frames) actualDigest.update(frame.parts.at(-1) ?? Buffer.alloc(0));
-			if (expectedBytes !== rawBytes || !expectedDigest || actualDigest.digest("hex") !== expectedDigest) {
-				this.noteRelayDrop(1, rawBytes, relayIdentity);
+			if (expectedBytes !== rawBytes || !expectedDigest || actualDigest.digest("hex") !== expectedDigest)
 				return { accepted: false, reason: "occurrence_checksum_or_length_mismatch" };
-			}
 		}
-		const bytes = frames.reduce((sum, frame) => sum + Math.ceil((frame.header.payloadLength * 4) / 3) + 12 * 1024, 0);
-		const ceiling = reserved ? JOURNAL_RELAY_MAX_BYTES : JOURNAL_RELAY_MAX_BYTES - CONTROL_RESERVE_BYTES;
-		if (this.stopped || bytes > ceiling || this.relayBytes + bytes > ceiling) {
-			this.noteRelayDrop(1, rawBytes, relayIdentity);
-			return { accepted: false, reason: this.stopped ? "stopped" : "relay_capacity" };
+		if (first.payloadKind === "exact-bytes") return { accepted: false, reason: "non_causal_payload_disabled" };
+		try {
+			this.onStructuredEvent?.(first.source, first.type, { ...first.metadata });
+		} catch {
+			return { accepted: false, reason: "structured_event_persistence_failed" };
 		}
-		const identityKey = `${first.runId}\0${first.runToken}`;
+		const identityKey = `${first.runId} ${first.runToken}`;
 		let wrapperSequence = this.wrapperSequences.get(identityKey) ?? 0n;
-		const wrapperSequences = frames.map(() => ++wrapperSequence);
+		const firstWrapperSequence = ++wrapperSequence;
+		wrapperSequence += BigInt(frames.length - 1);
 		this.wrapperSequences.set(identityKey, wrapperSequence);
 		if (first.type === "supervisor_exit" || first.type === "capture_channel_terminal") {
 			this.finalizationFrontiers.set(first.occurrenceId, {
@@ -1797,21 +1789,10 @@ export class IncidentRecorderWriter {
 				type: first.type,
 				firstProducerSequence: first.producerSequence.toString(),
 				lastProducerSequence: (first.producerSequence + BigInt(frames.length - 1)).toString(),
-				firstWrapperSequence: (wrapperSequences[0] ?? 0n).toString(),
-				lastWrapperSequence: (wrapperSequences.at(-1) ?? 0n).toString(),
+				firstWrapperSequence: firstWrapperSequence.toString(),
+				lastWrapperSequence: wrapperSequence.toString(),
 			});
 		}
-		this.relayQueue.push({
-			frames,
-			wrapperSequences,
-			bytes,
-			rawBytes,
-			lineIndex: 0,
-			reserved,
-			occurrenceId: first.occurrenceId,
-		});
-		this.relayBytes += bytes;
-		this.pumpRelay();
 		return { accepted: true };
 	}
 
