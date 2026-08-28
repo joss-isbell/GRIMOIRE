@@ -160,6 +160,13 @@ import {
 } from "./goals.js";
 import type { HostRequestHandlers, KernelSentAgentMessage } from "./kernel/index.js";
 import { type RestoreResult, snapshotPathIn } from "./kernel/state-snapshot.js";
+import {
+	commitLiturgyState,
+	LITURGY_SKILL_NAME,
+	LITURGY_STATE_CUSTOM_TYPE,
+	type LiturgyState,
+	loadLiturgyState,
+} from "./liturgy-state.js";
 import type { AcpMcpServerConfig } from "./mcp/acp-mcp-types.js";
 import type { McpManager } from "./mcp/mcp-manager.js";
 import {
@@ -1069,6 +1076,7 @@ export class AgentSession {
 	private readonly _sessionInputCheckpointWaiters = new Set<() => void>();
 	private _pendingNextTurnMessages: CustomMessage[] = [];
 
+	private _liturgyState: LiturgyState;
 	private _goalState: GoalState = emptyGoalState();
 	private _goalAccountingStartedAt: number | undefined = undefined;
 	private _goalContinuationAwaitsRlmWork = false;
@@ -1270,6 +1278,7 @@ export class AgentSession {
 		this._autonomousState = createAutonomousRuntimeState(config.autonomous, {
 			cwd: this._cwd,
 		});
+		this._liturgyState = loadLiturgyState(this.sessionManager.getBranch());
 		this._goalState = this._loadPersistedGoalState();
 		// Seed initial goal from CLI --goal flag, but only for top-level sessions
 		// and only when the branch contains only bootstrap entry types (model_change,
@@ -2920,6 +2929,29 @@ export class AgentSession {
 				messages: queuedMessages,
 			});
 		}
+	}
+
+	/** Handle LITURGY state requests for this exact AgentSession. */
+	handleLiturgyHostRequest(type: string, payload: Record<string, unknown> = {}): { state: LiturgyState } {
+		const allowed = type === "liturgy.get" ? [] : ["expected_revision", "state"];
+		const unknown = Object.keys(payload).filter((key) => !allowed.includes(key));
+		if (unknown.length > 0) {
+			throw new Error(`unknown Liturgy request field(s): ${unknown.join(", ")}`);
+		}
+		if (type === "liturgy.get") {
+			return { state: structuredClone(this._liturgyState) };
+		}
+		if (type !== "liturgy.commit") {
+			throw new Error(`unknown Liturgy request type "${type}"`);
+		}
+		if (!("expected_revision" in payload) || !("state" in payload)) {
+			throw new Error("liturgy.commit requires expected_revision and state");
+		}
+		const committed = commitLiturgyState(this._liturgyState, payload.expected_revision as number, payload.state);
+		this.sessionManager.appendCustomEntry(LITURGY_STATE_CUSTOM_TYPE, committed);
+		this.sessionManager.flushNow();
+		this._liturgyState = committed;
+		return { state: structuredClone(committed) };
 	}
 
 	/**
@@ -9100,6 +9132,11 @@ export class AgentSession {
 				.filter((skill) => !skill.disableModelInvocation)
 				.map((skill) => skill.name),
 		);
+		if (visibleKernelSkillNames.has(LITURGY_SKILL_NAME)) {
+			for (const type of ["liturgy.get", "liturgy.commit"]) {
+				handlers[type] = async (payload) => this.handleLiturgyHostRequest(type, payload);
+			}
+		}
 		if (this._agentMessageController && visibleKernelSkillNames.has(AGENT_MESSAGE_SKILL_NAME)) {
 			Object.assign(
 				handlers,

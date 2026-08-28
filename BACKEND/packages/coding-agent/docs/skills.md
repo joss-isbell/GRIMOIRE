@@ -50,10 +50,41 @@ Prime Agent ships with built-in skills that load by default:
 
 - `prime-intellect` - Prime Intellect products and workflows via the prime CLI: verifiers environments and the Environments Hub, evaluations (local and hosted), Hosted Training and prime-rl, sandboxes, tunnels, Prime Inference, GPU compute, and storage. Reference docs for each area load on demand from the skill's `references/` directory.
 - `skill-creator` - teaches the agent to create new skills: markdown skill layout, frontmatter rules, placement and precedence, and the full Python-backed skill contract (package layout, `run()` convention, optional CLI, kernel venv behavior) with a working template in `references/python-skills.md`.
-- `liturgy` - a Python-backed durable work-reconciliation board for phased, nested Agent work.
+- `liturgy` - a Python-backed durable work-reconciliation board that gives every Agent its own phased, nested view of assigned work.
 - `websearch` - a Python-backed Google search skill using the [Serper](https://serper.dev) API.
 
 Built-in skills behave like any other skill but have the lowest precedence: a user, project, package, or `--skill` skill with the same name overrides the built-in one.
+
+### LITURGY
+
+LITURGY keeps an Agent's current understanding of its assigned work visible and
+recoverable. It tracks phased tasks and nested subtasks, parallel owners,
+blockers, local focus, results, and evidence. The Agent reconciles this board as
+work changes instead of treating the initial plan as fixed.
+
+Every parent Agent and subagent has a separate host-bound LITURGY state. A child
+records only its assigned work on its own board; its tasks do not merge into the
+parent's board or a sibling's board. The skill API is bound to the current
+`AgentSession` and accepts no target Agent, session ID, or state path, so one
+Agent cannot use LITURGY to read or mutate another Agent's board.
+
+The first ordinary call creates a neutral `Agent work` board with an empty
+`Work` phase. An untouched default can be customized with `init`; once real work
+is recorded, `init` cannot erase it. State survives compaction and session
+resume through the owning session's durable record.
+
+The model calls the Python-backed skill directly:
+
+```python
+await liturgy("view")
+await liturgy("add", phase="Work", tasks=["Inspect the current behavior"])
+await liturgy("start", task="T001", focus=True)
+await liturgy("done", task="T001", note="Behavior verified",
+              evidence=["test/example.test.ts: passed"])
+```
+
+LITURGY is an execution aid. It does not replace the User's request, canonical
+requirements, version-controlled output, or user-visible progress reports.
 
 ### websearch
 

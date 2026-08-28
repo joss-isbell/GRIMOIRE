@@ -146,6 +146,11 @@ interface InspectableRlmSession {
 	_reapDeletedRlmSubagentRuntimesAfterCompaction(): Promise<void>;
 }
 
+interface LiturgyInspectableSession {
+	sessionFile?: string;
+	_createKernelHostHandlers(): HostRequestHandlers;
+}
+
 interface KernelPumpTestApi {
 	iopub: AsyncIterable<Buffer[]> & { close(): void };
 	startIopubPump(): void;
@@ -283,6 +288,7 @@ describe("AgentSession rlm recursion", () => {
 			sessionManager?: SessionManager;
 			settingsManager?: SettingsManager;
 			extensionsResult?: LoadExtensionsResult;
+			skills?: Skill[];
 		} = {},
 	): AgentSession {
 		const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
@@ -310,24 +316,26 @@ describe("AgentSession rlm recursion", () => {
 			modelRegistry: ModelRegistry.create(authStorage, join(tempDir, "models.json")),
 			resourceLoader: createTestResourceLoader({
 				extensionsResult: options.extensionsResult,
-				skills: options.agentMessageController
-					? [
-							{
-								name: "agent-message",
-								description: "test",
-								filePath: join(tempDir, "SKILL.md"),
-								baseDir: tempDir,
-								sourceInfo: createSyntheticSourceInfo(join(tempDir, "SKILL.md"), { source: "test" }),
-								disableModelInvocation: false,
-								kind: "python",
-								python: {
-									importName: "agent_message",
-									packagePath: tempDir,
-									pyprojectPath: join(tempDir, "pyproject.toml"),
+				skills:
+					options.skills ??
+					(options.agentMessageController
+						? [
+								{
+									name: "agent-message",
+									description: "test",
+									filePath: join(tempDir, "SKILL.md"),
+									baseDir: tempDir,
+									sourceInfo: createSyntheticSourceInfo(join(tempDir, "SKILL.md"), { source: "test" }),
+									disableModelInvocation: false,
+									kind: "python",
+									python: {
+										importName: "agent_message",
+										packagePath: tempDir,
+										pyprojectPath: join(tempDir, "pyproject.toml"),
+									},
 								},
-							},
-						]
-					: undefined,
+							]
+						: undefined),
 			}),
 			agentMessageController: options.agentMessageController,
 			subagentRuntimeHost: options.subagentRuntimeHost,
@@ -465,6 +473,69 @@ describe("AgentSession rlm recursion", () => {
 		const header = JSON.parse(readFileSync(child.sessionFile, "utf8").split("\n")[0] ?? "{}");
 		expect(header).toMatchObject({ parentSession: root.sessionFile, rlmDepth: 3 });
 		expect(child.rlmDepth).toBe(3);
+	});
+
+	it("keeps LITURGY state isolated across spawned siblings and a resumed child", async () => {
+		const liturgySkill: Skill = {
+			kind: "python",
+			name: "liturgy",
+			description: "test",
+			filePath: join(tempDir, "LITURGY-SKILL.md"),
+			baseDir: tempDir,
+			sourceInfo: createSyntheticSourceInfo(join(tempDir, "LITURGY-SKILL.md"), { source: "test" }),
+			disableModelInvocation: false,
+			python: {
+				importName: "liturgy",
+				packagePath: tempDir,
+				pyprojectPath: join(tempDir, "pyproject.toml"),
+			},
+		};
+		const root = createSession({ skills: [liturgySkill] });
+		const board = (owner: string) => ({
+			id: `${owner}-board`,
+			title: owner,
+			goal_objective: null,
+			created_at: "2026-01-01T00:00:00.000Z",
+			updated_at: "2026-01-01T00:00:00.000Z",
+			next_task_number: 1,
+			focused_task_id: null,
+			synthetic_default: false,
+			phases: [],
+			events: [],
+		});
+		const firstRun = await root.runRlmChild("first sibling", { name: "first-sibling" });
+		const secondRun = await root.runRlmChild("second sibling", { name: "second-sibling" });
+		const first = root.getRlmChildSession(firstRun.rlm_child_id) as unknown as LiturgyInspectableSession;
+		const second = root.getRlmChildSession(secondRun.rlm_child_id) as unknown as LiturgyInspectableSession;
+		if (!first?.sessionFile || !second) throw new Error("Missing spawned sibling session");
+
+		const firstHandlers = first._createKernelHostHandlers();
+		const secondHandlers = second._createKernelHostHandlers();
+		await firstHandlers["liturgy.commit"]!({
+			expected_revision: 0,
+			state: { schema_version: 1, revision: 0, active: board("first"), history: [] },
+		});
+		await secondHandlers["liturgy.commit"]!({
+			expected_revision: 0,
+			state: { schema_version: 1, revision: 0, active: board("second"), history: [] },
+		});
+		expect(await firstHandlers["liturgy.get"]!({})).toMatchObject({ state: { revision: 1, active: board("first") } });
+		expect(await secondHandlers["liturgy.get"]!({})).toMatchObject({
+			state: { revision: 1, active: board("second") },
+		});
+
+		const resumed = createSession({
+			skills: [liturgySkill],
+			sessionManager: SessionManager.open(first.sessionFile),
+		}) as unknown as LiturgyInspectableSession;
+		const resumedHandlers = resumed._createKernelHostHandlers();
+		expect(await resumedHandlers["liturgy.get"]!({})).toMatchObject({
+			state: { revision: 1, active: board("first") },
+		});
+		expect(await secondHandlers["liturgy.get"]!({})).toMatchObject({
+			state: { revision: 1, active: board("second") },
+		});
+		root.dispose();
 	});
 
 	it("lets the orchestrator choose a unique subagent session name", async () => {

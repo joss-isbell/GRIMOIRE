@@ -93,6 +93,7 @@ Prime Agent is built for long-running work, especially for evaluations in resear
 - **Daemon-backed continuity:** active sessions, IPython state, schedules, and subagents keep running when the terminal detaches and can be reattached later.
 - **Heartbeats and schedules:** `/heartbeat`, `rlm_heartbeat`, and `prime-agent schedule` can re-enter a session periodically or at a specific time.
 - **Persistent goals:** `/goal` keeps an objective and its progress active across turns until it is completed, paused, or cleared.
+- **LITURGY work boards:** every parent Agent and subagent gets a separate durable board for reconciling its own phased tasks, nested subtasks, blockers, ownership, results, and evidence. Host-bound session storage prevents parent and sibling boards from merging or being selected through the skill API.
 - **Bounded autonomous mode:** `/autonomous` continues within configured turn, token, and time budgets and can run user-defined quality gates. A passed gate checks only what that gate verifies; reaching a limit does not imply task success.
 
 ## Documentation

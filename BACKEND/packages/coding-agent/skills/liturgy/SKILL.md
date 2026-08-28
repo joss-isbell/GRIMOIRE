@@ -1,13 +1,20 @@
 ---
 name: liturgy
-description: Maintains a durable, phased execution board for a Prime Agent thread, with nested work, stable task IDs, parallel owners, blockers, focus, results, and evidence. Use when the user requests todos/checklists or progress tracking, supplies multiple required work items, starts a persistent goal, or when substantive work spans several independently verifiable checkpoints, turns, compaction, or parallel child Agents. Skip simple one-step work.
+description: Maintains the current Agent's isolated, durable LITURGY board with phased tasks, nested work, stable IDs, parallel owners, blockers, focus, results, and evidence. Every parent Agent and subagent uses its own board for assigned work; use view first and reconcile it as work changes.
 ---
 
 # LITURGY
 
 LITURGY is the product name for this durable work-reconciliation board. Use the
-Python-backed `liturgy` module. The capability is global, but each board belongs
-only to its Prime thread and is stored at `$RLM_SESSION_DIR/liturgy.json`.
+Python-backed `liturgy` module. The capability is global, but the host binds each
+call to the current `AgentSession` and persists only that Agent's board. The API
+accepts no target Agent, session ID, or state path. Parent, child, and sibling
+boards therefore remain separate.
+
+Call `view` when assigned work begins. The first ordinary call creates a neutral
+`Agent work` board with an empty `Work` phase. An untouched default may be
+customized with `init`; after real work is recorded, reconcile and close it
+instead of using `init` to erase it.
 
 ## Common calls
 
@@ -49,8 +56,9 @@ valid and therefore may require IDs.
 
 ## Operating rules
 
-1. The root Agent owns and writes its board. Child Agents have separate session
-   directories. They report through `agent_message` or artifacts.
+1. Every Agent owns and writes only its own board. A parent records delegated
+   ownership on its board; each child records only its assigned work on a
+   separate board and reports results through `agent_message` or artifacts.
 2. For delegated work, mark the task `in_progress` and set `owner` to the child
    name and ID. A spawn handle or delivered message is not proof of completion.
 3. Use `blocked` only when work cannot proceed. Do not mark a running child task
@@ -64,8 +72,9 @@ valid and therefore may require IDs.
 6. Reopen terminal work when it becomes actionable again. Reopening clears its
    stale owner, blocker, result, and evidence so new work is not presented with
    old terminal metadata.
-7. Before compaction or after recovery, call `view`. The JSON artifact is
-   authoritative; notebook variables and transcript recollection are not.
+7. Before compaction or after recovery, call `view`. The host-backed board
+   state is authoritative for this execution aid; notebook variables and
+   transcript recollection are not.
 8. `close` refuses while any task is pending, running, or blocked. Reconcile all
    work before closing. Retired items remain visible in the closed history.
 9. Board calls must not replace substantive work or user-visible progress
@@ -78,8 +87,8 @@ valid and therefore may require IDs.
   pass its objective snapshot as `goal_objective` during `init`.
 - Prime's goal continuation and child lifecycle remain authoritative. Do not
   build polling or continuation loops around this skill.
-- Only the root Agent mutates its board. Store large child evidence in files and
-  keep only references on the board.
+- Each Agent mutates only its own board. Store large child evidence in files and
+  keep only references on the applicable board.
 
 See [references/design.md](references/design.md) for the OMP comparison,
 lifecycle details, limitations, and verification model.

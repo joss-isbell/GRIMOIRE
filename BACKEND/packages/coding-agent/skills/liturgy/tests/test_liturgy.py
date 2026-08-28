@@ -1,8 +1,6 @@
 import asyncio
 import json
 import os
-import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -255,19 +253,84 @@ class LiturgyTests(unittest.TestCase):
         self.assertEqual(self.path.read_bytes(), before)
         self.assertEqual(list(Path(self.temp.name).glob(".*.tmp")), [])
 
-    def test_second_process_reads_same_thread_state(self):
-        self.init_board()
-        env = os.environ.copy()
-        result = subprocess.run(
-            [sys.executable, "-c", "import asyncio, liturgy; print(asyncio.run(liturgy.run('view')))"],
-            env=env,
-            text=True,
-            capture_output=True,
-            check=True,
-            timeout=10,
+    def test_first_view_creates_default_board(self):
+        output = self.call("view")
+        self.assertIn("# Agent work", output)
+        self.assertIn("revision 1", output)
+        state = self.state()
+        self.assertTrue(state["active"]["synthetic_default"])
+        self.assertEqual(state["active"]["phases"], [{"name": "Work", "tasks": []}])
+
+    def test_first_add_without_init_creates_and_mutates_default_in_one_commit(self):
+        output = self.call("add", phase="Work", tasks=["Begin immediately"])
+        self.assertIn("T001 Begin immediately", output)
+        self.assertIn("revision 1", output)
+        state = self.state()
+        self.assertFalse(state["active"]["synthetic_default"])
+        self.assertEqual(state["active"]["title"], "Agent work")
+
+    def test_init_customizes_untouched_default(self):
+        self.call("view")
+        output = self.call("init", title="Custom work", plan={"Build": ["Ship it"]})
+        self.assertIn("# Custom work", output)
+        self.assertIn("T001 Ship it", output)
+        self.assertIn("revision 2", output)
+        self.assertFalse(self.state()["active"]["synthetic_default"])
+
+    def test_init_rejects_mutated_default(self):
+        self.call("add", phase="Work", tasks=["Existing work"])
+        before = self.path.read_bytes()
+        with self.assertRaisesRegex(ValueError, "active Liturgy already exists"):
+            self.call("init", title="Replacement", plan={"Work": ["New work"]})
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_close_then_init_starts_new_board(self):
+        self.call("view")
+        self.call("close", note="Empty default reconciled")
+        output = self.call("init", title="Next work", plan={"Work": ["Next task"]})
+        self.assertIn("# Next work", output)
+        state = self.state()
+        self.assertEqual(len(state["history"]), 1)
+        self.assertEqual(state["active"]["title"], "Next work")
+
+    def test_standalone_fallback_uses_explicit_test_directory(self):
+        with mock.patch.object(liturgy, "_host_request", None):
+            output = self.call("view")
+        self.assertIn("# Agent work", output)
+        self.assertTrue(self.path.is_file())
+
+    def test_host_transport_needs_no_environment_or_path_selector(self):
+        host_state = liturgy._empty_state()
+        calls = []
+
+        async def host_request(method, payload):
+            nonlocal host_state
+            calls.append((method, payload))
+            if method == "liturgy.get":
+                return {"state": json.loads(json.dumps(host_state))}
+            if method == "liturgy.commit":
+                self.assertEqual(payload["expected_revision"], host_state["revision"])
+                host_state = {
+                    **json.loads(json.dumps(payload["state"])),
+                    "revision": host_state["revision"] + 1,
+                }
+                return {"state": json.loads(json.dumps(host_state))}
+            self.fail(f"unexpected host method: {method}")
+
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            liturgy, "_host_request", host_request
+        ):
+            first = self.call("view")
+            added = self.call("add", phase="Work", tasks=["Host task"])
+
+        self.assertIn("revision 1", first)
+        self.assertIn("T001 Host task", added)
+        self.assertEqual(
+            [method for method, _ in calls],
+            ["liturgy.get", "liturgy.commit", "liturgy.get", "liturgy.commit"],
         )
-        self.assertIn("T001 Inspect current behavior", result.stdout)
-        self.assertIn("revision 1", result.stdout)
+        self.assertEqual(host_state["revision"], 2)
+        self.assertFalse(self.path.exists())
 
 
 if __name__ == "__main__":

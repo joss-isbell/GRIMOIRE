@@ -28,7 +28,7 @@ implementation:
 
 | Outcome | Prime-native mechanism |
 |---|---|
-| Survive turns and compaction | Versioned JSON in `RLM_SESSION_DIR` |
+| Survive turns, compaction, and resume | Versioned state in the owning `AgentSession` record |
 | Resume a long objective | Prime's separate host-owned `goal` |
 | Represent understood work shape | Ordered phases with root tasks and nested subtasks |
 | Preserve identity through plan changes | Stable IDs and metadata-preserving `move` |
@@ -38,7 +38,7 @@ implementation:
 | Delegation | Root records an admitted child name/ID; child reports by message or artifact |
 | Blocked work | `blocked` only for an actual external dependency |
 | Completion confidence | Result note plus concrete evidence references |
-| Context recovery | `view` reloads the file-backed authoritative snapshot |
+| Context recovery | `view` reloads the current Agent's host-backed snapshot |
 | Adoption | Global prompt routing rule plus this skill's routing description |
 
 Stable generated task IDs replace OMP's verbatim-text identity and fuzzy content
@@ -54,7 +54,7 @@ state.
 
 ## Reconciliation lifecycle
 
-1. Initialize one board from a user checklist or a truthful execution plan.
+1. View the Agent's board when assigned work begins. First use creates a neutral default; customize an untouched default with `init` when a truthful plan is already known.
 2. Start one or more tasks. Set the root's local focus separately when useful.
 3. Record admitted child ownership on delegated tasks. When responsibility
    returns to the root, clear the stale owner as part of the next transition.
@@ -70,18 +70,23 @@ state.
 9. Close only after every task is completed or retired and the outcome audit is
    finished. Retired work remains visible in history.
 
-Each valid state mutation is an atomic file replacement and increments
-`revision`. Callers can pass `expected_revision` to reject stale updates.
-Invalid hierarchy changes, unknown schemas, and corrupt schemas fail closed and
-retain the file for diagnosis.
+Each valid state mutation uses a host-controlled compare-and-swap commit and
+increments `revision`. Callers can pass `expected_revision` to reject stale
+updates. The host validates the complete board and task schema before appending
+state to the owning session record. Invalid hierarchy changes, unknown schemas,
+and corrupt schemas fail closed without replacing the last valid state.
 
 ## Boundaries
 
 - Global installation makes the capability available in every session. It does
-  not make live task state global. Each thread has an isolated board.
-- Only the parent/root writes its board. A child has a different
-  `RLM_SESSION_DIR`; shared writes are unsupported.
-- Session deletion intentionally deletes its artifacts. Deactivation or resume
+  not make live task state global. Each Agent has a separate board.
+- The kernel host-request registry binds `liturgy.get` and `liturgy.commit` to
+  the exact owning `AgentSession`. Requests accept no Agent, session, or path
+  selector, so parent, child, and sibling boards cannot be addressed through
+  one another's LITURGY API.
+- Each Agent writes only its own board. A parent records delegated ownership;
+  each child records only the work assigned to that child.
+- Session deletion intentionally deletes its records. Deactivation or resume
   preserves them.
 - A child spawn, running state, queued message, or delivered message is not task
   completion.
@@ -90,9 +95,10 @@ retain the file for diagnosis.
 - The board is an execution aid. It does not replace canonical requirements,
   version-controlled output, an external operational ledger, or user-visible
   progress communication.
-- The global prompt rule improves reliable adoption, but a skill cannot provide
-  OMP's host-level sticky HUD, action counter, or hard stop hook. Those would
-  require a Prime host feature rather than skill code.
+- The routing description makes LITURGY visible for every Agent assignment,
+  while first-use initialization ensures an Agent can begin recording work
+  without a separate setup step. LITURGY does not provide OMP's sticky HUD,
+  action counter, or hard stop hook.
 - Name collisions can shadow a global skill according to normal Prime skill
   precedence. A custom `PRIME_AGENT_KERNEL_PYTHON` can also disable automatic
   package installation.

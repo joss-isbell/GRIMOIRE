@@ -1,1 +1,1 @@
-- Added the LITURGY skill for durable reconciliation of phased, nested Agent work.
+- Added LITURGY with a separate durable work-reconciliation board for every parent Agent and subagent.

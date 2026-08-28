@@ -9,6 +9,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
+try:
+    from rlm import host_request as _host_request
+except ImportError:  # Explicit standalone package-test mode.
+    _host_request = None
+
 _SCHEMA_VERSION = 1
 _STATE_FILE = "liturgy.json"
 _VALID_ACTIONS = {
@@ -34,12 +39,12 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def _state_path() -> Path:
-    root = os.environ.get("LITURGY_STATE_DIR") or os.environ.get("RLM_SESSION_DIR")
+def _standalone_state_path() -> Path:
+    root = os.environ.get("LITURGY_STATE_DIR")
     if not root:
         raise RuntimeError(
-            "liturgy needs RLM_SESSION_DIR (set by Prime Agent) or "
-            "LITURGY_STATE_DIR (for standalone tests)"
+            "liturgy needs the Prime Agent host bridge; LITURGY_STATE_DIR is only "
+            "available in a standalone package-test process"
         )
     directory = Path(root).expanduser().resolve()
     directory.mkdir(parents=True, exist_ok=True)
@@ -151,27 +156,63 @@ def _validate_state(state: dict[str, Any]) -> None:
         _validate_board(board)
 
 
-def _load() -> dict[str, Any]:
-    path = _state_path()
-    if not path.exists():
-        return _empty_state()
-    try:
-        state = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"Cannot read liturgy state at {path}: {exc}") from exc
+async def _load() -> dict[str, Any]:
+    if _host_request is not None:
+        response = await _host_request("liturgy.get", {})
+        if not isinstance(response, dict) or "state" not in response:
+            raise RuntimeError("Invalid liturgy.get response; state was not changed")
+        state = response["state"]
+        source = "host"
+    else:
+        path = _standalone_state_path()
+        if not path.exists():
+            return _empty_state()
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"Cannot read liturgy state at {path}: {exc}") from exc
+        source = str(path)
     if not isinstance(state, dict) or state.get("schema_version") != _SCHEMA_VERSION:
-        raise RuntimeError(f"Unsupported liturgy schema at {path}; state was not changed")
+        raise RuntimeError(f"Unsupported liturgy schema from {source}; state was not changed")
     if not isinstance(state.get("revision"), int) or not isinstance(state.get("history"), list):
-        raise RuntimeError(f"Invalid liturgy state at {path}; state was not changed")
+        raise RuntimeError(f"Invalid liturgy state from {source}; state was not changed")
     _validate_state(state)
     return state
 
 
-def _save(state: dict[str, Any]) -> None:
+async def _save(state: dict[str, Any]) -> None:
     _validate_state(state)
-    path = _state_path()
-    next_revision = state["revision"] + 1
-    saved = {**state, "revision": next_revision}
+    expected_revision = state["revision"]
+    if _host_request is not None:
+        response = await _host_request(
+            "liturgy.commit", {"expected_revision": expected_revision, "state": state}
+        )
+        if not isinstance(response, dict) or not isinstance(response.get("state"), dict):
+            raise RuntimeError("Invalid liturgy.commit response; state was not changed")
+        committed = response["state"]
+        if committed.get("revision") != expected_revision + 1:
+            raise RuntimeError("Invalid liturgy.commit revision; state was not changed")
+        _validate_state(committed)
+        state.clear()
+        state.update(committed)
+        return
+
+    path = _standalone_state_path()
+    current_revision = 0
+    if path.exists():
+        try:
+            current = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"Cannot read liturgy state at {path}: {exc}") from exc
+        if not isinstance(current, dict) or not isinstance(current.get("revision"), int):
+            raise RuntimeError(f"Invalid liturgy state at {path}; state was not changed")
+        current_revision = current["revision"]
+    if current_revision != expected_revision:
+        raise ValueError(
+            f"Stale liturgy revision: expected {expected_revision}, current {current_revision}. "
+            "View the Liturgy before retrying."
+        )
+    saved = {**state, "revision": expected_revision + 1}
     tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     payload = json.dumps(saved, indent=2, ensure_ascii=False) + "\n"
     try:
@@ -183,13 +224,64 @@ def _save(state: dict[str, Any]) -> None:
         except OSError:
             pass
         raise RuntimeError(f"Cannot write liturgy state at {path}: {exc}") from exc
-    state["revision"] = next_revision
+    state.clear()
+    state.update(saved)
+
+
+def _new_board(
+    title: str,
+    phases: list[tuple[str, list[str]]],
+    *,
+    goal_objective: str | None = None,
+    note: str | None = None,
+    synthetic_default: bool = False,
+) -> dict[str, Any]:
+    now = _now()
+    board: dict[str, Any] = {
+        "id": f"L-{uuid.uuid4().hex[:10]}",
+        "title": title,
+        "goal_objective": goal_objective,
+        "created_at": now,
+        "updated_at": now,
+        "next_task_number": 1,
+        "focused_task_id": None,
+        "phases": [],
+        "events": [],
+        "synthetic_default": synthetic_default,
+    }
+    for phase_name, values in phases:
+        board["phases"].append(
+            {"name": phase_name, "tasks": [_new_task(board, text) for text in values]}
+        )
+    if not synthetic_default:
+        _record(board, "init", note=note)
+    return board
+
+
+def _default_board() -> dict[str, Any]:
+    return _new_board("Agent work", [("Work", [])], synthetic_default=True)
+
+
+def _is_untouched_default(board: dict[str, Any]) -> bool:
+    phases = board.get("phases")
+    return bool(
+        board.get("synthetic_default") is True
+        and board.get("title") == "Agent work"
+        and board.get("goal_objective") is None
+        and board.get("next_task_number") == 1
+        and board.get("focused_task_id") is None
+        and board.get("events") == []
+        and isinstance(phases, list)
+        and len(phases) == 1
+        and phases[0].get("name") == "Work"
+        and phases[0].get("tasks") == []
+    )
 
 
 def _board(state: dict[str, Any]) -> dict[str, Any]:
     board = state.get("active")
     if not isinstance(board, dict):
-        raise ValueError("No active Liturgy. Use action='init' first.")
+        raise ValueError("No active Liturgy")
     return board
 
 
@@ -427,19 +519,32 @@ async def run(
     if action not in _VALID_ACTIONS:
         raise ValueError(f"Unknown action {action!r}; expected one of {sorted(_VALID_ACTIONS)}")
 
-    state = _load()
+    state = await _load()
     if action == "history":
         return _render_history(state)
-    if action == "view":
-        active = state.get("active")
-        return _render(active, state["revision"]) if isinstance(active, dict) else (
-            f"No active Liturgy. State revision: {state['revision']}. Use action='init' to create one."
-        )
-    if expected_revision is not None and expected_revision != state["revision"]:
+    if expected_revision is not None and action != "view" and expected_revision != state["revision"]:
         raise ValueError(
             f"Stale liturgy revision: expected {expected_revision}, current {state['revision']}. "
             "View the Liturgy before retrying."
         )
+
+    if action == "view" and not isinstance(state.get("active"), dict):
+        while not isinstance(state.get("active"), dict):
+            state["active"] = _default_board()
+            try:
+                await _save(state)
+            except ValueError:
+                # A concurrent first caller may have won the compare-and-swap.
+                # Reload its board rather than replacing it or hiding later stale writes.
+                state = await _load()
+        return _render(state["active"], state["revision"])
+    if action == "view":
+        return _render(_board(state), state["revision"])
+
+    creating_default = action != "init" and not isinstance(state.get("active"), dict)
+    if creating_default:
+        # The action and first board creation share one compare-and-swap commit.
+        state["active"] = _default_board()
 
     clean_note = _clean(note, "note")
     clean_owner = _clean(owner, "owner")
@@ -454,32 +559,24 @@ async def run(
             item["owner"] = clean_owner
 
     if action == "init":
-        if isinstance(state.get("active"), dict):
+        active = state.get("active")
+        if isinstance(active, dict) and not _is_untouched_default(active):
             raise ValueError("An active Liturgy already exists. Reconcile and close it before creating another.")
         clean_title = _clean(title, "title", required=True)
+        assert clean_title is not None
         normalized_plan = _normalize_plan(plan)
-        now = _now()
-        board: dict[str, Any] = {
-            "id": f"L-{uuid.uuid4().hex[:10]}",
-            "title": clean_title,
-            "goal_objective": _clean(goal_objective, "goal_objective"),
-            "created_at": now,
-            "updated_at": now,
-            "next_task_number": 1,
-            "focused_task_id": None,
-            "phases": [],
-            "events": [],
-        }
-        for phase_name, values in normalized_plan:
-            board["phases"].append(
-                {"name": phase_name, "tasks": [_new_task(board, text) for text in values]}
-            )
-        _record(board, "init", note=clean_note)
+        board = _new_board(
+            clean_title,
+            normalized_plan,
+            goal_objective=_clean(goal_objective, "goal_objective"),
+            note=clean_note,
+        )
         state["active"] = board
-        _save(state)
+        await _save(state)
         return _render(board, state["revision"])
 
     board = _board(state)
+    board["synthetic_default"] = False
 
     if action == "add":
         values = _normalize_tasks(tasks)
@@ -543,7 +640,7 @@ async def run(
             archived["close_note"] = clean_note
         state["history"].append(archived)
         state["active"] = None
-        _save(state)
+        await _save(state)
         return "Liturgy closed.\n\n" + _render_history(state)
 
     else:
@@ -622,5 +719,5 @@ async def run(
         item["updated_at"] = _now()
         _record(board, action, item, previous=previous, note=clean_note)
 
-    _save(state)
+    await _save(state)
     return _render(board, state["revision"])
