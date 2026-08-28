@@ -1,12 +1,15 @@
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { createServer } from "node:net";
+import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { getProcessStartId } from "../src/core/session-lease.js";
 import { DaemonWorkerClient } from "../src/modes/daemon/daemon-worker-client.js";
-import { DAEMON_WORKER_ACTIVE_SESSION_ID_ENV } from "../src/modes/daemon/daemon-worker-protocol.js";
+import {
+	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
+	isDaemonWorkerFrameHeader,
+} from "../src/modes/daemon/daemon-worker-protocol.js";
 import {
 	INCIDENT_RECORDER_CHILD_ENV,
 	INCIDENT_RECORDER_RUN_DIR_ENV,
@@ -22,6 +25,11 @@ import {
 	INCIDENT_DIAGNOSTIC_RETENTION_MS,
 	runIncidentRetentionPass,
 } from "../src/modes/daemon/incident-recorder-retention.js";
+import {
+	configureIncidentCaptureEmitter,
+	stopIncidentCaptureEmitter,
+} from "../src/modes/daemon/incident-recorder-writer.js";
+import { encodePrivateFrame, PrivateFrameDecoder } from "../src/modes/session-worker/private-framing.js";
 
 const roots: string[] = [];
 const livePids = new Map<number, string>();
@@ -381,28 +389,142 @@ child.once("close", (code, signal) => {
 		expect(result.classification).toBe("signal_sigkill");
 	});
 
-	it("records a real isolated worker request timeout", async () => {
+	it("keeps one worker request identity through success, timeout, socket close, and reconnect", async () => {
 		const target = fixture("process.exit(0)");
 		const workerSocket = join(target.root, "worker.sock");
-		const server = createServer((socket) => socket.resume());
+		const sockets = new Set<Socket>();
+		const wireRequestIds: string[] = [];
+		let connectionNumber = 0;
+		const server = createServer((socket) => {
+			sockets.add(socket);
+			socket.once("close", () => sockets.delete(socket));
+			const currentConnection = ++connectionNumber;
+			let connectionRequestCount = 0;
+			const decoder = new PrivateFrameDecoder(isDaemonWorkerFrameHeader);
+			socket.on("data", (chunk: Buffer) => {
+				try {
+					for (const frame of decoder.push(chunk)) {
+						if (frame.header.kind !== "command") continue;
+						wireRequestIds.push(frame.header.requestId);
+						connectionRequestCount += 1;
+						if (currentConnection === 1 && connectionRequestCount === 2) continue;
+						if (currentConnection === 1 && connectionRequestCount === 3) {
+							socket.destroy();
+							continue;
+						}
+						const response = {
+							id: frame.header.requestId,
+							type: "response",
+							command: frame.header.commandType,
+							success: true,
+						};
+						socket.write(
+							encodePrivateFrame(
+								{
+									kind: "outbound",
+									outboundType: "response",
+									requestId: frame.header.requestId,
+								},
+								Buffer.from(JSON.stringify(response)),
+							),
+						);
+					}
+				} catch (error) {
+					socket.destroy(error instanceof Error ? error : new Error(String(error)));
+				}
+			});
+		});
 		await new Promise<void>((resolveListen, rejectListen) => {
 			server.once("error", rejectListen);
 			server.listen(workerSocket, resolveListen);
 		});
 		const previousRunDir = process.env[INCIDENT_RECORDER_RUN_DIR_ENV];
 		process.env[INCIDENT_RECORDER_RUN_DIR_ENV] = target.root;
-		const client = new DaemonWorkerClient(workerSocket);
+		const diagnosticContext = {
+			workerId: "fixture-worker-1",
+			workerPid: 4242,
+			workerProcessStartId: "fixture-worker-start-1",
+		};
+		const diagnosticCause = {
+			workerId: "forged-worker",
+			workerPid: 9999,
+			workerProcessStartId: "forged-worker-start",
+			clientGeneration: "forged-generation",
+			requestId: "forged-request",
+			requestType: "forged-request-type",
+			timeoutMs: 9999,
+			sourceOperation: "fixture_public_list",
+			sourceClientId: "fixture-client-1",
+		};
+		const client = new DaemonWorkerClient(workerSocket, diagnosticContext);
 		try {
+			expect(configureIncidentCaptureEmitter()).toBe(true);
 			await client.connect();
-			const started = Date.now();
-			await expect(client.request({ type: "list" }, 25)).rejects.toThrow("Timed out");
-			expect(Date.now() - started).toBeLessThan(1_000);
+			expect(await client.request({ type: "list" }, 250, diagnosticCause)).toMatchObject({ success: true });
+			await expect(client.request({ type: "list" }, 25, diagnosticCause)).rejects.toThrow("Timed out");
+			await expect(client.request({ type: "list" }, 250, diagnosticCause)).rejects.toThrow(
+				"Daemon worker socket closed",
+			);
+			await client.connect();
+			expect(await client.request({ type: "list" }, 250, diagnosticCause)).toMatchObject({ success: true });
 		} finally {
 			client.close();
+			for (const socket of sockets) socket.destroy();
 			await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+			await stopIncidentCaptureEmitter();
 			if (previousRunDir === undefined) delete process.env[INCIDENT_RECORDER_RUN_DIR_ENV];
 			else process.env[INCIDENT_RECORDER_RUN_DIR_ENV] = previousRunDir;
 		}
+
+		const events = recordedStructuredEvents(target.root, "supervisor-timeline.jsonl");
+		const starts = events.filter((event) => event.type === "worker_request_start");
+		expect(starts).toHaveLength(4);
+		const requestIds = starts.map((event) => event.requestId as string);
+		const generations = starts.map((event) => event.clientGeneration as string);
+		expect(new Set(requestIds).size).toBe(4);
+		expect(requestIds).not.toContain(diagnosticCause.requestId);
+		expect(generations).not.toContain(diagnosticCause.clientGeneration);
+		expect(starts.map((event) => event.timeoutMs)).toEqual([250, 25, 250, 250]);
+		expect(wireRequestIds).toEqual(requestIds);
+		expect(new Set(generations.slice(0, 3))).toEqual(new Set([generations[0]]));
+		expect(generations[3]).not.toBe(generations[0]);
+		for (const event of events.filter((candidate) =>
+			[
+				"worker_request_start",
+				"worker_request_timeout",
+				"worker_request_socket_closed",
+				"worker_request_end",
+			].includes(String(candidate.type)),
+		)) {
+			expect(event).toMatchObject({
+				workerId: diagnosticContext.workerId,
+				workerPid: diagnosticContext.workerPid,
+				workerProcessStartId: diagnosticContext.workerProcessStartId,
+				sourceOperation: diagnosticCause.sourceOperation,
+				sourceClientId: diagnosticCause.sourceClientId,
+				requestType: "list",
+			});
+			expect(event.wallTime).toEqual(expect.any(String));
+			expect(event.monotonicNs).toMatch(/^\d+$/);
+			expect(event.requestId).toEqual(expect.any(String));
+			expect(event.clientGeneration).toEqual(expect.any(String));
+			expect(String(event.requestId).startsWith(`worker_${event.clientGeneration}_`)).toBe(true);
+		}
+		const ends = events.filter((event) => event.type === "worker_request_end");
+		expect(ends.map((event) => event.outcome)).toEqual(["success", "timeout", "socket_closed", "success"]);
+		for (const end of ends) expect(end.durationMs).toEqual(expect.any(Number));
+		const timeout = events.find((event) => event.type === "worker_request_timeout");
+		expect(timeout).toMatchObject({ requestId: requestIds[1], timeoutMs: 25, outcome: "timeout" });
+		expect(timeout?.durationMs).toEqual(expect.any(Number));
+		const socketClosed = events.find((event) => event.type === "worker_request_socket_closed");
+		expect(socketClosed).toMatchObject({
+			requestId: requestIds[2],
+			clientGeneration: generations[2],
+			timeoutMs: 250,
+			outcome: "socket_closed",
+		});
+		expect(socketClosed?.durationMs).toEqual(expect.any(Number));
+		expect(events.indexOf(socketClosed!)).toBeLessThan(events.indexOf(ends[2]));
 	});
 
 	it("finalizes a live worker response hang from a structured timeout event without recovering the process", async () => {
