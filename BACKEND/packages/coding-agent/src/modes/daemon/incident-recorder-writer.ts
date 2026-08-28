@@ -33,6 +33,7 @@ const STRING_FIELDS = new Set([
 	"disposition",
 	"event",
 	"forkserverProcessStartId",
+	"kernelIdentityLivenessResult",
 	"kernelProcessStartId",
 	"name",
 	"newState",
@@ -49,6 +50,7 @@ const STRING_FIELDS = new Set([
 	"recoveryId",
 	"requestId",
 	"requestType",
+	"requestedKillSignal",
 	"role",
 	"runId",
 	"sessionId",
@@ -64,6 +66,7 @@ const STRING_FIELDS = new Set([
 	"trigger",
 	"triggerRequestId",
 	"workerId",
+	"workerIdentityLivenessResult",
 	"workerProcessStartId",
 ]);
 const NON_CAUSAL_TYPES = new Set([

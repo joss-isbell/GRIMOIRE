@@ -2,6 +2,12 @@ import { EventEmitter } from "node:events";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
+
+const incidentRecorder = vi.hoisted(() => ({
+	emitIncidentDerived: vi.fn(() => ({ accepted: true as const, occurrenceId: "test-occurrence" })),
+}));
+vi.mock("../src/modes/daemon/incident-recorder-writer.js", () => incidentRecorder);
+
 import { KernelManager } from "../src/core/kernel/index.js";
 
 type TestMessage = {
@@ -12,7 +18,9 @@ type TestMessage = {
 };
 
 type ShutdownInternals = {
-	state: "running";
+	state: "idle" | "running" | "shutdown";
+	startGeneration: number;
+	kernelStderr: string;
 	connection: { key: string };
 	control: { send: (frames: Buffer[]) => Promise<void>; close: () => void };
 	kernel: EventEmitter & {
@@ -139,5 +147,154 @@ describe("KernelManager graceful shutdown", () => {
 		expect(match).not.toBeNull();
 		// +1s dispatch slack in mcp.py close(); the sum must undercut the host's 5s kill deadline.
 		expect((Number(match![1]) + 1) * 1000).toBeLessThan(5000);
+	});
+});
+
+describe("KernelManager programmatic shutdown transitions", () => {
+	it("observes each shutdown without changing repeated cleanup or return behavior", async () => {
+		incidentRecorder.emitIncidentDerived.mockClear();
+		const { manager, internals } = configuredManager((state) => {
+			state.kernel.exitCode = 0;
+			state.kernel.emit("exit", 0, null);
+		});
+		const kernel = internals.kernel;
+		incidentRecorder.emitIncidentDerived.mockImplementationOnce((_source, _type, fields) => {
+			expect(internals.state).toBe("running");
+			expect(internals.kernel).toBe(kernel);
+			expect(fields).toMatchObject({
+				reason: "shutdown",
+				callerCategory: "programmatic_api",
+				oldState: "running",
+				newState: "shutdown",
+				sessionId: "unavailable",
+				activeSessionId: "unavailable",
+				toolCallId: "unavailable",
+				workerPid: process.pid,
+				startGeneration: 0,
+				requestedKillSignal: "SIGTERM",
+			});
+			return { accepted: true, occurrenceId: "first" };
+		});
+
+		await expect(manager.shutdown()).resolves.toBe(true);
+		await expect(manager.shutdown()).resolves.toBe(true);
+
+		expect(internals.startGeneration).toBe(2);
+		expect(kernel.kill).toHaveBeenCalledTimes(1);
+		expect(kernel.kill).toHaveBeenCalledWith("SIGTERM");
+		expect(incidentRecorder.emitIncidentDerived).toHaveBeenCalledTimes(2);
+		expect(incidentRecorder.emitIncidentDerived.mock.calls[1]?.[2]).toMatchObject({
+			reason: "shutdown",
+			oldState: "shutdown",
+			newState: "shutdown",
+			startGeneration: 1,
+		});
+	});
+
+	it("preserves concurrent shutdown generation ownership and cleanup result", async () => {
+		incidentRecorder.emitIncidentDerived.mockClear();
+		let finishSend: (() => void) | undefined;
+		const sendBlocked = new Promise<void>((resolve) => {
+			finishSend = resolve;
+		});
+		const { manager, internals } = configuredManager(() => sendBlocked);
+		const kernel = internals.kernel;
+
+		const firstShutdown = manager.shutdown();
+		await new Promise((resolve) => globalThis.setTimeout(resolve, 0));
+		await expect(manager.shutdown()).resolves.toBe(true);
+		finishSend?.();
+		kernel.exitCode = 0;
+		kernel.emit("exit", 0, null);
+		await expect(firstShutdown).resolves.toBe(false);
+
+		expect(internals.startGeneration).toBe(1);
+		expect(kernel.kill).toHaveBeenCalledTimes(1);
+		expect(incidentRecorder.emitIncidentDerived).toHaveBeenCalledTimes(2);
+		expect(incidentRecorder.emitIncidentDerived.mock.calls.map((call) => call[2])).toEqual([
+			expect.objectContaining({ reason: "shutdown", oldState: "running", startGeneration: 0 }),
+			expect.objectContaining({ reason: "shutdown", oldState: "shutdown", startGeneration: 0 }),
+		]);
+	});
+
+	it("does not observe a snapshot shutdown superseded before its transition", async () => {
+		incidentRecorder.emitIncidentDerived.mockClear();
+		const { manager, internals } = configuredManager(() => {});
+		const mutable = internals as ShutdownInternals & { flushSnapshotForDispose: () => Promise<void> };
+		mutable.flushSnapshotForDispose = vi.fn(async () => {
+			mutable.startGeneration++;
+		});
+
+		await expect(manager.shutdown({ snapshot: true })).resolves.toBe(false);
+
+		expect(internals.state).toBe("running");
+		expect(incidentRecorder.emitIncidentDerived).not.toHaveBeenCalled();
+	});
+
+	it("preserves restart shutdown-reset-start sequencing with a restart observation", async () => {
+		incidentRecorder.emitIncidentDerived.mockClear();
+		const { manager, internals } = configuredManager((state) => {
+			state.kernel.exitCode = 0;
+			state.kernel.emit("exit", 0, null);
+		});
+		internals.kernelStderr = "prior stderr";
+		const start = vi.spyOn(manager, "start").mockImplementation(async () => {
+			expect(internals.state).toBe("idle");
+			expect(internals.kernelStderr).toBe("");
+			expect(internals.startGeneration).toBe(1);
+		});
+
+		await manager.restart();
+
+		expect(start).toHaveBeenCalledTimes(1);
+		expect(incidentRecorder.emitIncidentDerived).toHaveBeenCalledTimes(1);
+		expect(incidentRecorder.emitIncidentDerived.mock.calls[0]?.[2]).toMatchObject({
+			reason: "restart",
+			oldState: "running",
+			requestedKillSignal: "SIGTERM",
+		});
+	});
+
+	it("observes kill without changing repeated cleanup or signal behavior", async () => {
+		incidentRecorder.emitIncidentDerived.mockClear();
+		const { manager, internals } = configuredManager(() => {});
+		const kernel = internals.kernel;
+
+		await manager.kill();
+		await manager.kill();
+
+		expect(internals.startGeneration).toBe(2);
+		expect(kernel.kill).toHaveBeenCalledTimes(1);
+		expect(kernel.kill).toHaveBeenCalledWith("SIGKILL");
+		expect(incidentRecorder.emitIncidentDerived.mock.calls.map((call) => call[2])).toEqual([
+			expect.objectContaining({ reason: "kill", oldState: "running", requestedKillSignal: "SIGKILL" }),
+			expect.objectContaining({ reason: "kill", oldState: "shutdown", requestedKillSignal: "SIGKILL" }),
+		]);
+	});
+
+	it("observes dispose and disposeSync without changing repeated cleanup or signals", async () => {
+		incidentRecorder.emitIncidentDerived.mockClear();
+		const asyncFixture = configuredManager(() => {});
+		const syncFixture = configuredManager(() => {});
+		const asyncKernel = asyncFixture.internals.kernel;
+		const syncKernel = syncFixture.internals.kernel;
+
+		await asyncFixture.manager.dispose();
+		await asyncFixture.manager.dispose();
+		syncFixture.manager.disposeSync();
+		syncFixture.manager.disposeSync();
+
+		expect(asyncFixture.internals.startGeneration).toBe(2);
+		expect(syncFixture.internals.startGeneration).toBe(2);
+		expect(asyncKernel.kill).toHaveBeenCalledTimes(1);
+		expect(asyncKernel.kill).toHaveBeenCalledWith("SIGTERM");
+		expect(syncKernel.kill).toHaveBeenCalledTimes(1);
+		expect(syncKernel.kill).toHaveBeenCalledWith("SIGTERM");
+		expect(incidentRecorder.emitIncidentDerived.mock.calls.map((call) => call[2])).toEqual([
+			expect.objectContaining({ reason: "dispose", oldState: "running", requestedKillSignal: "SIGTERM" }),
+			expect.objectContaining({ reason: "dispose", oldState: "shutdown", requestedKillSignal: "SIGTERM" }),
+			expect.objectContaining({ reason: "dispose_sync", oldState: "running", requestedKillSignal: "SIGTERM" }),
+			expect.objectContaining({ reason: "dispose_sync", oldState: "shutdown", requestedKillSignal: "SIGTERM" }),
+		]);
 	});
 });
