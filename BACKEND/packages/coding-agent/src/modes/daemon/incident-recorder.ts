@@ -18,7 +18,6 @@ import {
 	readFileSync,
 	readlinkSync,
 	readSync,
-	realpathSync,
 	renameSync,
 	rmSync,
 	statSync,
@@ -28,7 +27,6 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
-import { Readable } from "node:stream";
 import {
 	type CliSubprocessLaunchSpec,
 	createCliSubprocessEnv,
@@ -63,12 +61,6 @@ import {
 import {
 	configureIncidentCaptureEmitter,
 	emitIncidentDerived,
-	INCIDENT_RECORDER_CAPTURE_FD,
-	INCIDENT_RECORDER_CAPTURE_FD_ENV,
-	INCIDENT_RECORDER_CAPTURE_OWNER_PID_ENV,
-	INCIDENT_RECORDER_CAPTURE_OWNER_START_ID_ENV,
-	INCIDENT_RECORDER_ROOT_FD,
-	INCIDENT_RECORDER_ROOT_FD_ENV,
 	IncidentRecorderWriter,
 	stopIncidentCaptureEmitter,
 	stopIncidentCaptureEmitterOnExit,
@@ -857,7 +849,12 @@ function appendStructuredCausalEvent(
 	type: string,
 	fields: Record<string, unknown>,
 ): void {
-	const causalSource: RawApplicationSource = source === "supervisor-events" ? "supervisor-events" : "recorder-events";
+	const causalSource: RawApplicationSource =
+		source === "supervisor-events"
+			? "supervisor-events"
+			: source === "loss-accounting"
+				? "loss-accounting"
+				: "recorder-events";
 	try {
 		writeRawLinesSync(
 			loadRawSegmentState(runDir, causalSource),
@@ -872,19 +869,53 @@ export function recordIncidentRecorderCausalEvent(
 	runDir: string,
 	type: string,
 	fields: Record<string, unknown> = {},
-): void {
-	if (!/^[a-z][a-z0-9_]{0,79}$/.test(type)) throw new Error("Invalid causal incident event type");
-	const line = `${JSON.stringify({ type, ...nowFields(), pid: process.pid, ...fields })}\n`;
-	const descriptor = openSync(
-		join(runDir, EVENT_FILE_NAME),
-		fsConstants.O_WRONLY | fsConstants.O_APPEND | fsConstants.O_CREAT | fsConstants.O_NOFOLLOW,
-		0o600,
-	);
+): boolean {
+	if (!/^[a-z][a-z0-9_]{0,79}$/.test(type)) return false;
+	let descriptor: number | undefined;
 	try {
-		writeSync(descriptor, line);
+		const observed = nowFields();
+		const source =
+			fields.source === "supervisor-events"
+				? "supervisor-events"
+				: fields.source === "loss-accounting"
+					? "loss-accounting"
+					: "recorder-events";
+		const producerPid =
+			typeof fields.producerPid === "number" && Number.isSafeInteger(fields.producerPid)
+				? fields.producerPid
+				: process.pid;
+		const producerProcessStartId =
+			typeof fields.producerProcessStartId === "string"
+				? fields.producerProcessStartId
+				: getProcessStartId(producerPid);
+		const trustedEnvelope = {
+			type,
+			...observed,
+			pid: process.pid,
+			source,
+			producerPid,
+			producerProcessStartId,
+			...(typeof fields.occurrenceId === "string" ? { occurrenceId: fields.occurrenceId } : {}),
+		};
+		let bytes = Buffer.from(`${JSON.stringify({ ...fields, ...trustedEnvelope })}\n`, "utf8");
+		if (bytes.length > 3584)
+			bytes = Buffer.from(`${JSON.stringify({ ...trustedEnvelope, fieldsTruncated: true })}\n`, "utf8");
+		if (bytes.length > 3584) return false;
+		descriptor = openSync(
+			join(runDir, EVENT_FILE_NAME),
+			fsConstants.O_WRONLY | fsConstants.O_APPEND | fsConstants.O_CREAT | fsConstants.O_NOFOLLOW,
+			0o600,
+		);
+		if (writeSync(descriptor, bytes) !== bytes.length) return false;
 		fsyncSync(descriptor);
+		return true;
+	} catch {
+		return false;
 	} finally {
-		closeSync(descriptor);
+		if (descriptor !== undefined)
+			try {
+				closeSync(descriptor);
+			} catch {}
 	}
 }
 
@@ -2446,7 +2477,8 @@ export async function recordSupervisorProcess(options: RecordProcessOptions): Pr
 		runToken,
 		bootId,
 		wrapperStartId,
-		onStructuredEvent: (source, type, fields) => appendStructuredCausalEvent(runDir, source, type, fields),
+		onStructuredEvent: (source, type, fields) =>
+			recordIncidentRecorderCausalEvent(runDir, type, { source, ...fields }),
 	});
 	await orderedWriter.start();
 	activeOrderedWriter = { runDir, writer: orderedWriter };
@@ -2456,16 +2488,10 @@ export async function recordSupervisorProcess(options: RecordProcessOptions): Pr
 		[INCIDENT_RECORDER_CHILD_ENV]: "1",
 		[INCIDENT_RECORDER_RUN_DIR_ENV]: runDir,
 		[INCIDENT_RECORDER_SOCKET_ENV]: options.socketPath,
-		[INCIDENT_RECORDER_CAPTURE_FD_ENV]: String(INCIDENT_RECORDER_CAPTURE_FD),
-		[INCIDENT_RECORDER_ROOT_FD_ENV]: String(INCIDENT_RECORDER_ROOT_FD),
 		[INCIDENT_RECORDER_RUN_ID_ENV]: runId,
 		[INCIDENT_RECORDER_RUN_TOKEN_ENV]: runToken,
 		...(nodeFatalReportsEnabled ? { NODE_REPORT_DIRECTORY: join(runDir, "raw-reports") } : {}),
 	});
-	// This wrapper may itself be a captured descendant. The new supervisor is the
-	// sole owner of its newly-created fd4 channel and must claim it after exec.
-	delete environment[INCIDENT_RECORDER_CAPTURE_OWNER_PID_ENV];
-	delete environment[INCIDENT_RECORDER_CAPTURE_OWNER_START_ID_ENV];
 	const launch = nodeFatalReportsEnabled
 		? {
 				...options.launch,
@@ -2501,19 +2527,12 @@ export async function recordSupervisorProcess(options: RecordProcessOptions): Pr
 	writePrivateJson(join(runDir, "launch.json"), launchSummary);
 	orderedWriter.recordDerived("recorder-events", "recorder_launch", launchSummary);
 	let child: ChildProcess;
-	let recorderRootDescriptor: number | undefined;
 	try {
-		const canonicalRecorderRoot = realpathSync(join(options.agentDir, "incident-recorder"));
-		recorderRootDescriptor = openSync(
-			canonicalRecorderRoot,
-			fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
-		);
 		child = spawn(launch.command, launch.args, {
 			cwd,
 			env: environment,
-			stdio: ["inherit", "inherit", "inherit", "ignore", "pipe", recorderRootDescriptor],
+			stdio: ["inherit", "inherit", "inherit"],
 		});
-		// fd4 is diagnostic-only. fd5 pins the actual canonical recorder root.
 	} catch (error) {
 		appendRunEvent(runDir, { type: "recorder_spawn_error", error });
 		await orderedWriter.stop().catch(() => undefined);
@@ -2526,13 +2545,8 @@ export async function recordSupervisorProcess(options: RecordProcessOptions): Pr
 		});
 		rmSync(join(runDir, ACTIVE_MARKER_FILE_NAME), { force: true });
 		throw error;
-	} finally {
-		if (recorderRootDescriptor !== undefined) {
-			try {
-				closeSync(recorderRootDescriptor);
-			} catch {}
-		}
 	}
+
 	const pid = child.pid;
 	if (!pid) {
 		// A failed spawn reports ENOENT asynchronously even though no target PID
@@ -2559,14 +2573,6 @@ export async function recordSupervisorProcess(options: RecordProcessOptions): Pr
 		processStartId: processStartId ?? "",
 		socketPath: options.socketPath,
 	});
-	const captureChannel = child.stdio[INCIDENT_RECORDER_CAPTURE_FD];
-	if (captureChannel instanceof Readable) orderedWriter.attachCaptureStream(captureChannel);
-	else
-		appendRunEvent(runDir, {
-			type: "capture_channel_unavailable",
-			fd: INCIDENT_RECORDER_CAPTURE_FD,
-			reason: "missing-pipe",
-		});
 	orderedWriter.recordDerived("recorder-events", "supervisor_stdio_source_unavailable", {
 		stdout: "inherited-to-preserve-original-stream-and-tty-semantics",
 		stderr: "inherited-to-preserve-original-stream-and-tty-semantics",

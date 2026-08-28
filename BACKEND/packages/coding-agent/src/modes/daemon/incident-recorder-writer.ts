@@ -1,39 +1,9 @@
-import { type ChildProcess, spawn } from "node:child_process";
-import { createHash } from "node:crypto";
-import {
-	closeSync,
-	constants as fsConstants,
-	fstatSync,
-	fsyncSync,
-	lstatSync,
-	openSync,
-	readFileSync,
-	readSync,
-	unlinkSync,
-	write,
-	writeFileSync,
-} from "node:fs";
-import type { Readable as ReadableStream } from "node:stream";
-import {
-	decodeIncidentRecorderFrame,
-	encodeIncidentRecorderFrame,
-	INCIDENT_RECORDER_FRAME_FLAGS,
-	INCIDENT_RECORDER_PROTOCOL_HEADER_BYTES,
-	INCIDENT_RECORDER_PROTOCOL_MAX_OCCURRENCE_BYTES,
-	INCIDENT_RECORDER_PROTOCOL_MAX_PAYLOAD_BYTES,
-	INCIDENT_RECORDER_RUN_ID_ENV,
-	INCIDENT_RECORDER_RUN_TOKEN_ENV,
-	type IncidentRecorderEncodedFrame,
-	type IncidentRecorderPayloadKind,
-	newIncidentRecorderIdentity,
-	validateIncidentRecorderFrameFlags,
-} from "./incident-recorder-protocol.js";
-import {
-	encodeIncidentRecorderTransportPacket,
-	type IncidentRecorderTransportCorruption,
-	IncidentRecorderTransportDecoder,
-	IncidentRecorderTransportSequenceTracker,
-} from "./incident-recorder-transport.js";
+import { randomUUID } from "node:crypto";
+import { closeSync, constants as fsConstants, fstatSync, lstatSync, openSync, write } from "node:fs";
+import { join } from "node:path";
+import type { Readable } from "node:stream";
+import { getProcessStartId } from "../../core/session-lease.js";
+import { INCIDENT_RECORDER_RUN_DIR_ENV } from "./incident-recorder-env.js";
 
 export const INCIDENT_RECORDER_CAPTURE_FD_ENV = "PRIME_INCIDENT_RECORDER_CAPTURE_FD";
 export const INCIDENT_RECORDER_CAPTURE_OWNER_PID_ENV = "PRIME_INCIDENT_RECORDER_CAPTURE_OWNER_PID";
@@ -41,1082 +11,221 @@ export const INCIDENT_RECORDER_CAPTURE_OWNER_START_ID_ENV = "PRIME_INCIDENT_RECO
 export const INCIDENT_RECORDER_CAPTURE_FD = 4;
 export const INCIDENT_RECORDER_ROOT_FD_ENV = "PRIME_INCIDENT_RECORDER_ROOT_FD";
 export const INCIDENT_RECORDER_ROOT_FD = 5;
-export const INCIDENT_RECORDER_CAPTURE_OWNER_CLAIM_FILE = ".capture-owner-v1";
-export const INCIDENT_RECORDER_EMITTER_MAX_BYTES = 8 * 1024 * 1024;
-export const INCIDENT_RECORDER_EMITTER_CHUNK_BYTES = INCIDENT_RECORDER_PROTOCOL_MAX_PAYLOAD_BYTES;
-export const INCIDENT_RECORDER_JOURNAL_NAMESPACE = "grimoire";
-export const INCIDENT_RECORDER_JOURNAL_IDENTIFIER = "prime-agent-raw-v1";
-export const INCIDENT_RECORDER_JOURNAL_LINE_MAX_BYTES = 48 * 1024;
 
-const CONTROL_RESERVE_BYTES = 64 * 1024;
-const JOURNAL_START_DEADLINE_MS = 150;
-const JOURNAL_RECONNECT_MS = 1_000;
-const SERVICE_EMITTER_MAX_BYTES = 256 * 1024;
-const SERVICE_EMITTER_MAX_IDENTITIES = 32;
-// One tombstone per occurrence that can be admitted inside the producer's bounded
-// transport window. Real old-sequence duplicates remain fenced by sequence state
-// after this LRU rolls over.
-const CAPTURE_OCCURRENCE_TOMBSTONE_MAX = Math.ceil(
-	INCIDENT_RECORDER_EMITTER_MAX_BYTES / (INCIDENT_RECORDER_PROTOCOL_HEADER_BYTES + 3 * 255 + 4 * 1024),
-);
-
-type Scalar = string | number | boolean | null;
-type ScalarMetadata = Readonly<Record<string, Scalar>>;
-type CaptureSource = string;
-
-// The producer hot path only reads this fixed set of data properties. It never walks
-// arbitrary diagnostic objects or invokes getters supplied by product code.
-const DIAGNOSTIC_SCALAR_KEYS = [
-	"agentId",
-	"attemptedBytes",
-	"attemptedRecords",
-	"bootId",
-	"bounds",
-	"bytes",
-	"bytesSinceLastMarker",
-	"cadenceMs",
-	"category",
-	"childPid",
-	"clientId",
+const EVENT_FILE_NAME = "timeline.jsonl";
+const MAX_EVENT_BYTES = 3584;
+const MAX_QUEUE_EVENTS = 64;
+const SENSITIVE_KEY =
+	/(?:token|secret|password|credential|authorization|cookie|prompt|payload|content|body|argv|environment)/i;
+const STRING_FIELDS = new Set([
+	"classification",
 	"code",
-	"command",
-	"commandId",
 	"commandType",
-	"connectionId",
-	"descriptorDir",
-	"diagnosticOnly",
-	"durationMs",
-	"drainTimeoutLostBytes",
-	"drainTimeoutLostRecords",
-	"drainTimeoutUncertainBytes",
-	"drainTimeoutUncertainRecords",
-	"encoding",
-	"fd",
-	"incompleteBytes",
-	"launchBytes",
-	"launchOccurrenceId",
-	"lostBytes",
-	"lostRecords",
-	"message",
-	"monotonicNs",
 	"name",
-	"nodeFatalReportsEnabled",
-	"observedMonotonicNs",
-	"observedWallTime",
-	"originalPath",
+	"origin",
 	"outcome",
 	"phase",
-	"pid",
 	"processStartId",
-	"producerOccurrenceId",
-	"provider",
+	"producerProcessStartId",
 	"reason",
-	"recordsSinceLastMarker",
-	"registrationOnly",
-	"runId",
-	"runName",
-	"signal",
-	"socketExists",
-	"socketPath",
-	"source",
-	"transportCorruptPackets",
-	"transportCorruptPacketsSinceLastMarker",
-	"transportCorruptWireBytes",
-	"transportCorruptWireBytesSinceLastMarker",
-	"transportMissingPackets",
-	"transportMissingPacketsSinceLastMarker",
-	"transportSequenceGapEvents",
-	"transportSequenceGapEventsSinceLastMarker",
-	"protocolClientId",
 	"requestId",
-	"sourcePath",
-	"sourceProducerId",
+	"requestType",
+	"runId",
+	"signal",
+	"socketStatus",
 	"state",
-	"targetPid",
+	"syscall",
 	"targetProcessStartId",
-	"thresholdMs",
-	"type",
-	"wallTime",
 	"workerId",
-	"wrapperPid",
-	"wrapperStartId",
-] as const;
+]);
+const NON_CAUSAL_TYPES = new Set([
+	"application_source_reference",
+	"supervisor_log_record",
+	"daemon_socket_outbound_write_outcome",
+	"daemon_socket_outbound_attempt_result",
+	"worker_transport_outbound_write_outcome",
+]);
+const RESERVED_FIELDS = new Set([
+	"type",
+	"source",
+	"wallTime",
+	"monotonicNs",
+	"pid",
+	"occurrenceId",
+	"producerPid",
+	"producerProcessStartId",
+]);
 
-function linuxIdentity(path: string, pattern: RegExp): string | undefined {
-	if (process.platform !== "linux") return undefined;
-	try {
-		const value = readFileSync(path, "utf8").trim();
-		return pattern.test(value) ? value : undefined;
-	} catch {
-		return undefined;
+type CaptureSource = "recorder-events" | "supervisor-events" | "recorder-control" | "loss-accounting" | string;
+type EmitterPhase = "idle" | "running" | "stopping" | "stopped" | "failed";
+
+export type IncidentRecorderAdmission =
+	| { accepted: true; occurrenceId: string }
+	| { accepted: false; occurrenceId: string; reason: string };
+
+export interface IncidentRecorderFinalizationExpectation {
+	supervisorExitOccurrenceId: string;
+	durableStructuredCapture: true;
+}
+
+function safeValue(key: string, value: unknown, depth = 0): unknown {
+	if (value === null || typeof value === "boolean") return value;
+	if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
+	if (typeof value === "string") {
+		if (!STRING_FIELDS.has(key) || !/^[A-Za-z0-9_.:+-]{1,256}$/.test(value)) return undefined;
+		return value;
 	}
-}
-
-function linuxProcessStartId(pid: number): string | undefined {
-	if (!Number.isSafeInteger(pid) || pid <= 0 || process.platform !== "linux") return undefined;
-	try {
-		const value = readFileSync(`/proc/${pid}/stat`, "utf8");
-		const commandEnd = value.lastIndexOf(")");
-		const startTime = value.slice(commandEnd + 2).split(" ")[19];
-		return startTime ? `proc:${startTime}` : undefined;
-	} catch {
-		return undefined;
-	}
-}
-
-interface DescriptorIdentity {
-	device: string;
-	inode: string;
-}
-
-interface CaptureOwnerClaim {
-	schemaVersion: 1;
-	runId: string;
-	runToken: string;
-	machineId: string;
-	bootId: string;
-	pid: number;
-	processStartId: string;
-	ownerNonce: string;
-	rootDevice: string;
-	rootInode: string;
-	captureDevice: string;
-	captureInode: string;
-}
-
-const CAPTURE_OWNER_CLAIM_MAX_BYTES = 4 * 1024;
-
-function descriptorIdentity(fd: number, expected: "directory" | "capture"): DescriptorIdentity | undefined {
-	try {
-		const stat = fstatSync(fd, { bigint: true });
-		if (expected === "directory" && !stat.isDirectory()) return undefined;
-		// fd4 is currently a pipe. Keep the capability check transport-neutral, but
-		// never accept a directory as the capture channel.
-		if (expected === "capture" && stat.isDirectory()) return undefined;
-		return { device: stat.dev.toString(), inode: stat.ino.toString() };
-	} catch {
-		return undefined;
-	}
-}
-
-function sameDescriptorIdentity(actual: DescriptorIdentity | undefined, device: string, inode: string): boolean {
-	return actual?.device === device && actual.inode === inode;
-}
-
-export function incidentRecorderCaptureOwnerClaimFileName(fd = INCIDENT_RECORDER_CAPTURE_FD): string | undefined {
-	const identity = descriptorIdentity(fd, "capture");
-	return identity
-		? `${INCIDENT_RECORDER_CAPTURE_OWNER_CLAIM_FILE}.${identity.device}.${identity.inode}.json`
-		: undefined;
-}
-
-function readCaptureOwnerClaim(path: string): Partial<CaptureOwnerClaim> | undefined {
-	let descriptor: number | undefined;
-	try {
-		const before = lstatSync(path, { bigint: true });
-		if (
-			!before.isFile() ||
-			before.isSymbolicLink() ||
-			before.nlink !== 1n ||
-			before.size <= 0n ||
-			before.size > BigInt(CAPTURE_OWNER_CLAIM_MAX_BYTES)
-		)
-			return undefined;
-		if (typeof process.getuid === "function" && before.uid !== BigInt(process.getuid())) return undefined;
-		if ((before.mode & 0o077n) !== 0n) return undefined;
-		descriptor = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-		const opened = fstatSync(descriptor, { bigint: true });
-		if (
-			!opened.isFile() ||
-			opened.nlink !== 1n ||
-			opened.dev !== before.dev ||
-			opened.ino !== before.ino ||
-			opened.size !== before.size
-		)
-			return undefined;
-		if (typeof process.getuid === "function" && opened.uid !== BigInt(process.getuid())) return undefined;
-		if ((opened.mode & 0o077n) !== 0n) return undefined;
-		const bytes = Buffer.alloc(Number(opened.size) + 1);
-		let offset = 0;
-		while (offset < bytes.length) {
-			const count = readSync(descriptor, bytes, offset, bytes.length - offset, offset);
-			if (count === 0) break;
-			offset += count;
-		}
-		if (offset !== Number(opened.size) || offset > CAPTURE_OWNER_CLAIM_MAX_BYTES) return undefined;
-		const after = fstatSync(descriptor, { bigint: true });
-		if (after.dev !== opened.dev || after.ino !== opened.ino || after.nlink !== 1n || after.size !== opened.size)
-			return undefined;
-		if (typeof process.getuid === "function" && after.uid !== BigInt(process.getuid())) return undefined;
-		if ((after.mode & 0o077n) !== 0n) return undefined;
-		return JSON.parse(bytes.subarray(0, offset).toString("utf8")) as Partial<CaptureOwnerClaim>;
-	} catch {
-		return undefined;
-	} finally {
-		if (descriptor !== undefined) {
-			try {
-				closeSync(descriptor);
-			} catch {}
-		}
-	}
-}
-
-class CaptureOwnerGuard {
-	constructor(
-		private readonly path: string,
-		private readonly expected: CaptureOwnerClaim,
-	) {}
-
-	validCheap(): boolean {
-		return (
-			process.pid === this.expected.pid &&
-			sameDescriptorIdentity(
-				descriptorIdentity(INCIDENT_RECORDER_ROOT_FD, "directory"),
-				this.expected.rootDevice,
-				this.expected.rootInode,
-			) &&
-			sameDescriptorIdentity(
-				descriptorIdentity(INCIDENT_RECORDER_CAPTURE_FD, "capture"),
-				this.expected.captureDevice,
-				this.expected.captureInode,
-			)
-		);
-	}
-
-	validAdmission(): boolean {
-		if (!this.validCheap() || linuxProcessStartId(process.pid) !== this.expected.processStartId) return false;
-		const value = readCaptureOwnerClaim(this.path);
-		return (
-			value?.schemaVersion === this.expected.schemaVersion &&
-			value.runId === this.expected.runId &&
-			value.runToken === this.expected.runToken &&
-			value.machineId === this.expected.machineId &&
-			value.bootId === this.expected.bootId &&
-			value.pid === this.expected.pid &&
-			value.processStartId === this.expected.processStartId &&
-			value.ownerNonce === this.expected.ownerNonce &&
-			value.rootDevice === this.expected.rootDevice &&
-			value.rootInode === this.expected.rootInode &&
-			value.captureDevice === this.expected.captureDevice &&
-			value.captureInode === this.expected.captureInode
-		);
-	}
-
-	release(): boolean {
-		if (!this.validAdmission()) return false;
-		try {
-			const stat = lstatSync(this.path, { bigint: true });
-			if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1n) return false;
-			if (typeof process.getuid === "function" && stat.uid !== BigInt(process.getuid())) return false;
-			if ((stat.mode & 0o077n) !== 0n || !this.validAdmission()) return false;
-			unlinkSync(this.path);
-			fsyncSync(INCIDENT_RECORDER_ROOT_FD);
-			return true;
-		} catch {
-			return false;
-		}
-	}
-}
-
-function claimCaptureOwner(runId: string, runToken: string): CaptureOwnerGuard | undefined {
-	if (process.platform !== "linux") return undefined;
-	const processStartId = linuxProcessStartId(process.pid);
-	const machineId = linuxIdentity("/etc/machine-id", /^[0-9a-f]{32}$/i);
-	const bootId = linuxIdentity("/proc/sys/kernel/random/boot_id", /^[0-9a-f-]{36}$/i);
-	const root = descriptorIdentity(INCIDENT_RECORDER_ROOT_FD, "directory");
-	const capture = descriptorIdentity(INCIDENT_RECORDER_CAPTURE_FD, "capture");
-	if (!processStartId || !machineId || !bootId || !root || !capture) return undefined;
-	const claim: CaptureOwnerClaim = {
-		schemaVersion: 1,
-		runId,
-		runToken,
-		machineId,
-		bootId,
-		pid: process.pid,
-		processStartId,
-		ownerNonce: newIncidentRecorderIdentity(),
-		rootDevice: root.device,
-		rootInode: root.inode,
-		captureDevice: capture.device,
-		captureInode: capture.inode,
-	};
-	const claimFileName = incidentRecorderCaptureOwnerClaimFileName();
-	if (!claimFileName) return undefined;
-	const path = `/proc/self/fd/${INCIDENT_RECORDER_ROOT_FD}/${claimFileName}`;
-	let descriptor: number | undefined;
-	try {
-		descriptor = openSync(
-			path,
-			fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
-			0o600,
-		);
-		const created = fstatSync(descriptor, { bigint: true });
-		if (!created.isFile() || created.nlink !== 1n) return undefined;
-		writeFileSync(
-			descriptor,
-			`${JSON.stringify(claim)}
-`,
-			{ encoding: "utf8" },
-		);
-		fsyncSync(descriptor);
-	} catch {
-		return undefined;
-	} finally {
-		if (descriptor !== undefined) {
-			try {
-				closeSync(descriptor);
-			} catch {}
-		}
-	}
-	try {
-		fsyncSync(INCIDENT_RECORDER_ROOT_FD);
-	} catch {
-		return undefined;
-	}
-	const guard = new CaptureOwnerGuard(path, claim);
-	return guard.validAdmission() ? guard : undefined;
-}
-
-function scalarMetadata(fields: Record<string, unknown>): Record<string, Scalar> {
-	const result: Record<string, Scalar> = {};
-	for (const key of DIAGNOSTIC_SCALAR_KEYS) {
-		const descriptor = Object.getOwnPropertyDescriptor(fields, key);
-		if (!descriptor || !("value" in descriptor)) continue;
-		const value = descriptor.value;
-		if (value === null || typeof value === "boolean") result[key] = value;
-		else if (typeof value === "number" && Number.isFinite(value)) result[key] = value;
-		else if (typeof value === "string") result[key] = value.slice(0, 512);
+	if (depth >= 3 || typeof value !== "object") return undefined;
+	if (Array.isArray(value))
+		return value.slice(0, 16).flatMap((item) => {
+			const safe = safeValue(key, item, depth + 1);
+			return safe === undefined ? [] : [safe];
+		});
+	const result: Record<string, unknown> = {};
+	const descriptors = Object.getOwnPropertyDescriptors(value);
+	for (const [childKey, descriptor] of Object.entries(descriptors).slice(0, 64)) {
+		if (!Object.hasOwn(descriptor, "value") || !/^[A-Za-z][A-Za-z0-9_.-]{0,63}$/.test(childKey)) continue;
+		if (SENSITIVE_KEY.test(childKey) || RESERVED_FIELDS.has(childKey)) continue;
+		const safe = safeValue(childKey, descriptor.value, depth + 1);
+		if (safe !== undefined) result[childKey] = safe;
 	}
 	return result;
 }
 
-function configuredEmitterMaximum(): number {
-	const value = Number(process.env.PRIME_INCIDENT_RECORDER_CAPTURE_MAX_BYTES);
-	return Number.isSafeInteger(value) && value >= 256 * 1024
-		? Math.min(value, INCIDENT_RECORDER_EMITTER_MAX_BYTES)
-		: INCIDENT_RECORDER_EMITTER_MAX_BYTES;
-}
-
-export type IncidentRecorderAdmission =
-	| { accepted: true; occurrenceId: string; disposition: "locally_admitted" }
-	| {
-			accepted: false;
-			disposition: "rejected";
-			reason: "stopped" | "terminal_reserved" | "occurrence_too_large" | "queue_capacity" | "encoding_failed";
-	  };
-
-export interface IncidentRecorderProducerSnapshot {
-	attemptedRecords: number;
-	attemptedBytes: number;
-	queuedRecords: number;
-	queuedBytes: number;
-	droppedRecords: number;
-	droppedBytes: number;
-	queueOccurrences: number;
-	retainedWireBytes: number;
-	inFlightWireBytes: number;
-	uncertainRecords: number;
-	uncertainBytes: number;
-	lossCheckpointQueued: boolean;
-}
-
-type ProducerCounters = Omit<
-	IncidentRecorderProducerSnapshot,
-	| "queueOccurrences"
-	| "retainedWireBytes"
-	| "inFlightWireBytes"
-	| "uncertainRecords"
-	| "uncertainBytes"
-	| "lossCheckpointQueued"
->;
-
-interface OutboundOccurrence {
-	occurrenceId: string;
-	source: string;
-	type: string;
-	bytes: Buffer;
-	payloadKind: IncidentRecorderPayloadKind;
-	encoding: string;
-	metadata: ScalarMetadata;
-	reserved: boolean;
-	terminal: boolean;
-	chunkCount: number;
-	firstSequence: bigint;
-	wallTimeMs: bigint;
-	monotonicNs: bigint;
-	estimatedWireBytes: number;
-	lossSnapshot?: { records: number; bytes: number };
-}
-
-interface ActiveOccurrenceWrite {
-	item: OutboundOccurrence;
-	settled: boolean;
-	invalidOwnerUncertain: boolean;
-}
-
-/** @internal Exported for isolated recorder survival fixtures. */
-export class BoundedFrameEmitter {
-	private readonly producerId = newIncidentRecorderIdentity();
-	private readonly producerStartId = linuxProcessStartId(process.pid) ?? "unavailable";
-	private readonly queue: OutboundOccurrence[] = [];
-	private queuedBytes = 0;
-	private inFlightBytes = 0;
-	private sequence = 0n;
-	private writing = false;
-	private stopping = false;
-	private stopped = false;
-	private invalidOwnerDisabled = false;
-	private activeWrite?: ActiveOccurrenceWrite;
-	private uncertainRecords = 0;
-	private uncertainBytes = 0;
-	private terminalQueued = false;
-	private reportedLostRecords = 0;
-	private reportedLostBytes = 0;
-	private lossCheckpointInProgress = false;
-	private lossCheckpointQueued = false;
-	private lossCheckpointRetry?: ReturnType<typeof setTimeout>;
-	private lossCheckpointNextAttemptMs = 0;
-	private readonly counters: ProducerCounters = {
-		attemptedRecords: 0,
-		attemptedBytes: 0,
-		queuedRecords: 0,
-		queuedBytes: 0,
-		droppedRecords: 0,
-		droppedBytes: 0,
-	};
-	private drainWaiters: Array<() => void> = [];
-
-	constructor(
-		private readonly writeOccurrence: (
-			frames: readonly IncidentRecorderEncodedFrame[],
-			callback: (error?: Error) => void,
-		) => void,
-		private readonly maximumBytes: number,
-		private readonly identity: { runId: string; runToken: string },
-		private readonly validateOwner: () => boolean = () => true,
-		private readonly validateAdmission: () => boolean = validateOwner,
-	) {}
-
-	private ownerIsValid(): boolean {
-		try {
-			return this.validateOwner();
-		} catch {
-			return false;
-		}
-	}
-
-	private admissionIsValid(): boolean {
-		try {
-			return this.validateAdmission();
-		} catch {
-			return false;
-		}
-	}
-
-	private disableInvalidOwner(): void {
-		if (this.invalidOwnerDisabled) return;
-		this.invalidOwnerDisabled = true;
-		this.stopped = true;
-
-		// The callback is the only authority for an occurrence whose async write has
-		// started. Retain one bounded callback tombstone until it proves success or
-		// failure. Every other admitted queue item was never attempted and is definite
-		// loss now. Loss checkpoints never account themselves as fresh loss.
-		const active = this.activeWrite?.settled === false ? this.activeWrite : undefined;
-		if (active) {
-			active.invalidOwnerUncertain = true;
-			if (active.item.payloadKind !== "loss") {
-				this.uncertainRecords = 1;
-				this.uncertainBytes = active.item.bytes.length;
-			}
-		}
-		for (const item of this.queue) {
-			if (item === active?.item || item.payloadKind === "loss") continue;
-			this.noteDrop(item.bytes.length, false);
-		}
-		this.lossCheckpointQueued = active?.item.lossSnapshot !== undefined;
-		this.queue.length = 0;
-		this.queuedBytes = 0;
-		this.writing = active !== undefined;
-		this.inFlightBytes = active?.item.estimatedWireBytes ?? 0;
-		this.lossCheckpointInProgress = false;
-		if (this.lossCheckpointRetry) clearTimeout(this.lossCheckpointRetry);
-		this.lossCheckpointRetry = undefined;
-		for (const resolve of this.drainWaiters.splice(0)) resolve();
-	}
-
-	emitDerived(source: CaptureSource, type: string, fields: Record<string, unknown>): IncidentRecorderAdmission {
-		return this.emitOccurrence(source, type, Buffer.alloc(0), "derived-scalar", "none", scalarMetadata(fields));
-	}
-
-	emitBytes(
-		source: CaptureSource,
-		type: string,
-		bytes: Uint8Array,
-		metadata: Record<string, unknown>,
-		encoding = "exact-bytes",
-	): IncidentRecorderAdmission {
-		return this.emitOccurrence(source, type, bytes, "exact-bytes", encoding, scalarMetadata(metadata));
-	}
-
-	emitControl(type: string, fields: Record<string, unknown>, terminal = false): IncidentRecorderAdmission {
-		return this.emitOccurrence(
-			"recorder-control",
-			type,
-			Buffer.alloc(0),
-			"control",
-			"none",
-			scalarMetadata(fields),
-			true,
-			terminal,
-		);
-	}
-
-	private emitOccurrence(
-		source: string,
-		type: string,
-		bytes: Uint8Array,
-		payloadKind: IncidentRecorderPayloadKind,
-		encoding: string,
-		metadata: ScalarMetadata,
-		reserved = false,
-		terminal = false,
-		internalDuringStop = false,
-	): IncidentRecorderAdmission {
-		// Loss checkpoints summarize product/control loss. A rejected checkpoint must
-		// not count itself as fresh loss and recursively inflate every later snapshot.
-		const accountOccurrence = payloadKind !== "loss";
-		if (accountOccurrence) {
-			this.counters.attemptedRecords += 1;
-			this.counters.attemptedBytes += bytes.byteLength;
-		}
-		const rejected = (
-			reason: Extract<IncidentRecorderAdmission, { accepted: false }>["reason"],
-			scheduleLoss = true,
-		): IncidentRecorderAdmission => {
-			if (accountOccurrence) this.noteDrop(bytes.byteLength, scheduleLoss);
-			return { accepted: false, disposition: "rejected", reason };
-		};
-		if (this.stopped) return rejected("stopped", false);
-		if (this.stopping && !internalDuringStop) return rejected("terminal_reserved", false);
-		if (this.terminalQueued) return rejected("terminal_reserved", false);
-		if (bytes.byteLength > INCIDENT_RECORDER_PROTOCOL_MAX_OCCURRENCE_BYTES) return rejected("occurrence_too_large");
-		const chunkCount = Math.max(1, Math.ceil(bytes.byteLength / INCIDENT_RECORDER_EMITTER_CHUNK_BYTES));
-		const estimatedDecodedBytes =
-			chunkCount * (INCIDENT_RECORDER_PROTOCOL_HEADER_BYTES + 3 * 255 + 4096) + bytes.byteLength;
-		const estimatedWireBytes = estimatedDecodedBytes + Math.floor(estimatedDecodedBytes / 254) + 2 * chunkCount;
-		const ceiling = reserved ? this.maximumBytes : this.maximumBytes - CONTROL_RESERVE_BYTES;
-		if (estimatedWireBytes > ceiling || this.queuedBytes + estimatedWireBytes > ceiling)
-			return rejected("queue_capacity");
-		// Over-budget traffic stops above without hashing, framing, COBS encoding, or
-		// the durable claim filesystem read. Admissible work still proves the claim
-		// before it copies caller bytes or allocates an occurrence identity.
-		if (!this.admissionIsValid()) {
-			const admission = rejected("stopped", false);
-			this.disableInvalidOwner();
-			return admission;
-		}
-		let ownedBytes: Buffer;
-		try {
-			// Always detach from the caller's view. This avoids both later mutation and a
-			// small slice retaining an arbitrarily large caller-owned ArrayBuffer.
-			ownedBytes = Buffer.from(bytes);
-		} catch {
-			return rejected("encoding_failed");
-		}
-		const occurrenceId = newIncidentRecorderIdentity();
-		const firstSequence = this.sequence + 1n;
-		this.sequence += BigInt(chunkCount);
-		this.counters.queuedRecords += 1;
-		this.counters.queuedBytes += ownedBytes.length;
-		const occurrenceMetadata: ScalarMetadata = Object.freeze({
-			...metadata,
-			attemptedRecords: this.counters.attemptedRecords,
-			attemptedBytes: this.counters.attemptedBytes,
-			queuedRecords: this.counters.queuedRecords,
-			queuedBytes: this.counters.queuedBytes,
-			droppedRecords: this.counters.droppedRecords,
-			droppedBytes: this.counters.droppedBytes,
-			producerPid: process.pid,
-			producerStartId: this.producerStartId,
-			queueDisposition: "locally_admitted",
-		});
-		const item: OutboundOccurrence = {
-			occurrenceId,
-			source,
-			type,
-			bytes: ownedBytes,
-			payloadKind,
-			encoding,
-			metadata: occurrenceMetadata,
-			reserved,
-			terminal,
-			chunkCount,
-			firstSequence,
-			wallTimeMs: BigInt(Date.now()),
-			monotonicNs: process.hrtime.bigint(),
-			estimatedWireBytes,
-		};
-		this.queue.push(item);
-		this.queuedBytes += estimatedWireBytes;
-		if (terminal) this.terminalQueued = true;
-		this.pump();
-		return { accepted: true, occurrenceId, disposition: "locally_admitted" };
-	}
-
-	private noteDrop(bytes: number, scheduleLoss = true): void {
-		this.counters.droppedRecords += 1;
-		this.counters.droppedBytes += bytes;
-		if (scheduleLoss) this.scheduleLossCheckpoint();
-	}
-
-	private scheduleLossCheckpoint(): void {
-		if (!this.ownerIsValid()) {
-			this.disableInvalidOwner();
-			return;
-		}
-		if (
-			this.stopped ||
-			this.stopping ||
-			this.terminalQueued ||
-			this.lossCheckpointQueued ||
-			this.lossCheckpointInProgress ||
-			this.lossCheckpointRetry ||
-			this.counters.droppedRecords === this.reportedLostRecords
-		)
-			return;
-		const delay = Math.max(1, this.lossCheckpointNextAttemptMs - Date.now());
-		this.lossCheckpointRetry = setTimeout(() => {
-			this.lossCheckpointRetry = undefined;
-			this.enqueueLossCheckpoint();
-		}, delay);
-		this.lossCheckpointRetry.unref();
-	}
-
-	private enqueueLossCheckpoint(internalDuringStop = false): void {
-		if (!this.ownerIsValid()) {
-			this.disableInvalidOwner();
-			return;
-		}
-		// A scheduled retry is the sole pending checkpoint owner. Letting pump race
-		// that timer can create duplicate attempts when a fast checkpoint write fails.
-		if (
-			this.stopped ||
-			this.terminalQueued ||
-			(this.stopping && !internalDuringStop) ||
-			this.lossCheckpointQueued ||
-			(!internalDuringStop && this.lossCheckpointRetry) ||
-			this.counters.droppedRecords === this.reportedLostRecords
-		)
-			return;
-		if (!internalDuringStop && Date.now() < this.lossCheckpointNextAttemptMs) {
-			this.scheduleLossCheckpoint();
-			return;
-		}
-		const records = this.counters.droppedRecords;
-		const bytes = this.counters.droppedBytes;
-		this.lossCheckpointNextAttemptMs = Date.now() + 1_000;
-		this.lossCheckpointInProgress = true;
-		const admission = this.emitOccurrence(
-			"loss-accounting",
-			"capture_channel_loss_checkpoint",
-			Buffer.alloc(0),
-			"loss",
-			"none",
-			{
-				lostRecords: records,
-				lostBytes: bytes,
-				recordsSinceLastMarker: records - this.reportedLostRecords,
-				bytesSinceLastMarker: bytes - this.reportedLostBytes,
-			},
-			true,
-			false,
-			internalDuringStop,
-		);
-		this.lossCheckpointInProgress = false;
-		if (!admission.accepted) {
-			if (!this.stopping) this.scheduleLossCheckpoint();
-			return;
-		}
-		const item = this.queue.at(-1);
-		if (item?.occurrenceId === admission.occurrenceId) {
-			item.lossSnapshot = { records, bytes };
-			this.lossCheckpointQueued = true;
-		}
-	}
-
-	private buildFrames(
-		item: OutboundOccurrence,
-		complete: (frames?: IncidentRecorderEncodedFrame[], error?: Error) => void,
-	): void {
-		const hash = createHash("sha256");
-		let hashIndex = 0;
-		const hashNext = (): void => {
-			if (!this.ownerIsValid()) {
-				this.disableInvalidOwner();
-				complete(undefined, new Error("Incident recorder capture owner changed"));
-				return;
-			}
-			const start = hashIndex * INCIDENT_RECORDER_EMITTER_CHUNK_BYTES;
-			if (start >= item.bytes.length) {
-				const digest = hash.digest("hex");
-				const occurrenceMetadata: ScalarMetadata = Object.freeze({
-					...item.metadata,
-					occurrenceRawBytes: item.bytes.length,
-					occurrenceSha256: digest,
-				});
-				const frames: IncidentRecorderEncodedFrame[] = [];
-				let index = 0;
-				const encodeNext = (): void => {
-					if (!this.ownerIsValid()) {
-						this.disableInvalidOwner();
-						complete(undefined, new Error("Incident recorder capture owner changed"));
-						return;
-					}
-					if (index >= item.chunkCount) {
-						complete(frames);
-						return;
-					}
-					const chunkStart = index * INCIDENT_RECORDER_EMITTER_CHUNK_BYTES;
-					const payload = item.bytes.subarray(
-						chunkStart,
-						Math.min(item.bytes.length, chunkStart + INCIDENT_RECORDER_EMITTER_CHUNK_BYTES),
-					);
-					try {
-						frames.push(
-							encodeIncidentRecorderFrame(
-								{
-									runId: this.identity.runId,
-									runToken: this.identity.runToken,
-									producerId: this.producerId,
-									occurrenceId: item.occurrenceId,
-									producerSequence: item.firstSequence + BigInt(index),
-									wallTimeMs: item.wallTimeMs,
-									monotonicNs: item.monotonicNs,
-									payloadKind: item.payloadKind,
-									flags:
-										(item.terminal ? INCIDENT_RECORDER_FRAME_FLAGS.terminal : 0) |
-										(index === 0 ? INCIDENT_RECORDER_FRAME_FLAGS.firstChunk : 0) |
-										(index === item.chunkCount - 1 ? INCIDENT_RECORDER_FRAME_FLAGS.lastChunk : 0),
-									chunkIndex: index,
-									chunkCount: item.chunkCount,
-									source: item.source,
-									type: item.type,
-									encoding: item.encoding,
-									metadata: occurrenceMetadata,
-								},
-								payload,
-							),
-						);
-					} catch (error) {
-						complete(undefined, error instanceof Error ? error : new Error(String(error)));
-						return;
-					}
-					index += 1;
-					setImmediate(encodeNext);
-				};
-				setImmediate(encodeNext);
-				return;
-			}
-			const end = Math.min(item.bytes.length, start + INCIDENT_RECORDER_EMITTER_CHUNK_BYTES);
-			hash.update(item.bytes.subarray(start, end));
-			hashIndex += 1;
-			setImmediate(hashNext);
-		};
-		setImmediate(hashNext);
-	}
-
-	private pump(): void {
-		if (this.stopped) return;
-		if (!this.ownerIsValid()) {
-			this.disableInvalidOwner();
-			return;
-		}
-		if (this.writing) return;
-		this.enqueueLossCheckpoint();
-		if (this.stopped) return;
-		const item = this.queue[0];
-		if (!item) {
-			for (const resolve of this.drainWaiters.splice(0)) resolve();
-			return;
-		}
-		this.writing = true;
-		this.inFlightBytes = item.estimatedWireBytes;
-		const operation: ActiveOccurrenceWrite = {
-			item,
-			settled: false,
-			invalidOwnerUncertain: false,
-		};
-		this.activeWrite = operation;
-		this.buildFrames(item, (frames, buildError) => {
-			if (buildError || !frames) {
-				this.finishItem(operation, buildError ?? new Error("Incident occurrence encoding failed"));
-				return;
-			}
-			this.writeOccurrence(frames, (error) => this.finishItem(operation, error));
-		});
-	}
-
-	private settleInvalidOwnerWrite(operation: ActiveOccurrenceWrite, error?: Error): void {
-		if (operation.settled) return;
-		operation.settled = true;
-		if (this.activeWrite === operation) this.activeWrite = undefined;
-		this.writing = false;
-		this.inFlightBytes = 0;
-		const { item } = operation;
-		if (item.payloadKind !== "loss") {
-			this.uncertainRecords = Math.max(0, this.uncertainRecords - 1);
-			this.uncertainBytes = Math.max(0, this.uncertainBytes - item.bytes.length);
-			if (error) this.noteDrop(item.bytes.length, false);
-		}
-		if (item.lossSnapshot) {
-			if (!error) {
-				this.reportedLostRecords = Math.max(this.reportedLostRecords, item.lossSnapshot.records);
-				this.reportedLostBytes = Math.max(this.reportedLostBytes, item.lossSnapshot.bytes);
-			}
-			this.lossCheckpointQueued = false;
-		}
-	}
-
-	private finishItem(operation: ActiveOccurrenceWrite, error?: Error): void {
-		if (operation.settled) return;
-		if (operation.invalidOwnerUncertain) {
-			this.settleInvalidOwnerWrite(operation, error);
-			return;
-		}
-		if (!this.ownerIsValid()) {
-			this.disableInvalidOwner();
-			this.settleInvalidOwnerWrite(operation, error);
-			return;
-		}
-		operation.settled = true;
-		if (this.activeWrite === operation) this.activeWrite = undefined;
-		this.writing = false;
-		this.inFlightBytes = 0;
-		const { item } = operation;
-		const wasHead = this.queue[0] === item;
-		if (wasHead) {
-			this.queue.shift();
-			this.queuedBytes = Math.max(0, this.queuedBytes - item.estimatedWireBytes);
-		}
-		if (!wasHead) {
-			this.pump();
-			return;
-		}
-		if (error) {
-			if (item.lossSnapshot) this.lossCheckpointQueued = false;
-			if (item.payloadKind !== "loss") this.noteDrop(item.bytes.length);
-		} else if (item.lossSnapshot) {
-			this.reportedLostRecords = item.lossSnapshot.records;
-			this.reportedLostBytes = item.lossSnapshot.bytes;
-			this.lossCheckpointQueued = false;
-			this.scheduleLossCheckpoint();
-		}
-		this.pump();
-	}
-
-	async flush(deadlineMs = 1_000): Promise<boolean> {
-		if (this.stopped) return false;
-		if (!this.ownerIsValid()) {
-			this.disableInvalidOwner();
-			return false;
-		}
-		this.pump();
-		if (this.stopped) return false;
-		if (!this.writing && this.queue.length === 0) return true;
-		await Promise.race([
-			new Promise<void>((resolve) => this.drainWaiters.push(resolve)),
-			new Promise<void>((resolve) => setTimeout(resolve, deadlineMs).unref()),
-		]);
-		return !this.stopped && !this.writing && this.queue.length === 0;
-	}
-
-	lossCounters(): { records: number; bytes: number } {
-		return { records: this.counters.droppedRecords, bytes: this.counters.droppedBytes };
-	}
-
-	/** @internal Bounded state used by isolated survival fixtures and diagnostics. */
-	producerSnapshot(): IncidentRecorderProducerSnapshot {
-		return {
-			...this.counters,
-			queueOccurrences: this.queue.length,
-			retainedWireBytes: this.queuedBytes,
-			inFlightWireBytes: this.inFlightBytes,
-			uncertainRecords: this.uncertainRecords,
-			uncertainBytes: this.uncertainBytes,
-			lossCheckpointQueued: this.lossCheckpointQueued,
-		};
-	}
-
-	async stop(deadlineMs = 1_000): Promise<IncidentRecorderAdmission | undefined> {
-		if (!this.ownerIsValid()) {
-			this.disableInvalidOwner();
-			return undefined;
-		}
-		if (this.stopped || this.stopping) return undefined;
-		this.stopping = true;
-		if (this.lossCheckpointRetry) clearTimeout(this.lossCheckpointRetry);
-		this.lossCheckpointRetry = undefined;
-
-		// Drain admitted product occurrences before taking the terminal snapshot. Calls
-		// arriving during this phase are rejected and counted, so the final loss marker
-		// and terminal record include them instead of freezing stale counters.
-		const drained = await this.flush(deadlineMs);
-		if (this.stopped) {
-			this.stopping = false;
-			return undefined;
-		}
-		let drainTimeoutLostRecords = 0;
-		let drainTimeoutLostBytes = 0;
-		let drainTimeoutUncertainRecords = 0;
-		let drainTimeoutUncertainBytes = 0;
-		if (!drained) {
-			const stranded = [...this.queue];
-			if (stranded.some((item) => item.lossSnapshot)) this.lossCheckpointQueued = false;
-			let firstDefiniteLoss = 0;
-			if (this.writing && stranded[0]) {
-				if (stranded[0].payloadKind !== "loss") {
-					drainTimeoutUncertainRecords = 1;
-					drainTimeoutUncertainBytes = stranded[0].bytes.length;
-				}
-				firstDefiniteLoss = 1;
-			}
-			for (const item of stranded.slice(firstDefiniteLoss)) {
-				if (item.payloadKind === "loss") continue;
-				drainTimeoutLostRecords += 1;
-				drainTimeoutLostBytes += item.bytes.length;
-				this.noteDrop(item.bytes.length, false);
-			}
-			this.queue.length = 0;
-			this.queuedBytes = 0;
-		}
-
-		this.enqueueLossCheckpoint(true);
-		const terminalAdmission = this.emitOccurrence(
-			"recorder-control",
-			"capture_channel_terminal",
-			Buffer.alloc(0),
-			"control",
-			"none",
-			{
-				attemptedRecords: this.counters.attemptedRecords,
-				attemptedBytes: this.counters.attemptedBytes,
-				queuedRecords: this.counters.queuedRecords,
-				queuedBytes: this.counters.queuedBytes,
-				lostRecords: this.counters.droppedRecords,
-				lostBytes: this.counters.droppedBytes,
-				drainTimeoutLostRecords,
-				drainTimeoutLostBytes,
-				drainTimeoutUncertainRecords,
-				drainTimeoutUncertainBytes,
-			},
-			true,
-			true,
-			true,
-		);
-		const terminalDrained = await this.flush(deadlineMs);
-		if (!terminalDrained) {
-			// The final marker itself may be undeliverable on a permanently blocked or
-			// broken channel. Keep this local tail bounded and stop all later writes.
-			this.queue.length = 0;
-			this.queuedBytes = 0;
-		}
-		this.stopped = true;
-		this.stopping = false;
-		if (this.lossCheckpointRetry) clearTimeout(this.lossCheckpointRetry);
-		this.lossCheckpointRetry = undefined;
-		return terminalAdmission;
-	}
-}
-
-let captureEmitter: BoundedFrameEmitter | undefined;
-let captureEmitterStop: Promise<void> | undefined;
-let captureOwnerGuard: CaptureOwnerGuard | undefined;
-
-/** @internal */
-export function writeEncodedFramesToFd(
-	fd: number,
-	frames: readonly IncidentRecorderEncodedFrame[],
-	callback: (error?: Error) => void,
-	validateOwner: () => boolean = () => true,
-): void {
-	let packets: readonly Buffer[];
+function safeFields(fields: Record<string, unknown>): Record<string, unknown> {
 	try {
-		packets = frames.map((frame) => encodeIncidentRecorderTransportPacket(Buffer.concat(frame.parts)));
-	} catch (error) {
-		callback(error instanceof Error ? error : new Error(String(error)));
+		const value = safeValue("fields", fields);
+		return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+	} catch {
+		return {};
+	}
+}
+
+function accepted(occurrenceId = randomUUID()): IncidentRecorderAdmission {
+	return { accepted: true, occurrenceId };
+}
+function rejected(reason: string, occurrenceId = randomUUID()): IncidentRecorderAdmission {
+	return { accepted: false, occurrenceId, reason };
+}
+
+interface EmitterState {
+	generation: number;
+	phase: EmitterPhase;
+	descriptor?: number;
+	queue: Buffer[];
+	writing: boolean;
+	stopPromise?: Promise<void>;
+	resolveStop?: () => void;
+	stopTimer?: ReturnType<typeof setTimeout>;
+}
+const emitter: EmitterState = { generation: 0, phase: "idle", queue: [], writing: false };
+
+function closeEmitterDescriptor(): void {
+	const descriptor = emitter.descriptor;
+	emitter.descriptor = undefined;
+	if (descriptor !== undefined)
+		try {
+			closeSync(descriptor);
+		} catch {}
+}
+
+function settleEmitterStop(): void {
+	if (emitter.writing) return;
+	if (emitter.stopTimer) clearTimeout(emitter.stopTimer);
+	emitter.stopTimer = undefined;
+	if (emitter.phase === "stopping") emitter.phase = "stopped";
+	closeEmitterDescriptor();
+	emitter.resolveStop?.();
+	emitter.resolveStop = undefined;
+}
+
+function failEmitter(generation: number): void {
+	if (generation !== emitter.generation) return;
+	emitter.phase = "failed";
+	emitter.queue.length = 0;
+	settleEmitterStop();
+}
+
+function pumpEmitter(): void {
+	if (emitter.writing || emitter.descriptor === undefined) return;
+	if (emitter.phase !== "running" && emitter.phase !== "stopping") return;
+	const next = emitter.queue.shift();
+	if (!next) {
+		if (emitter.phase === "stopping") settleEmitterStop();
 		return;
 	}
-	let packetIndex = 0;
-	let offset = 0;
-	let completed = false;
-	const finish = (error?: Error): void => {
-		if (completed) return;
-		completed = true;
-		callback(error);
-	};
-	const writeNext = (): void => {
-		let valid = false;
-		try {
-			valid = validateOwner();
-		} catch {}
-		if (!valid) {
-			finish(new Error("Incident recorder capture owner changed"));
-			return;
-		}
-		const packet = packets[packetIndex];
-		if (!packet) {
-			finish();
-			return;
-		}
-		write(fd, packet, offset, packet.length - offset, (error, written) => {
-			if (error) {
-				finish(error);
+	const generation = emitter.generation;
+	const descriptor = emitter.descriptor;
+	emitter.writing = true;
+	try {
+		write(descriptor, next, (error, bytesWritten) => {
+			if (generation !== emitter.generation) {
+				try {
+					closeSync(descriptor);
+				} catch {}
 				return;
 			}
-			if (written <= 0) {
-				setImmediate(writeNext);
+			emitter.writing = false;
+			if (error || bytesWritten !== next.length) {
+				failEmitter(generation);
 				return;
 			}
-			offset += written;
-			if (offset === packet.length) {
-				packetIndex += 1;
-				offset = 0;
+			if (emitter.phase === "stopped" || emitter.phase === "failed") {
+				closeEmitterDescriptor();
+				return;
 			}
-			writeNext();
+			pumpEmitter();
 		});
-	};
-	writeNext();
+	} catch {
+		emitter.writing = false;
+		failEmitter(generation);
+	}
 }
 
 export function configureIncidentCaptureEmitter(): boolean {
-	if (captureEmitter) return captureOwnerGuard?.validAdmission() === true;
-	const fd = Number(process.env[INCIDENT_RECORDER_CAPTURE_FD_ENV]);
-	const rootFd = Number(process.env[INCIDENT_RECORDER_ROOT_FD_ENV]);
-	const runId = process.env[INCIDENT_RECORDER_RUN_ID_ENV];
-	const runToken = process.env[INCIDENT_RECORDER_RUN_TOKEN_ENV];
-	if (fd !== INCIDENT_RECORDER_CAPTURE_FD || rootFd !== INCIDENT_RECORDER_ROOT_FD || !runId || !runToken) return false;
-
-	// The wrapper supplies two kernel capabilities: the fd4 capture channel and the
-	// canonical recorder root directory at fd5. The supervisor creates its unique
-	// claim below fd5, so a forged run-directory environment variable cannot move it.
-	const guard = claimCaptureOwner(runId, runToken);
-	if (!guard) return false;
-	captureOwnerGuard = guard;
-	process.env[INCIDENT_RECORDER_CAPTURE_OWNER_PID_ENV] = String(process.pid);
-	process.env[INCIDENT_RECORDER_CAPTURE_OWNER_START_ID_ENV] = linuxProcessStartId(process.pid) ?? "unavailable";
-	captureEmitter = new BoundedFrameEmitter(
-		(frames, callback) => writeEncodedFramesToFd(fd, frames, callback, () => guard.validCheap()),
-		configuredEmitterMaximum(),
-		{ runId, runToken },
-		() => guard.validCheap(),
-		() => guard.validAdmission(),
-	);
-	// Do not propagate usable capability labels to controlled descendants. Their
-	// spawn stdio also closes fd4/fd5 explicitly.
-	delete process.env[INCIDENT_RECORDER_CAPTURE_FD_ENV];
-	delete process.env[INCIDENT_RECORDER_ROOT_FD_ENV];
-	return true;
+	if (emitter.phase === "running") return true;
+	if (emitter.phase === "stopping") return false;
+	closeEmitterDescriptor();
+	const runDir = process.env[INCIDENT_RECORDER_RUN_DIR_ENV];
+	const processStartId = getProcessStartId(process.pid);
+	if (!runDir || !processStartId) return false;
+	let descriptor: number | undefined;
+	try {
+		const runStat = lstatSync(runDir);
+		if (!runStat.isDirectory() || runStat.isSymbolicLink() || (runStat.mode & 0o077) !== 0)
+			throw new Error("causal run directory is not private");
+		if (typeof process.getuid === "function" && runStat.uid !== process.getuid())
+			throw new Error("causal run directory owner mismatch");
+		descriptor = openSync(
+			join(runDir, EVENT_FILE_NAME),
+			fsConstants.O_WRONLY | fsConstants.O_APPEND | fsConstants.O_CREAT | fsConstants.O_NOFOLLOW,
+			0o600,
+		);
+		const stat = fstatSync(descriptor);
+		if (!stat.isFile() || stat.nlink !== 1 || (stat.mode & 0o077) !== 0)
+			throw new Error("causal event sink is not a private single-link file");
+		if (typeof process.getuid === "function" && stat.uid !== process.getuid())
+			throw new Error("causal event sink owner mismatch");
+		emitter.generation += 1;
+		emitter.phase = "running";
+		emitter.descriptor = descriptor;
+		emitter.queue = [];
+		emitter.writing = false;
+		emitter.stopPromise = undefined;
+		emitter.resolveStop = undefined;
+		emitter.stopTimer = undefined;
+		delete process.env[INCIDENT_RECORDER_CAPTURE_FD_ENV];
+		delete process.env[INCIDENT_RECORDER_CAPTURE_OWNER_PID_ENV];
+		delete process.env[INCIDENT_RECORDER_CAPTURE_OWNER_START_ID_ENV];
+		delete process.env[INCIDENT_RECORDER_ROOT_FD_ENV];
+		return true;
+	} catch {
+		if (descriptor !== undefined)
+			try {
+				closeSync(descriptor);
+			} catch {}
+		return false;
+	}
 }
 
 export function emitIncidentDerived(
@@ -1124,146 +233,84 @@ export function emitIncidentDerived(
 	type: string,
 	fields: Record<string, unknown>,
 ): IncidentRecorderAdmission {
+	const occurrenceId = randomUUID();
 	try {
-		return (
-			captureEmitter?.emitDerived(source, type, fields) ?? {
-				accepted: false,
-				disposition: "rejected",
-				reason: "stopped",
-			}
-		);
+		if (emitter.phase !== "running" || emitter.descriptor === undefined)
+			return rejected("capture_not_configured", occurrenceId);
+		if (!/^[a-z][a-z0-9_]{0,79}$/.test(type) || NON_CAUSAL_TYPES.has(type))
+			return rejected("non_causal_event", occurrenceId);
+		const processStartId = getProcessStartId(process.pid);
+		if (!processStartId) return rejected("producer_identity_unavailable", occurrenceId);
+		const event = {
+			...safeFields(fields),
+			type,
+			wallTime: new Date().toISOString(),
+			monotonicNs: process.hrtime.bigint().toString(),
+			pid: process.pid,
+			source: source === "supervisor-events" ? "supervisor-events" : "recorder-events",
+			occurrenceId,
+			producerPid: process.pid,
+			producerProcessStartId: processStartId,
+		};
+		let bytes = Buffer.from(`${JSON.stringify(event)}\n`, "utf8");
+		if (bytes.length > MAX_EVENT_BYTES) {
+			bytes = Buffer.from(
+				`${JSON.stringify({
+					type,
+					wallTime: event.wallTime,
+					monotonicNs: event.monotonicNs,
+					pid: process.pid,
+					source: event.source,
+					occurrenceId,
+					producerPid: process.pid,
+					producerProcessStartId: processStartId,
+					fieldsTruncated: true,
+				})}\n`,
+				"utf8",
+			);
+		}
+		if (bytes.length > MAX_EVENT_BYTES || emitter.queue.length >= MAX_QUEUE_EVENTS)
+			return rejected("bounded_queue_full", occurrenceId);
+		emitter.queue.push(bytes);
+		pumpEmitter();
+		return accepted(occurrenceId);
 	} catch {
-		return { accepted: false, disposition: "rejected", reason: "encoding_failed" };
-	}
-}
-
-export function emitIncidentBytes(
-	source: CaptureSource,
-	type: string,
-	bytes: Uint8Array,
-	metadata: Record<string, unknown>,
-): IncidentRecorderAdmission {
-	try {
-		return (
-			captureEmitter?.emitBytes(source, type, bytes, metadata) ?? {
-				accepted: false,
-				disposition: "rejected",
-				reason: "stopped",
-			}
-		);
-	} catch {
-		return { accepted: false, disposition: "rejected", reason: "encoding_failed" };
+		return rejected("capture_failed_open", occurrenceId);
 	}
 }
 
 export async function stopIncidentCaptureEmitter(): Promise<void> {
-	if (captureEmitterStop) {
-		await captureEmitterStop;
+	if (emitter.phase === "idle" || emitter.phase === "stopped" || emitter.phase === "failed") {
+		closeEmitterDescriptor();
 		return;
 	}
-	const emitter = captureEmitter;
-	if (!emitter) return;
-	const stopping = emitter.stop().then(() => undefined);
-	captureEmitterStop = stopping;
-	try {
-		await stopping;
-	} finally {
-		if (captureEmitter === emitter) captureEmitter = undefined;
-		if (captureEmitterStop === stopping) captureEmitterStop = undefined;
-		captureOwnerGuard?.release();
-		captureOwnerGuard = undefined;
-	}
+	if (emitter.stopPromise) return emitter.stopPromise;
+	emitter.phase = "stopping";
+	emitter.stopPromise = new Promise<void>((resolve) => {
+		emitter.resolveStop = resolve;
+		emitter.stopTimer = setTimeout(() => {
+			if (emitter.phase !== "stopping") return;
+			emitter.generation += 1;
+			emitter.phase = "stopped";
+			emitter.queue.length = 0;
+			emitter.writing = false;
+			// A pending libuv write still owns this descriptor. Detach it from the
+			// reusable emitter state; its stale callback closes it after settlement.
+			emitter.descriptor = undefined;
+			emitter.stopTimer = undefined;
+			emitter.resolveStop = undefined;
+			resolve();
+		}, 100);
+	});
+	pumpEmitter();
+	settleEmitterStop();
+	return emitter.stopPromise;
 }
 
 export function stopIncidentCaptureEmitterOnExit(): void {
-	// Exit cannot await a flush. Strict PID/start/fd/claim equality still gates
-	// removal, so a copied or tampered owner can never clean another claim.
-	captureOwnerGuard?.release();
-	captureOwnerGuard = undefined;
-	captureEmitter = undefined;
-	captureEmitterStop = undefined;
-}
-
-export interface IncidentJournalLine {
-	schema: "prime-agent-raw-v1";
-	runId: string;
-	runToken: string;
-	producerId: string;
-	producerSequence: string;
-	wrapperSequence: string;
-	occurrenceId: string;
-	chunkIndex: number;
-	chunkCount: number;
-	source: string;
-	type: string;
-	encoding: string;
-	payloadKind: IncidentRecorderPayloadKind;
-	producerPid: number | null;
-	producerStartId: string | null;
-	wrapperPid: number;
-	wrapperStartId: string | null;
-	targetPid: number | null;
-	targetStartId: string | null;
-	bootId: string | null;
-	machineId: string | null;
-	systemdInvocationId: string | null;
-	systemdCatPid: number | null;
-	systemdCatStartId: string | null;
-	eventWallTimeMs: string;
-	eventMonotonicNs: string;
-	rawOccurrenceBytes: number;
-	occurrenceSha256: string;
-	chunkBytes: number;
-	chunkSha256: string;
-	frameChecksum: number;
-	flags: number;
-	metadata: ScalarMetadata;
-	payloadBase64: string;
-	attemptedRecords: number | null;
-	attemptedBytes: number | null;
-	queuedRecords: number | null;
-	queuedBytes: number | null;
-	droppedRecords: number | null;
-	droppedBytes: number | null;
-	observationDisposition: "observed_by_wrapper";
-	queueDisposition: "locally_admitted";
-	wrapperRelayDisposition: "locally_admitted";
-	streamDisposition: "systemd_cat_stdin_write_attempted";
-	journalDurability: "not_asserted_by_writer";
-	wrapperRelayDroppedRecords: number;
-	wrapperRelayDroppedBytes: number;
-	wrapperRelayUncertainRecords: number;
-}
-
-interface RelayOccurrence {
-	frames: readonly IncidentRecorderEncodedFrame[];
-	wrapperSequences: readonly bigint[];
-	bytes: number;
-	rawBytes: number;
-	lineIndex: number;
-	reserved: boolean;
-	occurrenceId: string;
-}
-
-export interface IncidentRecorderRelayFrontier {
-	occurrenceId: string;
-	producerId: string;
-	type: string;
-	firstProducerSequence: string;
-	lastProducerSequence: string;
-	firstWrapperSequence: string;
-	lastWrapperSequence: string;
-}
-
-export interface IncidentRecorderFinalizationExpectation {
-	runId: string;
-	runToken: string;
-	wrapperPid: number;
-	wrapperStartId: string | null;
-	supervisorExit?: IncidentRecorderRelayFrontier;
-	wrapperTerminal?: IncidentRecorderRelayFrontier;
-	finalQueuedTailLoss: { records: number; bytes: number };
-	emitterFinalTailLoss: { records: number; bytes: number };
+	emitter.phase = "stopped";
+	emitter.queue.length = 0;
+	if (!emitter.writing) closeEmitterDescriptor();
 }
 
 export interface IncidentRecorderWriterOptions {
@@ -1273,867 +320,79 @@ export interface IncidentRecorderWriterOptions {
 	bootId?: string;
 	wrapperStartId?: string;
 	serviceSink?: boolean;
-	onStructuredEvent?: (source: string, type: string, fields: Record<string, unknown>) => void;
+	onStructuredEvent?: (source: string, type: string, fields: Record<string, unknown>) => boolean | undefined;
 }
 
 export class IncidentRecorderWriter {
-	private readonly runId: string;
-	private readonly runToken: string;
-	private readonly wrapperStartId: string | undefined;
-	private readonly bootId: string | undefined;
-	private readonly serviceSink: boolean;
-	private readonly onStructuredEvent?: (source: string, type: string, fields: Record<string, unknown>) => void;
-	private readonly machineId = linuxIdentity("/etc/machine-id", /^[0-9a-f]{32}$/i);
-	private readonly invocationId = process.env.INVOCATION_ID?.match(/^[0-9a-f]{32}$/i)?.[0];
-	private readonly emitter: BoundedFrameEmitter;
-	private readonly serviceEmitters = new Map<string, BoundedFrameEmitter>();
-	private readonly relayQueue: RelayOccurrence[] = [];
-	private relayBytes = 0;
-	private readonly wrapperSequences = new Map<string, bigint>();
-	private relayDroppedRecords = 0;
-	private relayDroppedBytes = 0;
-	private relayUncertainRecords = 0;
-	private relayLossReportedRecords = 0;
-	private relayLossReportedBytes = 0;
-	private readonly relayLossProducerId = newIncidentRecorderIdentity();
-	private relayLossProducerSequence = 0n;
-	private relayLossTimer?: ReturnType<typeof setInterval>;
-	private relayLossIdentity?: { runId: string; runToken: string };
-	private sourceIdentity: ScalarMetadata = {};
-	private cat?: ChildProcess;
-	private catStartId?: string;
-	private reconnectTimer?: ReturnType<typeof setTimeout>;
-	private captureDecoder?: IncidentRecorderTransportDecoder;
-	private readonly captureSequences = new IncidentRecorderTransportSequenceTracker();
-	private transportCorruptPackets = 0n;
-	private transportCorruptWireBytes = 0n;
-	private transportSequenceGapEvents = 0n;
-	private transportMissingPackets = 0n;
-	private transportReportedCorruptPackets = 0n;
-	private transportReportedCorruptWireBytes = 0n;
-	private transportReportedSequenceGapEvents = 0n;
-	private transportReportedMissingPackets = 0n;
-	private captureStream?: ReadableStream;
-	private readonly captureCompletedOccurrences: Array<{
-		frames: readonly Buffer[];
-		wireBytes: number;
-		rawBytes: number;
-	}> = [];
-	private captureCompletedBytes = 0;
-	private captureValidationRunning = false;
-	private captureStreamEnded = false;
-	private captureStreamEndIncomplete = 0;
-	private captureCloseRecorded = false;
-	private captureFrames: Array<Buffer | undefined> = [];
-	private captureOccurrenceId?: string;
-	private captureProducerId?: string;
-	private captureFirstSequence = 0n;
-	private captureChunkCount = 0;
-	private captureReceivedChunks = 0;
-	private captureRawBytes = 0;
-	private captureDeclaredRawBytes = 0;
-	private captureStartedAt = 0;
-	private readonly captureOccurrenceTombstones = new Map<string, "completed" | "discarded">();
+	private readonly onStructuredEvent?: (
+		source: string,
+		type: string,
+		fields: Record<string, unknown>,
+	) => boolean | undefined;
 	private stopped = false;
-	private pumping = false;
-	private readonly finalizationFrontiers = new Map<string, IncidentRecorderRelayFrontier>();
-	private terminalOccurrenceId?: string;
-	private finalTailDroppedRecords = 0;
-	private finalTailDroppedBytes = 0;
-	private emitterFinalTailLoss = { records: 0, bytes: 0 };
 
 	constructor(options: IncidentRecorderWriterOptions) {
-		this.runId = options.runId ?? process.env[INCIDENT_RECORDER_RUN_ID_ENV] ?? options.runDir.slice(-36);
-		this.runToken = options.runToken ?? process.env[INCIDENT_RECORDER_RUN_TOKEN_ENV] ?? newIncidentRecorderIdentity();
-		this.wrapperStartId = options.wrapperStartId ?? linuxProcessStartId(process.pid);
-		this.bootId = options.bootId ?? linuxIdentity("/proc/sys/kernel/random/boot_id", /^[0-9a-f-]{36}$/i);
-		this.serviceSink = options.serviceSink === true;
 		this.onStructuredEvent = options.onStructuredEvent;
-		this.emitter = this.createEmitter({ runId: this.runId, runToken: this.runToken });
 	}
 
-	private createEmitter(
-		identity: { runId: string; runToken: string },
-		maximumBytes = configuredEmitterMaximum(),
-	): BoundedFrameEmitter {
-		return new BoundedFrameEmitter(
-			(frames, callback) => {
-				const reserved = frames.every(
-					(frame) => frame.header.payloadKind === "control" || frame.header.payloadKind === "loss",
-				);
-				const admission = this.enqueueFrames(frames, reserved, true);
-				callback(
-					admission.accepted ? undefined : new Error(admission.reason ?? "wrapper relay rejected occurrence"),
-				);
-			},
-			maximumBytes,
-			identity,
-		);
+	async start(): Promise<void> {}
+
+	async setSourceIdentity(_identity: Record<string, unknown>): Promise<IncidentRecorderAdmission> {
+		return this.stopped ? rejected("writer_stopped") : accepted();
 	}
 
-	private serviceEmitter(identity: { runId: string; runToken: string }): BoundedFrameEmitter | undefined {
-		if (!this.serviceSink || !/^[0-9a-f-]{36}$/i.test(identity.runId) || !/^[0-9a-f-]{36}$/i.test(identity.runToken))
-			return undefined;
-		const key = `${identity.runId}\0${identity.runToken}`;
-		let emitter = this.serviceEmitters.get(key);
-		if (!emitter && this.serviceEmitters.size < SERVICE_EMITTER_MAX_IDENTITIES) {
-			emitter = this.createEmitter(identity, SERVICE_EMITTER_MAX_BYTES);
-			this.serviceEmitters.set(key, emitter);
-		}
-		return emitter;
-	}
-
-	async start(): Promise<void> {
-		if (this.stopped || this.serviceSink) return;
-		this.emitter.emitControl("causal_stream_start", {
-			wrapperPid: process.pid,
-			wrapperStartId: this.wrapperStartId ?? "unavailable",
-		});
-	}
-
-	private async connectJournalWithDeadline(): Promise<void> {
-		if (this.stopped || (this.cat && this.cat.stdin && !this.cat.stdin.destroyed)) return;
-		const child = spawn(
-			"systemd-cat",
-			[
-				`--namespace=${INCIDENT_RECORDER_JOURNAL_NAMESPACE}`,
-				`--identifier=${INCIDENT_RECORDER_JOURNAL_IDENTIFIER}`,
-				"--priority=info",
-				"--level-prefix=false",
-			],
-			{ stdio: ["pipe", "ignore", "ignore"] },
-		);
-		this.cat = child;
-		this.catStartId = child.pid ? linuxProcessStartId(child.pid) : undefined;
-		child.once("spawn", () => {
-			this.catStartId = child.pid ? linuxProcessStartId(child.pid) : undefined;
-		});
-		child.once("error", () => this.handleCatUnavailable(child));
-		child.once("close", () => this.handleCatUnavailable(child));
-		child.stdin?.once("error", () => this.handleCatUnavailable(child));
-		await Promise.race([
-			new Promise<void>((resolve) => {
-				child.once("spawn", resolve);
-				child.once("error", resolve);
-			}),
-			new Promise<void>((resolve) => setTimeout(resolve, JOURNAL_START_DEADLINE_MS).unref()),
-		]);
-		this.pumpRelay();
-	}
-
-	private handleCatUnavailable(child: ChildProcess): void {
-		if (this.cat !== child) return;
-		this.cat = undefined;
-		this.catStartId = undefined;
-		this.pumping = false;
-		if (this.stopped) return;
-		try {
-			child.stdin?.destroy();
-		} catch {}
-		if (child.exitCode === null && child.signalCode === null) {
-			try {
-				child.kill("SIGTERM");
-			} catch {}
-			const killTimer = setTimeout(() => {
-				try {
-					if (child.exitCode === null) child.kill("SIGKILL");
-				} catch {}
-			}, 250);
-			killTimer.unref();
-		}
-		if (this.stopped || this.reconnectTimer) return;
-		this.reconnectTimer = setTimeout(() => {
-			this.reconnectTimer = undefined;
-			void this.connectJournalWithDeadline().then(() => {
-				this.emitter.emitControl("journal_stream_reconnect_checkpoint", {
-					lostRecords: this.relayDroppedRecords,
-					lostBytes: this.relayDroppedBytes,
-					attemptedRecords: this.relayUncertainRecords,
-				});
-			});
-		}, JOURNAL_RECONNECT_MS);
-		this.reconnectTimer.unref();
-	}
-
-	async setSourceIdentity(identity: Record<string, unknown>): Promise<IncidentRecorderAdmission> {
-		this.sourceIdentity = scalarMetadata(identity);
-		return this.emitter.emitControl("run_source_identity_checkpoint", identity);
-	}
-
-	attachCaptureStream(stream: ReadableStream): void {
-		this.captureStream = stream;
-		this.captureDecoder = new IncidentRecorderTransportDecoder(
-			(frame, wireBytes) => this.acceptCaptureFrame(frame, wireBytes),
-			(evidence) => this.noteCaptureTransportCorruption(evidence),
-		);
-		stream.on("data", (chunk: Buffer) => this.captureDecoder?.push(chunk));
-		stream.once("end", () => {
-			const incomplete = this.captureDecoder?.finish() ?? 0;
-			this.noteCaptureSequenceAccounting(this.captureSequences.finish());
-			if (this.captureFrames.length > 0) this.dropCaptureAssembly(0);
-			this.captureStreamEnded = true;
-			this.captureStreamEndIncomplete = incomplete;
-			this.finishCaptureStreamIfDrained();
-		});
-	}
-
-	private noteCaptureTransportCorruption(evidence: IncidentRecorderTransportCorruption): void {
-		this.transportCorruptPackets += 1n;
-		this.transportCorruptWireBytes += BigInt(evidence.wireBytes);
-	}
-
-	private noteCaptureSequenceAccounting(accounting: { gapEvents: bigint; missingPackets: bigint }): void {
-		this.transportSequenceGapEvents += accounting.gapEvents;
-		this.transportMissingPackets += accounting.missingPackets;
-	}
-
-	private acceptCaptureFrame(frameBytes: Buffer, wireBytes: number): void {
-		let decoded: ReturnType<typeof decodeIncidentRecorderFrame>;
-		try {
-			decoded = decodeIncidentRecorderFrame(frameBytes);
-		} catch {
-			this.noteCaptureTransportCorruption({ kind: "invalid-protocol-packet", wireBytes });
-			return;
-		}
-		const { header } = decoded;
-		if (header.runId !== this.runId || header.runToken !== this.runToken) {
-			this.noteRelayDrop(1, header.payloadLength);
-			return;
-		}
-		try {
-			validateIncidentRecorderFrameFlags(header.flags, header.chunkIndex, header.chunkCount);
-		} catch {
-			this.noteRelayDrop(1, header.payloadLength);
-			return;
-		}
-		if (this.captureOccurrenceTombstones.has(header.occurrenceId)) return;
-		if (this.captureFrames.length > 0 && Date.now() - this.captureStartedAt > 5_000) {
-			this.dropCaptureAssembly(0);
-			if (this.captureOccurrenceTombstones.has(header.occurrenceId)) return;
-		}
-		const firstSequence = header.producerSequence - BigInt(header.chunkIndex);
-		const lastSequence = firstSequence + BigInt(header.chunkCount - 1);
-		if (firstSequence < 0n || lastSequence > (1n << 64n) - 1n) {
-			this.discardCaptureOccurrence(header.occurrenceId, this.declaredOccurrenceRawBytes(header));
-			return;
-		}
-		if (this.captureFrames.length > 0 && header.occurrenceId === this.captureOccurrenceId) {
-			const existing = this.captureFrames[header.chunkIndex];
-			if (existing?.equals(frameBytes)) return;
-			if (
-				header.producerId !== this.captureProducerId ||
-				firstSequence !== this.captureFirstSequence ||
-				header.chunkCount !== this.captureChunkCount ||
-				existing ||
-				this.captureRawBytes + header.payloadLength > INCIDENT_RECORDER_PROTOCOL_MAX_OCCURRENCE_BYTES
-			) {
-				this.dropCaptureAssembly(header.payloadLength);
-				return;
-			}
-		}
-		const sequence = this.captureSequences.observe(header.producerId, header.producerSequence);
-		this.noteCaptureSequenceAccounting(sequence);
-		if (sequence.duplicate) return;
-		if (this.captureFrames.length === 0) this.startCaptureAssembly(header);
-		else if (header.occurrenceId !== this.captureOccurrenceId) {
-			this.dropCaptureAssembly(0);
-			if (this.captureOccurrenceTombstones.has(header.occurrenceId)) return;
-			this.startCaptureAssembly(header);
-		}
-		this.noteCaptureSequenceAccounting(this.captureSequences.expect(header.producerId, firstSequence, lastSequence));
-		if (this.captureRawBytes + header.payloadLength > INCIDENT_RECORDER_PROTOCOL_MAX_OCCURRENCE_BYTES) {
-			this.dropCaptureAssembly(header.payloadLength);
-			return;
-		}
-		this.captureFrames[header.chunkIndex] = frameBytes;
-		this.captureRawBytes += header.payloadLength;
-		this.captureReceivedChunks += 1;
-		if (this.captureReceivedChunks !== this.captureChunkCount) return;
-		const frames = this.captureFrames.filter((frame): frame is Buffer => frame !== undefined);
-		if (frames.length !== this.captureChunkCount) {
-			this.dropCaptureAssembly(0);
-			return;
-		}
-		const occurrenceId = this.captureOccurrenceId;
-		const rawBytes = this.captureRawBytes;
-		this.resetCaptureAssembly();
-		if (occurrenceId) this.rememberCaptureOccurrence(occurrenceId, "completed");
-		const bufferedBytes = frames.reduce((total, value) => total + value.length, 0);
-		if (bufferedBytes > configuredEmitterMaximum() - this.captureCompletedBytes) {
-			this.noteRelayDrop(1, rawBytes);
-			return;
-		}
-		this.captureCompletedOccurrences.push({ frames, wireBytes: bufferedBytes, rawBytes });
-		this.captureCompletedBytes += bufferedBytes;
-		if (this.captureCompletedBytes >= configuredEmitterMaximum()) this.captureStream?.pause();
-		this.pumpCaptureValidation();
-	}
-
-	private declaredOccurrenceRawBytes(header: IncidentRecorderEncodedFrame["header"]): number {
-		const value = header.metadata.occurrenceRawBytes;
-		return typeof value === "number" &&
-			Number.isSafeInteger(value) &&
-			value >= 0 &&
-			value <= INCIDENT_RECORDER_PROTOCOL_MAX_OCCURRENCE_BYTES
-			? value
-			: header.payloadLength;
-	}
-
-	private startCaptureAssembly(header: IncidentRecorderEncodedFrame["header"]): void {
-		this.captureOccurrenceId = header.occurrenceId;
-		this.captureProducerId = header.producerId;
-		this.captureFirstSequence = header.producerSequence - BigInt(header.chunkIndex);
-		this.captureChunkCount = header.chunkCount;
-		this.captureReceivedChunks = 0;
-		this.captureFrames = new Array<Buffer | undefined>(header.chunkCount);
-		this.captureRawBytes = 0;
-		this.captureDeclaredRawBytes = this.declaredOccurrenceRawBytes(header);
-		this.captureStartedAt = Date.now();
-	}
-
-	private resetCaptureAssembly(): void {
-		this.captureFrames = [];
-		this.captureOccurrenceId = undefined;
-		this.captureProducerId = undefined;
-		this.captureFirstSequence = 0n;
-		this.captureChunkCount = 0;
-		this.captureReceivedChunks = 0;
-		this.captureRawBytes = 0;
-		this.captureDeclaredRawBytes = 0;
-		this.captureStartedAt = 0;
-	}
-
-	private rememberCaptureOccurrence(occurrenceId: string, disposition: "completed" | "discarded"): void {
-		this.captureOccurrenceTombstones.delete(occurrenceId);
-		this.captureOccurrenceTombstones.set(occurrenceId, disposition);
-		while (this.captureOccurrenceTombstones.size > CAPTURE_OCCURRENCE_TOMBSTONE_MAX) {
-			this.captureOccurrenceTombstones.delete(this.captureOccurrenceTombstones.keys().next().value as string);
-		}
-	}
-
-	private discardCaptureOccurrence(occurrenceId: string, bytes: number): void {
-		if (this.captureOccurrenceTombstones.has(occurrenceId)) return;
-		this.rememberCaptureOccurrence(occurrenceId, "discarded");
-		this.noteRelayDrop(1, bytes);
-	}
-
-	private pumpCaptureValidation(): void {
-		if (this.captureValidationRunning) return;
-		const occurrence = this.captureCompletedOccurrences[0];
-		if (!occurrence) {
-			this.finishCaptureStreamIfDrained();
-			return;
-		}
-		this.captureValidationRunning = true;
-		this.enqueueRawFrames(occurrence.frames, occurrence.rawBytes, () => {
-			this.captureValidationRunning = false;
-			if (this.captureCompletedOccurrences[0] === occurrence) this.captureCompletedOccurrences.shift();
-			this.captureCompletedBytes = Math.max(0, this.captureCompletedBytes - occurrence.wireBytes);
-			if (this.captureCompletedBytes < configuredEmitterMaximum() / 2) this.captureStream?.resume();
-			setImmediate(() => this.pumpCaptureValidation());
-		});
-	}
-
-	private finishCaptureStreamIfDrained(): void {
-		if (
-			!this.captureStreamEnded ||
-			this.captureCloseRecorded ||
-			this.captureValidationRunning ||
-			this.captureCompletedOccurrences.length > 0
-		)
-			return;
-		this.captureCloseRecorded = true;
-		this.recordDerived("recorder-events", "capture_pipe_closed", {
-			incompleteBytes: this.captureStreamEndIncomplete,
-		});
-	}
-
-	private dropCaptureAssembly(extraBytes: number): void {
-		const occurrenceId = this.captureOccurrenceId;
-		const bytes = Math.max(this.captureDeclaredRawBytes, this.captureRawBytes + extraBytes);
-		this.resetCaptureAssembly();
-		if (occurrenceId) this.discardCaptureOccurrence(occurrenceId, bytes);
-	}
-
-	private enqueueRawFrames(frames: readonly Buffer[], knownRawBytes: number, complete: () => void): void {
-		const decoded: IncidentRecorderEncodedFrame[] = [];
-		const occurrenceHash = createHash("sha256");
-		let rawBytes = 0;
-		let index = 0;
-		let first: IncidentRecorderEncodedFrame["header"] | undefined;
-		const next = (): void => {
-			const frame = frames[index];
-			if (!frame) {
-				if (
-					!first ||
-					rawBytes !== first.metadata.occurrenceRawBytes ||
-					occurrenceHash.digest("hex") !== first.metadata.occurrenceSha256
-				) {
-					this.noteRelayDrop(1, knownRawBytes);
-					complete();
-					return;
-				}
-				this.enqueueFrames(decoded, false, true);
-				complete();
-				return;
-			}
-			try {
-				const value = decodeIncidentRecorderFrame(frame);
-				first ??= value.header;
-				const semanticFlags = INCIDENT_RECORDER_FRAME_FLAGS.critical | INCIDENT_RECORDER_FRAME_FLAGS.terminal;
-				if (
-					value.header.runId !== this.runId ||
-					value.header.runToken !== this.runToken ||
-					value.header.runId !== first.runId ||
-					value.header.runToken !== first.runToken ||
-					value.header.producerId !== first.producerId ||
-					value.header.occurrenceId !== first.occurrenceId ||
-					value.header.source !== first.source ||
-					value.header.type !== first.type ||
-					value.header.encoding !== first.encoding ||
-					value.header.payloadKind !== first.payloadKind ||
-					value.header.chunkCount !== frames.length ||
-					value.header.chunkIndex !== index ||
-					value.header.producerSequence !== first.producerSequence + BigInt(index) ||
-					value.header.wallTimeMs !== first.wallTimeMs ||
-					value.header.monotonicNs !== first.monotonicNs ||
-					(value.header.flags & semanticFlags) !== (first.flags & semanticFlags) ||
-					JSON.stringify(value.header.metadata) !== JSON.stringify(first.metadata)
-				)
-					throw new Error("Capture occurrence contract changed across chunks");
-				decoded.push({ header: value.header, parts: [value.payload], bytes: frame.length });
-				occurrenceHash.update(value.payload);
-				rawBytes += value.payload.length;
-				index += 1;
-				setImmediate(next);
-			} catch {
-				this.noteRelayDrop(1, knownRawBytes);
-				complete();
-			}
-		};
-		setImmediate(next);
-	}
-
-	private enqueueFrames(
-		frames: readonly IncidentRecorderEncodedFrame[],
-		_reserved: boolean,
-		prevalidated = false,
-	): { accepted: boolean; reason?: string } {
-		if (frames.length === 0) return { accepted: false, reason: "empty_occurrence" };
-		const first = frames[0].header;
-		const rawBytes = frames.reduce((sum, frame) => sum + frame.header.payloadLength, 0);
-		const semanticFlags = INCIDENT_RECORDER_FRAME_FLAGS.critical | INCIDENT_RECORDER_FRAME_FLAGS.terminal;
-		const fixed = (frame: IncidentRecorderEncodedFrame): boolean => {
-			const header = frame.header;
-			return (
-				header.runId === first.runId &&
-				header.runToken === first.runToken &&
-				header.producerId === first.producerId &&
-				header.occurrenceId === first.occurrenceId &&
-				header.source === first.source &&
-				header.type === first.type &&
-				header.encoding === first.encoding &&
-				header.payloadKind === first.payloadKind &&
-				header.chunkCount === frames.length &&
-				header.wallTimeMs === first.wallTimeMs &&
-				header.monotonicNs === first.monotonicNs &&
-				(header.flags & semanticFlags) === (first.flags & semanticFlags) &&
-				JSON.stringify(header.metadata) === JSON.stringify(first.metadata)
-			);
-		};
-		const acceptedIdentity =
-			(first.runId === this.runId && first.runToken === this.runToken) ||
-			(this.serviceSink && this.serviceEmitters.has(`${first.runId} ${first.runToken}`));
-		if (
-			!acceptedIdentity ||
-			rawBytes > INCIDENT_RECORDER_PROTOCOL_MAX_OCCURRENCE_BYTES ||
-			frames.some((frame, index) => {
-				try {
-					validateIncidentRecorderFrameFlags(frame.header.flags, frame.header.chunkIndex, frame.header.chunkCount);
-				} catch {
-					return true;
-				}
-				return (
-					!fixed(frame) ||
-					frame.header.chunkIndex !== index ||
-					frame.header.producerSequence !== first.producerSequence + BigInt(index)
-				);
-			})
-		)
-			return { accepted: false, reason: "invalid_occurrence_contract" };
-		if (!prevalidated) {
-			const expectedDigest =
-				typeof first.metadata.occurrenceSha256 === "string" ? first.metadata.occurrenceSha256 : undefined;
-			const expectedBytes =
-				typeof first.metadata.occurrenceRawBytes === "number" ? first.metadata.occurrenceRawBytes : undefined;
-			const actualDigest = createHash("sha256");
-			for (const frame of frames) actualDigest.update(frame.parts.at(-1) ?? Buffer.alloc(0));
-			if (expectedBytes !== rawBytes || !expectedDigest || actualDigest.digest("hex") !== expectedDigest)
-				return { accepted: false, reason: "occurrence_checksum_or_length_mismatch" };
-		}
-		if (first.payloadKind === "exact-bytes") return { accepted: false, reason: "non_causal_payload_disabled" };
-		try {
-			this.onStructuredEvent?.(first.source, first.type, { ...first.metadata });
-		} catch {
-			return { accepted: false, reason: "structured_event_persistence_failed" };
-		}
-		const identityKey = `${first.runId} ${first.runToken}`;
-		let wrapperSequence = this.wrapperSequences.get(identityKey) ?? 0n;
-		const firstWrapperSequence = ++wrapperSequence;
-		wrapperSequence += BigInt(frames.length - 1);
-		this.wrapperSequences.set(identityKey, wrapperSequence);
-		if (first.type === "supervisor_exit" || first.type === "capture_channel_terminal") {
-			this.finalizationFrontiers.set(first.occurrenceId, {
-				occurrenceId: first.occurrenceId,
-				producerId: first.producerId,
-				type: first.type,
-				firstProducerSequence: first.producerSequence.toString(),
-				lastProducerSequence: (first.producerSequence + BigInt(frames.length - 1)).toString(),
-				firstWrapperSequence: firstWrapperSequence.toString(),
-				lastWrapperSequence: wrapperSequence.toString(),
-			});
-		}
-		return { accepted: true };
-	}
-
-	private renderJournalLine(frame: IncidentRecorderEncodedFrame, wrapperSequence: bigint): Buffer {
-		const payload = frame.parts.at(-1) ?? Buffer.alloc(0);
-		const metadata = frame.header.metadata;
-		const line: IncidentJournalLine = {
-			schema: "prime-agent-raw-v1",
-			runId: frame.header.runId,
-			runToken: frame.header.runToken,
-			producerId: frame.header.producerId,
-			producerSequence: frame.header.producerSequence.toString(),
-			wrapperSequence: wrapperSequence.toString(),
-			occurrenceId: frame.header.occurrenceId,
-			chunkIndex: frame.header.chunkIndex,
-			chunkCount: frame.header.chunkCount,
-			source: frame.header.source,
-			type: frame.header.type,
-			encoding: frame.header.encoding,
-			payloadKind: frame.header.payloadKind,
-			producerPid: typeof metadata.producerPid === "number" ? metadata.producerPid : null,
-			producerStartId: typeof metadata.producerStartId === "string" ? metadata.producerStartId : null,
-			wrapperPid: process.pid,
-			wrapperStartId: this.wrapperStartId ?? null,
-			targetPid:
-				typeof metadata.targetPid === "number"
-					? metadata.targetPid
-					: typeof this.sourceIdentity.pid === "number"
-						? this.sourceIdentity.pid
-						: null,
-			targetStartId:
-				typeof metadata.targetProcessStartId === "string"
-					? metadata.targetProcessStartId
-					: typeof this.sourceIdentity.processStartId === "string"
-						? this.sourceIdentity.processStartId
-						: null,
-			bootId: this.bootId ?? null,
-			machineId: this.machineId ?? null,
-			systemdInvocationId: this.invocationId ?? null,
-			systemdCatPid: this.cat?.pid ?? null,
-			systemdCatStartId: this.catStartId ?? null,
-			eventWallTimeMs: frame.header.wallTimeMs.toString(),
-			eventMonotonicNs: frame.header.monotonicNs.toString(),
-			rawOccurrenceBytes:
-				typeof metadata.occurrenceRawBytes === "number" ? metadata.occurrenceRawBytes : payload.length,
-			occurrenceSha256: typeof metadata.occurrenceSha256 === "string" ? metadata.occurrenceSha256 : "unavailable",
-			chunkBytes: payload.length,
-			chunkSha256: createHash("sha256").update(payload).digest("hex"),
-			frameChecksum: frame.header.checksum,
-			flags: frame.header.flags,
-			metadata,
-			payloadBase64: payload.toString("base64"),
-			attemptedRecords: typeof metadata.attemptedRecords === "number" ? metadata.attemptedRecords : null,
-			attemptedBytes: typeof metadata.attemptedBytes === "number" ? metadata.attemptedBytes : null,
-			queuedRecords: typeof metadata.queuedRecords === "number" ? metadata.queuedRecords : null,
-			queuedBytes: typeof metadata.queuedBytes === "number" ? metadata.queuedBytes : null,
-			droppedRecords: typeof metadata.droppedRecords === "number" ? metadata.droppedRecords : null,
-			droppedBytes: typeof metadata.droppedBytes === "number" ? metadata.droppedBytes : null,
-			observationDisposition: "observed_by_wrapper",
-			queueDisposition: "locally_admitted",
-			wrapperRelayDisposition: "locally_admitted",
-			streamDisposition: "systemd_cat_stdin_write_attempted",
-			journalDurability: "not_asserted_by_writer",
-			wrapperRelayDroppedRecords: this.relayDroppedRecords,
-			wrapperRelayDroppedBytes: this.relayDroppedBytes,
-			wrapperRelayUncertainRecords: this.relayUncertainRecords,
-		};
-		const encoded = Buffer.from(JSON.stringify(line), "utf8");
-		if (encoded.includes(0) || encoded.includes(10) || encoded.length >= INCIDENT_RECORDER_JOURNAL_LINE_MAX_BYTES) {
-			throw new Error("Incident journal line exceeds the dedicated namespace LineMax safety bound");
-		}
-		return Buffer.concat([encoded, Buffer.from("\n")]);
-	}
-
-	private emitRelayLossCheckpoint(): void {
-		const transportChanged =
-			this.transportCorruptPackets !== this.transportReportedCorruptPackets ||
-			this.transportCorruptWireBytes !== this.transportReportedCorruptWireBytes ||
-			this.transportSequenceGapEvents !== this.transportReportedSequenceGapEvents ||
-			this.transportMissingPackets !== this.transportReportedMissingPackets;
-		if (this.stopped || (this.relayDroppedRecords === this.relayLossReportedRecords && !transportChanged)) return;
-		const snapshotRecords = this.relayDroppedRecords;
-		const snapshotBytes = this.relayDroppedBytes;
-		const identity = this.relayLossIdentity ?? { runId: this.runId, runToken: this.runToken };
-		const sequence = ++this.relayLossProducerSequence;
-		const emptyDigest = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-		const frame = encodeIncidentRecorderFrame(
-			{
-				runId: identity.runId,
-				runToken: identity.runToken,
-				producerId: this.relayLossProducerId,
-				occurrenceId: newIncidentRecorderIdentity(),
-				producerSequence: sequence,
-				wallTimeMs: BigInt(Date.now()),
-				monotonicNs: process.hrtime.bigint(),
-				payloadKind: "loss",
-				flags: INCIDENT_RECORDER_FRAME_FLAGS.firstChunk | INCIDENT_RECORDER_FRAME_FLAGS.lastChunk,
-				chunkIndex: 0,
-				chunkCount: 1,
-				source: "recorder-control",
-				type: "wrapper_relay_loss_checkpoint",
-				encoding: "none",
-				metadata: {
-					lostRecords: snapshotRecords,
-					lostBytes: snapshotBytes,
-					recordsSinceLastMarker: snapshotRecords - this.relayLossReportedRecords,
-					bytesSinceLastMarker: snapshotBytes - this.relayLossReportedBytes,
-					transportCorruptPackets: this.transportCorruptPackets.toString(),
-					transportCorruptPacketsSinceLastMarker: (
-						this.transportCorruptPackets - this.transportReportedCorruptPackets
-					).toString(),
-					transportCorruptWireBytes: this.transportCorruptWireBytes.toString(),
-					transportCorruptWireBytesSinceLastMarker: (
-						this.transportCorruptWireBytes - this.transportReportedCorruptWireBytes
-					).toString(),
-					transportSequenceGapEvents: this.transportSequenceGapEvents.toString(),
-					transportSequenceGapEventsSinceLastMarker: (
-						this.transportSequenceGapEvents - this.transportReportedSequenceGapEvents
-					).toString(),
-					transportMissingPackets: this.transportMissingPackets.toString(),
-					transportMissingPacketsSinceLastMarker: (
-						this.transportMissingPackets - this.transportReportedMissingPackets
-					).toString(),
-					occurrenceRawBytes: 0,
-					occurrenceSha256: emptyDigest,
-					producerPid: process.pid,
-					producerStartId: this.wrapperStartId ?? "unavailable",
-				},
-			},
-			Buffer.alloc(0),
-		);
-		const admission = this.enqueueFrames([frame], true, true);
-		if (admission.accepted) {
-			this.relayLossReportedRecords = snapshotRecords;
-			this.relayLossReportedBytes = snapshotBytes;
-			this.transportReportedCorruptPackets = this.transportCorruptPackets;
-			this.transportReportedCorruptWireBytes = this.transportCorruptWireBytes;
-			this.transportReportedSequenceGapEvents = this.transportSequenceGapEvents;
-			this.transportReportedMissingPackets = this.transportMissingPackets;
-			this.relayLossIdentity = undefined;
-		}
-	}
-
-	private noteRelayDrop(records: number, bytes: number, identity?: { runId: string; runToken: string }): void {
-		this.relayDroppedRecords += records;
-		this.relayDroppedBytes += bytes;
-		if (identity) this.relayLossIdentity = identity;
-	}
-
-	private pumpRelay(): void {
-		if (this.pumping || (this.stopped && this.relayQueue.length === 0)) return;
-		const child = this.cat;
-		const stdin = child?.stdin;
-		const occurrence = this.relayQueue[0];
-		if (!child || !stdin || stdin.destroyed || !occurrence) return;
-		const frame = occurrence.frames[occurrence.lineIndex];
-		const wrapperSequence = occurrence.wrapperSequences[occurrence.lineIndex];
-		if (!frame || wrapperSequence === undefined) {
-			this.relayQueue.shift();
-			this.relayBytes = Math.max(0, this.relayBytes - occurrence.bytes);
-			this.pumpRelay();
-			return;
-		}
-		let line: Buffer;
-		try {
-			line = this.renderJournalLine(frame, wrapperSequence);
-		} catch {
-			this.relayQueue.shift();
-			this.relayBytes = Math.max(0, this.relayBytes - occurrence.bytes);
-			this.noteRelayDrop(1, occurrence.rawBytes, { runId: frame.header.runId, runToken: frame.header.runToken });
-			this.pumpRelay();
-			return;
-		}
-		this.pumping = true;
-		stdin.write(line, (error) => {
-			this.pumping = false;
-			if (error) {
-				this.relayUncertainRecords += 1;
-				this.relayQueue.shift();
-				this.relayBytes = Math.max(0, this.relayBytes - occurrence.bytes);
-				this.noteRelayDrop(1, occurrence.rawBytes, { runId: frame.header.runId, runToken: frame.header.runToken });
-				try {
-					child.stdin?.destroy();
-				} catch {}
-				this.handleCatUnavailable(child);
-				return;
-			}
-			occurrence.lineIndex += 1;
-			if (occurrence.lineIndex >= occurrence.frames.length) {
-				this.relayQueue.shift();
-				this.relayBytes = Math.max(0, this.relayBytes - occurrence.bytes);
-			}
-			setImmediate(() => this.pumpRelay());
-		});
+	attachCaptureStream(stream: Readable): void {
+		stream.resume();
 	}
 
 	recordDerived(source: CaptureSource, type: string, fields: Record<string, unknown>): IncidentRecorderAdmission {
-		return this.emitter.emitDerived(source, type, fields);
+		const occurrenceId = randomUUID();
+		if (this.stopped) return rejected("writer_stopped", occurrenceId);
+		try {
+			const result = this.onStructuredEvent?.(source, type, { ...safeFields(fields), occurrenceId });
+			return result === false ? rejected("durable_sink_unavailable", occurrenceId) : accepted(occurrenceId);
+		} catch {
+			return rejected("durable_sink_failed_open", occurrenceId);
+		}
 	}
 
 	recordExactBytes(
-		source: CaptureSource,
-		type: string,
-		bytes: Uint8Array,
-		encoding: string,
-		metadata: Record<string, unknown>,
+		_source: CaptureSource,
+		_type: string,
+		_value: Uint8Array,
+		_encoding: string,
+		_fields: Record<string, unknown>,
 	): IncidentRecorderAdmission {
-		return this.emitter.emitBytes(source, type, bytes, scalarMetadata(metadata), encoding);
+		return rejected("raw_bytes_not_causal");
 	}
 
 	recordDerivedForRun(
-		identity: { runId: string; runToken: string },
+		_identity: { runId: string; runToken: string },
 		source: CaptureSource,
 		type: string,
 		fields: Record<string, unknown>,
 	): IncidentRecorderAdmission {
-		const emitter = this.serviceEmitter(identity);
-		return (
-			emitter?.emitDerived(source, type, fields) ?? {
-				accepted: false,
-				disposition: "rejected",
-				reason: this.stopped ? "stopped" : "queue_capacity",
-			}
-		);
-	}
-
-	releaseRunIdentity(identity: { runId: string; runToken: string }): void {
-		if (!this.serviceSink) return;
-		const key = `${identity.runId}\0${identity.runToken}`;
-		this.serviceEmitters.delete(key);
-		this.wrapperSequences.delete(key);
+		return this.recordDerived(source, type, fields);
 	}
 
 	recordExactBytesForRun(
-		identity: { runId: string; runToken: string },
-		source: CaptureSource,
-		type: string,
-		bytes: Uint8Array,
-		encoding: string,
-		metadata: Record<string, unknown>,
+		_identity: { runId: string; runToken: string },
+		_source: CaptureSource,
+		_type: string,
+		_value: Uint8Array,
+		_encoding: string,
+		_fields: Record<string, unknown>,
 	): IncidentRecorderAdmission {
-		const emitter = this.serviceEmitter(identity);
-		return (
-			emitter?.emitBytes(source, type, bytes, scalarMetadata(metadata), encoding) ?? {
-				accepted: false,
-				disposition: "rejected",
-				reason: this.stopped ? "stopped" : "queue_capacity",
-			}
-		);
+		return rejected("raw_bytes_not_causal");
 	}
 
-	private async waitForCatClose(child: ChildProcess, deadlineMs: number): Promise<boolean> {
-		if (child.exitCode !== null || child.signalCode !== null) return true;
-		return await new Promise<boolean>((resolve) => {
-			let settled = false;
-			const finish = (closed: boolean) => {
-				if (settled) return;
-				settled = true;
-				clearTimeout(timer);
-				child.off("close", onClose);
-				resolve(closed);
-			};
-			const onClose = () => finish(true);
-			const timer = setTimeout(() => finish(false), Math.max(1, deadlineMs));
-			timer.unref();
-			child.once("close", onClose);
-		});
-	}
+	releaseRunIdentity(_identity: { runId: string; runToken: string }): void {}
 
-	async stop(deadlineMs = 1_000): Promise<void> {
-		if (this.stopped) return;
-		const captureDeadline = Date.now() + deadlineMs;
-		while (
-			(this.captureValidationRunning || this.captureCompletedOccurrences.length > 0) &&
-			Date.now() < captureDeadline
-		) {
-			await new Promise<void>((resolve) => setTimeout(resolve, 10));
-		}
-		if (this.relayLossTimer) clearInterval(this.relayLossTimer);
-		this.relayLossTimer = undefined;
-		this.emitRelayLossCheckpoint();
-		const emitterLossBefore = this.emitter.lossCounters();
-		const terminalAdmission = await this.emitter.stop(deadlineMs);
-		const emitterLossAfter = this.emitter.lossCounters();
-		this.emitterFinalTailLoss = {
-			records: emitterLossAfter.records - emitterLossBefore.records,
-			bytes: emitterLossAfter.bytes - emitterLossBefore.bytes,
-		};
-		if (terminalAdmission?.accepted) this.terminalOccurrenceId = terminalAdmission.occurrenceId;
-		const relayDeadline = Date.now() + deadlineMs;
-		while ((this.relayQueue.length > 0 || this.pumping) && Date.now() < relayDeadline) {
-			await new Promise<void>((resolve) => setTimeout(resolve, 10));
-		}
-		const cleanRelayDrain = this.relayQueue.length === 0 && !this.pumping;
+	async stop(_deadlineMs = 1_000): Promise<void> {
 		this.stopped = true;
-		if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-		this.reconnectTimer = undefined;
-		// Anything still queued was never handed to a completed stream write callback.
-		for (const occurrence of this.relayQueue.splice(0)) {
-			this.finalTailDroppedRecords += 1;
-			this.finalTailDroppedBytes += occurrence.rawBytes;
-			this.noteRelayDrop(1, occurrence.rawBytes);
-		}
-		this.relayBytes = 0;
-		const child = this.cat;
-		if (!child) return;
-		if (cleanRelayDrain) {
-			try {
-				child.stdin?.end();
-			} catch {}
-			if (await this.waitForCatClose(child, deadlineMs)) return;
-		}
-		try {
-			child.stdin?.destroy();
-		} catch {}
-		try {
-			child.kill("SIGTERM");
-		} catch {}
-		if (await this.waitForCatClose(child, 250)) return;
-		try {
-			child.kill("SIGKILL");
-		} catch {}
-		await this.waitForCatClose(child, 250);
 	}
 
 	finalizationExpectation(supervisorExitOccurrenceId: string): IncidentRecorderFinalizationExpectation {
-		return {
-			runId: this.runId,
-			runToken: this.runToken,
-			wrapperPid: process.pid,
-			wrapperStartId: this.wrapperStartId ?? null,
-			supervisorExit: this.finalizationFrontiers.get(supervisorExitOccurrenceId),
-			wrapperTerminal: this.terminalOccurrenceId
-				? this.finalizationFrontiers.get(this.terminalOccurrenceId)
-				: undefined,
-			finalQueuedTailLoss: { records: this.finalTailDroppedRecords, bytes: this.finalTailDroppedBytes },
-			emitterFinalTailLoss: this.emitterFinalTailLoss,
-		};
-	}
-
-	get isStopped(): boolean {
-		return this.stopped;
+		return { supervisorExitOccurrenceId, durableStructuredCapture: true };
 	}
 }

@@ -1,20 +1,7 @@
-import { spawn } from "node:child_process";
-import {
-	closeSync,
-	existsSync,
-	mkdirSync,
-	mkdtempSync,
-	openSync,
-	readdirSync,
-	readFileSync,
-	rmSync,
-	writeFileSync,
-} from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Readable } from "node:stream";
-import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { getProcessStartId } from "../src/core/session-lease.js";
 import { DaemonWorkerClient } from "../src/modes/daemon/daemon-worker-client.js";
@@ -29,27 +16,13 @@ import {
 	shouldRecordSupervisorLaunch,
 } from "../src/modes/daemon/incident-recorder.js";
 import {
-	decodeIncidentRecorderFrame,
-	encodeIncidentRecorderFrame,
-	INCIDENT_RECORDER_FRAME_FLAGS,
-	INCIDENT_RECORDER_RUN_ID_ENV,
-	INCIDENT_RECORDER_RUN_TOKEN_ENV,
-} from "../src/modes/daemon/incident-recorder-protocol.js";
-import {
 	INCIDENT_DIAGNOSTIC_RETENTION_MS,
 	runIncidentRetentionPass,
 } from "../src/modes/daemon/incident-recorder-retention.js";
-import { IncidentRecorderTransportDecoder } from "../src/modes/daemon/incident-recorder-transport.js";
-import {
-	INCIDENT_RECORDER_CAPTURE_FD_ENV,
-	INCIDENT_RECORDER_CAPTURE_OWNER_PID_ENV,
-	INCIDENT_RECORDER_CAPTURE_OWNER_START_ID_ENV,
-	INCIDENT_RECORDER_ROOT_FD_ENV,
-	writeEncodedFramesToFd,
-} from "../src/modes/daemon/incident-recorder-writer.js";
 
 const roots: string[] = [];
 const livePids = new Map<number, string>();
+const pendingRecords = new Set<Promise<RecordedProcessResult>>();
 
 function signalFixture(pid: number, signal: NodeJS.Signals | 0): void {
 	const expectedStartId = livePids.get(pid);
@@ -59,73 +32,44 @@ function signalFixture(pid: number, signal: NodeJS.Signals | 0): void {
 	process.kill(pid, signal);
 }
 
-afterEach(() => {
+afterEach(async () => {
 	for (const [pid, expectedStartId] of livePids) {
 		try {
 			if (getProcessStartId(pid) === expectedStartId) process.kill(pid, "SIGKILL");
 		} catch {}
 	}
 	livePids.clear();
+	await Promise.allSettled([...pendingRecords]);
 	for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
 function fixture(source: string): { root: string; agentDir: string; socketPath: string; script: string } {
-	const root = mkdtempSync(join(tmpdir(), "prime-agent-recorder-process-"));
+	const root = mkdtempSync(process.platform === "linux" ? "/tmp/pa-ir-" : join(tmpdir(), "pa-ir-"));
 	roots.push(root);
+	const socketPath = join(root, "isolated.sock");
+	if (process.platform === "linux" && Buffer.byteLength(socketPath) >= 108)
+		throw new Error(`isolated Unix socket path exceeds sun_path: ${socketPath}`);
 	const agentDir = join(root, "agent");
 	mkdirSync(agentDir, { mode: 0o700 });
 	const script = join(root, "fault.cjs");
 	writeFileSync(script, source, { mode: 0o600 });
-	return { root, agentDir, socketPath: join(root, "isolated.sock"), script };
+	return { root, agentDir, socketPath, script };
 }
 
 function record(target: ReturnType<typeof fixture>): Promise<RecordedProcessResult> {
-	return recordSupervisorProcess({
+	const pending = recordSupervisorProcess({
 		agentDir: target.agentDir,
 		socketPath: target.socketPath,
 		launch: { command: process.execPath, args: [target.script] },
 		environment: {},
 		cwd: target.root,
 	});
-}
-
-function decodeCaptureWire(wire: Buffer): ReturnType<typeof decodeIncidentRecorderFrame>[] {
-	const packets: Buffer[] = [];
-	const corruptions: unknown[] = [];
-	const decoder = new IncidentRecorderTransportDecoder(
-		(packet) => packets.push(packet),
-		(evidence) => corruptions.push(evidence),
+	pendingRecords.add(pending);
+	pending.then(
+		() => pendingRecords.delete(pending),
+		() => pendingRecords.delete(pending),
 	);
-	decoder.push(wire);
-	decoder.finish();
-	expect(corruptions).toEqual([]);
-	return packets.map((packet) => decodeIncidentRecorderFrame(packet));
-}
-
-function recordedStructuredTypes(runDir: string): string[] {
-	const types: string[] = [];
-	const timeline = join(runDir, "timeline.jsonl");
-	if (existsSync(timeline)) {
-		for (const line of readFileSync(timeline, "utf8").split("\n").filter(Boolean)) {
-			try {
-				const event = JSON.parse(line) as { type?: unknown };
-				if (typeof event.type === "string") types.push(event.type);
-			} catch {}
-		}
-	}
-	const directory = join(runDir, "raw-application", "recorder-events");
-	if (!existsSync(directory)) return types;
-	for (const name of readdirSync(directory).filter((candidate) => /^segment-\d{8}\.jsonl$/.test(candidate))) {
-		for (const line of readFileSync(join(directory, name), "utf8").split("\n").filter(Boolean)) {
-			try {
-				const frame = JSON.parse(line) as { chunkCount: number; chunkIndex: number; payload: string };
-				if (frame.chunkCount !== 1 || frame.chunkIndex !== 0) continue;
-				const envelope = JSON.parse(Buffer.from(frame.payload, "base64").toString("utf8")) as { type?: unknown };
-				if (typeof envelope.type === "string") types.push(envelope.type);
-			} catch {}
-		}
-	}
-	return types;
+	return pending;
 }
 
 function onlyRunDir(agentDir: string): string {
@@ -133,6 +77,22 @@ function onlyRunDir(agentDir: string): string {
 	const runName = readdirSync(runsRoot)[0];
 	if (!runName) throw new Error("isolated fixture has no recorder run");
 	return join(runsRoot, runName);
+}
+
+function recordedStructuredTypes(runDir: string): string[] {
+	const timeline = join(runDir, "timeline.jsonl");
+	if (!existsSync(timeline)) return [];
+	return readFileSync(timeline, "utf8")
+		.split("\n")
+		.filter(Boolean)
+		.flatMap((line) => {
+			try {
+				const event = JSON.parse(line) as { type?: unknown };
+				return typeof event.type === "string" ? [event.type] : [];
+			} catch {
+				return [];
+			}
+		});
 }
 
 async function waitForPid(agentDir: string): Promise<number> {
@@ -145,9 +105,10 @@ async function waitForPid(agentDir: string): Promise<number> {
 					pid: number;
 					processStartId?: string;
 				};
-				if (!identity.processStartId || getProcessStartId(identity.pid) !== identity.processStartId) continue;
-				livePids.set(identity.pid, identity.processStartId);
-				return identity.pid;
+				if (identity.processStartId && getProcessStartId(identity.pid) === identity.processStartId) {
+					livePids.set(identity.pid, identity.processStartId);
+					return identity.pid;
+				}
 			} catch {}
 		}
 		await new Promise((resolve) => setTimeout(resolve, 10));
@@ -230,352 +191,6 @@ describe("incident recorder isolated fault evidence", () => {
 		expect(existsSync(runDir)).toBe(false);
 	});
 
-	it("finishes writing a derived frame with an empty payload", async () => {
-		const target = fixture("");
-		const output = join(target.root, "derived-frame.bin");
-		const fd = openSync(output, "w", 0o600);
-		const frame = encodeIncidentRecorderFrame(
-			{
-				runId: "11111111-1111-4111-8111-111111111111",
-				runToken: "22222222-2222-4222-8222-222222222222",
-				producerId: "33333333-3333-4333-8333-333333333333",
-				occurrenceId: "44444444-4444-4444-8444-444444444444",
-				producerSequence: 1n,
-				wallTimeMs: 1n,
-				monotonicNs: 1n,
-				payloadKind: "derived-scalar",
-				flags: INCIDENT_RECORDER_FRAME_FLAGS.firstChunk | INCIDENT_RECORDER_FRAME_FLAGS.lastChunk,
-				chunkIndex: 0,
-				chunkCount: 1,
-				source: "supervisor-events",
-				type: "supervisor_heartbeat",
-				encoding: "none",
-				metadata: {},
-			},
-			Buffer.alloc(0),
-		);
-		try {
-			await Promise.race([
-				new Promise<void>((resolve, reject) =>
-					writeEncodedFramesToFd(fd, [frame], (error) => (error ? reject(error) : resolve())),
-				),
-				new Promise<never>((_, reject) =>
-					setTimeout(() => reject(new Error("empty payload write did not finish")), 250),
-				),
-			]);
-		} finally {
-			closeSync(fd);
-		}
-		const decoded = decodeCaptureWire(readFileSync(output));
-		expect(decoded).toHaveLength(1);
-		expect(decoded[0].payload).toHaveLength(0);
-	});
-
-	it("keeps inherited fd4 single-owner under two-process saturation", async () => {
-		const target = fixture("");
-		const script = fileURLToPath(new URL("./fixtures/incident-recorder-shared-fd.ts", import.meta.url));
-		const tsxLoader = fileURLToPath(new URL("../../../node_modules/tsx/dist/loader.mjs", import.meta.url));
-		const environment: NodeJS.ProcessEnv = {
-			...process.env,
-			[INCIDENT_RECORDER_CAPTURE_FD_ENV]: "4",
-			[INCIDENT_RECORDER_ROOT_FD_ENV]: "5",
-			[INCIDENT_RECORDER_RUN_ID_ENV]: "11111111-1111-4111-8111-111111111111",
-			[INCIDENT_RECORDER_RUN_TOKEN_ENV]: "22222222-2222-4222-8222-222222222222",
-			[INCIDENT_RECORDER_RUN_DIR_ENV]: target.root,
-			PRIME_INCIDENT_RECORDER_CAPTURE_MAX_BYTES: String(256 * 1024),
-			PRIME_TEST_TSX_LOADER: tsxLoader,
-		};
-		delete environment[INCIDENT_RECORDER_CAPTURE_OWNER_PID_ENV];
-		delete environment[INCIDENT_RECORDER_CAPTURE_OWNER_START_ID_ENV];
-		const recorderRootFd = openSync(target.root, "r");
-		const child = spawn(process.execPath, ["--import", tsxLoader, script], {
-			env: environment,
-			stdio: ["ignore", "pipe", "pipe", "ignore", "pipe", recorderRootFd],
-		});
-		closeSync(recorderRootFd);
-		if (!child.pid) throw new Error("shared fd fixture did not start");
-		const ownerPid = child.pid;
-		const ownerStartId = getProcessStartId(ownerPid);
-		if (!ownerStartId) throw new Error("shared fd fixture has no stable process identity");
-		livePids.set(ownerPid, ownerStartId);
-		const capture = child.stdio[4];
-		if (!(capture instanceof Readable)) throw new Error("shared fd fixture has no capture pipe");
-		let stdout = "";
-		let stderr = "";
-		child.stdout?.setEncoding("utf8");
-		child.stderr?.setEncoding("utf8");
-		child.stderr?.on("data", (chunk: string) => {
-			stderr += chunk;
-		});
-		const summary = await new Promise<Record<string, any>>((resolveSummary, rejectSummary) => {
-			child.once("error", rejectSummary);
-			child.stdout?.on("data", (chunk: string) => {
-				stdout += chunk;
-				const newline = stdout.indexOf("\n");
-				if (newline < 0) return;
-				try {
-					resolveSummary(JSON.parse(stdout.slice(0, newline)) as Record<string, any>);
-				} catch (error) {
-					rejectSummary(error);
-				}
-			});
-			child.once("close", (code, signal) =>
-				rejectSummary(
-					new Error(
-						`shared fd fixture exited before summary: code=${String(code)} signal=${String(signal)} stderr=${stderr}`,
-					),
-				),
-			);
-		});
-		// Reading starts only after the bounded producer queue has saturated.
-		const chunks: Buffer[] = [];
-		capture.on("data", (chunk: Buffer) => chunks.push(Buffer.from(chunk)));
-		const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
-			(resolveExit, rejectExit) => {
-				child.once("error", rejectExit);
-				child.once("close", (code, signal) => resolveExit({ code, signal }));
-			},
-		);
-		livePids.delete(ownerPid);
-		expect(exit, stderr).toEqual({ code: 0, signal: null });
-		expect(summary.pid).toBe(ownerPid);
-		expect(summary.processStartId).toBe(ownerStartId);
-		expect(summary.configured).toBe(true);
-		expect(summary.accepted).toBeGreaterThan(0);
-		expect(summary.rejected).toBeGreaterThan(0);
-		expect(summary.accepted + summary.rejected).toBe(summary.attempted);
-		expect(summary.contender).toMatchObject({ configured: false, admission: { accepted: false, reason: "stopped" } });
-		expect(summary.contenderExit).toEqual({ code: 0, signal: null });
-		expect(getProcessStartId(summary.contender.pid)).not.toBe(summary.contender.processStartId);
-		const ownerClaim = summary.ownerClaim as Record<string, unknown>;
-		expect(ownerClaim).toMatchObject({
-			schemaVersion: 1,
-			runId: "11111111-1111-4111-8111-111111111111",
-			runToken: "22222222-2222-4222-8222-222222222222",
-			pid: ownerPid,
-			processStartId: ownerStartId,
-		});
-		expect(ownerClaim.machineId).toMatch(/^[0-9a-f]{32}$/i);
-		expect(ownerClaim.bootId).toMatch(/^[0-9a-f-]{36}$/i);
-		expect(ownerClaim.ownerNonce).toMatch(/^[0-9a-f-]{36}$/i);
-
-		const wire = Buffer.concat(chunks);
-		const decoded = decodeCaptureWire(wire);
-		const exact = decoded.filter((frame) => frame.header.type === "shared_fd_owner");
-		expect(exact).toHaveLength(summary.accepted);
-		expect(new Set(exact.map((frame) => frame.header.occurrenceId)).size).toBe(exact.length);
-		for (let index = 0; index < exact.length; index += 1) {
-			const frame = exact[index];
-			expect(frame.header.producerSequence).toBe(BigInt(index + 1));
-			expect(frame.header.metadata).toMatchObject({
-				producerPid: ownerPid,
-				producerStartId: ownerStartId,
-			});
-			expect(frame.payload.length).toBe(24 * 1024);
-			expect(frame.payload.readUInt32BE(0)).toBe(index);
-			expect(frame.payload.subarray(4).every((byte) => byte === index % 251)).toBe(true);
-		}
-		expect(decoded.some((frame) => frame.header.type === "shared_fd_contender")).toBe(false);
-		const loss = decoded.filter((frame) => frame.header.type === "capture_channel_loss_checkpoint").at(-1);
-		expect(loss?.header.metadata).toMatchObject({
-			lostRecords: summary.rejected,
-			lostBytes: summary.rejectedBytes,
-		});
-		const terminal = decoded.find((frame) => frame.header.type === "capture_channel_terminal");
-		expect(terminal?.header.metadata).toMatchObject({
-			lostRecords: summary.rejected,
-			lostBytes: summary.rejectedBytes,
-		});
-	}, 15_000);
-
-	it("includes calls made after stop begins in terminal loss accounting", async () => {
-		const target = fixture("");
-		const script = fileURLToPath(new URL("./fixtures/incident-recorder-shared-fd.ts", import.meta.url));
-		const tsxLoader = fileURLToPath(new URL("../../../node_modules/tsx/dist/loader.mjs", import.meta.url));
-		const recorderRootFd = openSync(target.root, "r");
-		const child = spawn(process.execPath, ["--import", tsxLoader, script, "stop-race"], {
-			env: {
-				...process.env,
-				[INCIDENT_RECORDER_CAPTURE_FD_ENV]: "4",
-				[INCIDENT_RECORDER_ROOT_FD_ENV]: "5",
-				[INCIDENT_RECORDER_RUN_ID_ENV]: "55555555-5555-4555-8555-555555555555",
-				[INCIDENT_RECORDER_RUN_TOKEN_ENV]: "66666666-6666-4666-8666-666666666666",
-				[INCIDENT_RECORDER_RUN_DIR_ENV]: target.root,
-			},
-			stdio: ["ignore", "pipe", "pipe", "ignore", "pipe", recorderRootFd],
-		});
-		closeSync(recorderRootFd);
-		if (!child.pid) throw new Error("stop-race fixture did not start");
-		const pid = child.pid;
-		const processStartId = getProcessStartId(pid);
-		if (!processStartId) throw new Error("stop-race fixture has no stable process identity");
-		livePids.set(pid, processStartId);
-		const capture = child.stdio[4];
-		if (!(capture instanceof Readable)) throw new Error("stop-race fixture has no capture pipe");
-		const captureChunks: Buffer[] = [];
-		let stdout = "";
-		let stderr = "";
-		capture.on("data", (chunk: Buffer) => captureChunks.push(Buffer.from(chunk)));
-		child.stdout?.setEncoding("utf8");
-		child.stderr?.setEncoding("utf8");
-		child.stdout?.on("data", (chunk: string) => {
-			stdout += chunk;
-		});
-		child.stderr?.on("data", (chunk: string) => {
-			stderr += chunk;
-		});
-		const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
-			(resolveExit, rejectExit) => {
-				child.once("error", rejectExit);
-				child.once("close", (code, signal) => resolveExit({ code, signal }));
-			},
-		);
-		livePids.delete(pid);
-		expect(exit, stderr).toEqual({ code: 0, signal: null });
-		const summary = JSON.parse(stdout.trim()) as Record<string, any>;
-		expect(summary).toMatchObject({
-			pid,
-			processStartId,
-			configured: true,
-			first: { accepted: true },
-			afterStopBegan: { accepted: false, reason: "terminal_reserved" },
-		});
-		const wire = Buffer.concat(captureChunks);
-		const decoded = decodeCaptureWire(wire);
-		expect(decoded.some((frame) => frame.header.type === "after_stop_began")).toBe(false);
-		const loss = decoded.find((frame) => frame.header.type === "capture_channel_loss_checkpoint");
-		expect(loss?.header.metadata).toMatchObject({ lostRecords: 1, lostBytes: 24 * 1024 });
-		const terminal = decoded.find((frame) => frame.header.type === "capture_channel_terminal");
-		expect(terminal?.header.metadata).toMatchObject({
-			lostRecords: 1,
-			lostBytes: 24 * 1024,
-			drainTimeoutLostRecords: 0,
-			drainTimeoutLostBytes: 0,
-			drainTimeoutUncertainRecords: 0,
-			drainTimeoutUncertainBytes: 0,
-		});
-	}, 15_000);
-
-	it("reports definite and uncertain drain-timeout tail loss in the terminal frame", async () => {
-		const target = fixture("");
-		const script = fileURLToPath(new URL("./fixtures/incident-recorder-shared-fd.ts", import.meta.url));
-		const tsxLoader = fileURLToPath(new URL("../../../node_modules/tsx/dist/loader.mjs", import.meta.url));
-		const recorderRootFd = openSync(target.root, "r");
-		const child = spawn(process.execPath, ["--import", tsxLoader, script, "stop-timeout"], {
-			env: {
-				...process.env,
-				[INCIDENT_RECORDER_CAPTURE_FD_ENV]: "4",
-				[INCIDENT_RECORDER_ROOT_FD_ENV]: "5",
-				[INCIDENT_RECORDER_RUN_ID_ENV]: "77777777-7777-4777-8777-777777777777",
-				[INCIDENT_RECORDER_RUN_TOKEN_ENV]: "88888888-8888-4888-8888-888888888888",
-				[INCIDENT_RECORDER_RUN_DIR_ENV]: target.root,
-			},
-			stdio: ["ignore", "pipe", "pipe", "ignore", "pipe", recorderRootFd],
-		});
-		closeSync(recorderRootFd);
-		if (!child.pid) throw new Error("stop-timeout fixture did not start");
-		const pid = child.pid;
-		const processStartId = getProcessStartId(pid);
-		if (!processStartId) throw new Error("stop-timeout fixture has no stable process identity");
-		livePids.set(pid, processStartId);
-		const capture = child.stdio[4];
-		if (!(capture instanceof Readable)) throw new Error("stop-timeout fixture has no capture pipe");
-		const captureChunks: Buffer[] = [];
-		const delayedDrain = setTimeout(() => {
-			capture.on("data", (chunk: Buffer) => captureChunks.push(Buffer.from(chunk)));
-		}, 1_500);
-		let stdout = "";
-		let stderr = "";
-		child.stdout?.setEncoding("utf8");
-		child.stderr?.setEncoding("utf8");
-		child.stdout?.on("data", (chunk: string) => {
-			stdout += chunk;
-		});
-		child.stderr?.on("data", (chunk: string) => {
-			stderr += chunk;
-		});
-		const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
-			(resolveExit, rejectExit) => {
-				child.once("error", rejectExit);
-				child.once("close", (code, signal) => resolveExit({ code, signal }));
-			},
-		);
-		clearTimeout(delayedDrain);
-		livePids.delete(pid);
-		expect(exit, stderr).toEqual({ code: 0, signal: null });
-		const summary = JSON.parse(stdout.trim()) as Record<string, any>;
-		expect(summary.accepted).toBeGreaterThan(1);
-		expect(summary.rejected).toBeGreaterThan(0);
-		const wire = Buffer.concat(captureChunks);
-		const decoded = decodeCaptureWire(wire);
-		const terminal = decoded.find((frame) => frame.header.type === "capture_channel_terminal");
-		expect(terminal).toBeDefined();
-		const metadata = terminal?.header.metadata ?? {};
-		expect(metadata.drainTimeoutLostRecords).toEqual(expect.any(Number));
-		expect(metadata.drainTimeoutLostBytes).toBe(Number(metadata.drainTimeoutLostRecords) * 24 * 1024);
-		expect(metadata.drainTimeoutUncertainRecords).toBe(1);
-		expect(metadata.drainTimeoutUncertainBytes).toBe(24 * 1024);
-		expect(metadata.lostRecords).toBe(summary.rejected + Number(metadata.drainTimeoutLostRecords));
-		expect(metadata.lostBytes).toBe(summary.rejectedBytes + Number(metadata.drainTimeoutLostBytes));
-	}, 15_000);
-
-	it("self-disables a fork-copied emitter identity before any inherited-fd write", async () => {
-		const target = fixture("");
-		const script = fileURLToPath(new URL("./fixtures/incident-recorder-shared-fd.ts", import.meta.url));
-		const tsxLoader = fileURLToPath(new URL("../../../node_modules/tsx/dist/loader.mjs", import.meta.url));
-		const environment: NodeJS.ProcessEnv = {
-			...process.env,
-			[INCIDENT_RECORDER_CAPTURE_FD_ENV]: "4",
-			[INCIDENT_RECORDER_ROOT_FD_ENV]: "5",
-			[INCIDENT_RECORDER_RUN_ID_ENV]: "33333333-3333-4333-8333-333333333333",
-			[INCIDENT_RECORDER_RUN_TOKEN_ENV]: "44444444-4444-4444-8444-444444444444",
-			[INCIDENT_RECORDER_RUN_DIR_ENV]: target.root,
-		};
-		delete environment[INCIDENT_RECORDER_CAPTURE_OWNER_PID_ENV];
-		delete environment[INCIDENT_RECORDER_CAPTURE_OWNER_START_ID_ENV];
-		const recorderRootFd = openSync(target.root, "r");
-		const child = spawn(process.execPath, ["--import", tsxLoader, script, "fork-copy-identity-mismatch"], {
-			env: environment,
-			stdio: ["ignore", "pipe", "pipe", "ignore", "pipe", recorderRootFd],
-		});
-		closeSync(recorderRootFd);
-		if (!child.pid) throw new Error("fork-copy fixture did not start");
-		const pid = child.pid;
-		const processStartId = getProcessStartId(pid);
-		if (!processStartId) throw new Error("fork-copy fixture has no stable process identity");
-		livePids.set(pid, processStartId);
-		const capture = child.stdio[4];
-		if (!(capture instanceof Readable)) throw new Error("fork-copy fixture has no capture pipe");
-		const captureChunks: Buffer[] = [];
-		capture.on("data", (chunk: Buffer) => captureChunks.push(Buffer.from(chunk)));
-		let stdout = "";
-		let stderr = "";
-		child.stdout?.setEncoding("utf8");
-		child.stderr?.setEncoding("utf8");
-		child.stdout?.on("data", (chunk: string) => {
-			stdout += chunk;
-		});
-		child.stderr?.on("data", (chunk: string) => {
-			stderr += chunk;
-		});
-		const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
-			(resolveExit, rejectExit) => {
-				child.once("error", rejectExit);
-				child.once("close", (code, signal) => resolveExit({ code, signal }));
-			},
-		);
-		livePids.delete(pid);
-		expect(exit, stderr).toEqual({ code: 0, signal: null });
-		const summary = JSON.parse(stdout.trim()) as Record<string, any>;
-		expect(summary).toMatchObject({
-			pid,
-			processStartId,
-			configured: true,
-			admission: { accepted: false, reason: "stopped" },
-		});
-		expect(Buffer.concat(captureChunks)).toHaveLength(0);
-	}, 15_000);
-
 	it("classifies an uncaught exception and preserves its Node report", async () => {
 		const result = await record(fixture('throw new Error("isolated uncaught fault");'));
 		expect(result).toMatchObject({ code: 1, signal: null, classification: "uncaught_exception" });
@@ -618,7 +233,7 @@ describe("incident recorder isolated fault evidence", () => {
 
 	it("detects loss of an isolated live supervisor socket from structured causal state", async () => {
 		const target = fixture(
-			'const fs=require("node:fs");const net=require("node:net");const socket=process.env.PRIME_AGENT_INTERNAL_INCIDENT_RECORDER_SOCKET;const server=net.createServer();server.listen(socket,()=>{fs.unlinkSync(socket)});setInterval(()=>{},1000);',
+			'const fs=require("node:fs");const net=require("node:net");const socket=process.env.PRIME_AGENT_INTERNAL_INCIDENT_RECORDER_SOCKET;const server=net.createServer();server.listen(socket,()=>{try{fs.unlinkSync(socket)}catch(error){if(error?.code!=="ENOENT")throw error}});setInterval(()=>{},1000);',
 		);
 		const pending = record(target);
 		const pid = await waitForPid(target.agentDir);
