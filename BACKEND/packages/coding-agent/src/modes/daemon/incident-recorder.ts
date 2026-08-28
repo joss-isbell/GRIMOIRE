@@ -10,13 +10,11 @@ import {
 	constants as fsConstants,
 	fstatSync,
 	fsyncSync,
-	linkSync,
 	lstatSync,
 	mkdirSync,
 	opendirSync,
 	openSync,
 	readdirSync,
-	readFile,
 	readFileSync,
 	readlinkSync,
 	readSync,
@@ -38,7 +36,6 @@ import {
 } from "../../cli/subprocess-launch.js";
 import { getAgentDir, getDaemonLogPath, VERSION } from "../../config.js";
 import { getProcessStartId } from "../../core/session-lease.js";
-import { acquireIncidentCasTransaction } from "./incident-recorder-cas-transaction.js";
 import {
 	INCIDENT_RECORDER_CHILD_ENV,
 	INCIDENT_RECORDER_RUN_DIR_ENV,
@@ -94,7 +91,7 @@ const EVENT_FLUSH_INTERVAL_MS = 50;
 const RAW_MANIFEST_CHECKPOINT_MS = 5_000;
 const RAW_SEGMENT_ROTATION_MS = 5 * 60 * 1_000;
 const EVENT_BUFFER_BYTES = 64 * 1024;
-const RAW_RECORD_SCHEMA_VERSION = 2;
+const RAW_RECORD_SCHEMA_VERSION = 3;
 const RAW_FRAME_PAYLOAD_BYTES = 32 * 1024;
 
 const LINUX_BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id";
@@ -212,20 +209,6 @@ interface RawRecordFrame {
 }
 
 const rawSegmentStates = new Map<string, RawSegmentState>();
-const knownRawBlobDirectories = new Set<string>();
-const pendingRawBlobWrites = new Map<string, number>();
-const rawBlobWaiters = new Map<string, Array<() => void>>();
-interface RawBlobWriteTask {
-	runDir: string;
-	source: RawApplicationSource;
-	bytes: Buffer;
-	digest: string;
-	path: string;
-	collisionFallbackPath: string;
-	temporary: string;
-}
-const rawBlobWriteQueues = new Map<string, RawBlobWriteTask[]>();
-const activeRawBlobWriteQueues = new Set<string>();
 const bufferedApplicationStreams = new Map<string, BufferedEventState>();
 let rawRecordSequence = 0;
 let providerOccurrenceSequence = 0;
@@ -650,375 +633,87 @@ interface RawBlobReference {
 	digest?: string;
 	bytes: number;
 	path: string;
-	collisionFallbackPath: string;
+	collisionFallbackPath?: string;
 	encoding: string;
 	compression?: "gzip";
 	storedBytes?: number;
 	rootRelativePath?: string;
-	referenceKind?: "cas" | "ordered-occurrence-admission";
+	referenceKind?: "cas" | "ordered-occurrence-admission" | "bounded-causal-evidence";
 	producerOccurrenceId?: string;
 	pending?: boolean;
 	admissionDisposition?: "locally_admitted" | "rejected";
-	durability?: "pending_compactor_cas_resolution" | "not_admitted";
+	durability?: "pending_compactor_cas_resolution" | "not_admitted" | "fsynced-local-file";
 }
 
-function finishRawBlobWrite(runDir: string): void {
-	const remaining = Math.max(0, (pendingRawBlobWrites.get(runDir) ?? 1) - 1);
-	if (remaining > 0) {
-		pendingRawBlobWrites.set(runDir, remaining);
-		return;
-	}
-	pendingRawBlobWrites.delete(runDir);
-	for (const resolveWaiter of rawBlobWaiters.get(runDir)?.splice(0) ?? []) resolveWaiter();
-	rawBlobWaiters.delete(runDir);
-}
-
-function ensureRawBlobDirectory(directory: string): void {
-	if (knownRawBlobDirectories.has(directory)) return;
-	mkdirSync(directory, { recursive: true, mode: 0o700 });
-	chmodSync(directory, 0o700);
-	knownRawBlobDirectories.add(directory);
-}
-
-function leaseRunRawBlob(runDir: string, sourcePath: string): void {
-	const directory = join(runDir, ".cas-leases");
-	mkdirSync(directory, { recursive: true, mode: 0o700 });
-	const target = join(directory, basename(sourcePath));
-	try {
-		linkSync(sourcePath, target);
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-		const source = lstatSync(sourcePath);
-		const existing = lstatSync(target);
-		if (
-			!source.isFile() ||
-			source.isSymbolicLink() ||
-			!existing.isFile() ||
-			existing.isSymbolicLink() ||
-			source.dev !== existing.dev ||
-			source.ino !== existing.ino
-		)
-			throw new Error("CAS lease collision");
-	}
-}
-
-function completeRawBlobWrite(task: RawBlobWriteTask): void {
-	finishRawBlobWrite(task.runDir);
-	const queue = rawBlobWriteQueues.get(task.runDir);
-	queue?.shift();
-	if (!queue || queue.length === 0) {
-		rawBlobWriteQueues.delete(task.runDir);
-		activeRawBlobWriteQueues.delete(task.runDir);
-		return;
-	}
-	runNextRawBlobWrite(task.runDir);
-}
-
-function runNextRawBlobWrite(runDir: string): void {
-	const task = rawBlobWriteQueues.get(runDir)?.[0];
-	if (!task) {
-		activeRawBlobWriteQueues.delete(runDir);
-		return;
-	}
-	activeRawBlobWriteQueues.add(runDir);
-	writeFile(task.temporary, task.bytes, { mode: 0o600, flag: "wx" }, (error) => {
-		if (error) {
-			recordRawLoss(task.runDir, task.source, error, task.bytes.length);
-			completeRawBlobWrite(task);
-			return;
-		}
-		try {
-			linkSync(task.temporary, task.path);
-			chmodSync(task.path, 0o600);
-			leaseRunRawBlob(task.runDir, task.path);
-			rmSync(task.temporary, { force: true });
-			completeRawBlobWrite(task);
-			return;
-		} catch (linkError) {
-			if ((linkError as NodeJS.ErrnoException).code !== "EEXIST") {
-				try {
-					rmSync(task.temporary, { force: true });
-				} catch {}
-				recordRawLoss(task.runDir, task.source, linkError, task.bytes.length);
-				completeRawBlobWrite(task);
-				return;
-			}
-		}
-		readFile(task.path, (readError, existing) => {
-			if (!readError && existing.length === task.bytes.length && existing.equals(task.bytes)) {
-				try {
-					leaseRunRawBlob(task.runDir, task.path);
-					rmSync(task.temporary, { force: true });
-				} catch {}
-				completeRawBlobWrite(task);
-				return;
-			}
-			try {
-				renameSync(task.temporary, task.collisionFallbackPath);
-				chmodSync(task.collisionFallbackPath, 0o600);
-				leaseRunRawBlob(task.runDir, task.collisionFallbackPath);
-				recordRawLoss(
-					task.runDir,
-					task.source,
-					{
-						name: "RawContentAddressCollisionError",
-						message: "Existing SHA-256 blob did not match the captured bytes",
-						digest: task.digest,
-						path: task.path,
-						collisionFallbackPath: task.collisionFallbackPath,
-						readError,
-					},
-					task.bytes.length,
-				);
-				completeRawBlobWrite(task);
-			} catch (collisionError) {
-				recordRawLoss(task.runDir, task.source, collisionError, task.bytes.length);
-				completeRawBlobWrite(task);
-			}
-		});
-	});
-}
-
-function globalRawBlobDirectory(runDir: string, digest: string): string {
-	return join(dirname(dirname(runDir)), "cas", "sha256", digest.slice(0, 2));
-}
-
-function contentAddressRawBytes(
+function recordLinuxRawSource(
 	runDir: string,
-	source: RawApplicationSource,
-	value: Uint8Array,
-	encoding: string,
+	occurrence: LinuxRawSourceOccurrence,
+	_durable = false,
 ): RawBlobReference {
-	// Publish no path-only reference until its run-owned hard-link lease exists.
-	// The fallback path is bounded to one occurrence and this synchronous commit
-	// closes the cross-process GC race that the former queued write allowed.
-	return contentAddressRawBytesSync(runDir, source, value, encoding);
-}
-
-function contentAddressRawBytesSync(
-	runDir: string,
-	source: RawApplicationSource,
-	value: Uint8Array,
-	encoding: string,
-): RawBlobReference {
-	const transaction = acquireIncidentCasTransaction(dirname(dirname(runDir)));
-	if (!transaction) throw new Error("Incident CAS transaction unavailable");
-	const bytes = Buffer.from(value);
+	const maximumBytes = INCIDENT_RECORDER_LIMITS.evidenceFileBytes;
+	const bytes = occurrence.bytes.subarray(0, maximumBytes);
 	const digest = createHash("sha256").update(bytes).digest("hex");
-	const directory = globalRawBlobDirectory(runDir, digest);
-	ensureRawBlobDirectory(directory);
-	const path = join(directory, `${digest}.blob`);
-	const collisionFallbackPath = join(directory, `${digest}.collision-${process.pid}-${randomUUID()}.blob`);
-	const temporary = join(directory, `.${digest}.tmp-${process.pid}-${randomUUID()}`);
-	let descriptor: number | undefined;
+	const directory = join(runDir, "evidence", "linux");
+	const path = join(directory, `${digest}.bin`);
 	try {
-		descriptor = openSync(temporary, "wx", 0o600);
-		writeSync(descriptor, bytes);
-		fsyncSync(descriptor);
-		closeSync(descriptor);
-		descriptor = undefined;
-		try {
-			linkSync(temporary, path);
-			chmodSync(path, 0o600);
-			rmSync(temporary, { force: true });
-		} catch (linkError) {
-			if ((linkError as NodeJS.ErrnoException).code !== "EEXIST") throw linkError;
-			const existing = readFileSync(path);
-			if (existing.length === bytes.length && existing.equals(bytes)) {
-				rmSync(temporary, { force: true });
-			} else {
-				renameSync(temporary, collisionFallbackPath);
-				chmodSync(collisionFallbackPath, 0o600);
-				if (source !== "loss-accounting") {
-					recordRawLoss(
-						runDir,
-						source,
-						{
-							name: "RawContentAddressCollisionError",
-							message: "Existing SHA-256 blob did not match the captured bytes",
-							digest,
-							path,
-							collisionFallbackPath,
-						},
-						bytes.length,
-					);
-				}
+		mkdirSync(directory, { recursive: true, mode: 0o700 });
+		if (!existsSync(path)) {
+			const descriptor = openSync(path, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
+			try {
+				writeSync(descriptor, bytes);
+				fsyncSync(descriptor);
+			} finally {
+				closeSync(descriptor);
 			}
 		}
-		const leasePath = existsSync(collisionFallbackPath) ? collisionFallbackPath : path;
-		leaseRunRawBlob(runDir, leasePath);
+		appendStructuredCausalEvent(runDir, "recorder-events", "linux_evidence_captured", {
+			source: occurrence.source,
+			sourcePath: occurrence.sourcePath,
+			phase: occurrence.phase,
+			observedWallTime: occurrence.wallTime,
+			observedMonotonicNs: occurrence.monotonicNs,
+			identity: occurrence.identity,
+			bounds: occurrence.bounds,
+			evidence: { path, sha256: digest, bytes: bytes.length, truncated: occurrence.bytes.length > bytes.length },
+		});
 	} catch (error) {
-		if (descriptor !== undefined) {
-			try {
-				closeSync(descriptor);
-			} catch {}
-		}
-		try {
-			rmSync(temporary, { force: true });
-		} catch {}
-		if (source !== "loss-accounting") recordRawLoss(runDir, source, error, bytes.length);
-		throw error;
-	} finally {
-		transaction.release();
+		recordRawLoss(runDir, "linux-raw-source", error, occurrence.bytes.length);
 	}
-	return { algorithm: "sha256", digest, bytes: bytes.length, path, collisionFallbackPath, encoding };
-}
-
-function recordLinuxRawSource(runDir: string, occurrence: LinuxRawSourceOccurrence, durable = false): RawBlobReference {
-	const rawSource: RawApplicationSource =
-		occurrence.source === "system-journal-export" || occurrence.source === "journal-query-error"
-			? "linux-journal-source"
-			: "linux-raw-source";
-	const orderedWriter = orderedWriterForRun(runDir);
-	if (orderedWriter) {
-		const admission = orderedWriter.recordExactBytes(
-			rawSource,
-			"linux_raw_source_occurrence",
-			occurrence.bytes,
-			occurrence.encoding,
-			{
-				source: occurrence.source,
-				sourcePath: occurrence.sourcePath,
-				phase: occurrence.phase,
-				observedWallTime: occurrence.wallTime,
-				observedMonotonicNs: occurrence.monotonicNs,
-				identity: occurrence.identity,
-				bounds: occurrence.bounds,
-			},
-		);
-		return {
-			algorithm: "journald-occurrence",
-			bytes: occurrence.bytes.byteLength,
-			path: runDir,
-			collisionFallbackPath: runDir,
-			encoding: occurrence.encoding,
-			referenceKind: "ordered-occurrence-admission",
-			producerOccurrenceId: admission.accepted ? admission.occurrenceId : undefined,
-			pending: admission.accepted,
-			admissionDisposition: admission.accepted ? "locally_admitted" : "rejected",
-			durability: admission.accepted ? "pending_compactor_cas_resolution" : "not_admitted",
-		};
-	}
-	const service = activeServiceRecorder;
-	const serviceIdentity = serviceRunIdentity(runDir);
-	if (service) {
-		const admission = serviceIdentity
-			? service.writer.recordExactBytesForRun(
-					serviceIdentity,
-					rawSource,
-					"linux_raw_source_occurrence",
-					occurrence.bytes,
-					occurrence.encoding,
-					{
-						source: occurrence.source,
-						sourcePath: occurrence.sourcePath,
-						phase: occurrence.phase,
-						observedWallTime: occurrence.wallTime,
-						observedMonotonicNs: occurrence.monotonicNs,
-						targetPid: serviceIdentity.targetPid,
-						targetProcessStartId: serviceIdentity.targetProcessStartId,
-					},
-				)
-			: undefined;
-		return {
-			algorithm: "journald-occurrence",
-			bytes: occurrence.bytes.byteLength,
-			path: runDir,
-			collisionFallbackPath: runDir,
-			encoding: occurrence.encoding,
-			referenceKind: "ordered-occurrence-admission",
-			producerOccurrenceId: admission?.accepted ? admission.occurrenceId : undefined,
-			pending: admission?.accepted === true,
-			admissionDisposition: admission?.accepted ? "locally_admitted" : "rejected",
-			durability: admission?.accepted ? "pending_compactor_cas_resolution" : "not_admitted",
-		};
-	}
-	const payloadBlob = durable
-		? contentAddressRawBytesSync(runDir, rawSource, occurrence.bytes, occurrence.encoding)
-		: contentAddressRawBytes(runDir, rawSource, occurrence.bytes, occurrence.encoding);
-	const fields = {
-		source: occurrence.source,
-		sourcePath: occurrence.sourcePath,
-		phase: occurrence.phase,
-		observedWallTime: occurrence.wallTime,
-		observedMonotonicNs: occurrence.monotonicNs,
-		identity: occurrence.identity,
-		bounds: occurrence.bounds,
-		payloadBlob,
+	return {
+		algorithm: "sha256",
+		digest,
+		bytes: bytes.length,
+		path,
+		encoding: occurrence.encoding,
+		referenceKind: "bounded-causal-evidence",
+		durability: "fsynced-local-file",
 	};
-	if (durable) {
-		writeRawLinesSync(
-			loadRawSegmentState(runDir, rawSource),
-			serializeRawRecord(runDir, rawSource, "linux_raw_source_occurrence", fields, true),
-		);
-	} else {
-		const key = `${runDir}\0${rawSource}`;
-		let state = bufferedApplicationStreams.get(key);
-		if (!state) {
-			state = { runDir, source: rawSource, pending: [], pendingBytes: 0, writing: false, waiters: [] };
-			bufferedApplicationStreams.set(key, state);
-		}
-		for (const line of serializeRawRecord(runDir, rawSource, "linux_raw_source_occurrence", fields)) {
-			state.pending.push(line);
-			state.pendingBytes += Buffer.byteLength(line);
-		}
-		if (state.pendingBytes >= EVENT_BUFFER_BYTES) flushSupervisorEvents(state);
-		else scheduleSupervisorEventFlush(state);
-	}
-	return payloadBlob;
-}
-
-function waitForRawBlobWrites(runDir: string): Promise<void> {
-	if ((pendingRawBlobWrites.get(runDir) ?? 0) === 0) return Promise.resolve();
-	return new Promise((resolveWaiter) => {
-		const waiters = rawBlobWaiters.get(runDir) ?? [];
-		waiters.push(resolveWaiter);
-		rawBlobWaiters.set(runDir, waiters);
-	});
 }
 
 function serializeRawRecord(
-	runDir: string,
+	_runDir: string,
 	source: RawApplicationSource,
 	type: string,
 	fields: Record<string, unknown>,
-	durable = false,
+	_durable = false,
 ): string[] {
 	const timestamp = nowFields();
 	const sequence = ++rawRecordSequence;
 	const recordId = `${process.pid}:${sequence}:${randomUUID()}`;
-	const payloadBytes = Buffer.from(JSON.stringify(encodeDiagnosticValue(fields)), "utf8");
-	const payloadBlob = durable
-		? contentAddressRawBytesSync(runDir, source, payloadBytes, "utf8-json/derived-diagnostic-json-v1")
-		: contentAddressRawBytes(runDir, source, payloadBytes, "utf8-json/derived-diagnostic-json-v1");
 	const envelope = {
-		schemaVersion: RAW_RECORD_SCHEMA_VERSION,
+		schemaVersion: 3,
 		recordId,
 		sequence,
 		...timestamp,
 		pid: process.pid,
 		processStartId: getProcessStartId(process.pid),
 		type,
+		fields: encodeDiagnosticValue(fields),
 		provenance: {
 			source,
-			capture: "private-local-derived-diagnostic",
-			canonical: false,
-			preservesObjectGraphIdentity: false,
-			preservesRuntimeObjectIdentity: false,
-			valueEncoding: "derived-diagnostic-json-v1",
-			characterEncoding: "utf-8",
-			frameEncoding: "json-lines/base64",
+			capture: "private-local-causal-diagnostic",
 			executable: process.execPath,
-			argv: [...process.argv],
-			cwd: process.cwd(),
-			runtime: {
-				release: process.release,
-				versions: process.versions,
-				platform: process.platform,
-				arch: process.arch,
-			},
 		},
-		payloadBlob,
 	};
 	const serialized = Buffer.from(JSON.stringify(envelope), "utf8");
 	const chunkCount = Math.max(1, Math.ceil(serialized.length / RAW_FRAME_PAYLOAD_BYTES));
@@ -1034,7 +729,8 @@ function serializeRawRecord(
 				.subarray(chunkIndex * RAW_FRAME_PAYLOAD_BYTES, (chunkIndex + 1) * RAW_FRAME_PAYLOAD_BYTES)
 				.toString("base64"),
 		};
-		lines.push(`${JSON.stringify(frame)}\n`);
+		lines.push(`${JSON.stringify(frame)}
+`);
 	}
 	return lines;
 }
@@ -1305,7 +1001,6 @@ async function flushRecordedProcessBytes(runDir: string): Promise<void> {
 				}),
 		),
 	);
-	await waitForRawBlobWrites(runDir);
 	await flushRawSegmentManifests(runDir);
 }
 
@@ -1615,9 +1310,17 @@ function captureRawProcFile(
 				pid,
 				processStartId,
 				sha256,
-				payloadBlob: recorder
-					? recorder(sourcePath, value)
-					: contentAddressRawBytes(runDir, "recorder-events", value, "binary"),
+				payloadBlob:
+					recorder?.(sourcePath, value) ??
+					recordLinuxRawSource(runDir, {
+						source: "procfs",
+						sourcePath,
+						bytes: value,
+						encoding: "exact-file-bytes",
+						phase: "incident-pin",
+						...nowFields(),
+						identity: { targetPid: pid, targetProcessStartId: processStartId },
+					}),
 			});
 		}
 		return value;
@@ -3047,105 +2750,38 @@ function evidenceTarget(runDir: string): Record<string, unknown> | undefined {
 		: { identityUnavailable: true, reason: "target_identity_unavailable" };
 }
 
-function rawProviderPayload(value: unknown): { bytes: Buffer; encoding: string } {
-	if (Buffer.isBuffer(value)) return { bytes: value, encoding: "opaque-provider-bytes" };
-	if (value instanceof Uint8Array) {
-		return {
-			bytes: Buffer.from(value.buffer, value.byteOffset, value.byteLength),
-			encoding: "opaque-provider-bytes",
-		};
-	}
-	return {
-		bytes: Buffer.from(JSON.stringify(encodeDiagnosticValue(value)), "utf8"),
-		encoding: "utf8-json/derived-diagnostic-json-v1",
-	};
-}
-
-function appendProviderReferenceEnvelope(
-	runDir: string,
-	fileName: string,
-	envelope: Record<string, unknown>,
-	source: "provider-evidence" | "provider-manifest",
-): void {
-	const evidenceDirectory = join(runDir, "evidence");
-	mkdirSync(evidenceDirectory, { recursive: true, mode: 0o700 });
-	const path = join(evidenceDirectory, fileName);
-	const serialized = `${JSON.stringify(envelope)}\n`;
-	appendFile(path, serialized, { mode: 0o600 }, (error) => {
-		if (error) recordRawLoss(runDir, source, error, Buffer.byteLength(serialized));
-		else {
-			try {
-				chmodSync(path, 0o600);
-			} catch (chmodError) {
-				recordRawLoss(runDir, source, chmodError, Buffer.byteLength(serialized));
-			}
-		}
-	});
-}
-
 export function ingestIncidentRecorderEvidence<P extends IncidentEvidenceProvider>(
 	runDir: string,
 	provider: P,
 	evidence: IncidentProviderEvidenceMap[P] | Uint8Array,
 ): void {
 	try {
-		const payload = rawProviderPayload(evidence);
-		const orderedWriter = orderedWriterForRun(runDir);
-		if (orderedWriter) {
-			orderedWriter.recordExactBytes(
-				"provider-evidence",
-				"external_raw_evidence_ingested",
-				payload.bytes,
-				payload.encoding,
-				{
-					provider,
-					target: evidenceTarget(runDir),
-					diagnosticOnly: true,
-				},
-			);
-			return;
+		const sequence = ++providerOccurrenceSequence;
+		const directory = join(runDir, "evidence", "providers");
+		mkdirSync(directory, { recursive: true, mode: 0o700 });
+		const base = `${String(sequence).padStart(8, "0")}-${safeToken(provider)}`;
+		let reference: Record<string, unknown>;
+		if (evidence instanceof Uint8Array) {
+			const bytes = Buffer.from(evidence).subarray(0, INCIDENT_RECORDER_LIMITS.evidenceFileBytes);
+			const digest = createHash("sha256").update(bytes).digest("hex");
+			const path = join(directory, `${base}.bin`);
+			writeFileSync(path, bytes, { flag: "wx", mode: 0o600 });
+			reference = { path, sha256: digest, bytes: bytes.length, truncated: evidence.byteLength > bytes.length };
+		} else {
+			const path = join(directory, `${base}.json`);
+			writePrivateJson(path, {
+				version: 1,
+				provider,
+				target: evidenceTarget(runDir),
+				evidence: encodeDiagnosticValue(evidence),
+				observed: nowFields(),
+			});
+			reference = { path, encoding: "private-causal-json" };
 		}
-		const serviceIdentity = serviceRunIdentity(runDir);
-		if (activeServiceRecorder) {
-			if (serviceIdentity) {
-				activeServiceRecorder.writer.recordExactBytesForRun(
-					serviceIdentity,
-					"provider-evidence",
-					"external_raw_evidence_ingested",
-					payload.bytes,
-					payload.encoding,
-					{
-						provider,
-						diagnosticOnly: true,
-						targetPid: serviceIdentity.targetPid,
-						targetProcessStartId: serviceIdentity.targetProcessStartId,
-					},
-				);
-			}
-			return;
-		}
-		if (runHasLiveWriter(runDir)) return;
-		const timestamp = nowFields();
-		const payloadReference = contentAddressRawBytes(runDir, "provider-evidence", payload.bytes, payload.encoding);
-		const envelope = {
-			schemaVersion: 2,
-			canonical: false,
-			canonicalPayloadReference: true,
-			sequence: ++providerOccurrenceSequence,
-			...timestamp,
+		appendStructuredCausalEvent(runDir, "recorder-events", "external_causal_evidence_ingested", {
 			provider,
 			target: evidenceTarget(runDir),
-			payloadReference,
-			payloadEncoding: payload.encoding,
-			unknownFieldsPreserved: true,
-			diagnosticOnly: true,
-		};
-		appendProviderReferenceEnvelope(runDir, `${safeToken(provider)}.jsonl`, envelope, "provider-evidence");
-		appendRunEvent(runDir, {
-			type: "external_raw_evidence_ingested",
-			provider,
-			payloadReference,
-			occurrence: envelope,
+			reference,
 		});
 	} catch (error) {
 		recordRawLoss(runDir, "provider-evidence", error, 0);
@@ -3154,73 +2790,28 @@ export function ingestIncidentRecorderEvidence<P extends IncidentEvidenceProvide
 
 export function registerIncidentProviderSourceManifest(runDir: string, manifest: IncidentProviderSourceManifest): void {
 	try {
-		const payload = rawProviderPayload(manifest);
-		const orderedWriter = orderedWriterForRun(runDir);
-		if (orderedWriter) {
-			orderedWriter.recordExactBytes(
-				"provider-manifest",
-				"provider_source_manifest_registered",
-				payload.bytes,
-				payload.encoding,
-				{
-					provider: manifest.provider,
-					registrationOnly: true,
-					artifactBytesCopied: false,
-				},
-			);
-			return;
-		}
-		const serviceIdentity = serviceRunIdentity(runDir);
-		if (activeServiceRecorder) {
-			if (serviceIdentity) {
-				activeServiceRecorder.writer.recordExactBytesForRun(
-					serviceIdentity,
-					"provider-manifest",
-					"provider_source_manifest_registered",
-					payload.bytes,
-					payload.encoding,
-					{
-						provider: manifest.provider,
-						registrationOnly: true,
-						artifactBytesCopied: false,
-						targetPid: serviceIdentity.targetPid,
-						targetProcessStartId: serviceIdentity.targetProcessStartId,
-					},
-				);
-			}
-			return;
-		}
-		if (runHasLiveWriter(runDir)) return;
-		const timestamp = nowFields();
-		const payloadReference = contentAddressRawBytes(runDir, "provider-manifest", payload.bytes, payload.encoding);
-		const envelope = {
-			schemaVersion: 1,
-			canonical: false,
-			canonicalPayloadReference: true,
-			sequence: ++providerOccurrenceSequence,
-			...timestamp,
+		const sequence = ++providerOccurrenceSequence;
+		const directory = join(runDir, "evidence", "provider-manifests");
+		mkdirSync(directory, { recursive: true, mode: 0o700 });
+		const path = join(directory, `${String(sequence).padStart(8, "0")}-${safeToken(manifest.provider)}.json`);
+		writePrivateJson(path, {
+			version: 1,
 			provider: manifest.provider,
-			payloadReference,
-			registrationOnly: true,
+			configuration: encodeDiagnosticValue(manifest.configuration),
+			clocks: encodeDiagnosticValue(manifest.clocks),
+			lossCounters: encodeDiagnosticValue(manifest.lossCounters),
+			artifacts: manifest.artifacts.slice(0, 64).map((artifact) => ({
+				path: artifact.path,
+				format: artifact.format,
+				bytes: artifact.bytes,
+				sha256: artifact.sha256,
+			})),
+			observed: nowFields(),
+		});
+		appendStructuredCausalEvent(runDir, "recorder-events", "provider_source_manifest_registered", {
+			provider: manifest.provider,
+			reference: { path, encoding: "private-causal-json" },
 			artifactBytesCopied: false,
-			retentionPolicy:
-				manifest.provider === "atop"
-					? { milliseconds: 3 * 24 * 60 * 60 * 1_000 }
-					: manifest.provider === "sysdig"
-						? { rollingMilliseconds: 60 * 60 * 1_000, incidentPins: true }
-						: { milliseconds: INCIDENT_RECORDER_LIMITS.retentionAgeMs },
-			supportedStockFormats: {
-				atop: "stock-atop-raw",
-				sysdig: ".scap",
-				lttng: "CTF",
-			},
-		};
-		appendProviderReferenceEnvelope(runDir, "provider-source-manifests.jsonl", envelope, "provider-manifest");
-		appendRunEvent(runDir, {
-			type: "provider_source_manifest_registered",
-			provider: manifest.provider,
-			payloadReference,
-			occurrence: envelope,
 		});
 	} catch (error) {
 		recordRawLoss(runDir, "provider-manifest", error, 0);
@@ -3708,13 +3299,13 @@ export function renderIncidentRecorderSystemdUnit(options: RenderServiceOptions)
 	}
 	const args = [options.nodePath, options.entrypointPath, "--incident-recorder-service"];
 	if (options.agentDir) args.push("--agent-dir", options.agentDir);
-	// 192M/256M caused sustained cgroup reclaim and severe WSL latency in the
-	// isolated recorder trial. These are the measured stable staged limits.
-	const memoryMax = options.memoryMax ?? "1G";
-	const memoryHigh = options.memoryHigh ?? "768M";
+	// The causal recorder performs bounded metadata sampling only. It never
+	// replays journal history or compacts an application-output warehouse.
+	const memoryMax = options.memoryMax ?? "256M";
+	const memoryHigh = options.memoryHigh ?? "192M";
 	const memorySwapMax = options.memorySwapMax ?? "0";
-	const cpuQuota = options.cpuQuota ?? "25%";
-	const ioWeight = options.ioWeight ?? 25;
+	const cpuQuota = options.cpuQuota ?? "10%";
+	const ioWeight = options.ioWeight ?? 10;
 	const restartSeconds = options.restartSeconds ?? 2;
 	const tasksMax = options.tasksMax ?? 64;
 	const limitNOFILE = options.limitNOFILE ?? 4096;
@@ -3740,7 +3331,7 @@ export function renderIncidentRecorderSystemdUnit(options: RenderServiceOptions)
 		startLimitBurst < 1
 	)
 		throw new Error("Invalid incident recorder service resource controls");
-	return `[Unit]\nDescription=Prime Agent incident compactor, sampler, and finalizer\nStartLimitIntervalSec=${startLimitIntervalSeconds}s\nStartLimitBurst=${startLimitBurst}\n\n[Service]\nType=simple\nKillMode=control-group\nEnvironment=${INCIDENT_RECORDER_SERVICE_ENV}=1\nExecStartPre=/usr/bin/test -S /run/systemd/journal.grimoire/stdout\nExecStart=${args.map(systemdQuote).join(" ")}\nRestart=on-failure\nRestartSec=${restartSeconds}s\nMemoryHigh=${memoryHigh}\nMemoryMax=${memoryMax}\nMemorySwapMax=${memorySwapMax}\nCPUQuota=${cpuQuota}\nIOWeight=${ioWeight}\nIOSchedulingClass=idle\nNice=10\nTasksMax=${tasksMax}\nLimitNOFILE=${limitNOFILE}\nOOMPolicy=stop\nRuntimeDirectory=prime-agent\nRuntimeDirectoryMode=0700\nUMask=0077\n\n[Install]\nWantedBy=default.target\n`;
+	return `[Unit]\nDescription=Prime Agent causal incident recorder\nStartLimitIntervalSec=${startLimitIntervalSeconds}s\nStartLimitBurst=${startLimitBurst}\n\n[Service]\nType=simple\nKillMode=control-group\nEnvironment=${INCIDENT_RECORDER_SERVICE_ENV}=1\nExecStart=${args.map(systemdQuote).join(" ")}\nRestart=on-failure\nRestartSec=${restartSeconds}s\nMemoryHigh=${memoryHigh}\nMemoryMax=${memoryMax}\nMemorySwapMax=${memorySwapMax}\nCPUQuota=${cpuQuota}\nIOWeight=${ioWeight}\nIOSchedulingClass=idle\nNice=10\nTasksMax=${tasksMax}\nLimitNOFILE=${limitNOFILE}\nOOMPolicy=stop\nRuntimeDirectory=prime-agent\nRuntimeDirectoryMode=0700\nUMask=0077\n\n[Install]\nWantedBy=default.target\n`;
 }
 
 export function renderIncidentRecorderSystemdRequirements(
@@ -3908,8 +3499,6 @@ export function installIncidentRecorderSystemdService(options: InstallServiceOpt
 		return { status: "failed", message: "incident recorder service paths must be absolute" };
 	if ((options.platform ?? process.platform) !== "linux")
 		return { status: "unsupported", message: "systemd user service is only available on Linux" };
-	const namespace = installIncidentRecorderJournaldNamespace(options);
-	if (namespace.status === "failed" || namespace.status === "unavailable") return namespace;
 	const systemctl = options.systemctlPath ?? "systemctl";
 	const run =
 		options.spawnSyncImpl ??
@@ -3964,8 +3553,8 @@ export function installIncidentRecorderSystemdService(options: InstallServiceOpt
 			message: verify.error?.message ?? verify.stderr ?? "incident recorder service readiness verification failed",
 		};
 	return {
-		status: changed || namespace.status === "installed" ? "installed" : "unchanged",
+		status: changed ? "installed" : "unchanged",
 		unitPath,
-		message: `namespace=${namespace.status}; user-service=${changed ? "installed" : "unchanged"}`,
+		message: `causal-recorder user-service=${changed ? "installed" : "unchanged"}`,
 	};
 }
