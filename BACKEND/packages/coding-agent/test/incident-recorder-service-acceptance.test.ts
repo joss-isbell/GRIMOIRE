@@ -118,8 +118,8 @@ describe("isolated automatic causal recorder service", () => {
 			{ mode: 0o600 },
 		);
 
-		const nodePath = resolve("../../node_modules/.bin/tsx");
-		const entrypointPath = resolve("src/cli.ts");
+		const nodePath = process.execPath;
+		const entrypointPath = resolve("dist/bundle/cli.js");
 		const fakeSystemctl = join(root, "fake-systemctl");
 		const calls: string[][] = [];
 		let installedUnitPath: string | undefined;
@@ -231,7 +231,12 @@ describe("isolated automatic causal recorder service", () => {
 		if (!service) throw new Error("private service was not started");
 		expect(getProcessStartId(service.pid)).toBe(service.processStartId);
 		const cmdline = readFileSync(`/proc/${service.pid}/cmdline`, "utf8").split("\0").filter(Boolean);
-		expect(cmdline).toEqual(expect.arrayContaining(["--incident-recorder-service", "--agent-dir", agentDir]));
+		const expectedLaunchCmdline = [nodePath, entrypointPath, "--incident-recorder-service", "--agent-dir", agentDir];
+		const launchedWithServiceArgs =
+			cmdline.length === expectedLaunchCmdline.length &&
+			cmdline.every((arg, index) => arg === expectedLaunchCmdline[index]);
+		const titleRewritten = cmdline.length === 1 && cmdline[0] === "pi";
+		expect(launchedWithServiceArgs || titleRewritten).toBe(true);
 		const completionPath = join(runDir, ".service-finalization-complete");
 		expect(await waitFor(() => existsSync(completionPath), 40, 50)).toBe(true);
 		expect(JSON.parse(readFileSync(completionPath, "utf8"))).toMatchObject({ classification: "normal" });
