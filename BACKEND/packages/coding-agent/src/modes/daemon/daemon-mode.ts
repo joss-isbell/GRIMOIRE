@@ -192,6 +192,7 @@ import {
 	SESSION_LEASE_OWNER_ID_ENV,
 	SESSION_LEASES_ENABLED_ENV,
 } from "./daemon-worker-protocol.js";
+import { INCIDENT_RECORDER_WORKER_ID_ENV, installIncidentDiagnosticHooks } from "./incident-recorder.js";
 import {
 	INCIDENT_RECORDER_CHILD_ENV,
 	INCIDENT_RECORDER_RUN_DIR_ENV,
@@ -453,8 +454,19 @@ class BoundSessionUnavailableError extends Error {}
 
 export async function runDaemonMode(options: DaemonModeOptions): Promise<never> {
 	const socketPath = normalizeSocketPath(options.socketPath ?? defaultDaemonSocketPath());
+	const removeDiagnosticHooks = options.worker
+		? installIncidentDiagnosticHooks(socketPath, "worker", {
+				workerId: process.env[INCIDENT_RECORDER_WORKER_ID_ENV],
+				activeSessionId: process.env[DAEMON_WORKER_ACTIVE_SESSION_ID_ENV],
+			})
+		: () => {};
 	const daemon = new AgentDaemon(socketPath, options);
-	await daemon.start();
+	try {
+		await daemon.start();
+	} catch (error) {
+		removeDiagnosticHooks();
+		throw error;
+	}
 	return new Promise(() => {});
 }
 

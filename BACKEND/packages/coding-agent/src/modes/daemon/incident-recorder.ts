@@ -65,6 +65,8 @@ export {
 	INCIDENT_RECORDER_SOCKET_ENV,
 };
 
+export const INCIDENT_RECORDER_WORKER_ID_ENV = "PRIME_AGENT_INTERNAL_INCIDENT_RECORDER_WORKER_ID";
+
 const EVENT_FILE_NAME = "timeline.jsonl";
 const SERVICE_EVENT_FILE_NAME = "service-timeline.jsonl";
 const SUPERVISOR_EVENT_FILE_NAME = "supervisor-timeline.jsonl";
@@ -431,17 +433,55 @@ function appendRunEvent(runDir: string, event: { type: string; [key: string]: un
 	appendCausalRunEvent(runDir, "recorder-events", type, fields);
 }
 
-export function appendSupervisorDiagnosticEvent(type: string, fields: Record<string, unknown> = {}): void {
-	emitIncidentDerived("supervisor-events", type, fields);
+export function appendSupervisorDiagnosticEvent(
+	type: string,
+	fields: Record<string, unknown> = {},
+): IncidentRecorderAdmission {
+	return emitIncidentDerived("supervisor-events", type, fields);
 }
 
 export async function flushSupervisorDiagnosticCapture(): Promise<void> {
 	await stopIncidentCaptureEmitter();
 }
 
-export function installSupervisorDiagnosticHooks(socketPath: string): () => void {
-	if (!process.env[INCIDENT_RECORDER_RUN_DIR_ENV] || !configureIncidentCaptureEmitter()) return () => {};
-	appendSupervisorDiagnosticEvent("supervisor_started", {
+export type IncidentDiagnosticRole = "supervisor" | "worker";
+
+export interface IncidentDiagnosticContext {
+	workerId?: string;
+	activeSessionId?: string;
+	sessionId?: string;
+}
+
+function recordWorkerFatalEvidenceGap(
+	runDir: string,
+	correlation: Record<string, unknown>,
+	origin: "uncaughtException" | "unhandledRejection",
+	phase: "fatal_event" | "fatal_report_summary",
+	reason: string,
+	triggerRequestId: string,
+): void {
+	appendCausalRunEvent(runDir, "loss-accounting", "worker_fatal_evidence_gap", {
+		...correlation,
+		origin,
+		phase,
+		reason,
+		triggerRequestId,
+	});
+}
+
+export function installIncidentDiagnosticHooks(
+	socketPath: string,
+	role: IncidentDiagnosticRole,
+	context: Readonly<IncidentDiagnosticContext>,
+): () => void {
+	const runDir = process.env[INCIDENT_RECORDER_RUN_DIR_ENV];
+	if (!runDir || !configureIncidentCaptureEmitter()) return () => {};
+	const correlation = { role, ...context };
+	const nodeReport = role === "worker" ? process.report : undefined;
+	const previousWorkerReportOnUncaughtException = nodeReport?.reportOnUncaughtException;
+	if (nodeReport) nodeReport.reportOnUncaughtException = false;
+	appendSupervisorDiagnosticEvent(`${role}_started`, {
+		...correlation,
 		socketPath,
 		runtimeCategory: process.versions.bun ? "bun" : process.versions.node ? "node" : "foreign",
 		nodeVersion: process.versions.node,
@@ -452,9 +492,11 @@ export function installSupervisorDiagnosticHooks(socketPath: string): () => void
 			argv: process.argv,
 		},
 		nodeFatalReportsEnabled: process.release.name === "node" && !process.versions.bun,
+		workerFatalReportSummaryEnabled: role === "worker" && nodeReport !== undefined,
 	});
 	const heartbeat = setInterval(() => {
-		appendSupervisorDiagnosticEvent("supervisor_heartbeat", {
+		appendSupervisorDiagnosticEvent(`${role}_heartbeat`, {
+			...correlation,
 			memory: process.memoryUsage(),
 			uptimeSeconds: process.uptime(),
 			socketExists: existsSync(socketPath),
@@ -462,10 +504,54 @@ export function installSupervisorDiagnosticHooks(socketPath: string): () => void
 	}, HEARTBEAT_INTERVAL_MS);
 	heartbeat.unref();
 	const fatal = (error: Error, origin: "uncaughtException" | "unhandledRejection") => {
-		appendSupervisorDiagnosticEvent(origin === "unhandledRejection" ? "unhandled_rejection" : "fatal_exception", {
+		const fatalAdmission = appendSupervisorDiagnosticEvent(
+			origin === "unhandledRejection" ? "unhandled_rejection" : "fatal_exception",
+			{
+				...correlation,
+				origin,
+				error,
+			},
+		);
+		if (role !== "worker") return;
+		if (!fatalAdmission.accepted || fatalAdmission.fieldsTruncated) {
+			recordWorkerFatalEvidenceGap(
+				runDir,
+				correlation,
+				origin,
+				"fatal_event",
+				fatalAdmission.accepted ? "bounded_event_fields_truncated" : fatalAdmission.reason,
+				fatalAdmission.occurrenceId,
+			);
+		}
+		let reportSummary: Record<string, unknown>;
+		let unavailable = false;
+		try {
+			reportSummary = minimizeWorkerNodeReport(nodeReport?.getReport(error));
+			unavailable = nodeReport === undefined;
+		} catch {
+			reportSummary = { schemaVersion: 1, unavailable: true };
+			unavailable = true;
+		}
+		const reportAdmission = appendSupervisorDiagnosticEvent("worker_fatal_report", {
+			...correlation,
 			origin,
-			error,
+			exception: workerFatalErrorSummary(error),
+			report: reportSummary,
 		});
+		if (unavailable || !reportAdmission.accepted || reportAdmission.fieldsTruncated) {
+			recordWorkerFatalEvidenceGap(
+				runDir,
+				correlation,
+				origin,
+				"fatal_report_summary",
+				unavailable
+					? "node_report_summary_unavailable"
+					: reportAdmission.accepted
+						? "bounded_event_fields_truncated"
+						: reportAdmission.reason,
+				reportAdmission.occurrenceId,
+			);
+		}
 	};
 	const exit = () => stopIncidentCaptureEmitterOnExit();
 	process.on("uncaughtExceptionMonitor", fatal);
@@ -474,7 +560,13 @@ export function installSupervisorDiagnosticHooks(socketPath: string): () => void
 		clearInterval(heartbeat);
 		process.off("uncaughtExceptionMonitor", fatal);
 		process.off("exit", exit);
+		if (nodeReport && previousWorkerReportOnUncaughtException !== undefined)
+			nodeReport.reportOnUncaughtException = previousWorkerReportOnUncaughtException;
 	};
+}
+
+export function installSupervisorDiagnosticHooks(socketPath: string): () => void {
+	return installIncidentDiagnosticHooks(socketPath, "supervisor", {});
 }
 
 function safeRunName(): string {
@@ -709,6 +801,41 @@ function minimizeNodeReport(value: unknown): Record<string, unknown> {
 		javascriptHeap: numericTree(report.javascriptHeap),
 		libuvHandleCounts: handleCounts,
 		workerCount: Array.isArray(report.workers) ? report.workers.length : undefined,
+	};
+}
+
+function shallowNumericRecord(value: unknown): Record<string, number | boolean> | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const result: Record<string, number | boolean> = {};
+	for (const [key, child] of Object.entries(value).slice(0, 32)) {
+		if (!/^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(key)) continue;
+		if (typeof child === "boolean" || (typeof child === "number" && Number.isFinite(child))) result[key] = child;
+	}
+	return Object.keys(result).length > 0 ? result : undefined;
+}
+
+function minimizeWorkerNodeReport(value: unknown): Record<string, unknown> {
+	const minimized = minimizeNodeReport(value);
+	return {
+		schemaVersion: 1,
+		header: minimized.header,
+		resourceUsage: shallowNumericRecord(minimized.resourceUsage),
+		uvthreadResourceUsage: shallowNumericRecord(minimized.uvthreadResourceUsage),
+		javascriptHeap: shallowNumericRecord(minimized.javascriptHeap),
+		libuvHandleCounts: minimized.libuvHandleCounts,
+		workerCount: minimized.workerCount,
+	};
+}
+
+function workerFatalErrorSummary(error: unknown): Record<string, unknown> {
+	const failure = error instanceof Error ? error : undefined;
+	const code = failure ? (failure as Error & { code?: unknown }).code : undefined;
+	const fingerprintSource = failure?.stack ?? failure?.message ?? String(error);
+	return {
+		name: safeToken(failure?.name, "unknown_error"),
+		...(typeof code === "string" ? { code: safeToken(code) } : {}),
+		reason: `sha256:${createHash("sha256").update(fingerprintSource).digest("hex")}`,
+		stackLineCount: failure?.stack?.split("\n").length,
 	};
 }
 

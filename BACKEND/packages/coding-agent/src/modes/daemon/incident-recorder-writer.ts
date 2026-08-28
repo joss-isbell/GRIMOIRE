@@ -22,25 +22,46 @@ const MAX_QUEUE_EVENTS = 64;
 const SENSITIVE_KEY =
 	/(?:token|secret|password|credential|authorization|cookie|prompt|payload|content|body|argv|environment)/i;
 const STRING_FIELDS = new Set([
+	"activeSessionId",
+	"arch",
+	"callerCategory",
 	"classification",
+	"clientGeneration",
 	"code",
 	"commandType",
+	"disposition",
+	"event",
+	"forkserverProcessStartId",
+	"kernelProcessStartId",
 	"name",
+	"newState",
+	"nodejsVersion",
+	"oldState",
 	"origin",
 	"outcome",
+	"platform",
 	"phase",
 	"processStartId",
 	"producerProcessStartId",
 	"reason",
+	"recoveryId",
 	"requestId",
 	"requestType",
+	"role",
 	"runId",
+	"sessionId",
 	"signal",
 	"socketStatus",
+	"sourceClientId",
+	"sourceOperation",
 	"state",
 	"syscall",
 	"targetProcessStartId",
+	"toolCallId",
+	"trigger",
+	"triggerRequestId",
 	"workerId",
+	"workerProcessStartId",
 ]);
 const NON_CAUSAL_TYPES = new Set([
 	"application_source_reference",
@@ -64,7 +85,7 @@ type CaptureSource = "recorder-events" | "supervisor-events" | "recorder-control
 type EmitterPhase = "idle" | "running" | "stopping" | "stopped" | "failed";
 
 export type IncidentRecorderAdmission =
-	| { accepted: true; occurrenceId: string }
+	| { accepted: true; occurrenceId: string; fieldsTruncated?: true }
 	| { accepted: false; occurrenceId: string; reason: string };
 
 function safeValue(key: string, value: unknown, depth = 0): unknown {
@@ -100,8 +121,8 @@ export function sanitizeIncidentCausalFields(fields: Record<string, unknown>): R
 	}
 }
 
-function accepted(occurrenceId = randomUUID()): IncidentRecorderAdmission {
-	return { accepted: true, occurrenceId };
+function accepted(occurrenceId = randomUUID(), fieldsTruncated = false): IncidentRecorderAdmission {
+	return { accepted: true, occurrenceId, ...(fieldsTruncated ? { fieldsTruncated: true as const } : {}) };
 }
 function rejected(reason: string, occurrenceId = randomUUID()): IncidentRecorderAdmission {
 	return { accepted: false, occurrenceId, reason };
@@ -287,7 +308,8 @@ export function emitIncidentDerived(
 			producerProcessStartId: processStartId,
 		};
 		let bytes = Buffer.from(`${JSON.stringify(event)}\n`, "utf8");
-		if (bytes.length > MAX_EVENT_BYTES) {
+		const fieldsTruncated = bytes.length > MAX_EVENT_BYTES;
+		if (fieldsTruncated) {
 			bytes = Buffer.from(
 				`${JSON.stringify({
 					type,
@@ -307,7 +329,7 @@ export function emitIncidentDerived(
 			return rejected("bounded_queue_full", occurrenceId);
 		emitter.queue.push(bytes);
 		pumpEmitter();
-		return accepted(occurrenceId);
+		return accepted(occurrenceId, fieldsTruncated);
 	} catch {
 		return rejected("capture_failed_open", occurrenceId);
 	}

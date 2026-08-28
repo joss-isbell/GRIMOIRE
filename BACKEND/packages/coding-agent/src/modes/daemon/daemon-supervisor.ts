@@ -129,6 +129,7 @@ import {
 import {
 	appendSupervisorDiagnosticEvent,
 	flushSupervisorDiagnosticCapture,
+	INCIDENT_RECORDER_WORKER_ID_ENV,
 	installSupervisorDiagnosticHooks,
 } from "./incident-recorder.js";
 import {
@@ -2594,18 +2595,17 @@ export class DaemonSupervisor {
 			[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV]: this.socketPath,
 			[DAEMON_WORKER_RECOVERY_JOURNAL_ENV]: recoveryJournalPath,
 			[DAEMON_WORKER_STARTUP_GATE_FD_ENV]: String(WORKER_STARTUP_GATE_FD),
+			[INCIDENT_RECORDER_WORKER_ID_ENV]: workerId,
 			[ORPHAN_PROCESS_JOURNAL_ENV]: orphanProcessJournalPath,
 			[SESSION_LEASES_ENABLED_ENV]: "1",
 			[SESSION_LEASE_OWNER_ID_ENV]: rootActiveSessionId,
 		});
 		delete workerEnvironment.RLM_DEPTH;
-		delete workerEnvironment[INCIDENT_RECORDER_CHILD_ENV];
-		delete workerEnvironment[INCIDENT_RECORDER_RUN_DIR_ENV];
-		delete workerEnvironment[INCIDENT_RECORDER_SOCKET_ENV];
 		await this.assertRecoveryAllowed();
 		const workerCwd = createCommand.config?.cwd ?? process.cwd();
 		appendSupervisorDiagnosticEvent("worker_launch", {
 			workerId,
+			activeSessionId: rootActiveSessionId,
 			rootActiveSessionId,
 			socketPath,
 			recoveryJournalPath,
@@ -2669,10 +2669,11 @@ export class DaemonSupervisor {
 			childProcessStartId = getProcessStartId(childPid);
 			appendSupervisorDiagnosticEvent("worker_process_spawned", {
 				workerId,
+				activeSessionId: rootActiveSessionId,
 				rootActiveSessionId,
 				socketPath,
 				childPid,
-				childProcessStartId,
+				workerProcessStartId: childProcessStartId,
 				command: launch.command,
 				argv: [...launch.args],
 				cwd: workerCwd,
