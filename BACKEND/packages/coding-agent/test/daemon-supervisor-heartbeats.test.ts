@@ -8,7 +8,12 @@ import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 
 interface SupervisorHarness {
 	workers: Map<string, unknown>;
-	forwardToWorker(worker: unknown, command: DaemonCommand, timeoutMs?: number): Promise<DaemonResponse>;
+	forwardToWorker(
+		worker: unknown,
+		command: DaemonCommand,
+		timeoutMs?: number,
+		diagnosticCause?: Record<string, unknown>,
+	): Promise<DaemonResponse>;
 	handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<DaemonResponse | undefined>;
 	handleWorkerFrame(worker: unknown, frame: unknown): void;
 }
@@ -38,6 +43,52 @@ function worker(lifecycle: "ready" | "recovering" | "failed", connected = true) 
 }
 
 describe("daemon supervisor heartbeat aggregation", () => {
+	it("propagates one trusted public source through distinct heartbeat worker targets", async () => {
+		const supervisor = createSupervisorHarness();
+		const makeTarget = (workerId: string, pid: number, processStartId: string) => {
+			const request = vi.fn(
+				async (
+					command: { type: "heartbeats_list" },
+					_timeoutMs?: number,
+					_diagnosticCause?: Record<string, unknown>,
+				) => success(undefined, command.type, { heartbeats: [{ job: { id: `${workerId}-heartbeat` } }] }),
+			);
+			return {
+				descriptor: { workerId, lifecycle: "ready" as const, pid, processStartId },
+				client: { request },
+				intentionalStop: false,
+				request,
+			};
+		};
+		const first = makeTarget("first", 101, "first-process-start");
+		const second = makeTarget("second", 202, "second-process-start");
+		supervisor.workers.set("first", first);
+		supervisor.workers.set("second", second);
+
+		const response = await supervisor.handleCommand({ id: "heartbeat-client-1" } as DaemonSocketClient, {
+			id: "heartbeats-list-1",
+			type: "heartbeats_list",
+		});
+
+		expect(response).toMatchObject({ success: true });
+		for (const target of [first, second]) {
+			expect(target.request).toHaveBeenCalledOnce();
+			expect(target.request.mock.calls[0]?.[2]).toEqual({
+				callerCategory: "public_heartbeats_list",
+				sourceOperation: "heartbeats-list-1",
+				sourceOperationType: "heartbeats_list",
+				sourceClientId: "heartbeat-client-1",
+			});
+		}
+		expect(
+			new Set(
+				[first, second].map(
+					(target) => `${target.descriptor.workerId}:${target.descriptor.pid}:${target.descriptor.processStartId}`,
+				),
+			).size,
+		).toBe(2);
+	});
+
 	it("uses the last complete worker snapshot during recovery", async () => {
 		const supervisor = createSupervisorHarness();
 		const first = worker("ready");

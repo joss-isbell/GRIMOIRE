@@ -2,6 +2,22 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const incidentRecorderCapture = vi.hoisted(() => ({
+	events: [] as Array<{ type: string; fields: Record<string, unknown> }>,
+}));
+
+vi.mock("../src/modes/daemon/incident-recorder.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../src/modes/daemon/incident-recorder.js")>();
+	return {
+		...actual,
+		appendSupervisorDiagnosticEvent(type: string, fields: Record<string, unknown> = {}) {
+			incidentRecorderCapture.events.push({ type, fields: { ...fields } });
+			return { accepted: true as const, occurrenceId: "00000000-0000-4000-8000-000000000000" };
+		},
+	};
+});
+
 import { success } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
@@ -16,6 +32,7 @@ interface Deferred<T> {
 }
 
 interface FakeClient {
+	id: string;
 	attachedActiveSessionIds: Set<string>;
 }
 
@@ -32,6 +49,7 @@ interface FakeWorker {
 		rootActiveSessionId: string;
 		rootSessionId: string;
 		pid: number;
+		processStartId: string;
 		createCommand: { type: "create"; sessionPath?: string; noSession?: boolean };
 		sessionFile?: string;
 		stopRequestedAt?: string;
@@ -46,7 +64,8 @@ interface FakeWorker {
 	intentionalStop: boolean;
 	stopRevision: number;
 	eventSummaryRefresh?: {
-		active: boolean;
+		active?: Promise<boolean>;
+		activeObservationId?: string;
 		pending?: {
 			coalescedCount: number;
 			coalescedCountSaturated?: boolean;
@@ -119,8 +138,8 @@ function workerListResponse(summaries: SessionSummary[]) {
 	return success(undefined, "list", { sessions: summaries });
 }
 
-function fakeCaller(): FakeClient {
-	return Object.assign(Object.create(null), { attachedActiveSessionIds: new Set<string>() }) as FakeClient;
+function fakeCaller(id = "fixture-client"): FakeClient {
+	return Object.assign(Object.create(null), { id, attachedActiveSessionIds: new Set<string>() }) as FakeClient;
 }
 
 function makeWorker(root: string, workerId: string): FakeWorker {
@@ -131,7 +150,8 @@ function makeWorker(root: string, workerId: string): FakeWorker {
 			lifecycle: "ready",
 			rootActiveSessionId: cached.activeSessionId ?? cached.id,
 			rootSessionId: cached.sessionId,
-			pid: 100,
+			pid: 100 + Number(workerId.split("-").at(-1) ?? 0),
+			processStartId: `${workerId}-process-start`,
 			createCommand: { type: "create", sessionPath: cached.sessionFile },
 			sessionFile: cached.sessionFile,
 		},
@@ -183,6 +203,7 @@ function expectBoundedState(runtime: SupervisorRuntime, workerCount: number): vo
 }
 
 beforeEach(() => {
+	incidentRecorderCapture.events.length = 0;
 	vi.useFakeTimers();
 	vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
 });
@@ -194,6 +215,34 @@ afterEach(() => {
 });
 
 describe("DaemonSupervisor public status/list observation fan-out", () => {
+	it("propagates one trusted public list source through every worker request", async () => {
+		const { runtime, workers } = makeHarness();
+		await publicList(runtime, fakeCaller("public-client-1"), "public-list-1");
+
+		const expectedSource = {
+			callerCategory: "public_list",
+			sourceOperation: "public-list-1",
+			sourceOperationType: "list",
+			sourceClientId: "public-client-1",
+		};
+		for (const worker of workers) {
+			expect(worker.client.request).toHaveBeenCalledOnce();
+			expect(worker.client.request.mock.calls[0]?.[2]).toMatchObject({
+				...expectedSource,
+				observationId: expect.any(String),
+			});
+			expect(worker.client.requestWorker).toHaveBeenCalledOnce();
+			expect(worker.client.requestWorker.mock.calls[0]?.[2]).toEqual(expectedSource);
+		}
+		expect(
+			new Set(
+				workers.map(
+					(worker) => `${worker.descriptor.workerId}:${worker.descriptor.pid}:${worker.descriptor.processStartId}`,
+				),
+			).size,
+		).toBe(workers.length);
+	});
+
 	it("shares 10,000 concurrent public lists across clients and workers", async () => {
 		const { runtime, workers } = makeHarness();
 		const callers = Array.from({ length: 32 }, () => fakeCaller());
@@ -241,13 +290,17 @@ describe("DaemonSupervisor public status/list observation fan-out", () => {
 			const first = deferred<ReturnType<typeof workerListResponse>>();
 			let active = 0;
 			let maxActive = 0;
-			worker.client.request.mockImplementationOnce(async () => {
-				active++;
-				maxActive = Math.max(maxActive, active);
-				const response = await first.promise;
-				active--;
-				return response;
-			});
+			let requestEndCause: Cause | undefined;
+			worker.client.request.mockImplementationOnce(
+				async (_command: unknown, _timeoutMs: unknown, diagnosticCause: Cause) => {
+					active++;
+					maxActive = Math.max(maxActive, active);
+					const response = await first.promise;
+					active--;
+					requestEndCause = diagnosticCause;
+					return response;
+				},
+			);
 			worker.client.request.mockImplementation(async () => {
 				active++;
 				maxActive = Math.max(maxActive, active);
@@ -257,17 +310,50 @@ describe("DaemonSupervisor public status/list observation fan-out", () => {
 
 			let list: Promise<unknown>;
 			if (order === "event-first") {
-				runtime.scheduleWorkerEventSummaryRefresh(worker, { causeOutboundType: "child_update" }, "bounded");
+				runtime.scheduleWorkerEventSummaryRefresh(
+					worker,
+					{
+						callerCategory: "outbound_frame",
+						causeOutboundType: "child_update",
+						observationId: "caller-supplied",
+					},
+					"bounded",
+				);
 				list = publicList(runtime);
 			} else {
 				list = publicList(runtime);
-				runtime.scheduleWorkerEventSummaryRefresh(worker, { causeOutboundType: "session_replaced" }, "urgent");
+				runtime.scheduleWorkerEventSummaryRefresh(
+					worker,
+					{ callerCategory: "outbound_frame", causeOutboundType: "session_replaced" },
+					"urgent",
+				);
 			}
 			expect(worker.client.request).toHaveBeenCalledTimes(1);
+			const requestCause = worker.client.request.mock.calls[0]?.[2] as Cause;
+			expect(requestCause).toMatchObject({
+				callerCategory: order === "event-first" ? "outbound_frame" : "public_list",
+				observationId: expect.stringMatching(
+					/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+				),
+			});
+			if (order === "event-first") {
+				const coalesced = incidentRecorderCapture.events.find(
+					(event) => event.type === "worker_summary_observation_coalesced",
+				);
+				expect(coalesced?.fields).toMatchObject({
+					callerCategory: "public_list",
+					observationId: requestCause.observationId,
+					workerId: worker.descriptor.workerId,
+				});
+			}
 			first.resolve(workerListResponse([...worker.summaries.values()]));
 			await list;
 			await settle();
 			expect(worker.client.request).toHaveBeenCalledTimes(order === "event-first" ? 1 : 2);
+			if (order === "event-first") {
+				expect(requestEndCause?.observationId).toBe(requestCause.observationId);
+				expect(worker.eventSummaryRefresh?.activeObservationId).toBeUndefined();
+			}
 			expect(maxActive).toBe(1);
 			expectBoundedState(runtime, 1);
 		},

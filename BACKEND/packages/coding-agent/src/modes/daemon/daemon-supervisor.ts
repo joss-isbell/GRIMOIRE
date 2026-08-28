@@ -297,6 +297,7 @@ interface PendingWorkerEventSummaryRefresh {
 
 interface WorkerEventSummaryRefreshState {
 	active?: Promise<boolean>;
+	activeObservationId?: string;
 	lastStartedAt: number;
 	lastSuccessfulAt: number;
 	retryNotBefore: number;
@@ -905,7 +906,10 @@ export class DaemonSupervisor {
 		await Promise.all(
 			[...this.workers.values()].map(async (worker) => {
 				try {
-					await this.refreshWorkerSummaries(worker);
+					await this.refreshWorkerSummaries(worker, false, {
+						callerCategory: "idle_sweep",
+						phase: "initial",
+					});
 					refreshed.add(worker);
 				} catch {
 					// A disconnected or transitioning worker is never an eviction candidate.
@@ -932,7 +936,10 @@ export class DaemonSupervisor {
 							30_000,
 						);
 						if (response && !response.success) throw new Error(response.error);
-						await this.refreshWorkerSummaries(worker);
+						await this.refreshWorkerSummaries(worker, false, {
+							callerCategory: "idle_sweep",
+							phase: "post_passivation",
+						});
 					} catch (error) {
 						refreshed.delete(worker);
 						this.log(`Child passivation sweep failed for worker ${worker.descriptor.workerId}: ${String(error)}`);
@@ -954,7 +961,12 @@ export class DaemonSupervisor {
 			);
 			if (this.shuttingDown || this.updateRestartPhase !== undefined) return;
 			await Promise.all(
-				candidates.map((worker) => this.refreshWorkerSummaries(worker).catch(() => refreshed.delete(worker))),
+				candidates.map((worker) =>
+					this.refreshWorkerSummaries(worker, false, {
+						callerCategory: "idle_sweep",
+						phase: "validation",
+					}).catch(() => refreshed.delete(worker)),
+				),
 			);
 			if (this.shuttingDown || this.updateRestartPhase !== undefined) return;
 			const evictable = candidates.filter(
@@ -1231,6 +1243,19 @@ export class DaemonSupervisor {
 
 	private protocolClientId(client: DaemonSocketClient): string {
 		return this.protocolClientIds.get(client) ?? client.id;
+	}
+
+	private publicCommandDiagnosticCause(
+		client: DaemonSocketClient,
+		command: Pick<DaemonCommand, "id" | "type">,
+		callerCategory: "public_list" | "public_heartbeats_list",
+	): Record<string, unknown> {
+		return {
+			callerCategory,
+			sourceOperation: command.id,
+			sourceOperationType: command.type,
+			sourceClientId: this.protocolClientId(client),
+		};
 	}
 
 	private async releaseClientSessionInputPauses(
@@ -1698,7 +1723,7 @@ export class DaemonSupervisor {
 					// A create forwarded to a recovering worker still surfaces an opaque lifecycle error.
 					const response = await this.forwardToWorker(worker, withoutSupervisorCreateFields(command));
 					if (response.success && isSessionSummary(response.data)) {
-						await this.refreshWorkerSummaries(worker);
+						await this.refreshWorkerSummaries(worker, false, { callerCategory: "post_create_refresh" });
 						await this.syncAgentPeers().catch(() => undefined);
 						return { ...response, id: command.id, data: this.publicSummary(worker, response.data) };
 					}
@@ -2003,9 +2028,10 @@ export class DaemonSupervisor {
 				return success(command.id, "cron_list", { jobs: sortCronJobs([...jobs.values()]) });
 			}
 			case "heartbeats_list": {
+				const diagnosticCause = this.publicCommandDiagnosticCause(client, command, "public_heartbeats_list");
 				if (command.activeSessionId) {
 					const match = await this.findWorkerForClient(client, command.activeSessionId);
-					return this.forwardToWorker(match.worker, command);
+					return this.forwardToWorker(match.worker, command, WORKER_REQUEST_TIMEOUT_MS, diagnosticCause);
 				}
 				const workers = [...this.workers.values()].filter(
 					(worker) => this.isLiveWorker(worker) && worker.descriptor.lifecycle !== "failed",
@@ -2015,8 +2041,8 @@ export class DaemonSupervisor {
 					await Promise.all(
 						workers.map(async (worker) => {
 							if (worker.client && worker.descriptor.lifecycle === "ready") {
-								const response = await this.forwardToWorker(worker, command, 5000).catch((error: unknown) =>
-									failure(command.id, command.type, error, serializeDaemonError(error)),
+								const response = await this.forwardToWorker(worker, command, 5000, diagnosticCause).catch(
+									(error: unknown) => failure(command.id, command.type, error, serializeDaemonError(error)),
 								);
 								if (response.success) {
 									const snapshot = heartbeatsFromResponse(response);
@@ -2308,26 +2334,17 @@ export class DaemonSupervisor {
 		client: DaemonSocketClient,
 		command: Extract<DaemonCommand, { type: "list" }>,
 	): Promise<DaemonResponse> {
+		const diagnosticCause = this.publicCommandDiagnosticCause(client, command, "public_list");
 		await Promise.all(
 			[...this.workers.values()]
 				.filter((worker) => !this.isWorkerStopping(worker))
 				.map((worker) =>
-					this.refreshWorkerSummariesForObservation(
-						worker,
-						{
-							causeKind: "public_command",
-							causeCommandType: command.type,
-							causeClientId: this.protocolClientId(client),
-						},
-						"bounded",
-					).catch(() => undefined),
+					this.refreshWorkerSummariesForObservation(worker, diagnosticCause, "bounded").catch(() => undefined),
 				),
 		);
-		await this.syncAgentPeers({
-			causeKind: "public_command",
-			causeCommandType: command.type,
-			causeClientId: this.protocolClientId(client),
-		}).catch((error) => this.log(`Could not synchronize agent peers: ${String(error)}`));
+		await this.syncAgentPeers(diagnosticCause).catch((error) =>
+			this.log(`Could not synchronize agent peers: ${String(error)}`),
+		);
 		const clientOwnedWorkers = [...this.workers.values()].filter((worker) => !this.isVisibleWorker(worker));
 		// Stopping workers stay listed (with an honest workerState) because this
 		// list also feeds busy-daemon safety checks in daemon-launch.
@@ -2768,7 +2785,9 @@ export class DaemonSupervisor {
 			worker.descriptor.rootSessionId = summary.sessionId;
 			worker.descriptor.sessionFile = summary.sessionFile;
 			await this.subscribeWorker(worker, rootActiveSessionId);
-			await this.refreshWorkerSummaries(worker, true);
+			await this.refreshWorkerSummaries(worker, true, {
+				callerCategory: existing ? "recovery_validation" : "worker_startup_validation",
+			});
 			if (existing && (this.isWorkerRecoveryCancelled(worker) || worker.stopRevision !== recoveryStopRevision)) {
 				throw new Error(`Session worker ${workerId} recovery was cancelled`);
 			}
@@ -2946,7 +2965,7 @@ export class DaemonSupervisor {
 			const observedProcessStartId = getProcessStartId(worker.descriptor.pid);
 			await this.connectWorker(worker, 2000);
 			await this.subscribeWorker(worker, worker.descriptor.rootActiveSessionId);
-			await this.refreshWorkerSummaries(worker, true);
+			await this.refreshWorkerSummaries(worker, true, { callerCategory: "startup_adoption" });
 			if (worker.descriptor.processStartId === undefined && observedProcessStartId) {
 				worker.descriptor.processStartId = observedProcessStartId;
 			}
@@ -3285,7 +3304,7 @@ export class DaemonSupervisor {
 						try {
 							await this.connectWorker(worker, 1500);
 							await this.subscribeWorker(worker, worker.descriptor.rootActiveSessionId);
-							await this.refreshWorkerSummaries(worker, true);
+							await this.refreshWorkerSummaries(worker, true, { callerCategory: "recovery_validation" });
 							if (this.isWorkerRecoveryCancelled(worker)) {
 								return;
 							}
@@ -3547,6 +3566,17 @@ export class DaemonSupervisor {
 			return Promise.resolve(false);
 		}
 		if (state.active) {
+			if (priority === "bounded" && diagnosticCause.callerCategory === "public_list" && state.activeObservationId) {
+				appendSupervisorDiagnosticEvent("worker_summary_observation_coalesced", {
+					...diagnosticCause,
+					observationId: state.activeObservationId,
+					workerId: worker.descriptor.workerId,
+					workerPid: worker.descriptor.pid,
+					workerProcessStartId: worker.descriptor.processStartId,
+					coalescedCount: 1,
+					coalescedCountSaturated: false,
+				});
+			}
 			return priority === "urgent" ? this.queueWorkerObservation(state, diagnosticCause, priority) : state.active;
 		}
 		if (now < state.retryNotBefore) {
@@ -3617,7 +3647,8 @@ export class DaemonSupervisor {
 		diagnosticCause: Record<string, unknown>,
 	): Promise<boolean> {
 		state.lastStartedAt = Date.now();
-		const observation = this.refreshWorkerSummaries(worker, false, diagnosticCause)
+		const observationId = randomUUID();
+		const observation = this.refreshWorkerSummaries(worker, false, { ...diagnosticCause, observationId })
 			.then((changed) => {
 				state.lastSuccessfulAt = Date.now();
 				state.retryNotBefore = 0;
@@ -3633,10 +3664,14 @@ export class DaemonSupervisor {
 				throw error;
 			})
 			.finally(() => {
-				if (state.active === observation) state.active = undefined;
+				if (state.active === observation) {
+					state.active = undefined;
+					state.activeObservationId = undefined;
+				}
 				this.drainPendingWorkerObservation(worker, state);
 			});
 		state.active = observation;
+		state.activeObservationId = observationId;
 		return observation;
 	}
 
@@ -3658,7 +3693,7 @@ export class DaemonSupervisor {
 	private async refreshWorkerSummaries(
 		worker: ResidentWorker,
 		recovery = false,
-		diagnosticCause: Record<string, unknown> = { causeKind: "supervisor_internal" },
+		diagnosticCause: Record<string, unknown> = { callerCategory: "other_summary_refresh" },
 	): Promise<boolean> {
 		if (this.isWorkerStopping(worker)) throw new Error("Session worker is stopping");
 		const capturedClient = worker.client;
@@ -4077,7 +4112,11 @@ export class DaemonSupervisor {
 		let matches = this.matchWorkers(selector, includeWorker);
 		if (matches.length === 0) {
 			await Promise.all(
-				[...this.workers.values()].map((worker) => this.refreshWorkerSummaries(worker).catch(() => undefined)),
+				[...this.workers.values()].map((worker) =>
+					this.refreshWorkerSummaries(worker, false, { callerCategory: "session_lookup_refresh" }).catch(
+						() => undefined,
+					),
+				),
 			);
 			matches = this.matchWorkers(selector, includeWorker);
 		}
@@ -4182,14 +4221,15 @@ export class DaemonSupervisor {
 		worker: ResidentWorker,
 		command: DaemonCommand,
 		timeoutMs = WORKER_REQUEST_TIMEOUT_MS,
+		diagnosticCause: Record<string, unknown> = { callerCategory: "forwarded_command" },
 	): Promise<DaemonResponse> {
 		const client = this.requireAvailableWorkerClient(worker, command.type === "kill");
-		const response = await client.request(withoutCommandId(command), timeoutMs);
+		const response = await client.request(withoutCommandId(command), timeoutMs, diagnosticCause);
 		if (command.type === "get_state" && response.success && isSessionSummary(response.data)) {
 			return { ...response, id: command.id, data: this.publicSummary(worker, response.data) };
 		}
 		if (command.type === "rename" && response.success && isSessionSummary(response.data)) {
-			await this.refreshWorkerSummaries(worker);
+			await this.refreshWorkerSummaries(worker, false, { callerCategory: "post_rename_refresh" });
 			return { ...response, id: command.id, data: this.publicSummary(worker, response.data) };
 		}
 		return responseWithId(response, command.id);
@@ -5092,6 +5132,7 @@ export class DaemonSupervisor {
 			sessionEventType === "rlm_child_update"
 		) {
 			const diagnosticCause = {
+				callerCategory: "outbound_frame",
 				causeKind: "worker_outbound_frame",
 				causeWorkerId: worker.descriptor.workerId,
 				causeActiveSessionId: activeSessionId,
