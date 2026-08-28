@@ -1,14 +1,38 @@
 import { EventEmitter } from "node:events";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
 const incidentRecorder = vi.hoisted(() => ({
-	emitIncidentDerived: vi.fn(() => ({ accepted: true as const, occurrenceId: "test-occurrence" })),
+	emitIncidentDerived: vi.fn((_source: string, _type: string, _fields: Record<string, unknown>) => ({
+		accepted: true as const,
+		occurrenceId: "test-occurrence",
+	})),
+}));
+const sessionResourceRegistry = vi.hoisted(() => ({
+	cleanup: undefined as ((sessionId?: string) => void) | undefined,
 }));
 vi.mock("../src/modes/daemon/incident-recorder-writer.js", () => incidentRecorder);
+vi.mock("@earendil-works/pi-ai", async (importOriginal) => {
+	const original = await importOriginal<typeof import("@earendil-works/pi-ai")>();
+	return {
+		...original,
+		registerSessionResourceCleanup: vi.fn((cleanup: (sessionId?: string) => void) => {
+			sessionResourceRegistry.cleanup = cleanup;
+			return () => {
+				if (sessionResourceRegistry.cleanup === cleanup) sessionResourceRegistry.cleanup = undefined;
+			};
+		}),
+	};
+});
 
 import { KernelManager } from "../src/core/kernel/index.js";
+
+const kernelLifecycleEvents = ["beforeExit", "SIGINT", "SIGTERM", "exit"] as const;
+const listenersBeforeKernelStart = new Map(
+	kernelLifecycleEvents.map((event) => [event, new Set(process.listeners(event))]),
+);
 
 type TestMessage = {
 	header: { msg_type: string };
@@ -147,6 +171,202 @@ describe("KernelManager graceful shutdown", () => {
 		expect(match).not.toBeNull();
 		// +1s dispatch slack in mcp.py close(); the sum must undercut the host's 5s kill deadline.
 		expect((Number(match![1]) + 1) * 1000).toBeLessThan(5000);
+	});
+});
+
+describe("KernelManager session resource cleanup transition", () => {
+	it("uses the registered callback without changing snapshot, stale ownership, or cleanup", async () => {
+		incidentRecorder.emitIncidentDerived.mockClear();
+		expect(sessionResourceRegistry.cleanup).toBeTypeOf("function");
+		const previousForkserver = process.env.PRIME_AGENT_KERNEL_FORKSERVER;
+		process.env.PRIME_AGENT_KERNEL_FORKSERVER = "0";
+		const directory = mkdtempSync(join(tmpdir(), "prime-kernel-session-cleanup-"));
+		const python = join(directory, "fake-python");
+		writeFileSync(python, "#!/bin/sh\nexec sleep 60\n", { mode: 0o700 });
+		const managers: KernelManager[] = [];
+		type SessionInternals = ShutdownInternals & {
+			waitForResolvedConnection(path: string): Promise<never>;
+			flushSnapshotForDispose(): Promise<void>;
+			cleanupResources(): void;
+		};
+		const trackedManager = (sessionId: string): { manager: KernelManager; internals: SessionInternals } => {
+			const manager = new KernelManager({ python, cwd: directory, sessionId });
+			managers.push(manager);
+			const internals = manager as unknown as SessionInternals;
+			internals.waitForResolvedConnection = vi.fn(() => new Promise<never>(() => {}));
+			void manager.start();
+			expect(internals.state).toBe("starting");
+			internals.state = "running";
+			return { manager, internals };
+		};
+
+		try {
+			const { internals } = trackedManager("owned-session");
+			const kernel = internals.kernel;
+			const kill = vi.spyOn(kernel, "kill");
+			const flush = vi.spyOn(internals, "flushSnapshotForDispose").mockResolvedValue();
+			const cleanup = vi.spyOn(internals, "cleanupResources");
+			incidentRecorder.emitIncidentDerived.mockImplementation((_source, type, fields) => {
+				if (type === "kernel_shutdown_transition" && fields.reason === "session_resource_cleanup") {
+					expect(flush).toHaveBeenCalledTimes(1);
+					expect(internals.state).toBe("running");
+					expect(cleanup).not.toHaveBeenCalled();
+					expect(fields).toMatchObject({
+						callerCategory: "session_resource_cleanup",
+						oldState: "running",
+						newState: "shutdown",
+						requestedKillSignal: "SIGTERM",
+						observedSignal: "unavailable",
+					});
+				}
+				return { accepted: true, occurrenceId: "session-cleanup" };
+			});
+
+			sessionResourceRegistry.cleanup?.("other-session");
+			expect(flush).not.toHaveBeenCalled();
+			sessionResourceRegistry.cleanup?.("owned-session");
+			await vi.waitFor(() => expect(cleanup).toHaveBeenCalledTimes(1));
+			expect(internals.state).toBe("shutdown");
+			expect(internals.startGeneration).toBe(2);
+			expect(kill).toHaveBeenCalledWith("SIGTERM");
+
+			incidentRecorder.emitIncidentDerived.mockClear();
+			const staleFixture = trackedManager("stale-session");
+			const staleCleanup = vi.spyOn(staleFixture.internals, "cleanupResources");
+			vi.spyOn(staleFixture.internals, "flushSnapshotForDispose").mockImplementation(async () => {
+				staleFixture.internals.startGeneration++;
+			});
+			sessionResourceRegistry.cleanup?.("stale-session");
+			await vi.waitFor(() => expect(staleFixture.internals.startGeneration).toBe(2));
+			expect(staleFixture.internals.state).toBe("running");
+			expect(staleCleanup).not.toHaveBeenCalled();
+			expect(incidentRecorder.emitIncidentDerived).not.toHaveBeenCalled();
+			staleFixture.internals.flushSnapshotForDispose = vi.fn(async () => {});
+			await staleFixture.manager.dispose();
+		} finally {
+			await Promise.allSettled(managers.map((manager) => manager.dispose()));
+			if (previousForkserver === undefined) delete process.env.PRIME_AGENT_KERNEL_FORKSERVER;
+			else process.env.PRIME_AGENT_KERNEL_FORKSERVER = previousForkserver;
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("KernelManager installed process cleanup transitions", () => {
+	it("keeps real hook cleanup, exit codes, signals, and transition evidence", async () => {
+		incidentRecorder.emitIncidentDerived.mockClear();
+		const previousForkserver = process.env.PRIME_AGENT_KERNEL_FORKSERVER;
+		process.env.PRIME_AGENT_KERNEL_FORKSERVER = "0";
+		const directory = mkdtempSync(join(tmpdir(), "prime-kernel-hooks-"));
+		const python = join(directory, "fake-python");
+		writeFileSync(python, "#!/bin/sh\nexec sleep 60\n", { mode: 0o700 });
+		const events = kernelLifecycleEvents;
+		const exit = vi
+			.spyOn(process, "exit")
+			.mockImplementation((_code?: string | number | null): never => undefined as never);
+		const managers: KernelManager[] = [];
+
+		const startTrackedManager = (): {
+			manager: KernelManager;
+			internals: ShutdownInternals & { waitForResolvedConnection(path: string): Promise<never> };
+			kernel: ShutdownInternals["kernel"];
+			kill: ReturnType<typeof vi.spyOn>;
+			cleanup: ReturnType<typeof vi.spyOn>;
+		} => {
+			const manager = new KernelManager({ python, cwd: directory });
+			managers.push(manager);
+			const internals = manager as unknown as ShutdownInternals & {
+				waitForResolvedConnection(path: string): Promise<never>;
+				cleanupResources(): void;
+			};
+			internals.waitForResolvedConnection = vi.fn(() => new Promise<never>(() => {}));
+			const cleanup = vi.spyOn(internals, "cleanupResources");
+			void manager.start();
+			expect(internals.state).toBe("starting");
+			expect(internals.kernel).toBeDefined();
+			const kernel = internals.kernel;
+			const kill = vi.spyOn(kernel, "kill");
+			return { manager, internals, kernel, kill, cleanup };
+		};
+
+		try {
+			const beforeExitFixture = startTrackedManager();
+			const installed = new Map(
+				events.map((event) => [
+					event,
+					process.listeners(event).filter((listener) => !listenersBeforeKernelStart.get(event)?.has(listener)),
+				]),
+			);
+			for (const event of events) expect(installed.get(event)).toHaveLength(1);
+			const invoke = (event: (typeof events)[number]): void => {
+				const listener = installed.get(event)?.[0];
+				if (!listener) throw new Error(`missing installed ${event} handler`);
+				listener(0);
+			};
+
+			invoke("beforeExit");
+			await vi.waitFor(() => expect(beforeExitFixture.cleanup).toHaveBeenCalledTimes(1));
+			expect(beforeExitFixture.kill).toHaveBeenCalledWith("SIGTERM");
+
+			const sigintFixture = startTrackedManager();
+			invoke("SIGINT");
+			await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(130));
+			expect(sigintFixture.cleanup).toHaveBeenCalledTimes(1);
+			expect(sigintFixture.kill).toHaveBeenCalledWith("SIGTERM");
+
+			const sigtermFixture = startTrackedManager();
+			invoke("SIGTERM");
+			await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(143));
+			expect(sigtermFixture.cleanup).toHaveBeenCalledTimes(1);
+			expect(sigtermFixture.kill).toHaveBeenCalledWith("SIGTERM");
+
+			const processExitFixture = startTrackedManager();
+			invoke("exit");
+			expect(processExitFixture.cleanup).toHaveBeenCalledTimes(1);
+			expect(processExitFixture.kill).toHaveBeenCalledWith("SIGTERM");
+
+			const transitions = incidentRecorder.emitIncidentDerived.mock.calls
+				.filter((call) => call[1] === "kernel_shutdown_transition")
+				.map((call) => call[2])
+				.filter((fields) => ["before_exit", "sigint", "sigterm", "process_exit"].includes(String(fields.reason)));
+			expect(transitions).toEqual([
+				expect.objectContaining({
+					reason: "before_exit",
+					callerCategory: "process_lifecycle",
+					requestedKillSignal: "SIGTERM",
+					observedSignal: "unavailable",
+				}),
+				expect.objectContaining({
+					reason: "sigint",
+					callerCategory: "process_signal",
+					requestedKillSignal: "SIGTERM",
+					observedSignal: "SIGINT",
+				}),
+				expect.objectContaining({
+					reason: "sigterm",
+					callerCategory: "process_signal",
+					requestedKillSignal: "SIGTERM",
+					observedSignal: "SIGTERM",
+				}),
+				expect.objectContaining({
+					reason: "process_exit",
+					callerCategory: "process_lifecycle",
+					requestedKillSignal: "SIGTERM",
+					observedSignal: "unavailable",
+				}),
+			]);
+		} finally {
+			for (const event of events) {
+				for (const listener of process.listeners(event)) {
+					if (!listenersBeforeKernelStart.get(event)?.has(listener)) process.removeListener(event, listener);
+				}
+			}
+			exit.mockRestore();
+			await Promise.allSettled(managers.map((manager) => manager.dispose()));
+			if (previousForkserver === undefined) delete process.env.PRIME_AGENT_KERNEL_FORKSERVER;
+			else process.env.PRIME_AGENT_KERNEL_FORKSERVER = previousForkserver;
+			rmSync(directory, { recursive: true, force: true });
+		}
 	});
 });
 

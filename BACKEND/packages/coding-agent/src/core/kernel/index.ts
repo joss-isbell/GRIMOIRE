@@ -51,7 +51,30 @@ const KERNEL_ABORT_GRACE_MS = 1000;
 const KERNEL_BUSY_REUSE_WAIT_MS = 5000;
 const KERNEL_BUSY_INTERRUPT_INTERVAL_MS = 500;
 const MAX_LATE_SENT_AGENT_MESSAGE_HANDLERS = 256;
-type ProgrammaticShutdownReason = "shutdown" | "restart" | "kill" | "dispose" | "dispose_sync";
+type KernelShutdownReason =
+	| "shutdown"
+	| "restart"
+	| "kill"
+	| "dispose"
+	| "dispose_sync"
+	| "direct_spawn_error"
+	| "direct_child_exit"
+	| "connection_resolution_failure"
+	| "readiness_failure"
+	| "forked_kernel_liveness_death"
+	| "session_resource_cleanup"
+	| "before_exit"
+	| "sigint"
+	| "sigterm"
+	| "process_exit";
+type KernelShutdownCallerCategory =
+	| "programmatic_api"
+	| "child_process_event"
+	| "startup_failure"
+	| "liveness_monitor"
+	| "session_resource_cleanup"
+	| "process_lifecycle"
+	| "process_signal";
 const KERNEL_BUSY_AFTER_INTERRUPT_MESSAGE =
 	"IPython kernel is still running the previously interrupted cell. Wait and try again, or kill the IPython kernel to start fresh.";
 
@@ -557,7 +580,7 @@ let signalHandlersInstalled = false;
 registerSessionResourceCleanup((sessionId) => {
 	for (const k of liveKernels) {
 		if (!sessionId || k.ownerSessionId === sessionId) {
-			void k.dispose();
+			void k.disposeForSessionResourceCleanup();
 		}
 	}
 });
@@ -566,25 +589,25 @@ function installSignalHandlersOnce(): void {
 	if (signalHandlersInstalled) return;
 	signalHandlersInstalled = true;
 
-	const asyncShutdown = async (): Promise<void> => {
+	const asyncShutdown = async (reason: "before_exit" | "sigint" | "sigterm"): Promise<void> => {
 		// These paths can await, so flush the namespace snapshot before tearing down.
-		await Promise.allSettled([...liveKernels].map((k) => k.shutdown({ snapshot: true })));
+		await Promise.allSettled([...liveKernels].map((k) => k.shutdownForProcessLifecycle(reason)));
 	};
 
 	// `beforeExit` and signal handlers can await async cleanup. `exit`
 	// can only do sync work (Node won't run pending microtasks past it),
-	// so it falls back to `disposeSync()` which kills the child synchronously.
+	// so it falls back to synchronous disposal which kills the child synchronously.
 	process.on("beforeExit", () => {
-		void asyncShutdown();
+		void asyncShutdown("before_exit");
 	});
 	process.on("SIGINT", () => {
-		void asyncShutdown().finally(() => process.exit(130));
+		void asyncShutdown("sigint").finally(() => process.exit(130));
 	});
 	process.on("SIGTERM", () => {
-		void asyncShutdown().finally(() => process.exit(143));
+		void asyncShutdown("sigterm").finally(() => process.exit(143));
 	});
 	process.on("exit", () => {
-		for (const k of liveKernels) k.disposeSync();
+		for (const k of liveKernels) k.disposeSyncForProcessExit();
 	});
 }
 
@@ -598,6 +621,10 @@ export class KernelManager {
 	private readonly commTargets = new Map<string, string>();
 	private readonly handledHostRequestCommIds = new Set<string>();
 	private kernel?: ChildProcess;
+	/** Last selected kernel identity is retained through cleanup for the transition observation. */
+	private kernelPid?: number;
+	private kernelProcessStartId?: string;
+	private readonly workerProcessStartId = getProcessStartId(process.pid);
 	// Set instead of `kernel` for forkserver-forked kernels (not our child):
 	// signaling/liveness go through the forkserver, never process.kill.
 	private forkedKernel?: ForkedKernelHandle;
@@ -719,6 +746,8 @@ export class KernelManager {
 					throw new Error("Kernel start superseded");
 				}
 				this.forkedKernel = handle;
+				this.kernelPid = handle.pid;
+				this.kernelProcessStartId = getProcessStartId(handle.pid);
 				recordOrphanProcessState(handle.pid, true);
 				forked = true;
 			} catch (err) {
@@ -749,6 +778,8 @@ export class KernelManager {
 				stdio: ["ignore", "pipe", "pipe"],
 			});
 			this.kernel = kernel;
+			this.kernelPid = kernel.pid;
+			this.kernelProcessStartId = kernel.pid === undefined ? undefined : getProcessStartId(kernel.pid);
 			if (kernel.pid !== undefined) recordOrphanProcessState(kernel.pid, true);
 
 			kernel.stderr?.on("data", (buf: Buffer) => {
@@ -759,6 +790,7 @@ export class KernelManager {
 			kernel.on("error", (err) => {
 				if (this.kernel !== kernel) return;
 				this.appendKernelDiagnostic(`spawn error: ${err.message}`);
+				this.transitionToShutdown("direct_spawn_error", "child_process_event", "SIGTERM");
 				this.state = "shutdown";
 				liveKernels.delete(this);
 				this.cleanupResources();
@@ -769,6 +801,13 @@ export class KernelManager {
 				if (this.state !== "shutdown") {
 					this.appendKernelDiagnostic(`unexpected exit code=${code} signal=${signal}`);
 				}
+				this.transitionToShutdown(
+					"direct_child_exit",
+					"child_process_event",
+					"SIGTERM",
+					signal ?? "unavailable",
+					"not_live",
+				);
 				this.state = "shutdown";
 				liveKernels.delete(this);
 				this.cleanupResources();
@@ -786,7 +825,8 @@ export class KernelManager {
 			const canRetryStartup = (this.state as string) !== "shutdown";
 			// Only the call that performed the cleanup may resurrect to idle; a
 			// concurrent kill()/teardown owns the state otherwise.
-			if ((await this.shutdown()) && canRetryStartup) this.state = "idle";
+			if ((await this.shutdownForReason("connection_resolution_failure", {}, "startup_failure")) && canRetryStartup)
+				this.state = "idle";
 			throw e;
 		}
 
@@ -812,7 +852,9 @@ export class KernelManager {
 			const canRetryStartup = (this.state as string) !== "shutdown";
 			// Only the call that performed the cleanup may resurrect to idle; a
 			// concurrent kill()/teardown owns the state otherwise.
-			if ((await this.shutdown()) && canRetryStartup) this.state = "idle";
+			if ((await this.shutdownForReason("readiness_failure", {}, "startup_failure")) && canRetryStartup) {
+				this.state = "idle";
+			}
 			throw e;
 		}
 
@@ -838,15 +880,28 @@ export class KernelManager {
 	private async checkForkedKernelDeath(): Promise<void> {
 		if (this.state !== "running" || this.forkedLivenessProbeInFlight) return;
 		const probed = this.forkedKernel;
+		let kernelIdentityLivenessResult = "not_live";
 		this.forkedLivenessProbeInFlight = true;
 		try {
-			if (!(await this.forkedKernelDead(probed))) return;
+			if (
+				!(await this.forkedKernelDead(probed, undefined, () => {
+					kernelIdentityLivenessResult = "unknown_forkserver_unavailable";
+				}))
+			)
+				return;
 		} finally {
 			this.forkedLivenessProbeInFlight = false;
 		}
 		// Re-check after the await: teardown or a restart may have raced this poll.
 		if (this.state !== "running" || this.forkedKernel !== probed) return;
 		this.appendKernelDiagnostic("forked kernel exited unexpectedly");
+		this.transitionToShutdown(
+			"forked_kernel_liveness_death",
+			"liveness_monitor",
+			"SIGTERM",
+			"unavailable",
+			kernelIdentityLivenessResult,
+		);
 		this.state = "shutdown";
 		liveKernels.delete(this);
 		this.cleanupResources();
@@ -855,7 +910,11 @@ export class KernelManager {
 	// Liveness from the forkserver's reap table; a pid-0 probe would race reuse.
 	// `timeoutMs` bounds the probe (timeout counts as alive so the caller's own
 	// deadline decides); without it the protocol request timeout applies.
-	private async forkedKernelDead(probed: ForkedKernelHandle | undefined, timeoutMs?: number): Promise<boolean> {
+	private async forkedKernelDead(
+		probed: ForkedKernelHandle | undefined,
+		timeoutMs?: number,
+		onForkServerUnavailable?: () => void,
+	): Promise<boolean> {
 		if (!probed) return false;
 		try {
 			const alive = probed.isAlive();
@@ -863,9 +922,12 @@ export class KernelManager {
 			alive.catch(() => {}); // absorb a rejection that lands after the race is lost
 			return !(await Promise.race([alive, sleep(timeoutMs, true, { ref: false })]));
 		} catch (error) {
-			// A timeout is unknown liveness, not proven death (the forkserver may just be stalled in a slow fork).
-			if (error instanceof ForkServerUnavailable && error.timedOut) return false;
-			// Forkserver gone: its kernels' parent_handle watchdogs exit them too.
+			if (error instanceof ForkServerUnavailable) {
+				// A timeout is unknown liveness, not proven death (the forkserver may just be stalled in a slow fork).
+				if (error.timedOut) return false;
+				// Forkserver gone: its kernels' parent_handle watchdogs exit them too.
+				onForkServerUnavailable?.();
+			}
 			return true;
 		}
 	}
@@ -1517,39 +1579,47 @@ export class KernelManager {
 		await this.control.send(encode(msg, this.connection.key));
 	}
 
-	/** Records the complete programmatic shutdown observation before changing lifecycle state. */
-	private transitionToShutdown(reason: ProgrammaticShutdownReason, requestedKillSignal: NodeJS.Signals): void {
+	/** Records every shutdown observation before changing lifecycle state or cleaning resources. */
+	private transitionToShutdown(
+		reason: KernelShutdownReason,
+		callerCategory: KernelShutdownCallerCategory,
+		requestedKillSignal: NodeJS.Signals,
+		observedSignal: NodeJS.Signals | "unavailable" = "unavailable",
+		kernelIdentityLivenessResult?: string,
+	): void {
 		const oldState = this.state;
-		const workerProcessStartId = getProcessStartId(process.pid);
-		const kernelPid = this.kernel?.pid ?? this.forkedKernel?.pid;
-		const kernelProcessStartId = kernelPid === undefined ? undefined : getProcessStartId(kernelPid);
+		const immediateKernelProcessStartId =
+			this.kernelPid === undefined ? undefined : getProcessStartId(this.kernelPid);
 		const directKernelExited =
 			this.kernel !== undefined && (this.kernel.exitCode !== null || this.kernel.signalCode !== null);
 		emitIncidentDerived("recorder-events", "kernel_shutdown_transition", {
 			reason,
-			callerCategory: "programmatic_api",
+			callerCategory,
 			oldState,
 			newState: "shutdown",
 			sessionId: "unavailable",
 			activeSessionId: "unavailable",
 			toolCallId: "unavailable",
 			workerPid: process.pid,
-			workerProcessStartId: workerProcessStartId ?? "unavailable",
-			workerIdentityLivenessResult: workerProcessStartId ? "alive_identity_confirmed" : "identity_unavailable",
-			kernelPid: kernelPid ?? null,
-			kernelProcessStartId: kernelProcessStartId ?? "unavailable",
+			workerProcessStartId: this.workerProcessStartId ?? "unavailable",
+			workerIdentityLivenessResult: this.workerProcessStartId ? "alive_identity_confirmed" : "identity_unavailable",
+			kernelPid: this.kernelPid ?? null,
+			kernelProcessStartId: this.kernelProcessStartId ?? "unavailable",
 			kernelIdentityLivenessResult:
-				kernelPid === undefined
+				kernelIdentityLivenessResult ??
+				(this.kernelPid === undefined
 					? "kernel_unavailable"
-					: kernelProcessStartId
+					: immediateKernelProcessStartId && immediateKernelProcessStartId === this.kernelProcessStartId
 						? "alive_identity_confirmed"
 						: directKernelExited
 							? "not_live"
-							: "identity_unavailable",
+							: "identity_unavailable"),
 			forkserverPid: null,
-			forkserverProcessStartId: null,
+			forkserverProcessStartId: "unavailable",
+			forkserverIdentityLivenessResult: "unavailable",
 			startGeneration: this.startGeneration,
 			requestedKillSignal,
+			observedSignal,
 		});
 	}
 
@@ -1648,12 +1718,33 @@ export class KernelManager {
 		return this.shutdownForReason("shutdown", opts);
 	}
 
+	/** Internal process-hook entry point; not a programmatic shutdown request. */
+	shutdownForProcessLifecycle(reason: "before_exit" | "sigint" | "sigterm"): Promise<boolean> {
+		return this.shutdownForReason(
+			reason,
+			{ snapshot: true },
+			reason === "before_exit" ? "process_lifecycle" : "process_signal",
+			reason === "sigint" ? "SIGINT" : reason === "sigterm" ? "SIGTERM" : "unavailable",
+		);
+	}
+
 	private async shutdownForReason(
-		reason: Extract<ProgrammaticShutdownReason, "shutdown" | "restart">,
+		reason: Extract<
+			KernelShutdownReason,
+			| "shutdown"
+			| "restart"
+			| "connection_resolution_failure"
+			| "readiness_failure"
+			| "before_exit"
+			| "sigint"
+			| "sigterm"
+		>,
 		opts: { snapshot?: boolean } = {},
+		callerCategory: KernelShutdownCallerCategory = "programmatic_api",
+		observedSignal: NodeJS.Signals | "unavailable" = "unavailable",
 	): Promise<boolean> {
 		if (this.state === "shutdown") {
-			this.transitionToShutdown(reason, "SIGTERM");
+			this.transitionToShutdown(reason, callerCategory, "SIGTERM", observedSignal);
 			liveKernels.delete(this);
 			this.cleanupResources();
 			return true;
@@ -1666,7 +1757,7 @@ export class KernelManager {
 			await this.flushSnapshotForDispose();
 			if (this.startStale(generation)) return false; // superseded mid-flush: the newer owner already cleaned this kernel
 		}
-		this.transitionToShutdown(reason, "SIGTERM");
+		this.transitionToShutdown(reason, callerCategory, "SIGTERM", observedSignal);
 		this.state = "shutdown";
 		liveKernels.delete(this);
 
@@ -1731,7 +1822,7 @@ export class KernelManager {
 	}
 
 	async kill(): Promise<void> {
-		this.transitionToShutdown("kill", "SIGKILL");
+		this.transitionToShutdown("kill", "programmatic_api", "SIGKILL");
 		this.state = "shutdown";
 		liveKernels.delete(this);
 		this.cleanupResources("SIGKILL");
@@ -1860,13 +1951,25 @@ export class KernelManager {
 
 	/** Graceful cleanup. Waits briefly for in-flight host request handlers before closing sockets. */
 	dispose(): Promise<void> {
+		return this.disposeForReason("dispose", "programmatic_api");
+	}
+
+	/** Internal session-cleanup entry point; retains the existing graceful disposal behavior. */
+	disposeForSessionResourceCleanup(): Promise<void> {
+		return this.disposeForReason("session_resource_cleanup", "session_resource_cleanup");
+	}
+
+	private disposeForReason(
+		reason: "dispose" | "session_resource_cleanup",
+		callerCategory: KernelShutdownCallerCategory,
+	): Promise<void> {
 		return (async () => {
 			// Captured before any await: teardowns and newer starts bump the counter.
 			const generation = this.startGeneration;
 			// Final namespace flush while the kernel is still live (session end / reload).
 			await this.flushSnapshotForDispose();
 			if (this.startStale(generation)) return; // superseded mid-flush: the newer owner already cleaned this kernel
-			this.transitionToShutdown("dispose", "SIGTERM");
+			this.transitionToShutdown(reason, callerCategory, "SIGTERM");
 			this.state = "shutdown";
 			liveKernels.delete(this);
 			const inFlightHostRequests = [...this.inFlightHostRequests];
@@ -1881,9 +1984,21 @@ export class KernelManager {
 		})();
 	}
 
-	/** Synchronous best-effort cleanup. Safe to call from `process.on('exit')`. */
+	/** Synchronous best-effort cleanup. Safe to call outside a process exit hook. */
 	disposeSync(): void {
-		this.transitionToShutdown("dispose_sync", "SIGTERM");
+		this.disposeSyncForReason("dispose_sync", "programmatic_api");
+	}
+
+	/** Synchronous process-exit cleanup with an explicit lifecycle cause. */
+	disposeSyncForProcessExit(): void {
+		this.disposeSyncForReason("process_exit", "process_lifecycle");
+	}
+
+	private disposeSyncForReason(
+		reason: "dispose_sync" | "process_exit",
+		callerCategory: KernelShutdownCallerCategory,
+	): void {
+		this.transitionToShutdown(reason, callerCategory, "SIGTERM");
 		this.state = "shutdown";
 		liveKernels.delete(this);
 		// TODO: replace this best-effort hard-exit path if Node exposes an awaitable process-exit cleanup hook.
