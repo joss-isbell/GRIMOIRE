@@ -13,7 +13,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { IncidentRecorderCompactor } from "../src/modes/daemon/incident-recorder-compactor.js";
 
 const roots: string[] = [];
@@ -120,6 +120,7 @@ function writeJson(path: string, value: unknown): void {
 afterEach(() => {
 	for (const compactor of compactors.splice(0)) compactor.dispose();
 	for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+	vi.useRealTimers();
 });
 
 describe("incident compactor survival bounds", () => {
@@ -202,6 +203,55 @@ describe("incident compactor survival bounds", () => {
 		expect(snapshot.storageDiscoveryLastTransientError).toBe("storage_discovery_directory_changed_before_open");
 		expect(snapshot.storageDiscoveryError).toBeUndefined();
 		expect(compactor.accountedStorageBytes).toBe(uniqueAllocatedBytes([recorderRoot]));
+	});
+
+	it("batches monotonic cursor persistence and flushes a quiet suffix on its deadline", async () => {
+		const target = fixture("checkpoint-batching");
+		const recorderRoot = join(target.agentDir, "incident-recorder");
+		mkdirSync(recorderRoot, { recursive: true, mode: 0o700 });
+		const compactor = createCompactor({ agentDir: target.agentDir, freeReserveBytes: 0 });
+		finishStorageDiscovery(compactor);
+		const checkpointPath = join(recorderRoot, "compactor-cursor.json");
+		const cursorApi = compactor as unknown as {
+			wrapperSequences: Map<string, bigint>;
+			producerSequences: Map<string, bigint>;
+			commitCursor(
+				cursor: string,
+				machineId: string,
+				bootId: string,
+				invocationId: string | null,
+				realtimeUs: string,
+			): void;
+		};
+		for (let index = 0; index < 4_096; index += 1) {
+			cursorApi.wrapperSequences.set(`wrapper-${index}`, BigInt(index));
+			cursorApi.producerSequences.set(`producer-${index}`, BigInt(index));
+		}
+		vi.useFakeTimers();
+
+		for (let index = 1; index < 64; index += 1) {
+			cursorApi.commitCursor(`cursor-${index}`, "machine", "boot", "invocation", String(index));
+		}
+		expect(existsSync(checkpointPath)).toBe(false);
+		expect(compactor.survivalSnapshot().checkpointPendingEntries).toBe(63);
+
+		cursorApi.commitCursor("cursor-64", "machine", "boot", "invocation", "64");
+		const batched = JSON.parse(readFileSync(checkpointPath, "utf8")) as {
+			cursor: string;
+			wrapperSequences: Record<string, string>;
+			producerSequences: Record<string, string>;
+		};
+		expect(batched.cursor).toBe("cursor-64");
+		expect(Object.keys(batched.wrapperSequences)).toHaveLength(4_096);
+		expect(Object.keys(batched.producerSequences)).toHaveLength(4_096);
+		expect(compactor.survivalSnapshot().checkpointPendingEntries).toBe(0);
+
+		cursorApi.commitCursor("cursor-65", "machine", "boot", "invocation", "65");
+		expect(compactor.survivalSnapshot().checkpointPendingEntries).toBe(1);
+		await vi.advanceTimersByTimeAsync(1_000);
+		expect(JSON.parse(readFileSync(checkpointPath, "utf8"))).toMatchObject({ cursor: "cursor-65" });
+		expect(compactor.survivalSnapshot().checkpointPendingEntries).toBe(0);
+		expect(compactor.survivalSnapshot().checkpointPersistenceError).toBeUndefined();
 	});
 
 	it("fails closed when a canonical owner is removed after a sibling was classified mid-scan", () => {

@@ -45,6 +45,11 @@ const PIN_AFTER_MS = 15 * 60 * 1_000;
 const SEQUENCE_TRACKER_MAX_KEYS = 4096;
 const PENDING_ENTRY_MAX_COUNT = 8192;
 const PENDING_ENTRY_MAX_BYTES = 8 * 1024 * 1024;
+// Cursor lag is safe because immutable refs/CAS publish before acknowledgement;
+// a crash replays the uncheckpointed suffix idempotently. Batch full sequence-map
+// snapshots to prevent stale-journal catch-up from rewriting them per entry.
+const CHECKPOINT_BATCH_ENTRIES = 64;
+const CHECKPOINT_MAX_DELAY_MS = 1_000;
 const ASSEMBLY_DEADLINE_MS = 5_000;
 const ASSEMBLY_MAX_COUNT = 256;
 const ASSEMBLY_MAX_BYTES = 8 * 1024 * 1024;
@@ -247,6 +252,8 @@ interface CursorCheckpoint {
 	producerSequences: Record<string, string>;
 }
 
+type PendingCursorCheckpoint = Omit<CursorCheckpoint, "version" | "wrapperSequences" | "producerSequences">;
+
 interface StorageTopologySignature {
 	dev: bigint;
 	ino: bigint;
@@ -301,6 +308,8 @@ export interface IncidentRecorderCompactorSurvivalSnapshot {
 	producerSequenceKeys: number;
 	accountedStorageBytes: number;
 	reservedStorageBytes: number;
+	checkpointPendingEntries: number;
+	checkpointPersistenceError?: string;
 	storageDiscoveryEntries: number;
 	storageDiscoverySliceEntries: number;
 	storageDiscoveryDepth: number;
@@ -865,6 +874,10 @@ export class IncidentRecorderCompactor {
 	private readonly wrapperSequences = new Map<string, bigint>();
 	private readonly producerSequences = new Map<string, bigint>();
 	private checkpoint?: CursorCheckpoint;
+	private pendingCheckpoint?: PendingCursorCheckpoint;
+	private checkpointPendingEntries = 0;
+	private checkpointFlushTimer?: ReturnType<typeof setTimeout>;
+	private checkpointPersistenceError?: Error;
 	private readonly assemblies = new Map<string, Assembly>();
 	private assemblyBytes = 0;
 	private readonly pendingEntries: JournalRecordReference[] = [];
@@ -1013,6 +1026,10 @@ export class IncidentRecorderCompactor {
 	dispose(): void {
 		if (this.disposed) return;
 		this.disposed = true;
+		if (this.checkpointFlushTimer) clearTimeout(this.checkpointFlushTimer);
+		this.checkpointFlushTimer = undefined;
+		this.pendingCheckpoint = undefined;
+		this.checkpointPendingEntries = 0;
 		for (const wake of [...this.disposalWaiters]) wake();
 		this.disposalWaiters.clear();
 		const terminateReader = this.activeReaderTermination;
@@ -1372,6 +1389,7 @@ export class IncidentRecorderCompactor {
 	 */
 	async initializeStorageDiscovery(): Promise<void> {
 		this.assertActive();
+		if (this.storageDiscovery.complete) return;
 		while (!this.advanceStorageDiscovery()) {
 			const reason = this.storageDiscovery.error;
 			if (reason) {
@@ -1615,6 +1633,10 @@ export class IncidentRecorderCompactor {
 			producerSequenceKeys: this.producerSequences.size,
 			accountedStorageBytes: this.storageBytes,
 			reservedStorageBytes: this.outstandingStorageReservationBytes,
+			checkpointPendingEntries: this.checkpointPendingEntries,
+			...(this.checkpointPersistenceError
+				? { checkpointPersistenceError: this.checkpointPersistenceError.message }
+				: {}),
 			storageDiscoveryEntries: this.storageDiscovery.entries,
 			storageDiscoverySliceEntries: this.storageDiscovery.lastSliceEntries,
 			storageDiscoveryDepth: this.storageDiscovery.stack.length,
@@ -1891,6 +1913,7 @@ export class IncidentRecorderCompactor {
 		this.ensureOwnedDirectory(this.root);
 		for (;;) {
 			this.assertActive();
+			this.throwCheckpointPersistenceError();
 			if (this.diskPaused) await this.waitForWorkDelay(Math.max(1, this.pausedUntilMs - Date.now()));
 			const args = [
 				`--namespace=${INCIDENT_RECORDER_JOURNAL_NAMESPACE}`,
@@ -1949,6 +1972,7 @@ export class IncidentRecorderCompactor {
 				parserError ??= error instanceof Error ? error : new Error(String(error));
 			}
 			this.flushAllIncomplete("journal_stream_disconnected_before_occurrence_completion");
+			this.flushPendingCheckpoint();
 			if (parserError) {
 				const poison = parser.poisonFields();
 				const poisonCursor = optionalText(poison, "__CURSOR");
@@ -1966,6 +1990,7 @@ export class IncidentRecorderCompactor {
 				if ((parserError as NodeJS.ErrnoException).code === "ENOSPC" || this.diskPaused) continue;
 				if (poisonCursor && poisonMachine && poisonBoot && poisonRealtime) {
 					this.commitCursor(poisonCursor, poisonMachine, poisonBoot, poisonInvocation, poisonRealtime);
+					this.flushPendingCheckpoint();
 					continue;
 				}
 				throw parserError;
@@ -1985,6 +2010,7 @@ export class IncidentRecorderCompactor {
 					journalctl: stderr,
 				});
 				this.checkpoint = undefined;
+				this.discardPendingCheckpoint();
 				this.wrapperSequences.clear();
 				this.producerSequences.clear();
 				this.pendingEntries.length = 0;
@@ -2610,6 +2636,55 @@ export class IncidentRecorderCompactor {
 		fsyncDirectory(runDirectory);
 	}
 
+	private throwCheckpointPersistenceError(): void {
+		if (this.checkpointPersistenceError) throw this.checkpointPersistenceError;
+	}
+
+	private flushPendingCheckpoint(): void {
+		this.throwCheckpointPersistenceError();
+		const pending = this.pendingCheckpoint;
+		if (!pending) return;
+		const wrapperSequences: Record<string, string> = {};
+		for (const [key, value] of this.wrapperSequences) wrapperSequences[key] = value.toString();
+		const producerSequences: Record<string, string> = {};
+		for (const [key, value] of this.producerSequences) producerSequences[key] = value.toString();
+		const checkpoint: CursorCheckpoint = {
+			version: 1,
+			...pending,
+			wrapperSequences,
+			producerSequences,
+		};
+		this.writeOwnedCheckpoint(this.checkpointPath, checkpoint);
+		this.checkpoint = checkpoint;
+		this.pendingCheckpoint = undefined;
+		this.checkpointPendingEntries = 0;
+		if (this.checkpointFlushTimer) clearTimeout(this.checkpointFlushTimer);
+		this.checkpointFlushTimer = undefined;
+	}
+
+	private scheduleCheckpointFlush(): void {
+		if (this.checkpointFlushTimer) return;
+		this.checkpointFlushTimer = setTimeout(() => {
+			this.checkpointFlushTimer = undefined;
+			if (this.disposed) return;
+			try {
+				this.flushPendingCheckpoint();
+			} catch (error) {
+				this.checkpointPersistenceError =
+					error instanceof Error ? error : new Error(`Incident checkpoint persistence failed: ${String(error)}`);
+				this.activeReaderTermination?.();
+			}
+		}, CHECKPOINT_MAX_DELAY_MS);
+		this.checkpointFlushTimer.unref();
+	}
+
+	private discardPendingCheckpoint(): void {
+		if (this.checkpointFlushTimer) clearTimeout(this.checkpointFlushTimer);
+		this.checkpointFlushTimer = undefined;
+		this.pendingCheckpoint = undefined;
+		this.checkpointPendingEntries = 0;
+	}
+
 	private commitCursor(
 		cursor: string,
 		machineId: string,
@@ -2617,21 +2692,17 @@ export class IncidentRecorderCompactor {
 		invocationId: string | null,
 		realtimeUs: string,
 	): void {
-		const wrapperSequences: Record<string, string> = {};
-		for (const [key, value] of this.wrapperSequences) wrapperSequences[key] = value.toString();
-		const producerSequences: Record<string, string> = {};
-		for (const [key, value] of this.producerSequences) producerSequences[key] = value.toString();
-		this.checkpoint = {
-			version: 1,
+		this.throwCheckpointPersistenceError();
+		this.pendingCheckpoint = {
 			cursor,
 			machineId,
 			bootId,
 			invocationId,
 			lastRealtimeUs: realtimeUs,
-			wrapperSequences,
-			producerSequences,
 		};
-		this.writeOwnedCheckpoint(this.checkpointPath, this.checkpoint);
+		this.checkpointPendingEntries = Math.min(Number.MAX_SAFE_INTEGER, this.checkpointPendingEntries + 1);
+		if (this.checkpointPendingEntries >= CHECKPOINT_BATCH_ENTRIES) this.flushPendingCheckpoint();
+		else this.scheduleCheckpointFlush();
 	}
 
 	private startPinRangeScan(
