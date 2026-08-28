@@ -40,10 +40,6 @@ import { getAgentDir, getDaemonLogPath, VERSION } from "../../config.js";
 import { getProcessStartId } from "../../core/session-lease.js";
 import { acquireIncidentCasTransaction } from "./incident-recorder-cas-transaction.js";
 import {
-	IncidentRecorderCompactor,
-	type StoppedTargetArtifactClosePublication,
-} from "./incident-recorder-compactor.js";
-import {
 	INCIDENT_RECORDER_CHILD_ENV,
 	INCIDENT_RECORDER_RUN_DIR_ENV,
 	INCIDENT_RECORDER_SERVICE_ENV,
@@ -237,7 +233,6 @@ let providerOccurrenceSequence = 0;
 let activeOrderedWriter: { runDir: string; writer: IncidentRecorderWriter } | undefined;
 interface ServiceRecorderRuntime {
 	writer: IncidentRecorderWriter;
-	compactor: IncidentRecorderCompactor;
 }
 let activeServiceRecorder: ServiceRecorderRuntime | undefined;
 
@@ -284,7 +279,7 @@ function serviceRecordDerived(
 ): boolean {
 	const runtime = activeServiceRecorder;
 	const identity = serviceRunIdentity(runDir);
-	if (!runtime || !identity || !runtime.compactor.admitObservation(24 * 1024)) return false;
+	if (!runtime || !identity) return false;
 	return runtime.writer.recordDerivedForRun(identity, source, type, {
 		...fields,
 		targetPid: identity.targetPid,
@@ -908,25 +903,24 @@ function recordLinuxRawSource(runDir: string, occurrence: LinuxRawSourceOccurren
 	const service = activeServiceRecorder;
 	const serviceIdentity = serviceRunIdentity(runDir);
 	if (service) {
-		const admission =
-			serviceIdentity && service.compactor.admitObservation(occurrence.bytes.byteLength + 24 * 1024)
-				? service.writer.recordExactBytesForRun(
-						serviceIdentity,
-						rawSource,
-						"linux_raw_source_occurrence",
-						occurrence.bytes,
-						occurrence.encoding,
-						{
-							source: occurrence.source,
-							sourcePath: occurrence.sourcePath,
-							phase: occurrence.phase,
-							observedWallTime: occurrence.wallTime,
-							observedMonotonicNs: occurrence.monotonicNs,
-							targetPid: serviceIdentity.targetPid,
-							targetProcessStartId: serviceIdentity.targetProcessStartId,
-						},
-					)
-				: undefined;
+		const admission = serviceIdentity
+			? service.writer.recordExactBytesForRun(
+					serviceIdentity,
+					rawSource,
+					"linux_raw_source_occurrence",
+					occurrence.bytes,
+					occurrence.encoding,
+					{
+						source: occurrence.source,
+						sourcePath: occurrence.sourcePath,
+						phase: occurrence.phase,
+						observedWallTime: occurrence.wallTime,
+						observedMonotonicNs: occurrence.monotonicNs,
+						targetPid: serviceIdentity.targetPid,
+						targetProcessStartId: serviceIdentity.targetProcessStartId,
+					},
+				)
+			: undefined;
 		return {
 			algorithm: "journald-occurrence",
 			bytes: occurrence.bytes.byteLength,
@@ -1927,184 +1921,20 @@ function readOrderedEvents(runDir: string): IncidentRecorderEvent[] {
 		}
 	});
 }
-function hasCompactedFinalizationBarrier(runDir: string): boolean {
-	const expectationPath = join(runDir, "finalization-barrier-expectation.json");
-	let expectation: {
-		version?: number;
-		runId?: string;
-		runToken?: string;
-		wrapperPid?: number;
-		wrapperStartId?: string | null;
-		exitCode?: number | "unavailable";
-		exitSignal?: string | "unavailable";
-		supervisorExit?: {
-			occurrenceId: string;
-			producerId: string;
-			firstProducerSequence: string;
-			lastProducerSequence: string;
-			firstWrapperSequence: string;
-			lastWrapperSequence: string;
-		};
-		wrapperTerminal?: {
-			occurrenceId: string;
-			producerId: string;
-			firstProducerSequence: string;
-			lastProducerSequence: string;
-			firstWrapperSequence: string;
-			lastWrapperSequence: string;
-		};
-	};
-	try {
-		expectation = JSON.parse(readFileSync(expectationPath, "utf8")) as typeof expectation;
-	} catch {
-		return false;
-	}
-	const canonicalUuid = (value: unknown): value is string =>
-		typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
-	const unsignedSequence = (value: unknown): value is string =>
-		typeof value === "string" && /^(?:0|[1-9]\d{0,19})$/.test(value);
-	const validFrontier = (
-		value: typeof expectation.supervisorExit,
-	): value is NonNullable<typeof expectation.supervisorExit> =>
-		!!value &&
-		canonicalUuid(value.occurrenceId) &&
-		canonicalUuid(value.producerId) &&
-		unsignedSequence(value.firstProducerSequence) &&
-		unsignedSequence(value.lastProducerSequence) &&
-		unsignedSequence(value.firstWrapperSequence) &&
-		unsignedSequence(value.lastWrapperSequence) &&
-		BigInt(value.firstProducerSequence) <= BigInt(value.lastProducerSequence) &&
-		BigInt(value.firstWrapperSequence) <= BigInt(value.lastWrapperSequence);
-	if (
-		expectation.version !== 1 ||
-		!canonicalUuid(expectation.runId) ||
-		!canonicalUuid(expectation.runToken) ||
-		!Number.isSafeInteger(expectation.wrapperPid) ||
-		(expectation.wrapperPid ?? 0) <= 0 ||
-		!(expectation.wrapperStartId === null || typeof expectation.wrapperStartId === "string") ||
-		!(Number.isSafeInteger(expectation.exitCode) || expectation.exitCode === "unavailable") ||
-		!(typeof expectation.exitSignal === "string" && expectation.exitSignal.length > 0) ||
-		!validFrontier(expectation.supervisorExit) ||
-		!validFrontier(expectation.wrapperTerminal) ||
-		expectation.supervisorExit.producerId !== expectation.wrapperTerminal.producerId
-	)
-		return false;
-	const runId = basename(runDir).slice(-36);
-	if (expectation.runId !== runId) return false;
-	readOrderedEvents(runDir);
-	const references = [...(orderedEventCaches.get(runDir)?.references.values() ?? [])];
-	const sequenceRangeEquals = (values: unknown, first: string, last: string): boolean => {
-		if (!Array.isArray(values) || values.length < 1 || values.some((value) => typeof value !== "string"))
-			return false;
-		try {
-			return (
-				values[0] === first &&
-				values.at(-1) === last &&
-				values.every((value, index) => BigInt(value as string) === BigInt(first) + BigInt(index))
-			);
-		} catch {
-			return false;
-		}
-	};
-	const gapCovers = (expected: NonNullable<typeof expectation.supervisorExit>): boolean => {
-		const producerStreams = new Set<string>();
-		const wrapperStreams = new Set<string>();
-		for (const reference of references) {
-			if (
-				reference.state !== "gap_or_uncertainty" ||
-				!reference.evidence ||
-				typeof reference.evidence !== "object" ||
-				Array.isArray(reference.evidence)
-			)
-				continue;
-			const evidence = reference.evidence as Record<string, unknown>;
-			if (
-				evidence.runId !== expectation.runId ||
-				evidence.runToken !== expectation.runToken ||
-				typeof evidence.streamKeyHash !== "string" ||
-				!/^[0-9a-f]{64}$/.test(evidence.streamKeyHash)
-			)
-				continue;
-			try {
-				if (
-					evidence.producerId === expected.producerId &&
-					typeof evidence.expectedProducerFrom === "string" &&
-					typeof evidence.expectedProducerThrough === "string" &&
-					BigInt(evidence.expectedProducerFrom) <= BigInt(expected.firstProducerSequence) &&
-					BigInt(evidence.expectedProducerThrough) >= BigInt(expected.lastProducerSequence)
-				)
-					producerStreams.add(evidence.streamKeyHash);
-				if (
-					evidence.wrapperPid === expectation.wrapperPid &&
-					evidence.wrapperStartId === expectation.wrapperStartId &&
-					typeof evidence.expectedWrapperFrom === "string" &&
-					typeof evidence.expectedWrapperThrough === "string" &&
-					BigInt(evidence.expectedWrapperFrom) <= BigInt(expected.firstWrapperSequence) &&
-					BigInt(evidence.expectedWrapperThrough) >= BigInt(expected.lastWrapperSequence)
-				)
-					wrapperStreams.add(evidence.streamKeyHash);
-			} catch {}
-		}
-		return [...producerStreams].some((stream) => wrapperStreams.has(stream));
-	};
-	const completeMatches = (
-		expected: NonNullable<typeof expectation.supervisorExit>,
-		kind: "exit" | "terminal",
-	): boolean =>
-		references.some((reference) => {
-			if (reference.state !== "complete") return false;
-			const identity = reference.identity;
-			if (!identity || typeof identity !== "object" || Array.isArray(identity)) return false;
-			const child = identity as Record<string, unknown>;
-			if (
-				child.runId !== expectation.runId ||
-				child.runToken !== expectation.runToken ||
-				child.producerId !== expected.producerId ||
-				child.occurrenceId !== expected.occurrenceId
-			)
-				return false;
-			if (
-				!sequenceRangeEquals(reference.wrapperOrder, expected.firstWrapperSequence, expected.lastWrapperSequence) ||
-				!sequenceRangeEquals(reference.producerOrder, expected.firstProducerSequence, expected.lastProducerSequence)
-			)
-				return false;
-			const metadata = reference.metadata;
-			const transport = reference.transportIdentity;
-			if (
-				!metadata ||
-				typeof metadata !== "object" ||
-				Array.isArray(metadata) ||
-				!transport ||
-				typeof transport !== "object" ||
-				Array.isArray(transport)
-			)
-				return false;
-			const fields = metadata as Record<string, unknown>;
-			const transportFields = transport as Record<string, unknown>;
-			if (
-				fields.producerPid !== transportFields.wrapperPid ||
-				transportFields.wrapperPid !== expectation.wrapperPid ||
-				transportFields.wrapperStartId !== expectation.wrapperStartId
-			)
-				return false;
-			if (kind === "exit")
-				return (
-					reference.type === "supervisor_exit" &&
-					reference.source === "recorder-events" &&
-					Object.hasOwn(fields, "code") &&
-					Object.hasOwn(fields, "signal") &&
-					fields.code === (expectation.exitCode === "unavailable" ? null : expectation.exitCode) &&
-					fields.signal === (expectation.exitSignal === "unavailable" ? null : expectation.exitSignal)
-				);
-			return (
-				reference.type === "capture_channel_terminal" &&
-				reference.source === "recorder-control" &&
-				reference.terminal === true
-			);
-		});
+function hasDurableFinalizationBarrier(runDir: string): boolean {
+	if (existsSync(join(runDir, ACTIVE_MARKER_FILE_NAME))) return false;
+	const terminal = readSmallJson<{
+		completed?: unknown;
+		exitCode?: unknown;
+		exitSignal?: unknown;
+		disposition?: unknown;
+	}>(join(runDir, ".retention-terminal.json"));
+	if (!terminal || !terminal.completed || typeof terminal.completed !== "object") return false;
 	return (
-		(completeMatches(expectation.supervisorExit, "exit") || gapCovers(expectation.supervisorExit)) &&
-		(completeMatches(expectation.wrapperTerminal, "terminal") || gapCovers(expectation.wrapperTerminal))
+		Object.hasOwn(terminal, "exitCode") &&
+		Object.hasOwn(terminal, "exitSignal") &&
+		(terminal.exitCode === null || Number.isSafeInteger(terminal.exitCode)) &&
+		(terminal.exitSignal === null || typeof terminal.exitSignal === "string")
 	);
 }
 
@@ -2339,174 +2169,49 @@ async function sanitizeNodeReports(runDir: string, _removeRawDirectory = false):
 		state.pending.shift();
 		return "pending";
 	}
-	const admission = activeIncidentCompactor?.streamStoppedTargetArtifact(
-		basename(runDir).slice(-36),
-		sourcePath,
-		"node-report-json-bytes",
-		closePublicationPath,
-		{ deadlineMs: Date.now() + 40, byteBudget: 4 * 1024 * 1024 },
-	);
-	if (!admission || admission.state === "pending") return "pending";
-	if (admission.state === "error") {
+	const captured = readBoundedPrefix(sourcePath, 4 * 1024 * 1024);
+	if (!captured || captured.truncated) {
 		writeImmutableJsonOnce(join(rawReportsDir, `${entryName}.error.json`), {
 			schemaVersion: 1,
-			state: "error",
+			state: "gap_or_uncertainty",
 			source: sourceMetadata,
-			reason: admission.reason,
+			reason: captured ? "node_report_exceeded_4_mib_bound" : "node_report_unreadable",
 		});
-		appendRunEvent(runDir, { type: "node_report_capture_error", originalPath: sourcePath, reason: admission.reason });
 		state.pending.shift();
 		return "pending";
 	}
+	const digest = createHash("sha256").update(captured.value).digest("hex");
+	const report = readJsonValue(captured.value);
+	if (!report || typeof report !== "object" || Array.isArray(report)) {
+		writeImmutableJsonOnce(join(rawReportsDir, `${entryName}.error.json`), {
+			schemaVersion: 1,
+			state: "gap_or_uncertainty",
+			source: sourceMetadata,
+			reason: "node_report_json_invalid",
+		});
+		state.pending.shift();
+		return "pending";
+	}
+	writePrivateJson(join(reportsDir, `report-${digest.slice(0, 16)}.json`), {
+		...minimizeNodeReport(report),
+		causalCapture: { sha256: digest, bytes: captured.value.length, source: sourceMetadata },
+	});
 	writeImmutableJsonOnce(join(rawReportsDir, `${entryName}.reference.json`), {
 		schemaVersion: 1,
 		state: "complete",
-		occurrence: { originalPath: sourcePath, sourceMetadata },
-		artifact: admission.artifact,
+		originalPath: sourcePath,
+		sha256: digest,
+		bytes: captured.value.length,
 	});
-	appendRunEvent(runDir, { type: "node_report_captured", originalPath: sourcePath, bytes: admission.artifact.bytes });
-	const summaryPrefix = readBoundedPrefix(sourcePath, 64 * 1024)?.value;
-	const summary = minimizeNodeReport(summaryPrefix ? readJsonValue(summaryPrefix) : undefined);
-	writePrivateJson(join(reportsDir, `report-${admission.artifact.digest.slice(0, 16)}.json`), {
-		...summary,
-		canonical: false,
-		source: admission.artifact,
-	});
+	appendRunEvent(runDir, { type: "node_report_captured", originalPath: sourcePath, bytes: captured.value.length });
 	state.pending.shift();
 	return state.discoveryComplete && state.pending.length === 0 ? "complete" : "pending";
 }
 
-interface ProviderArtifactCaptureState {
-	seenReferences: Set<string>;
-	pending: Array<{
-		provider: string;
-		path: string;
-		format: string;
-		closePublication?: StoppedTargetArtifactClosePublication;
-	}>;
-}
-const providerArtifactCaptureStates = new Map<string, ProviderArtifactCaptureState>();
-
-function captureStoppedProviderArtifacts(runDir: string): "pending" | "complete" {
-	let state = providerArtifactCaptureStates.get(runDir);
-	if (!state) {
-		state = { seenReferences: new Set(), pending: [] };
-		providerArtifactCaptureStates.set(runDir, state);
-		while (providerArtifactCaptureStates.size > 4096)
-			providerArtifactCaptureStates.delete(providerArtifactCaptureStates.keys().next().value as string);
-	}
-	const cache = orderedEventCaches.get(runDir);
-	for (const [name, reference] of cache?.references ?? []) {
-		if (state.seenReferences.has(name) || reference.type !== "provider_source_manifest_registered") continue;
-		state.seenReferences.add(name);
-		const cas = reference.cas;
-		if (!cas || typeof cas !== "object" || Array.isArray(cas)) continue;
-		const path = (cas as Record<string, unknown>).path;
-		const bytes = (cas as Record<string, unknown>).bytes;
-		if (typeof path !== "string" || typeof bytes !== "number" || bytes > 256 * 1024) continue;
-		const encoded = readBoundedPrefix(path, 256 * 1024);
-		if (!encoded || encoded.truncated) continue;
-		const decoded = decodeDiagnosticValue(readJsonValue(encoded.value));
-		if (!decoded || typeof decoded !== "object" || Array.isArray(decoded)) continue;
-		const manifest = decoded as Record<string, unknown>;
-		const provider = typeof manifest.provider === "string" ? manifest.provider : "unknown";
-		if (!Array.isArray(manifest.artifacts)) continue;
-		for (const artifact of manifest.artifacts.slice(0, 64 - state.pending.length)) {
-			if (!artifact || typeof artifact !== "object" || Array.isArray(artifact)) continue;
-			const fields = artifact as Record<string, unknown>;
-			if (typeof fields.path !== "string" || !isAbsolute(fields.path)) continue;
-			state.pending.push({
-				provider,
-				path: fields.path,
-				format: typeof fields.format === "string" ? fields.format : "exact-provider-bytes",
-				closePublication:
-					fields.closePublication && typeof fields.closePublication === "object"
-						? (fields.closePublication as StoppedTargetArtifactClosePublication)
-						: undefined,
-			});
-		}
-	}
-	const artifact = state.pending[0];
-	if (!artifact) return "complete";
-	const evidenceDirectory = join(runDir, "evidence", "provider-artifacts");
-	mkdirSync(evidenceDirectory, { recursive: true, mode: 0o700 });
-	const id = createHash("sha256").update(`${artifact.provider}\0${artifact.path}`).digest("hex");
-	const completePath = join(evidenceDirectory, `${id}.reference.json`);
-	const errorPath = join(evidenceDirectory, `${id}.error.json`);
-	if (existsSync(completePath) || existsSync(errorPath)) {
-		state.pending.shift();
-		return "pending";
-	}
-	let metadata: Record<string, unknown>;
-	const closePublicationPath = join(evidenceDirectory, `${id}.closed.json`);
-	try {
-		const source = lstatSync(artifact.path, { bigint: true });
-		const publication = artifact.closePublication;
-		if (
-			!source.isFile() ||
-			source.isSymbolicLink() ||
-			!publication ||
-			publication.schemaVersion !== 1 ||
-			publication.state !== "closed" ||
-			publication.proof !== "provider_published_closed" ||
-			publication.source?.path !== artifact.path ||
-			publication.source.dev !== source.dev.toString() ||
-			publication.source.ino !== source.ino.toString() ||
-			publication.source.bytes !== Number(source.size) ||
-			publication.source.mtimeMs !== Number(source.mtimeMs) ||
-			publication.source.ctimeMs !== Number(source.ctimeMs)
-		)
-			throw new Error("artifact_close_publication_required_or_stale");
-		metadata = {
-			provider: artifact.provider,
-			sourcePath: artifact.path,
-			dev: source.dev.toString(),
-			ino: source.ino.toString(),
-			bytes: Number(source.size),
-			mtimeMs: Number(source.mtimeMs),
-			ctimeMs: Number(source.ctimeMs),
-		};
-		writeImmutableJsonOnce(closePublicationPath, publication);
-	} catch (error) {
-		writeImmutableJsonOnce(errorPath, {
-			schemaVersion: 1,
-			state: "gap_or_uncertainty",
-			sourcePath: artifact.path,
-			reason: serializeError(error),
-		});
-		appendRunEvent(runDir, {
-			type: "provider_artifact_capture_gap",
-			provider: artifact.provider,
-			sourcePath: artifact.path,
-			reason: serializeError(error),
-		});
-		state.pending.shift();
-		return "pending";
-	}
-	const admission = activeIncidentCompactor?.streamStoppedTargetArtifact(
-		basename(runDir).slice(-36),
-		artifact.path,
-		artifact.format,
-		closePublicationPath,
-		{ deadlineMs: Date.now() + 40, byteBudget: 4 * 1024 * 1024 },
-	);
-	if (!admission || admission.state === "pending") return "pending";
-	if (admission.state === "error")
-		writeImmutableJsonOnce(errorPath, {
-			schemaVersion: 1,
-			state: "error",
-			source: metadata,
-			reason: admission.reason,
-		});
-	else
-		writeImmutableJsonOnce(completePath, {
-			schemaVersion: 1,
-			state: "complete",
-			source: metadata,
-			artifact: admission.artifact,
-		});
-	state.pending.shift();
-	return "pending";
+function captureStoppedProviderArtifacts(_runDir: string): "complete" {
+	// Causal provider observations are already stored as bounded structured events.
+	// Do not copy or content-address arbitrary provider files in the automatic path.
+	return "complete";
 }
 
 function readJsonValue(value: Buffer): unknown {
@@ -3168,7 +2873,7 @@ export async function recordSupervisorProcess(options: RecordProcessOptions): Pr
 	});
 	appendRunEvent(runDir, { type: "supervisor_spawned", childPid: pid, processStartId, nodeFatalReportsEnabled });
 	orderedWriter.recordDerived("recorder-control", "service_sampling_owner", {
-		owner: "incident-recorder-compactor-sampler",
+		owner: "incident-recorder-causal-sampler",
 		targetPid: pid,
 		targetProcessStartId: processStartId ?? "",
 	});
@@ -3325,7 +3030,6 @@ export interface IncidentProviderSourceManifest {
 		ino?: number;
 		bytes?: number;
 		sha256?: string;
-		closePublication?: StoppedTargetArtifactClosePublication;
 		[key: string]: unknown;
 	}>;
 	configuration?: unknown;
@@ -3412,7 +3116,7 @@ export function ingestIncidentRecorderEvidence<P extends IncidentEvidenceProvide
 		}
 		const serviceIdentity = serviceRunIdentity(runDir);
 		if (activeServiceRecorder) {
-			if (serviceIdentity && activeServiceRecorder.compactor.admitObservation(payload.bytes.length + 24 * 1024)) {
+			if (serviceIdentity) {
 				activeServiceRecorder.writer.recordExactBytesForRun(
 					serviceIdentity,
 					"provider-evidence",
@@ -3477,7 +3181,7 @@ export function registerIncidentProviderSourceManifest(runDir: string, manifest:
 		}
 		const serviceIdentity = serviceRunIdentity(runDir);
 		if (activeServiceRecorder) {
-			if (serviceIdentity && activeServiceRecorder.compactor.admitObservation(payload.bytes.length + 24 * 1024)) {
+			if (serviceIdentity) {
 				activeServiceRecorder.writer.recordExactBytesForRun(
 					serviceIdentity,
 					"provider-manifest",
@@ -3619,7 +3323,10 @@ interface ServiceSamplingState {
 	nodeReportPendingMarked?: boolean;
 }
 const serviceSamplingRuns = new Map<string, ServiceSamplingState>();
-let activeIncidentCompactor: IncidentRecorderCompactor | undefined;
+interface DisposableIncidentRecorderCompactor {
+	dispose(): void;
+}
+let activeIncidentCompactor: DisposableIncidentRecorderCompactor | undefined;
 let serviceRunsDirectory: Dir | undefined;
 let serviceRunsDirectoryPath: string | undefined;
 const serviceRunPaths = new Map<string, string>();
@@ -3650,14 +3357,15 @@ function closeServiceRunsDirectory(): void {
 }
 
 /** @internal Replaces or releases the service-owned compactor and retained run scan. */
-export function replaceIncidentRecorderServiceCompactor(replacement: IncidentRecorderCompactor | undefined): void {
+export function replaceIncidentRecorderServiceCompactor(
+	replacement: DisposableIncidentRecorderCompactor | undefined,
+): void {
 	const previous = activeIncidentCompactor;
 	if (previous === replacement) {
 		if (!replacement) closeServiceRunsDirectory();
 		return;
 	}
 	activeIncidentCompactor = replacement;
-	if (activeServiceRecorder?.compactor === previous) activeServiceRecorder = undefined;
 	closeServiceRunsDirectory();
 	previous?.dispose();
 }
@@ -3728,22 +3436,6 @@ export async function inspectIncidentRecorderRuns(agentDir: string, nowMs = Date
 					serviceSamplingRuns.set(run.runDir, sampling);
 					while (serviceSamplingRuns.size > 4096)
 						serviceSamplingRuns.delete(serviceSamplingRuns.keys().next().value as string);
-					if (activeIncidentCompactor?.admitObservation(256 * 1024) !== true) {
-						const identity = serviceRunIdentity(run.runDir);
-						if (identity)
-							activeServiceRecorder?.writer.recordDerivedForRun(
-								identity,
-								"recorder-control",
-								"service_sampling_storage_paused",
-								{
-									state: "paused",
-									targetPid: run.pid,
-									targetProcessStartId: run.processStartId ?? "",
-								},
-							);
-						sampling.diskPauseMarked = true;
-						continue;
-					}
 					sampling.previous = baselineLinuxIncidentEvidence({
 						runDir: run.runDir,
 						pid: run.pid,
@@ -3763,27 +3455,6 @@ export async function inspectIncidentRecorderRuns(agentDir: string, nowMs = Date
 					sampling.latencyBurstUntilMs = Math.max(sampling.latencyBurstUntilMs, nowMs + 15_000);
 				}
 				if (nowMs >= sampling.nextSampleMs) {
-					const admitted = activeIncidentCompactor?.admitObservation(256 * 1024) === true;
-					if (!admitted) {
-						if (!sampling.diskPauseMarked) {
-							const identity = serviceRunIdentity(run.runDir);
-							if (identity)
-								activeServiceRecorder?.writer.recordDerivedForRun(
-									identity,
-									"recorder-control",
-									"service_sampling_storage_paused",
-									{
-										state: "paused",
-										targetPid: run.pid,
-										targetProcessStartId: run.processStartId ?? "",
-									},
-								);
-							sampling.diskPauseMarked = true;
-						}
-						sampling.nextSampleMs = nowMs + 1_000;
-						continue;
-					}
-					sampling.diskPauseMarked = false;
 					const inAnomalyBurst = nowMs < sampling.anomalyBurstUntilMs;
 					const inLatencyBurst = nowMs < sampling.latencyBurstUntilMs;
 					const current = sampleLinuxIncidentEvidence({
@@ -3812,11 +3483,11 @@ export async function inspectIncidentRecorderRuns(agentDir: string, nowMs = Date
 		const exited = exitEvent !== undefined;
 		if (!live) {
 			if (runHasLiveProxy(run.runDir)) continue;
-			if (!hasCompactedFinalizationBarrier(run.runDir)) {
+			if (!hasDurableFinalizationBarrier(run.runDir)) {
 				const pendingPath = join(run.runDir, ".service-finalization-pending");
-				if (!existsSync(pendingPath) && !activeIncidentCompactor?.diskPaused)
+				if (!existsSync(pendingPath))
 					writeImmutableJsonOnce(pendingPath, {
-						state: "waiting_for_compacted_supervisor_exit_and_wrapper_frontier",
+						state: "waiting_for_durable_wrapper_exit_disposition",
 						retryable: true,
 						observed: nowFields(),
 					});
@@ -3834,25 +3505,6 @@ export async function inspectIncidentRecorderRuns(agentDir: string, nowMs = Date
 				while (serviceSamplingRuns.size > 4096)
 					serviceSamplingRuns.delete(serviceSamplingRuns.keys().next().value as string);
 			}
-			if (!activeIncidentCompactor?.admitObservation(8 * 1024 * 1024)) {
-				if (!stoppedState.diskPauseMarked) {
-					const identity = serviceRunIdentity(run.runDir);
-					if (identity)
-						activeServiceRecorder?.writer.recordDerivedForRun(
-							identity,
-							"recorder-control",
-							"stopped_target_capture_storage_paused",
-							{
-								state: "pending",
-								targetPid: run.pid,
-								targetProcessStartId: run.processStartId ?? "",
-							},
-						);
-					stoppedState.diskPauseMarked = true;
-				}
-				continue;
-			}
-			stoppedState.diskPauseMarked = false;
 			if (!stoppedState.stoppedBroadCaptured)
 				try {
 					sampleLinuxIncidentEvidence({
@@ -3913,13 +3565,6 @@ export async function inspectIncidentRecorderRuns(agentDir: string, nowMs = Date
 				{ code, signal, classification },
 			);
 			if (incidentDir) {
-				activeIncidentCompactor?.requestPin(
-					basename(run.runDir).slice(-36),
-					incidentDir,
-					Number.isFinite(Date.parse(exitEvent?.wallTime ?? ""))
-						? Date.parse(exitEvent?.wallTime ?? "")
-						: Date.now(),
-				);
 				appendRunEvent(run.runDir, { type: "service_incident_finalized", incidentId: basename(incidentDir) });
 				finalized.push(incidentDir);
 			}
@@ -3934,7 +3579,6 @@ export async function inspectIncidentRecorderRuns(agentDir: string, nowMs = Date
 				if (completedIdentity) activeServiceRecorder?.writer.releaseRunIdentity(completedIdentity);
 				serviceSamplingRuns.delete(run.runDir);
 				nodeReportCaptureStates.delete(run.runDir);
-				providerArtifactCaptureStates.delete(run.runDir);
 			}
 			continue;
 		}
@@ -3978,63 +3622,28 @@ function serviceInspectionCadenceMs(nowMs = Date.now()): number {
 }
 
 export async function runIncidentRecorderService(agentDir = getAgentDir()): Promise<never> {
-	if (process.platform !== "linux")
-		throw new Error("Incident recorder service requires Linux journald namespace support");
+	if (process.platform !== "linux") throw new Error("Incident recorder service requires Linux process evidence");
 	mkdirSync(join(agentDir, "incident-recorder", "runs"), { recursive: true, mode: 0o700 });
-	const compactor = new IncidentRecorderCompactor({ agentDir });
-	replaceIncidentRecorderServiceCompactor(compactor);
-	try {
-		// Inspection, finalization, retention, and the service writer all mutate
-		// recorder-owned roots. Freeze exact startup accounting before any of them
-		// starts so the service cannot invalidate its own two-pass proof.
-		await compactor.initializeStorageDiscovery();
-		const serviceWriter = new IncidentRecorderWriter({
-			runDir: join(agentDir, "incident-recorder"),
-			runId: randomUUID(),
-			runToken: randomUUID(),
-			bootId: linuxBootId(),
-			wrapperStartId: getProcessStartId(process.pid),
-			serviceSink: true,
-		});
-		await serviceWriter.start();
-		activeServiceRecorder = { writer: serviceWriter, compactor };
-		const compactorRun = compactor.run();
-		let nextRetentionPassMs = 0;
-		for (;;) {
-			try {
-				await inspectIncidentRecorderRuns(agentDir);
-				const nowMs = Date.now();
-				if (!compactor.diskPaused) compactor.processPendingPins(nowMs);
-				if (nowMs >= nextRetentionPassMs) {
-					const retention = runIncidentRetentionPass({ agentDir, nowMs, ...INCIDENT_RETENTION_SERVICE_BUDGET });
-					if (retention.uncertainties.length > 0)
-						writePrivateJsonAtomicSync(join(agentDir, "incident-recorder", "retention-uncertainty.json"), {
-							version: 1,
-							state: "fail_closed",
-							observed: nowFields(),
-							reasons: retention.uncertainties.slice(0, 32),
-						});
-					if (retention.moreWork)
-						writePrivateJsonAtomicSync(join(agentDir, "incident-recorder", "retention-deferred.json"), {
-							version: 1,
-							state: "bounded_incremental_work_remains",
-							observed: nowFields(),
-							scannedEntries: retention.scannedEntries,
-							deletedEntries: retention.deletedEntries,
-						});
-					nextRetentionPassMs = nowMs + 60_000;
-				}
-			} catch {
-				// A malformed or unavailable evidence source must not stop later recorder passes.
+	let nextRetentionPassMs = 0;
+	for (;;) {
+		try {
+			await inspectIncidentRecorderRuns(agentDir);
+			const nowMs = Date.now();
+			if (nowMs >= nextRetentionPassMs) {
+				const retention = runIncidentRetentionPass({ agentDir, nowMs, ...INCIDENT_RETENTION_SERVICE_BUDGET });
+				if (retention.uncertainties.length > 0)
+					writePrivateJsonAtomicSync(join(agentDir, "incident-recorder", "retention-uncertainty.json"), {
+						version: 1,
+						state: "fail_closed",
+						observed: nowFields(),
+						reasons: retention.uncertainties.slice(0, 32),
+					});
+				nextRetentionPassMs = nowMs + 60_000;
 			}
-			await Promise.race([
-				compactorRun,
-				new Promise<void>((resolveDelay) => setTimeout(resolveDelay, serviceInspectionCadenceMs())),
-			]);
+		} catch {
+			// An unavailable evidence source must not stop later causal-observation passes.
 		}
-	} finally {
-		if (activeIncidentCompactor === compactor) replaceIncidentRecorderServiceCompactor(undefined);
-		else compactor.dispose();
+		await new Promise<void>((resolveDelay) => setTimeout(resolveDelay, serviceInspectionCadenceMs()));
 	}
 }
 
