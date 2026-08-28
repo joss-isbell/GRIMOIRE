@@ -245,6 +245,15 @@ describe("builtin skills", () => {
 			expect(compact?.kind === "python" && compact.python.importName).toBe("compact");
 		});
 
+		it("loads the bundled LITURGY skill as a python skill", () => {
+			const { skills } = loadSkillsFromDir({ dir: getBundledSkillsDir(), source: "builtin" });
+
+			const liturgy = skills.find((s) => s.name === "liturgy");
+			expect(liturgy).toBeDefined();
+			expect(liturgy?.kind).toBe("python");
+			expect(liturgy?.kind === "python" && liturgy.python.importName).toBe("liturgy");
+		});
+
 		it("loads the bundled RLM heartbeat skill as a python skill", () => {
 			const { skills } = loadSkillsFromDir({ dir: getBundledSkillsDir(), source: "builtin" });
 
