@@ -54,12 +54,6 @@ describe("incident recorder systemd user service", () => {
 			homeDir,
 			platform: "linux" as const,
 			spawnSyncImpl: fakeSystemctl,
-			privilegedInstallFile: () => {
-				throw new Error("automatic install must not request root");
-			},
-			privilegedReadFile: () => {
-				throw new Error("automatic install must not inspect root-owned journald configuration");
-			},
 		};
 		const first = installIncidentRecorderSystemdService(options);
 		expect(first.status).toBe("installed");

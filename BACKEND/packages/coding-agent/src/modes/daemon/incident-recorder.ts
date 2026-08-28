@@ -2842,7 +2842,7 @@ interface ActiveRun {
 	machineId: string;
 	bootId: string;
 	pid: number;
-	processStartId?: string;
+	processStartId: string;
 	socketPath: string;
 }
 
@@ -2865,7 +2865,8 @@ function loadActiveRun(runDir: string): ActiveRun | undefined {
 		typeof launch.socketPath !== "string" ||
 		typeof identity.machineId !== "string" ||
 		typeof identity.bootId !== "string" ||
-		typeof identity.pid !== "number"
+		typeof identity.pid !== "number" ||
+		typeof identity.processStartId !== "string"
 	)
 		return undefined;
 	return {
@@ -2874,7 +2875,7 @@ function loadActiveRun(runDir: string): ActiveRun | undefined {
 		bootId: identity.bootId,
 		socketPath: launch.socketPath,
 		pid: identity.pid,
-		processStartId: typeof identity.processStartId === "string" ? identity.processStartId : undefined,
+		processStartId: identity.processStartId,
 	};
 }
 
@@ -3261,52 +3262,8 @@ export interface RenderServiceOptions {
 	startLimitBurst?: number;
 }
 
-export interface RenderJournaldNamespaceOptions {
-	storageMaxUse?: string;
-	systemKeepFree?: string;
-	lineMax?: string;
-	maxRetentionSec?: string;
-}
-
-export interface IncidentRecorderSystemdRequirements {
-	journaldConfig: { path: "/etc/systemd/journald@grimoire.conf"; contents: string };
-	socketDropIn: { path: "/etc/systemd/system/systemd-journald@grimoire.socket.d/prime-agent.conf"; contents: string };
-	enableUnit: "systemd-journald@grimoire.socket";
-	serviceUnit: string;
-}
-
 function systemdQuote(value: string): string {
 	return `"${value.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
-}
-
-function systemdSizeBytes(value: string): number | undefined {
-	const match = /^([1-9][0-9]*)([KMGT]?)$/.exec(value);
-	if (!match) return undefined;
-	const exponent = "KMGT".indexOf(match[2]) + 1;
-	const bytes = Number(match[1]) * 1024 ** exponent;
-	return Number.isSafeInteger(bytes) ? bytes : undefined;
-}
-
-export function renderIncidentRecorderJournaldNamespaceConfig(options: RenderJournaldNamespaceOptions = {}): string {
-	const lineMax = options.lineMax ?? "48K";
-	const storageMaxUse = options.storageMaxUse ?? "16G";
-	const systemKeepFree = options.systemKeepFree ?? "10G";
-	const maxRetentionSec = options.maxRetentionSec ?? "3d";
-	const lineMaxBytes = systemdSizeBytes(lineMax);
-	if (
-		!lineMaxBytes ||
-		lineMaxBytes < 48 * 1024 ||
-		!systemdSizeBytes(storageMaxUse) ||
-		!systemdSizeBytes(systemKeepFree) ||
-		!/^[1-9][0-9]*[smhdw]$/.test(maxRetentionSec)
-	) {
-		throw new Error("Invalid journald namespace retention or size setting");
-	}
-	return `[Journal]\nStorage=persistent\nMaxRetentionSec=${maxRetentionSec}\nCompress=yes\nForwardToSyslog=no\nRateLimitIntervalSec=0\nRateLimitBurst=0\nLineMax=${lineMax}\nSystemMaxUse=${storageMaxUse}\nSystemKeepFree=${systemKeepFree}\n`;
-}
-
-export function renderIncidentRecorderJournaldSocketDropIn(): string {
-	return `[Unit]\nDescription=Automatic Prime Agent raw diagnostic journal namespace socket\n\n[Install]\nWantedBy=sockets.target\n`;
 }
 
 export function renderIncidentRecorderSystemdUnit(options: RenderServiceOptions): string {
@@ -3350,24 +3307,6 @@ export function renderIncidentRecorderSystemdUnit(options: RenderServiceOptions)
 	return `[Unit]\nDescription=Prime Agent causal incident recorder\nStartLimitIntervalSec=${startLimitIntervalSeconds}s\nStartLimitBurst=${startLimitBurst}\n\n[Service]\nType=simple\nKillMode=control-group\nEnvironment=${INCIDENT_RECORDER_SERVICE_ENV}=1\nExecStart=${args.map(systemdQuote).join(" ")}\nRestart=on-failure\nRestartSec=${restartSeconds}s\nMemoryHigh=${memoryHigh}\nMemoryMax=${memoryMax}\nMemorySwapMax=${memorySwapMax}\nCPUQuota=${cpuQuota}\nIOWeight=${ioWeight}\nIOSchedulingClass=idle\nNice=10\nTasksMax=${tasksMax}\nLimitNOFILE=${limitNOFILE}\nOOMPolicy=stop\nRuntimeDirectory=prime-agent\nRuntimeDirectoryMode=0700\nUMask=0077\n\n[Install]\nWantedBy=default.target\n`;
 }
 
-export function renderIncidentRecorderSystemdRequirements(
-	service: RenderServiceOptions,
-	namespace: RenderJournaldNamespaceOptions = {},
-): IncidentRecorderSystemdRequirements {
-	return {
-		journaldConfig: {
-			path: "/etc/systemd/journald@grimoire.conf",
-			contents: renderIncidentRecorderJournaldNamespaceConfig(namespace),
-		},
-		socketDropIn: {
-			path: "/etc/systemd/system/systemd-journald@grimoire.socket.d/prime-agent.conf",
-			contents: renderIncidentRecorderJournaldSocketDropIn(),
-		},
-		enableUnit: "systemd-journald@grimoire.socket",
-		serviceUnit: renderIncidentRecorderSystemdUnit(service),
-	};
-}
-
 export interface InstallServiceOptions extends RenderServiceOptions {
 	platform?: NodeJS.Platform;
 	homeDir?: string;
@@ -3377,137 +3316,12 @@ export interface InstallServiceOptions extends RenderServiceOptions {
 		command: string,
 		args: readonly string[],
 	) => Pick<SpawnSyncReturns<string>, "status" | "error" | "stderr">;
-	privilegedInstallFile?: (
-		path: string,
-		contents: string,
-	) => { status: number | null; error?: Error; stderr?: string };
-	privilegedReadFile?: (path: string) => string | undefined;
-	privilegedCommandPath?: string;
 }
 
 export interface InstallServiceResult {
 	status: "installed" | "unchanged" | "unsupported" | "unavailable" | "failed";
 	unitPath?: string;
 	message?: string;
-}
-
-export function installIncidentRecorderJournaldNamespace(options: InstallServiceOptions): InstallServiceResult {
-	if ((options.platform ?? process.platform) !== "linux")
-		return { status: "unsupported", message: "journald namespace is only available on Linux" };
-	const requirements = renderIncidentRecorderSystemdRequirements(options);
-	const run =
-		options.spawnSyncImpl ??
-		((command: string, args: readonly string[]) =>
-			spawnSync(command, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }));
-	const installFile: NonNullable<InstallServiceOptions["privilegedInstallFile"]> =
-		options.privilegedInstallFile ??
-		((path: string, contents: string) => {
-			const temporary = join(options.agentDir ?? getAgentDir(), `namespace-install-${randomUUID()}`);
-			try {
-				writeFileSync(temporary, contents, { mode: 0o600 });
-				if (typeof process.getuid === "function" && process.getuid() === 0) {
-					mkdirSync(dirname(path), { recursive: true, mode: 0o755 });
-					writeFileSync(path, contents, { mode: 0o644 });
-					return { status: 0 };
-				}
-				const result = run(options.privilegedCommandPath ?? "sudo", [
-					"-n",
-					"install",
-					"-D",
-					"-m",
-					"0644",
-					temporary,
-					path,
-				]);
-				return { status: result.status, error: result.error, stderr: result.stderr };
-			} finally {
-				try {
-					rmSync(temporary, { force: true });
-				} catch {}
-			}
-		});
-	const readPrivileged =
-		options.privilegedReadFile ??
-		((path: string) => {
-			try {
-				return readFileSync(path, "utf8");
-			} catch {
-				return undefined;
-			}
-		});
-	let changed = false;
-	for (const file of [requirements.journaldConfig, requirements.socketDropIn]) {
-		const current = readPrivileged(file.path);
-		if (current === file.contents) continue;
-		const installed = installFile(file.path, file.contents);
-		if (installed.error || installed.status !== 0)
-			return {
-				status: "unavailable",
-				message: installed.error?.message ?? installed.stderr ?? `privilege unavailable for ${file.path}`,
-			};
-		const verified = readPrivileged(file.path);
-		if (verified !== file.contents)
-			return { status: "failed", message: `journald namespace file verification failed for ${file.path}` };
-		changed = true;
-	}
-	const privileged = (args: readonly string[]) =>
-		typeof process.getuid === "function" && process.getuid() === 0
-			? run(options.systemctlPath ?? "systemctl", args)
-			: run(options.privilegedCommandPath ?? "sudo", ["-n", options.systemctlPath ?? "systemctl", ...args]);
-	if (changed) {
-		const reload = privileged(["daemon-reload"]);
-		if (reload.error || reload.status !== 0)
-			return { status: "failed", message: reload.error?.message ?? reload.stderr ?? "system daemon-reload failed" };
-	}
-	const enabled = privileged(["enable", "--now", requirements.enableUnit]);
-	if (enabled.error || enabled.status !== 0)
-		return {
-			status: "unavailable",
-			message: enabled.error?.message ?? enabled.stderr ?? "journald namespace socket enable failed",
-		};
-	const serviceActivation = privileged([changed ? "restart" : "start", "systemd-journald@grimoire.service"]);
-	if (serviceActivation.error || serviceActivation.status !== 0) {
-		return {
-			status: "failed",
-			message:
-				serviceActivation.error?.message ??
-				serviceActivation.stderr ??
-				`journald namespace service ${changed ? "restart" : "start"} failed`,
-		};
-	}
-	const serviceReady = privileged(["is-active", "--quiet", "systemd-journald@grimoire.service"]);
-	if (serviceReady.error || serviceReady.status !== 0)
-		return {
-			status: "failed",
-			message:
-				serviceReady.error?.message ??
-				serviceReady.stderr ??
-				"journald namespace service readiness verification failed",
-		};
-	const socketReady = privileged(["is-active", "--quiet", requirements.enableUnit]);
-	if (socketReady.error || socketReady.status !== 0)
-		return {
-			status: "failed",
-			message:
-				socketReady.error?.message ??
-				socketReady.stderr ??
-				"journald namespace socket readiness verification failed",
-		};
-	if (!options.spawnSyncImpl) {
-		try {
-			if (!statSync("/run/systemd/journal.grimoire/stdout").isSocket())
-				throw new Error("namespace stdout path is not a socket");
-		} catch (error) {
-			return {
-				status: "failed",
-				message: error instanceof Error ? error.message : "journald namespace stdout socket verification failed",
-			};
-		}
-	}
-	return {
-		status: changed ? "installed" : "unchanged",
-		message: `journald namespace ${changed ? "changed and restarted" : "unchanged"}; service and socket ready`,
-	};
 }
 
 export function installIncidentRecorderSystemdService(options: InstallServiceOptions): InstallServiceResult {
