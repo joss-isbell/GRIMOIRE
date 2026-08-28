@@ -320,6 +320,23 @@ describe("incident compactor survival bounds", () => {
 		linkSync(occurrence, runOccurrence);
 		linkSync(gap, runGap);
 		linkSync(incomplete, runIncomplete);
+		const activeRun = join(recorderRoot, "runs", "2026-08-28T00-00-00.000Z-11111111-1111-4111-8111-111111111111");
+		const rawCasId = "8".repeat(64);
+		const rawCas = join(recorderRoot, "cas", "sha256", rawCasId.slice(0, 2), `${rawCasId}.blob`);
+		const rawLease = join(activeRun, ".cas-leases", basename(rawCas));
+		const collisionId = "9".repeat(64);
+		const collisionName = `${collisionId}.collision-123-22222222-2222-4222-8222-222222222222.blob`;
+		const collisionCas = join(recorderRoot, "cas", "sha256", collisionId.slice(0, 2), collisionName);
+		const collisionLease = join(activeRun, ".cas-leases", collisionName);
+		for (const [owner, lease] of [
+			[rawCas, rawLease],
+			[collisionCas, collisionLease],
+		] as const) {
+			mkdirSync(dirname(owner), { recursive: true, mode: 0o700 });
+			mkdirSync(dirname(lease), { recursive: true, mode: 0o700 });
+			writeFileSync(owner, basename(owner), { mode: 0o600 });
+			linkSync(owner, lease);
+		}
 		const journalPin = join(incidentRoot, "journal-pins", "cas", `${casId}.blob`);
 		mkdirSync(dirname(journalPin), { recursive: true, mode: 0o700 });
 		linkSync(cas, journalPin);
@@ -359,6 +376,13 @@ describe("incident compactor survival bounds", () => {
 				admission: "allow",
 			},
 			{ shape: "journal pin", owner: cas, reference: journalPin, admission: "allow" },
+			{ shape: "run-owned raw CAS lease", owner: rawCas, reference: rawLease, admission: "allow" },
+			{
+				shape: "run-owned raw CAS collision lease",
+				owner: collisionCas,
+				reference: collisionLease,
+				admission: "allow",
+			},
 			{ shape: "immutable crash temp", owner: gap, reference: immutableTemporary, admission: "allow" },
 			{
 				shape: "Sysdig incident-owned pin",
@@ -374,6 +398,8 @@ describe("incident compactor survival bounds", () => {
 			"gap canonical and run ref",
 			"incomplete canonical and run ref",
 			"journal pin",
+			"run-owned raw CAS lease",
+			"run-owned raw CAS collision lease",
 			"immutable crash temp",
 			"Sysdig incident-owned pin",
 			"unknown hard-link shape",
@@ -662,6 +688,7 @@ describe("incident compactor survival bounds", () => {
 			},
 		});
 		writeFileSync(source, "after!", { mode: 0o600 });
+		utimesSync(source, 1, 1);
 		expect(
 			compactor.streamStoppedTargetArtifact(RUN_ID, source, "exact", publication, {
 				deadlineMs: Date.now() + 1_000,

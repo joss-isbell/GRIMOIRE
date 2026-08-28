@@ -1084,8 +1084,18 @@ export class IncidentRecorderCompactor {
 		if (immutableTemporary?.[1]) return join(dirname(path), immutableTemporary[1]);
 		const recorderRelative = relativeDescendant(this.root, path);
 		if (recorderRelative !== undefined) {
-			let match = /^cas\/sha256\/([0-9a-f]{2})\/([0-9a-f]{64})\.blob$/.exec(recorderRelative);
+			let match =
+				/^cas\/sha256\/([0-9a-f]{2})\/([0-9a-f]{64})(?:\.collision-[1-9][0-9]*-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?\.blob$/.exec(
+					recorderRelative,
+				);
 			if (match?.[1] && match[2] && match[1] === match[2].slice(0, 2)) return path;
+			match =
+				/^runs\/[^/]{1,180}\/\.cas-leases\/([0-9a-f]{64})((?:\.collision-[1-9][0-9]*-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?\.blob)$/.exec(
+					recorderRelative,
+				);
+			if (match?.[1] && match[2]) {
+				return join(this.root, "cas", "sha256", match[1].slice(0, 2), `${match[1]}${match[2]}`);
+			}
 			match = /^refs\/occurrences\/sha256\/([0-9a-f]{2})\/([0-9a-f]{64})\.json$/.exec(recorderRelative);
 			if (match?.[1] && match[2] && match[1] === match[2].slice(0, 2)) return path;
 			match = /^refs\/(?:gaps|incomplete)\/([0-9a-f]{64})\.json$/.exec(recorderRelative);
