@@ -14,7 +14,12 @@ import {
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { IncidentRecorderCompactor } from "../src/modes/daemon/incident-recorder-compactor.js";
+import {
+	IncidentRecorderCompactor,
+	incidentJournalReaderResumeDelayMs,
+	incidentJournalReaderSinceArgument,
+	incidentJournalReplayFenceDisposition,
+} from "../src/modes/daemon/incident-recorder-compactor.js";
 
 const roots: string[] = [];
 const compactors: IncidentRecorderCompactor[] = [];
@@ -124,6 +129,27 @@ afterEach(() => {
 });
 
 describe("incident compactor survival bounds", () => {
+	it("bounds journal replay to retained time and paces provider reads", () => {
+		const nowMs = 3 * 24 * 60 * 60 * 1_000 + 10_000;
+		expect(incidentJournalReaderSinceArgument(undefined, nowMs)).toBe("--since=@10.000000");
+		expect(incidentJournalReaderSinceArgument({ lastRealtimeUs: "20000000" }, nowMs)).toBe("--since=@19.000000");
+		expect(
+			incidentJournalReaderSinceArgument({ lastRealtimeUs: String((nowMs + 6 * 60 * 1_000) * 1_000) }, nowMs),
+		).toBe("--since=@10.000000");
+		expect(incidentJournalReaderResumeDelayMs(1024 * 1024, 0)).toBe(1_000);
+		expect(incidentJournalReaderResumeDelayMs(64 * 1024, 10)).toBe(53);
+		expect(incidentJournalReaderResumeDelayMs(64 * 1024, 1_000)).toBe(0);
+		expect(() => incidentJournalReaderResumeDelayMs(-1, 0)).toThrow("Invalid incident journal reader pacing input");
+		const fence = { cursor: "durable-cursor", lastRealtimeUs: "20000000" };
+		expect(incidentJournalReplayFenceDisposition(fence, "durable-cursor", "20000000")).toBe("matched");
+		expect(incidentJournalReplayFenceDisposition(fence, "earlier", "20500000")).toBe("skip");
+		expect(incidentJournalReplayFenceDisposition(fence, "later", "21000001")).toBe("missing");
+		expect(incidentJournalReplayFenceDisposition(fence, undefined, undefined)).toBe("skip");
+		expect(
+			incidentJournalReplayFenceDisposition({ cursor: "durable-cursor", lastRealtimeUs: "invalid" }, "other", "1"),
+		).toBe("missing");
+	});
+
 	it("discovers a scaled CAS backlog in fixed slices and counts each regular hard-linked inode once", () => {
 		const target = fixture("storage");
 		const recorderRoot = join(target.agentDir, "incident-recorder");

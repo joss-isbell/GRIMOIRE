@@ -50,6 +50,8 @@ const PENDING_ENTRY_MAX_BYTES = 8 * 1024 * 1024;
 // snapshots to prevent stale-journal catch-up from rewriting them per entry.
 const CHECKPOINT_BATCH_ENTRIES = 64;
 const CHECKPOINT_MAX_DELAY_MS = 1_000;
+const JOURNAL_READER_BYTES_PER_SECOND = 1024 * 1024;
+const JOURNAL_READER_REPLAY_OVERLAP_US = 1_000_000n;
 const ASSEMBLY_DEADLINE_MS = 5_000;
 const ASSEMBLY_MAX_COUNT = 256;
 const ASSEMBLY_MAX_BYTES = 8 * 1024 * 1024;
@@ -253,6 +255,60 @@ interface CursorCheckpoint {
 }
 
 type PendingCursorCheckpoint = Omit<CursorCheckpoint, "version" | "wrapperSequences" | "producerSequences">;
+
+export function incidentJournalReaderResumeDelayMs(
+	chunkBytes: number,
+	processingMs: number,
+	bytesPerSecond = JOURNAL_READER_BYTES_PER_SECOND,
+): number {
+	if (
+		!Number.isSafeInteger(chunkBytes) ||
+		chunkBytes < 0 ||
+		!Number.isFinite(processingMs) ||
+		processingMs < 0 ||
+		!Number.isSafeInteger(bytesPerSecond) ||
+		bytesPerSecond < 1
+	) {
+		throw new Error("Invalid incident journal reader pacing input");
+	}
+	return Math.max(0, Math.ceil((chunkBytes * 1_000) / bytesPerSecond) - Math.floor(processingMs));
+}
+
+export function incidentJournalReaderSinceArgument(
+	checkpoint: Pick<CursorCheckpoint, "lastRealtimeUs"> | undefined,
+	nowMs = Date.now(),
+): string {
+	if (!Number.isFinite(nowMs)) throw new Error("Invalid incident journal reader wall time");
+	const nowUs = BigInt(Math.max(0, Math.trunc(nowMs))) * 1_000n;
+	let sinceUs = BigInt(Math.max(0, Math.trunc(nowMs - INCIDENT_DIAGNOSTIC_RETENTION_MS))) * 1_000n;
+	if (checkpoint && /^[0-9]+$/.test(checkpoint.lastRealtimeUs)) {
+		const checkpointUs = BigInt(checkpoint.lastRealtimeUs);
+		const replayFromUs =
+			checkpointUs > JOURNAL_READER_REPLAY_OVERLAP_US ? checkpointUs - JOURNAL_READER_REPLAY_OVERLAP_US : 0n;
+		if (checkpointUs <= nowUs + 5n * 60n * 1_000_000n && replayFromUs > sinceUs) sinceUs = replayFromUs;
+	}
+	const seconds = sinceUs / 1_000_000n;
+	const micros = (sinceUs % 1_000_000n).toString().padStart(6, "0");
+	return `--since=@${seconds}.${micros}`;
+}
+
+interface JournalReplayFence {
+	cursor: string;
+	lastRealtimeUs: string;
+}
+
+export function incidentJournalReplayFenceDisposition(
+	fence: JournalReplayFence,
+	observedCursor: string | null | undefined,
+	observedRealtimeUs: string | null | undefined,
+): "skip" | "matched" | "missing" {
+	if (observedCursor === fence.cursor) return "matched";
+	if (!/^[0-9]+$/.test(fence.lastRealtimeUs)) return "missing";
+	if (!observedRealtimeUs || !/^[0-9]+$/.test(observedRealtimeUs)) return "skip";
+	return BigInt(observedRealtimeUs) <= BigInt(fence.lastRealtimeUs) + JOURNAL_READER_REPLAY_OVERLAP_US
+		? "skip"
+		: "missing";
+}
 
 interface StorageTopologySignature {
 	dev: bigint;
@@ -1932,11 +1988,17 @@ export class IncidentRecorderCompactor {
 				"--all",
 				"--follow",
 				"--no-tail",
+				incidentJournalReaderSinceArgument(this.checkpoint),
 			];
-			if (this.checkpoint?.cursor) args.push(`--after-cursor=${this.checkpoint.cursor}`);
+			let replayFence: JournalReplayFence | undefined = this.checkpoint
+				? { cursor: this.checkpoint.cursor, lastRealtimeUs: this.checkpoint.lastRealtimeUs }
+				: undefined;
 			const child = spawn(this.options.journalctlPath ?? "journalctl", args, { stdio: ["ignore", "pipe", "pipe"] });
 			let readerKillTimer: ReturnType<typeof setTimeout> | undefined;
+			let readerResumeTimer: ReturnType<typeof setTimeout> | undefined;
 			const terminateReader = (): void => {
+				if (readerResumeTimer) clearTimeout(readerResumeTimer);
+				readerResumeTimer = undefined;
 				try {
 					child.kill("SIGTERM");
 				} catch {}
@@ -1951,16 +2013,56 @@ export class IncidentRecorderCompactor {
 			this.activeReaderTermination = terminateReader;
 			const parser = new JournalExportParser((fields) => {
 				this.assertActive();
+				if (replayFence) {
+					const observedCursor = optionalText(fields, "__CURSOR");
+					const observedRealtimeUs = optionalText(fields, "__REALTIME_TIMESTAMP");
+					const disposition = incidentJournalReplayFenceDisposition(
+						replayFence,
+						observedCursor,
+						observedRealtimeUs,
+					);
+					if (disposition === "skip") return;
+					if (disposition === "matched") {
+						replayFence = undefined;
+						return;
+					}
+					this.writeGap({
+						reason: "journal_cursor_not_found_inside_retained_overlap",
+						removedCursor: replayFence.cursor,
+						lastRealtimeUs: replayFence.lastRealtimeUs,
+						observedCursor,
+						observedRealtimeUs,
+					});
+					this.checkpoint = undefined;
+					this.discardPendingCheckpoint();
+					this.wrapperSequences.clear();
+					this.producerSequences.clear();
+					this.pendingEntries.length = 0;
+					this.pendingEntryHead = 0;
+					this.pendingEntryBytes = 0;
+					rmSync(this.checkpointPath, { force: true });
+					fsyncDirectory(dirname(this.checkpointPath));
+					replayFence = undefined;
+				}
 				this.acceptEntry(fields);
 			});
 			let parserError: Error | undefined;
 			child.stdout?.on("data", (chunk: Buffer) => {
+				child.stdout?.pause();
+				const processingStartedMs = Date.now();
 				try {
 					parser.push(chunk);
 				} catch (error) {
 					parserError = error instanceof Error ? error : new Error(String(error));
 					terminateReader();
+					return;
 				}
+				const delayMs = incidentJournalReaderResumeDelayMs(chunk.length, Date.now() - processingStartedMs);
+				readerResumeTimer = setTimeout(() => {
+					readerResumeTimer = undefined;
+					if (!this.disposed && child.exitCode === null && child.signalCode === null) child.stdout?.resume();
+				}, delayMs);
+				readerResumeTimer.unref();
 			});
 			let stderr = "";
 			child.stderr?.on("data", (chunk: Buffer) => {
@@ -1973,6 +2075,8 @@ export class IncidentRecorderCompactor {
 				},
 			);
 			if (readerKillTimer) clearTimeout(readerKillTimer);
+			if (readerResumeTimer) clearTimeout(readerResumeTimer);
+			readerResumeTimer = undefined;
 			if (!result.error && this.activeReaderTermination === terminateReader)
 				this.activeReaderTermination = undefined;
 			this.assertActive();
@@ -2756,7 +2860,10 @@ export class IncidentRecorderCompactor {
 		let bytes = 0;
 		let killTimer: ReturnType<typeof setTimeout> | undefined;
 		let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+		let resumeTimer: ReturnType<typeof setTimeout> | undefined;
 		const terminate = (): void => {
+			if (resumeTimer) clearTimeout(resumeTimer);
+			resumeTimer = undefined;
 			if (deadlineTimer) {
 				clearTimeout(deadlineTimer);
 				deadlineTimer = undefined;
@@ -2780,6 +2887,8 @@ export class IncidentRecorderCompactor {
 		deadlineTimer.unref();
 		child.stdout?.on("data", (chunk: Buffer) => {
 			if (this.disposed) return;
+			child.stdout?.pause();
+			const processingStartedMs = Date.now();
 			bytes += chunk.length;
 			if (bytes > PENDING_ENTRY_MAX_BYTES) {
 				error = new Error("Pin range scan exceeded its byte bound");
@@ -2791,7 +2900,14 @@ export class IncidentRecorderCompactor {
 			} catch (caught) {
 				error = caught instanceof Error ? caught : new Error(String(caught));
 				terminate();
+				return;
 			}
+			const delayMs = incidentJournalReaderResumeDelayMs(chunk.length, Date.now() - processingStartedMs);
+			resumeTimer = setTimeout(() => {
+				resumeTimer = undefined;
+				if (!this.disposed && child.exitCode === null && child.signalCode === null) child.stdout?.resume();
+			}, delayMs);
+			resumeTimer.unref();
 		});
 		child.once("error", (caught) => {
 			error = caught;
@@ -2799,6 +2915,8 @@ export class IncidentRecorderCompactor {
 		child.once("close", (code) => {
 			if (deadlineTimer) clearTimeout(deadlineTimer);
 			if (killTimer) clearTimeout(killTimer);
+			if (resumeTimer) clearTimeout(resumeTimer);
+			resumeTimer = undefined;
 			this.activePinScans.delete(incidentDir);
 			if (this.disposed) return;
 			try {
