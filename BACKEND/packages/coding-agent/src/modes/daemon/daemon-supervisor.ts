@@ -331,6 +331,8 @@ interface ResidentWorker {
 	deferredRecovery?: Promise<void>;
 	recoveryEpisode?: WorkerRecoveryEpisodeContext;
 	recoveryEpisodeSource?: Readonly<Record<string, string>>;
+	recoveryEpisodeWorkerIdentity?: { readonly pid: number; readonly processStartId?: string };
+	recoveryEpisodeTerminalOutcome?: "success" | "failure" | "cancelled";
 	intentionalStop: boolean;
 	stopRevision: number;
 	launchEnv?: Record<string, string>;
@@ -1291,6 +1293,11 @@ export class DaemonSupervisor {
 		};
 		worker.recoveryEpisode = episode;
 		worker.recoveryEpisodeSource = episodeSource;
+		worker.recoveryEpisodeWorkerIdentity = {
+			pid: worker.descriptor.pid,
+			processStartId: worker.descriptor.processStartId,
+		};
+		worker.recoveryEpisodeTerminalOutcome = undefined;
 		appendSupervisorDiagnosticEvent("worker_recovery_episode_started", {
 			workerId: worker.descriptor.workerId,
 			workerPid: worker.descriptor.pid,
@@ -1306,10 +1313,44 @@ export class DaemonSupervisor {
 		return worker.recoveryEpisode ? { ...worker.recoveryEpisode } : {};
 	}
 
+	private emitWorkerRecoveryFact(
+		worker: ResidentWorker,
+		episode: WorkerRecoveryEpisodeContext,
+		type: "worker_recovery_action" | "worker_recovery_action_outcome" | "worker_recovery_episode_outcome",
+		fields: Record<string, unknown>,
+	): void {
+		appendSupervisorDiagnosticEvent(type, {
+			workerId: worker.descriptor.workerId,
+			workerPid: worker.recoveryEpisodeWorkerIdentity?.pid ?? worker.descriptor.pid,
+			workerProcessStartId: worker.recoveryEpisodeWorkerIdentity
+				? worker.recoveryEpisodeWorkerIdentity.processStartId
+				: worker.descriptor.processStartId,
+			rootActiveSessionId: worker.descriptor.rootActiveSessionId,
+			...worker.recoveryEpisodeSource,
+			...episode,
+			...fields,
+		});
+	}
+
+	private endWorkerRecoveryEpisode(
+		worker: ResidentWorker,
+		episode: WorkerRecoveryEpisodeContext,
+		outcome: "success" | "failure" | "cancelled",
+	): void {
+		if (worker.recoveryEpisode !== episode || worker.recoveryEpisodeTerminalOutcome !== undefined) {
+			return;
+		}
+		worker.recoveryEpisodeTerminalOutcome = outcome;
+		this.emitWorkerRecoveryFact(worker, episode, "worker_recovery_episode_outcome", { outcome });
+	}
+
 	private clearWorkerRecoveryEpisode(worker: ResidentWorker, episode: WorkerRecoveryEpisodeContext): void {
 		if (worker.recoveryEpisode === episode) {
+			this.endWorkerRecoveryEpisode(worker, episode, "cancelled");
 			worker.recoveryEpisode = undefined;
 			worker.recoveryEpisodeSource = undefined;
+			worker.recoveryEpisodeWorkerIdentity = undefined;
+			worker.recoveryEpisodeTerminalOutcome = undefined;
 		}
 	}
 
@@ -3032,6 +3073,12 @@ export class DaemonSupervisor {
 			}
 			return;
 		}
+		const recoveryEpisode = this.beginWorkerRecoveryEpisode(worker, {
+			triggerUnavailableReason: "supervisor_startup",
+		});
+		this.emitWorkerRecoveryFact(worker, recoveryEpisode, "worker_recovery_action", {
+			disposition: "adopt_existing",
+		});
 		try {
 			if (!isProcessAlive(worker.descriptor.pid)) {
 				throw new Error("Session worker process is no longer running");
@@ -3050,14 +3097,28 @@ export class DaemonSupervisor {
 			worker.descriptor.consecutiveFailures = 0;
 			this.persistWorker(worker);
 			this.broadcastHeartbeatsChanged();
+			this.emitWorkerRecoveryFact(worker, recoveryEpisode, "worker_recovery_action_outcome", {
+				disposition: "adopt_existing",
+				outcome: "success",
+			});
+			this.endWorkerRecoveryEpisode(worker, recoveryEpisode, "success");
+			this.clearWorkerRecoveryEpisode(worker, recoveryEpisode);
 		} catch (error) {
 			if (isSupervisorRecoveryCancelled(error)) {
+				this.emitWorkerRecoveryFact(worker, recoveryEpisode, "worker_recovery_action_outcome", {
+					disposition: "adopt_existing",
+					outcome: "cancelled",
+				});
+				this.endWorkerRecoveryEpisode(worker, recoveryEpisode, "cancelled");
+				this.clearWorkerRecoveryEpisode(worker, recoveryEpisode);
 				return;
 			}
-			this.log(`Could not adopt worker ${worker.descriptor.workerId}: ${String(error)}`);
-			const recoveryEpisode = this.beginWorkerRecoveryEpisode(worker, {
-				triggerUnavailableReason: "supervisor_startup",
+			this.emitWorkerRecoveryFact(worker, recoveryEpisode, "worker_recovery_action_outcome", {
+				disposition: "adopt_existing",
+				outcome: "failure",
+				classification: "worker_recovery_error",
 			});
+			this.log(`Could not adopt worker ${worker.descriptor.workerId}: ${String(error)}`);
 			await this.recoverWorker(worker, recoveryEpisode);
 		}
 	}
@@ -3393,9 +3454,17 @@ export class DaemonSupervisor {
 			return;
 		}
 		if (worker.descriptor.ownerClientId && !worker.launchEnv && !isProcessAlive(worker.descriptor.pid)) {
+			this.emitWorkerRecoveryFact(worker, recoveryEpisode, "worker_recovery_action", {
+				disposition: "wait_for_client_context",
+			});
 			worker.descriptor.lifecycle = "failed";
 			worker.descriptor.lastError = "Waiting for the owning client to reconnect";
 			this.persistWorker(worker);
+			this.emitWorkerRecoveryFact(worker, recoveryEpisode, "worker_recovery_action_outcome", {
+				disposition: "wait_for_client_context",
+				outcome: "success",
+			});
+			this.endWorkerRecoveryEpisode(worker, recoveryEpisode, "failure");
 			this.clearWorkerRecoveryEpisode(worker, recoveryEpisode);
 			return;
 		}
@@ -3416,6 +3485,9 @@ export class DaemonSupervisor {
 						worker.descriptor.processStartId === undefined ||
 						observedProcessStartId === worker.descriptor.processStartId;
 					if (processAlive && processIdentityMatches) {
+						this.emitWorkerRecoveryFact(worker, recoveryEpisode, "worker_recovery_action", {
+							disposition: "reconnect_existing",
+						});
 						try {
 							await this.connectWorker(worker, 1500);
 							await this.subscribeWorker(worker, worker.descriptor.rootActiveSessionId, {
@@ -3423,6 +3495,10 @@ export class DaemonSupervisor {
 							});
 							await this.refreshWorkerSummaries(worker, true, { callerCategory: "recovery_validation" });
 							if (this.isWorkerRecoveryCancelled(worker)) {
+								this.emitWorkerRecoveryFact(worker, recoveryEpisode, "worker_recovery_action_outcome", {
+									disposition: "reconnect_existing",
+									outcome: "cancelled",
+								});
 								return;
 							}
 							if (worker.descriptor.processStartId === undefined && observedProcessStartId) {
@@ -3436,11 +3512,25 @@ export class DaemonSupervisor {
 								this.log(`Could not synchronize agent peers after worker recovery: ${String(error)}`),
 							);
 							this.broadcastHeartbeatsChanged();
+							this.emitWorkerRecoveryFact(worker, recoveryEpisode, "worker_recovery_action_outcome", {
+								disposition: "reconnect_existing",
+								outcome: "success",
+							});
+							this.endWorkerRecoveryEpisode(worker, recoveryEpisode, "success");
 							return;
 						} catch (error) {
 							if (isSupervisorRecoveryCancelled(error)) {
+								this.emitWorkerRecoveryFact(worker, recoveryEpisode, "worker_recovery_action_outcome", {
+									disposition: "reconnect_existing",
+									outcome: "cancelled",
+								});
 								throw error;
 							}
+							this.emitWorkerRecoveryFact(worker, recoveryEpisode, "worker_recovery_action_outcome", {
+								disposition: "reconnect_existing",
+								outcome: "failure",
+								classification: "worker_recovery_error",
+							});
 							await this.assertRecoveryAllowed();
 							worker.client?.close();
 							worker.client = undefined;
@@ -3459,21 +3549,50 @@ export class DaemonSupervisor {
 					}
 					const recoveryCommand = worker.descriptor.ownerClientId ? worker.transientCreateCommand : undefined;
 					if (!recoveryCommand || !worker.launchEnv) {
+						this.emitWorkerRecoveryFact(worker, recoveryEpisode, "worker_recovery_action", {
+							disposition: "wait_for_client_context",
+						});
 						await this.recoverUncertainWorkerOperations(worker, false);
 						worker.descriptor.lifecycle = "failed";
 						worker.descriptor.lastError = "Waiting for a client with fresh runtime context";
 						this.persistWorker(worker);
 						await this.syncAgentPeers().catch(() => undefined);
+						this.emitWorkerRecoveryFact(worker, recoveryEpisode, "worker_recovery_action_outcome", {
+							disposition: "wait_for_client_context",
+							outcome: "success",
+						});
+						this.endWorkerRecoveryEpisode(worker, recoveryEpisode, "failure");
 						return;
 					}
-					const safeToKillWorkerProcess =
-						processAlive && processIdentityMatches && worker.descriptor.processStartId !== undefined;
-					await this.recoverUncertainWorkerOperations(worker, safeToKillWorkerProcess);
-					if (this.isWorkerRecoveryCancelled(worker)) {
+					this.emitWorkerRecoveryFact(worker, recoveryEpisode, "worker_recovery_action", {
+						disposition: "replace_worker",
+					});
+					try {
+						const safeToKillWorkerProcess =
+							processAlive && processIdentityMatches && worker.descriptor.processStartId !== undefined;
+						await this.recoverUncertainWorkerOperations(worker, safeToKillWorkerProcess);
+						if (this.isWorkerRecoveryCancelled(worker)) {
+							this.emitWorkerRecoveryFact(worker, recoveryEpisode, "worker_recovery_action_outcome", {
+								disposition: "replace_worker",
+								outcome: "cancelled",
+							});
+							return;
+						}
+						await this.launchWorker(recoveryCommand, worker, worker.descriptor.ownerClientId);
+						this.emitWorkerRecoveryFact(worker, recoveryEpisode, "worker_recovery_action_outcome", {
+							disposition: "replace_worker",
+							outcome: "success",
+						});
+						this.endWorkerRecoveryEpisode(worker, recoveryEpisode, "success");
 						return;
+					} catch (error) {
+						this.emitWorkerRecoveryFact(worker, recoveryEpisode, "worker_recovery_action_outcome", {
+							disposition: "replace_worker",
+							outcome: isSupervisorRecoveryCancelled(error) ? "cancelled" : "failure",
+							...(isSupervisorRecoveryCancelled(error) ? {} : { classification: "worker_recovery_error" }),
+						});
+						throw error;
 					}
-					await this.launchWorker(recoveryCommand, worker, worker.descriptor.ownerClientId);
-					return;
 				} catch (error) {
 					if (isSupervisorRecoveryCancelled(error) || this.isWorkerRecoveryCancelled(worker)) {
 						return;
@@ -3502,6 +3621,11 @@ export class DaemonSupervisor {
 			this.log(`Worker ${worker.descriptor.workerId} failed after three recovery attempts`);
 		})().finally(() => {
 			worker.recovery = undefined;
+			this.endWorkerRecoveryEpisode(
+				worker,
+				recoveryEpisode,
+				this.isWorkerRecoveryCancelled(worker) ? "cancelled" : "failure",
+			);
 			this.clearWorkerRecoveryEpisode(worker, recoveryEpisode);
 		});
 		return worker.recovery;

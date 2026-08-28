@@ -1735,6 +1735,16 @@ describe("daemon worker supervisor monitoring", () => {
 		await recovery;
 
 		expect(worker.recovery).toBeUndefined();
+		const terminalFacts = supervisorDiagnosticTestState.events.filter(
+			(event) =>
+				event.type === "worker_recovery_episode_outcome" && event.fields.workerId === worker.descriptor.workerId,
+		);
+		expect(terminalFacts).toHaveLength(1);
+		expect(terminalFacts[0]?.fields).toMatchObject({
+			outcome: "cancelled",
+			workerPid: process.pid,
+			triggerUnavailableReason: "supervisor_internal_recovery",
+		});
 	});
 
 	it("fails closed after pid reuse without fresh runtime context", async () => {
@@ -2025,6 +2035,134 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(supervisor.launchWorker).not.toHaveBeenCalled();
 		expect(worker.descriptor.lifecycle).toBe("ready");
 		expect(worker.descriptor.consecutiveFailures).toBe(0);
+		const recoveryFacts = supervisorDiagnosticTestState.events.filter(
+			(event) => event.fields.workerId === worker.descriptor.workerId,
+		);
+		expect(recoveryFacts.map((event) => [event.type, event.fields.disposition, event.fields.outcome])).toEqual([
+			["worker_recovery_episode_started", undefined, undefined],
+			["worker_recovery_action", "reconnect_existing", undefined],
+			["worker_recovery_action_outcome", "reconnect_existing", "success"],
+			["worker_recovery_episode_outcome", undefined, "success"],
+		]);
+		const [{ fields: recoveryStart }] = recoveryFacts;
+		for (const { fields } of recoveryFacts) {
+			expect(fields).toMatchObject({
+				recoveryId: recoveryStart?.recoveryId,
+				triggerUnavailableReason: "supervisor_internal_recovery",
+				workerPid: process.pid,
+			});
+		}
+	});
+
+	it("emits a successful deferred-wait action with a failed terminal recovery", async () => {
+		const worker = {
+			descriptor: {
+				workerId: "worker-waiting-for-context",
+				pid: 999_999_999,
+				processStartId: "dead-worker-start",
+				rootActiveSessionId: "active-waiting-for-context",
+				ownerClientId: "owner-1",
+				consecutiveFailures: 0,
+			},
+			intentionalStop: false,
+			stopRevision: 0,
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			shuttingDown: false,
+			persistWorker: vi.fn(),
+		}) as { recoverWorker(target: typeof worker): Promise<void> };
+
+		await supervisor.recoverWorker(worker);
+
+		const facts = supervisorDiagnosticTestState.events.filter(
+			(event) => event.fields.workerId === worker.descriptor.workerId,
+		);
+		expect(facts.map((event) => [event.type, event.fields.disposition, event.fields.outcome])).toEqual([
+			["worker_recovery_episode_started", undefined, undefined],
+			["worker_recovery_action", "wait_for_client_context", undefined],
+			["worker_recovery_action_outcome", "wait_for_client_context", "success"],
+			["worker_recovery_episode_outcome", undefined, "failure"],
+		]);
+		for (const { fields } of facts) {
+			expect(fields).toMatchObject({
+				workerPid: 999_999_999,
+				workerProcessStartId: "dead-worker-start",
+			});
+		}
+	});
+
+	it.each(["success", "failure"] as const)("emits replacement %s without leaking error messages", async (outcome) => {
+		vi.useFakeTimers();
+		const worker = {
+			descriptor: {
+				workerId: `worker-replacement-${outcome}`,
+				pid: 999_999_999,
+				processStartId: "dead-replacement-start",
+				rootActiveSessionId: `active-replacement-${outcome}`,
+				ownerClientId: "owner-1",
+				consecutiveFailures: 0,
+			},
+			intentionalStop: false,
+			stopRevision: 0,
+			transientCreateCommand: { type: "create" as const },
+			launchEnv: { SAFE: "value" },
+		};
+		let replacementFailed = false;
+		const launchWorker = vi.fn(async () => {
+			if (outcome === "failure") {
+				replacementFailed = true;
+				throw new Error("secret replacement detail");
+			}
+			worker.descriptor.pid = 123_456;
+			worker.descriptor.processStartId = "new-replacement-start";
+			return worker;
+		});
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			shuttingDown: false,
+			assertRecoveryAllowed: vi.fn(async () => {
+				if (replacementFailed) throw new Error("retry gate failure");
+			}),
+			recoverUncertainWorkerOperations: vi.fn(async () => undefined),
+			launchWorker,
+			persistWorker: vi.fn(),
+			syncAgentPeers: vi.fn(async () => undefined),
+			log: vi.fn(),
+		}) as { recoverWorker(target: typeof worker): Promise<void> };
+
+		const recovery = supervisor.recoverWorker(worker);
+		await vi.runAllTimersAsync();
+		await recovery;
+
+		const facts = supervisorDiagnosticTestState.events.filter(
+			(event) => event.fields.workerId === worker.descriptor.workerId,
+		);
+		expect(
+			facts.map((event) => [
+				event.type,
+				event.fields.disposition,
+				event.fields.outcome,
+				event.fields.classification,
+			]),
+		).toEqual([
+			["worker_recovery_episode_started", undefined, undefined, undefined],
+			["worker_recovery_action", "replace_worker", undefined, undefined],
+			[
+				"worker_recovery_action_outcome",
+				"replace_worker",
+				outcome,
+				outcome === "failure" ? "worker_recovery_error" : undefined,
+			],
+			["worker_recovery_episode_outcome", undefined, outcome, undefined],
+		]);
+		for (const { fields } of facts) {
+			expect(fields).toMatchObject({
+				workerPid: 999_999_999,
+				workerProcessStartId: "dead-replacement-start",
+			});
+			expect(JSON.stringify(fields)).not.toContain("secret replacement detail");
+		}
 	});
 
 	it("reports a stop-tombstoned worker as stopping, not ready", () => {
@@ -2157,6 +2295,29 @@ describe("daemon worker supervisor monitoring", () => {
 			expect.objectContaining({ recoveryId: starts[0]?.fields.recoveryId }),
 			expect.objectContaining({ recoveryId: starts[0]?.fields.recoveryId }),
 		]);
+		const adoptionFacts = supervisorDiagnosticTestState.events.filter(
+			(event) =>
+				event.fields.workerId === worker.descriptor.workerId &&
+				(event.type === "worker_recovery_action" || event.type === "worker_recovery_action_outcome"),
+		);
+		expect(adoptionFacts.map((event) => [event.type, event.fields.disposition, event.fields.outcome])).toEqual([
+			["worker_recovery_action", "adopt_existing", undefined],
+			["worker_recovery_action_outcome", "adopt_existing", "failure"],
+			["worker_recovery_action", "adopt_existing", undefined],
+			["worker_recovery_action_outcome", "adopt_existing", "failure"],
+		]);
+		for (const { fields } of adoptionFacts) {
+			expect(fields).toMatchObject({
+				recoveryId: starts[0]?.fields.recoveryId,
+				triggerUnavailableReason: "supervisor_startup",
+				workerPid: 999_999_999,
+			});
+		}
+		expect(adoptionFacts.filter((event) => event.fields.outcome === "failure")).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ fields: expect.objectContaining({ classification: "worker_recovery_error" }) }),
+			]),
+		);
 	});
 
 	it("adopts a tombstoned worker through identity-aware stop handling", async () => {
