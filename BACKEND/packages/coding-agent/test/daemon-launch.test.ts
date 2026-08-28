@@ -215,6 +215,7 @@ describe("shouldStartDaemonEarly", () => {
 		["help", ["--help"]],
 		["version", ["--version"]],
 		["model listing", ["--list-models"]],
+		["incident recorder service", ["--incident-recorder-service", "--agent-dir", "/tmp/private-agent"]],
 		["management command after global flags", ["--daemon-socket", "/tmp/prime.sock", "status"]],
 		["startup benchmark", []],
 	])("does not start early for %s", (label, args) => {
