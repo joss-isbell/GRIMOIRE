@@ -54,6 +54,7 @@ import type { AgentConnectionHeartbeat } from "../agent-connection/types.js";
 import { attachJsonlLineReader, serializeJsonLine } from "../rpc/jsonl.js";
 import type { PrivateFrame } from "../session-worker/private-framing.js";
 import { createActiveSessionId, type DaemonSocketClient } from "./active-session-state.js";
+import { normalizeNodeExitCallback } from "./automatic-collapse-recorder-schema.js";
 import { CommandRecoveryJournal, createCommandIdempotencyKey } from "./command-recovery-journal.js";
 import { CompactAssistantStreamReconstructor, isCompactAssistantDelta } from "./compact-session-stream.js";
 import { DAEMON_CATALOG_ROLE_ENV, DaemonCatalogClient } from "./daemon-catalog-process.js";
@@ -174,6 +175,14 @@ const IDLE_EVICTION_DRAIN_TIMEOUT_MS = 5_000;
 const CHILD_PASSIVATION_PER_WORKER_CAP = 2;
 const SUPERVISOR_CONFIG_FILE_NAME = "supervisor-config";
 const WORKER_STARTUP_GATE_FD = 3;
+
+function appendWorkerParentWaitDiagnosticNoThrow(type: string, fields: Record<string, unknown>): void {
+	try {
+		appendSupervisorDiagnosticEvent(type, fields);
+	} catch {
+		// Parent-wait capture is observational and must never control worker lifecycle completion.
+	}
+}
 
 const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"ack_result",
@@ -2769,20 +2778,38 @@ export class DaemonSupervisor {
 		let terminalWaitUnavailable = false;
 		const childClosed = new Promise<WorkerProcessCloseResult>((resolveClose) =>
 			child.once("close", (code, signal) => {
+				const exitCode = code;
+				const exitSignal = signal;
 				detachWorkerStderr();
-				const result = { code, signal };
+				const result = { code: exitCode, signal: exitSignal };
 				if (!terminalWaitUnavailable && childPid !== undefined) {
-					appendSupervisorDiagnosticEvent("process_terminal_disposition", {
+					const normalized = normalizeNodeExitCallback(exitCode, exitSignal);
+					const context = {
 						role: "worker",
 						workerId,
 						activeSessionId: rootActiveSessionId,
 						rootActiveSessionId,
 						targetPid: childPid,
 						targetProcessStartId: childProcessStartId,
-						code,
-						signal,
+						code: exitCode,
+						signal: exitSignal,
 						intentionalStop: worker?.intentionalStop ?? false,
-					});
+					};
+					if (normalized.kind === "invalid") {
+						appendWorkerParentWaitDiagnosticNoThrow("process_terminal_observation_invalid", {
+							classification: "authoritative_parent_wait_invalid",
+							origin: "node_callback",
+							...context,
+							reason: normalized.reason,
+						});
+					} else {
+						appendWorkerParentWaitDiagnosticNoThrow("process_terminal_disposition", {
+							classification: "authoritative_parent_wait",
+							origin: "node_callback",
+							...context,
+							disposition: normalized.kind,
+						});
+					}
 				}
 				resolveClose(result);
 			}),

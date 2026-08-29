@@ -34,6 +34,9 @@ import { createDeferred } from "./suite/scheduling.js";
 
 const supervisorDiagnosticTestState = vi.hoisted(() => ({
 	events: [] as Array<{ type: string; fields: Record<string, unknown> }>,
+	terminalAdmissionOverridden: false,
+	terminalAdmissionResult: undefined as unknown,
+	terminalRecorderError: undefined as Error | undefined,
 }));
 
 const workerLaunchTestState = vi.hoisted(() => ({
@@ -76,6 +79,14 @@ vi.mock("../src/modes/daemon/incident-recorder.js", async (importOriginal) => {
 		...actual,
 		appendSupervisorDiagnosticEvent(type: string, fields: Record<string, unknown>) {
 			supervisorDiagnosticTestState.events.push({ type, fields: sanitizeIncidentCausalFields(fields) });
+			const terminalOffer =
+				type === "process_terminal_disposition" || type === "process_terminal_observation_invalid";
+			if (supervisorDiagnosticTestState.terminalRecorderError && terminalOffer) {
+				throw supervisorDiagnosticTestState.terminalRecorderError;
+			}
+			if (supervisorDiagnosticTestState.terminalAdmissionOverridden && terminalOffer) {
+				return supervisorDiagnosticTestState.terminalAdmissionResult;
+			}
 			return actual.appendSupervisorDiagnosticEvent(type, fields);
 		},
 	};
@@ -118,7 +129,7 @@ vi.mock("../src/cli/subprocess-launch.js", async (importOriginal) => {
 				const markerPath = JSON.stringify(workerLaunchTestState.gateMarkerPath);
 				const terminalHandler =
 					workerLaunchTestState.fixtureMode === "terminal-gate"
-						? 'process.on("SIGUSR1", () => process.exit(0)); '
+						? 'process.on("SIGUSR1", () => process.exit(0)); process.on("SIGUSR2", () => process.exit(23)); '
 						: "";
 				return {
 					command: process.execPath,
@@ -269,6 +280,55 @@ function createSupervisorSnapshotState() {
 	};
 }
 
+async function launchTerminalObservationWorker(options: { missingProcessStartId?: boolean } = {}) {
+	const root = mkdtempSync(join(tmpdir(), "prime-supervisor-terminal-observation-test-"));
+	const descriptorDir = join(root, "descriptors");
+	const markerPath = join(root, "startup-marker");
+	mkdirSync(descriptorDir, { recursive: true });
+	supervisorRegistryDirs.add(root);
+	workerLaunchTestState.capture = true;
+	workerLaunchTestState.forceMissingProcessStartId = options.missingProcessStartId ?? false;
+	workerLaunchTestState.fixtureMode = "terminal-gate";
+	workerLaunchTestState.gateMarkerPath = markerPath;
+	const workers = new Map<string, unknown>();
+	const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+		...createSupervisorSnapshotState(),
+		defaultSessionConfig: { cwd: root, agentDir: root },
+		descriptorDir,
+		socketPath: join(root, "supervisor.sock"),
+		workers,
+		shuttingDown: false,
+		assertRecoveryAllowed: vi.fn(async () => undefined),
+		connectWorker: vi.fn(async (worker: { descriptor: { rootActiveSessionId: string } }) => {
+			await waitForFile(markerPath);
+			return {
+				request: vi.fn(async () => ({
+					success: true,
+					data: {
+						id: worker.descriptor.rootActiveSessionId,
+						activeSessionId: worker.descriptor.rootActiveSessionId,
+						sessionId: "terminal-observation-session",
+						cwd: root,
+					},
+				})),
+			};
+		}),
+		subscribeWorker: vi.fn(async () => undefined),
+		refreshWorkerSummaries: vi.fn(async () => undefined),
+		syncAgentPeers: vi.fn(async () => undefined),
+		log: vi.fn(),
+	}) as {
+		launchWorker(command: { type: "create"; config: { cwd: string; agentDir: string } }): Promise<{
+			descriptor: { workerId: string; rootActiveSessionId: string; processStartId?: string };
+			intentionalStop: boolean;
+		}>;
+	};
+	const worker = await supervisor.launchWorker({ type: "create", config: { cwd: root, agentDir: root } });
+	const child = workerLaunchTestState.spawned.at(-1)?.child;
+	if (!child?.pid) throw new Error("Worker child identity was not captured");
+	return { child, descriptorDir, root, supervisor, worker, workers };
+}
+
 const recoveryEligibilityInvalidations: Array<{
 	name: string;
 	invalidate(supervisor: DeferredRecoveryHarness, worker: DeferredRecoveryWorker): void;
@@ -335,6 +395,9 @@ describe("daemon worker supervisor monitoring", () => {
 		workerLaunchTestState.cliEntrypoint = "";
 		workerLaunchTestState.spawned.length = 0;
 		supervisorDiagnosticTestState.events.length = 0;
+		supervisorDiagnosticTestState.terminalAdmissionOverridden = false;
+		supervisorDiagnosticTestState.terminalAdmissionResult = undefined;
+		supervisorDiagnosticTestState.terminalRecorderError = undefined;
 		vi.useRealTimers();
 		for (const registryDir of supervisorRegistryDirs) {
 			rmSync(registryDir, { recursive: true, force: true });
@@ -626,7 +689,7 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(workers.size).toBe(0);
 	});
 
-	it("rolls back promptly when the child closes its startup gate before commit", async () => {
+	it("T007-B3 rolls back promptly when a recorder throw follows startup-gate close", async () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-closed-gate-test-"));
 		const descriptorDir = join(root, "descriptors");
 		mkdirSync(descriptorDir, { recursive: true });
@@ -634,6 +697,7 @@ describe("daemon worker supervisor monitoring", () => {
 		workerLaunchTestState.capture = true;
 		workerLaunchTestState.forceMissingProcessStartId = true;
 		workerLaunchTestState.fixtureMode = "close-gate";
+		supervisorDiagnosticTestState.terminalRecorderError = new Error("synthetic startup-close recorder throw");
 		let assertionCount = 0;
 		const workers = new Map<string, unknown>();
 		const connectWorker = vi.fn();
@@ -744,16 +808,39 @@ describe("daemon worker supervisor monitoring", () => {
 	});
 
 	it.each([
-		{ name: "clean exit", terminate: "SIGUSR1" as const, code: 0, signal: null, intentionalStop: false },
-		{ name: "signal exit", terminate: "SIGTERM" as const, code: null, signal: "SIGTERM", intentionalStop: false },
+		{
+			name: "clean exit",
+			terminate: "SIGUSR1" as const,
+			code: 0,
+			signal: null,
+			disposition: "exited",
+			intentionalStop: false,
+		},
+		{
+			name: "exit 23",
+			terminate: "SIGUSR2" as const,
+			code: 23,
+			signal: null,
+			disposition: "exited",
+			intentionalStop: false,
+		},
+		{
+			name: "signal exit",
+			terminate: "SIGTERM" as const,
+			code: null,
+			signal: "SIGTERM",
+			disposition: "signaled",
+			intentionalStop: false,
+		},
 		{
 			name: "intentional signal exit",
 			terminate: "SIGTERM" as const,
 			code: null,
 			signal: "SIGTERM",
+			disposition: "signaled",
 			intentionalStop: true,
 		},
-	])("records one exact worker terminal disposition for $name", async (scenario) => {
+	])("T007-B3 records one exact worker terminal disposition for $name", async (scenario) => {
 		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-terminal-disposition-test-"));
 		const descriptorDir = join(root, "descriptors");
 		const markerPath = join(root, "startup-marker");
@@ -813,6 +900,8 @@ describe("daemon worker supervisor monitoring", () => {
 		);
 		expect(dispositions).toHaveLength(1);
 		expect(dispositions[0]?.fields).toEqual({
+			classification: "authoritative_parent_wait",
+			origin: "node_callback",
 			role: "worker",
 			workerId: worker.descriptor.workerId,
 			activeSessionId: worker.descriptor.rootActiveSessionId,
@@ -821,8 +910,122 @@ describe("daemon worker supervisor monitoring", () => {
 			targetProcessStartId: expectedProcessStartId,
 			code: scenario.code,
 			signal: scenario.signal,
+			disposition: scenario.disposition,
 			intentionalStop: scenario.intentionalStop,
 		});
+	});
+
+	it.each([
+		{ name: "ambiguous", code: 0, signal: "SIGTERM", reason: "ambiguous_pair" },
+		{ name: "missing", code: null, signal: null, reason: "missing_code_and_signal" },
+		{ name: "bad-code", code: 256, signal: null, reason: "invalid_exit_code" },
+		{ name: "bad-signal", code: null, signal: "SIG_NOT_REAL", reason: "invalid_signal_name" },
+	] as const)("T007-B3 types a $name callback pair as invalid instead of a disposition", async (scenario) => {
+		const { child, worker, workers, descriptorDir } = await launchTerminalObservationWorker();
+		const exited = new Promise<void>((resolveExit) => child.once("exit", () => resolveExit()));
+
+		(child.emit as (event: string, ...args: unknown[]) => boolean)("close", scenario.code, scenario.signal);
+
+		const invalid = supervisorDiagnosticTestState.events.filter(
+			(event) => event.type === "process_terminal_observation_invalid",
+		);
+		expect(invalid).toHaveLength(1);
+		expect(invalid[0]?.fields).toEqual({
+			classification: "authoritative_parent_wait_invalid",
+			origin: "node_callback",
+			role: "worker",
+			workerId: worker.descriptor.workerId,
+			activeSessionId: worker.descriptor.rootActiveSessionId,
+			rootActiveSessionId: worker.descriptor.rootActiveSessionId,
+			targetPid: child.pid,
+			targetProcessStartId: worker.descriptor.processStartId,
+			code: scenario.code,
+			signal: scenario.signal,
+			reason: scenario.reason,
+			intentionalStop: false,
+		});
+		expect(invalid[0]?.fields).not.toHaveProperty("disposition");
+		expect(invalid[0]?.fields).not.toHaveProperty("rawWaitWord");
+		expect(invalid[0]?.fields).not.toHaveProperty("coreDumped");
+		expect(
+			supervisorDiagnosticTestState.events.filter((event) => event.type === "process_terminal_disposition"),
+		).toEqual([]);
+		expect(workers.size).toBe(1);
+		expect(readdirSync(descriptorDir).filter((name) => name.endsWith(".json"))).toHaveLength(1);
+		child.kill("SIGKILL");
+		await exited;
+	});
+
+	it("T007-B3 omits an unavailable captured process-start identity", async () => {
+		const { child, worker } = await launchTerminalObservationWorker({ missingProcessStartId: true });
+		expect(worker.descriptor.processStartId).toBeUndefined();
+		const closed = new Promise<[number | null, NodeJS.Signals | null]>((resolveClose) =>
+			child.once("close", (code, signal) => resolveClose([code, signal])),
+		);
+		process.kill(child.pid!, "SIGUSR2");
+		expect(await closed).toEqual([23, null]);
+
+		const dispositions = supervisorDiagnosticTestState.events.filter(
+			(event) => event.type === "process_terminal_disposition",
+		);
+		expect(dispositions).toHaveLength(1);
+		expect(dispositions[0]?.fields).not.toHaveProperty("targetProcessStartId");
+		expect(dispositions[0]?.fields).toMatchObject({
+			classification: "authoritative_parent_wait",
+			origin: "node_callback",
+			code: 23,
+			signal: null,
+			disposition: "exited",
+		});
+	});
+
+	it.each([
+		["accepted", { accepted: true, occurrenceId: "accepted" }],
+		["not-configured", { accepted: false, occurrenceId: "missing", reason: "capture_not_configured" }],
+		["full", { accepted: false, occurrenceId: "full", reason: "bounded_queue_full" }],
+		["serialization-rejected", { accepted: false, occurrenceId: "serialization", reason: "capture_failed_open" }],
+		["arbitrarily-rejected", { accepted: false, occurrenceId: "arbitrary", reason: "non_causal_event" }],
+	] as const)("T007-B3 preserves real worker close completion when capture is %s", async (_mode, result) => {
+		const { child, workers, descriptorDir } = await launchTerminalObservationWorker();
+		supervisorDiagnosticTestState.terminalAdmissionOverridden = true;
+		supervisorDiagnosticTestState.terminalAdmissionResult = result;
+		const closed = new Promise<[number | null, NodeJS.Signals | null]>((resolveClose) =>
+			child.once("close", (code, signal) => resolveClose([code, signal])),
+		);
+
+		process.kill(child.pid!, "SIGUSR2");
+
+		expect(await closed).toEqual([23, null]);
+		expect(child.exitCode).toBe(23);
+		expect(child.signalCode).toBeNull();
+		expect(workers.size).toBe(1);
+		expect(readdirSync(descriptorDir).filter((name) => name.endsWith(".json"))).toHaveLength(1);
+		expect(
+			supervisorDiagnosticTestState.events.filter((event) => event.type === "process_terminal_disposition"),
+		).toHaveLength(1);
+	});
+
+	it("T007-B3 contains a thrown terminal recorder offer in the close callback", async () => {
+		const { child, workers, descriptorDir } = await launchTerminalObservationWorker();
+		const recorderError = new Error("synthetic terminal recorder throw");
+		supervisorDiagnosticTestState.terminalRecorderError = recorderError;
+		let laterCloseListenerRan = false;
+		let offerWasVisibleToLaterListener = false;
+		child.once("close", () => {
+			laterCloseListenerRan = true;
+			offerWasVisibleToLaterListener = supervisorDiagnosticTestState.events.some(
+				(event) => event.type === "process_terminal_disposition",
+			);
+		});
+		const exited = new Promise<void>((resolveExit) => child.once("exit", () => resolveExit()));
+
+		expect(() => (child.emit as (event: string, ...args: unknown[]) => boolean)("close", 23, null)).not.toThrow();
+		expect(laterCloseListenerRan).toBe(true);
+		expect(offerWasVisibleToLaterListener).toBe(true);
+		expect(workers.size).toBe(1);
+		expect(readdirSync(descriptorDir).filter((name) => name.endsWith(".json"))).toHaveLength(1);
+		child.kill("SIGKILL");
+		await exited;
 	});
 
 	it("preserves an authoritative close after a post-spawn process error", async () => {
@@ -886,6 +1089,8 @@ describe("daemon worker supervisor monitoring", () => {
 		);
 		expect(dispositions).toHaveLength(1);
 		expect(dispositions[0]?.fields).toEqual({
+			classification: "authoritative_parent_wait",
+			origin: "node_callback",
 			role: "worker",
 			workerId: worker.descriptor.workerId,
 			activeSessionId: worker.descriptor.rootActiveSessionId,
@@ -894,6 +1099,7 @@ describe("daemon worker supervisor monitoring", () => {
 			targetProcessStartId: expectedProcessStartId,
 			code: 0,
 			signal: null,
+			disposition: "exited",
 			intentionalStop: false,
 		});
 	});
@@ -926,6 +1132,9 @@ describe("daemon worker supervisor monitoring", () => {
 		).toHaveLength(1);
 		expect(
 			supervisorDiagnosticTestState.events.filter((event) => event.type === "process_terminal_disposition"),
+		).toEqual([]);
+		expect(
+			supervisorDiagnosticTestState.events.filter((event) => event.type === "process_terminal_observation_invalid"),
 		).toEqual([]);
 	});
 
