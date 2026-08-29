@@ -767,6 +767,40 @@ describe("T007-A correlation container second repair regressions", () => {
 		});
 	});
 
+	it("snapshots an earlier descriptor value before any later descriptor trap can mutate it", () => {
+		const firstKernel = kernel();
+		const laterParent = parentRaw();
+		let kernelDescriptorCalls = 0;
+		let parentDescriptorCalls = 0;
+		const container = new Proxy(
+			{ kernel: firstKernel, parent: laterParent },
+			{
+				ownKeys() {
+					return ["kernel", "parent"];
+				},
+				getOwnPropertyDescriptor(target, property) {
+					if (property === "kernel") kernelDescriptorCalls += 1;
+					if (property === "parent") {
+						parentDescriptorCalls += 1;
+						firstKernel.claim = { kind: "kernel_exit", groupDead: true, rawWaitWord: 9 };
+					}
+					return Reflect.getOwnPropertyDescriptor(target, property);
+				},
+			},
+		);
+
+		const result = correlateTerminalEvidence(container);
+		expect(result).toMatchObject({
+			kind: "matching_parent_kernel_dual",
+			disposition: { kind: "exited", exitCode: 23 },
+			kernel: { claim: { rawWaitWord: 5888 } },
+		});
+		expect(kernelDescriptorCalls).toBe(1);
+		expect(parentDescriptorCalls).toBe(1);
+		expect(firstKernel.claim).toMatchObject({ rawWaitWord: 9 });
+		expect(isDeeplyFrozen(result)).toBe(true);
+	});
+
 	it("uses one data descriptor snapshot without ordinary reads and returns detached frozen evidence", () => {
 		const original = kernel();
 		let ordinaryGetCalls = 0;
