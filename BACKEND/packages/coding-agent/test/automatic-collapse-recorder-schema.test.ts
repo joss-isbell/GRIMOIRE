@@ -1,19 +1,28 @@
 import { describe, expect, it } from "vitest";
+import * as recorderSchema from "../src/modes/daemon/automatic-collapse-recorder-schema.js";
 import {
+	APPLICATION_STATES,
 	AUTOMATIC_COLLAPSE_EVIDENCE_SCHEMA_VERSION,
+	AUTOMATIC_COLLAPSE_ROLES,
 	type AutomaticCollapseEvidenceEnvelope,
 	advanceEvidenceCustody,
 	correlateTerminalEvidence,
 	decodeLinuxWaitWord,
+	EVIDENCE_CUSTODY_STATES,
+	EVIDENCE_PROVIDERS,
+	LINUX_SIGNAL_NAMES,
+	NODE_CALLBACK_SIGNAL_NAMES,
 	normalizeNodeExitCallback,
 	validateAutomaticCollapseEvidence,
-	windowsSurvivingCustody,
 } from "../src/modes/daemon/automatic-collapse-recorder-schema.js";
+
+type DeepMutable<T> = { -readonly [Key in keyof T]: DeepMutable<T[Key]> };
+type MutableEvidenceEnvelope = DeepMutable<AutomaticCollapseEvidenceEnvelope>;
 
 function envelope(
 	claim: AutomaticCollapseEvidenceEnvelope["claim"],
 	overrides: Partial<AutomaticCollapseEvidenceEnvelope> = {},
-): AutomaticCollapseEvidenceEnvelope {
+): MutableEvidenceEnvelope {
 	const provider =
 		claim.kind === "kernel_exit"
 			? "linux_kernel"
@@ -57,7 +66,7 @@ function envelope(
 		custody: "kernel_produced",
 		claim,
 		...overrides,
-	} as AutomaticCollapseEvidenceEnvelope;
+	} as MutableEvidenceEnvelope;
 }
 
 const kernel = () => envelope({ kind: "kernel_exit", groupDead: true, rawWaitWord: 5888 });
@@ -228,7 +237,10 @@ describe("deterministic terminal correlation", () => {
 		const stoppedKernel = envelope({ kind: "kernel_exit", groupDead: true, rawWaitWord: (19 << 8) | 0x7f });
 		for (const application of [transition, requested, silence])
 			expect(correlateTerminalEvidence({ application })).toEqual({ kind: "no_terminal_claim" });
-		expect(correlateTerminalEvidence({ kernel: stoppedKernel })).toEqual({ kind: "no_terminal_claim" });
+		expect(correlateTerminalEvidence({ kernel: stoppedKernel })).toMatchObject({
+			kind: "invalid_evidence",
+			invalid: [{ slot: "kernel" }],
+		});
 	});
 });
 
@@ -261,9 +273,10 @@ describe("strict evidence schema and privacy boundary", () => {
 		const threadOnly = { ...valid, claim: { kind: "kernel_exit", groupDead: false, rawWaitWord: 5888 } };
 		expectInvalid(missing);
 		expectInvalid(threadOnly);
-		expect(correlateTerminalEvidence({ kernel: threadOnly as unknown as AutomaticCollapseEvidenceEnvelope })).toEqual(
-			{ kind: "no_terminal_claim" },
-		);
+		expect(correlateTerminalEvidence({ kernel: threadOnly })).toMatchObject({
+			kind: "invalid_evidence",
+			invalid: [{ slot: "kernel" }],
+		});
 	});
 
 	it("requires the full Linux process and kernel task keys with one matching boot identity", () => {
@@ -360,14 +373,249 @@ describe("strict evidence schema and privacy boundary", () => {
 	});
 });
 
-describe("custody truth", () => {
-	it("allows only the ordered custody progression and only trusts Windows commit", () => {
+describe("custody stages", () => {
+	it("keeps adjacency structural and exposes no bare-label Windows survival truth", () => {
 		expect(advanceEvidenceCustody("kernel_produced", "linux_received")).toBe(true);
 		expect(advanceEvidenceCustody("linux_received", "host_published")).toBe(true);
 		expect(advanceEvidenceCustody("host_published", "windows_committed")).toBe(true);
 		expect(advanceEvidenceCustody("kernel_produced", "windows_committed")).toBe(false);
-		for (const state of ["kernel_produced", "linux_received", "host_published"] as const)
-			expect(windowsSurvivingCustody(state)).toBe(false);
-		expect(windowsSurvivingCustody("windows_committed")).toBe(true);
+		expect("windowsSurvivingCustody" in recorderSchema).toBe(false);
+	});
+});
+
+describe("T007-A adversarial repair regressions", () => {
+	it("captures one detached, deeply frozen descriptor snapshot and never re-reads input", () => {
+		const original = kernel();
+		let rawReads = 0;
+		original.claim = new Proxy(original.claim, {
+			get(target, property, receiver) {
+				if (property === "rawWaitWord") {
+					rawReads += 1;
+					return rawReads === 1 ? 5888 : 9;
+				}
+				return Reflect.get(target, property, receiver);
+			},
+		});
+		const correlation = correlateTerminalEvidence({ kernel: original });
+		expect(correlation).toMatchObject({
+			kind: "kernel_only",
+			disposition: { kind: "exited", exitCode: 23 },
+			kernel: { claim: { rawWaitWord: 5888 } },
+		});
+		expect(rawReads).toBe(0);
+		if (correlation.kind !== "kernel_only") throw new Error("expected stable kernel correlation");
+		expect(correlation.kernel).not.toBe(original);
+		expect(Object.isFrozen(correlation)).toBe(true);
+		expect(Object.isFrozen(correlation.kernel)).toBe(true);
+		expect(Object.isFrozen(correlation.kernel.processAnchor.linuxProcessKey)).toBe(true);
+
+		const mutable = kernel();
+		const validated = validateAutomaticCollapseEvidence(mutable);
+		expect(validated.ok).toBe(true);
+		if (!validated.ok) throw new Error("expected valid snapshot");
+		mutable.claim = { kind: "kernel_exit", groupDead: true, rawWaitWord: 9 };
+		mutable.processAnchor.linuxProcessKey.procStartTicks = "999";
+		expect(validated.value.claim).toMatchObject({ rawWaitWord: 5888 });
+		expect(validated.value.processAnchor.linuxProcessKey.procStartTicks).toBe("987654321");
+		expect(validated.value).not.toBe(mutable);
+		expect(Object.isFrozen(validated.value)).toBe(true);
+		expect(Object.isFrozen(validated.value.claim)).toBe(true);
+		expect(() => {
+			(validated.value.claim as unknown as { rawWaitWord: number }).rawWaitWord = 1;
+		}).toThrow();
+		expect(validated.value.claim).toMatchObject({ rawWaitWord: 5888 });
+	});
+
+	it("uses frozen exports and private canonical membership and custody ordering", () => {
+		for (const list of [
+			AUTOMATIC_COLLAPSE_ROLES,
+			EVIDENCE_PROVIDERS,
+			APPLICATION_STATES,
+			EVIDENCE_CUSTODY_STATES,
+			LINUX_SIGNAL_NAMES,
+			NODE_CALLBACK_SIGNAL_NAMES,
+		]) {
+			const mutable = list as unknown as string[];
+			const before = [...mutable];
+			let threw = false;
+			try {
+				mutable.push("attacker_value");
+			} catch {
+				threw = true;
+			}
+			if (mutable.length !== before.length) mutable.splice(0, mutable.length, ...before);
+			expect(threw).toBe(true);
+			expect(list).toEqual(before);
+			expect(Object.isFrozen(list)).toBe(true);
+		}
+
+		const roleList = AUTOMATIC_COLLAPSE_ROLES as unknown as string[];
+		const rolesBefore = [...roleList];
+		let roleAccepted = false;
+		try {
+			roleList.push("attacker_role");
+			const adversarial = kernel() as unknown as { roleAssignment: { role: string } };
+			adversarial.roleAssignment.role = "attacker_role";
+			roleAccepted = validateAutomaticCollapseEvidence(adversarial).ok;
+		} catch {
+			// Frozen export is the expected path.
+		} finally {
+			if (roleList.length !== rolesBefore.length) roleList.splice(0, roleList.length, ...rolesBefore);
+		}
+		expect(roleAccepted).toBe(false);
+
+		const custodyList = EVIDENCE_CUSTODY_STATES as unknown as string[];
+		const custodyBefore = [...custodyList];
+		let skipAllowed = false;
+		try {
+			custodyList.splice(
+				0,
+				custodyList.length,
+				"kernel_produced",
+				"windows_committed",
+				"linux_received",
+				"host_published",
+			);
+			skipAllowed = advanceEvidenceCustody("kernel_produced", "windows_committed");
+		} catch {
+			// Frozen export is the expected path.
+		} finally {
+			if (custodyList.join() !== custodyBefore.join()) custodyList.splice(0, custodyList.length, ...custodyBefore);
+		}
+		expect(skipAllowed).toBe(false);
+
+		const invalidRole = kernel() as unknown as { roleAssignment: { role: string } };
+		invalidRole.roleAssignment.role = "attacker_value";
+		expectInvalid(invalidRole);
+		const invalidProvider = kernel() as unknown as { source: { provider: string } };
+		invalidProvider.source.provider = "attacker_value";
+		expectInvalid(invalidProvider);
+		const invalidState = envelope({
+			kind: "application_transition",
+			observation: "state_transition",
+			from: "running",
+			to: "stopped",
+		}) as unknown as { claim: { to: string } };
+		invalidState.claim.to = "attacker_value";
+		expectInvalid(invalidState);
+		const invalidRequestedSignal = envelope({
+			kind: "application_transition",
+			observation: "signal_requested",
+			requestedSignal: "SIGTERM",
+		}) as unknown as { claim: { requestedSignal: string } };
+		invalidRequestedSignal.claim.requestedSignal = "attacker_value";
+		expectInvalid(invalidRequestedSignal);
+		const invalidCustody = kernel() as unknown as { custody: string };
+		invalidCustody.custody = "attacker_value";
+		expectInvalid(invalidCustody);
+		expect(normalizeNodeExitCallback(null, "attacker_value")).toEqual({
+			kind: "invalid",
+			reason: "invalid_signal_name",
+		});
+	});
+
+	it("rejects every hidden or opaque own-key path without invoking getters", () => {
+		const nonenumerable = kernel();
+		Object.defineProperty(nonenumerable, "evidenceId", {
+			value: nonenumerable.evidenceId,
+			enumerable: false,
+		});
+		expectInvalid(nonenumerable);
+
+		const symbolExtra = kernel() as AutomaticCollapseEvidenceEnvelope & Record<PropertyKey, unknown>;
+		symbolExtra[Symbol("secretPayload")] = new Map([["credentials", "private"]]);
+		expectInvalid(symbolExtra);
+
+		const opaque = kernel() as unknown as { processAnchor: { installationRun: unknown } };
+		opaque.processAnchor.installationRun = new Map([["installationId", "install-1"]]);
+		expectInvalid(opaque);
+
+		let getterCalls = 0;
+		const getter = kernel();
+		Object.defineProperty(getter.claim, "payload", {
+			get() {
+				getterCalls += 1;
+				return "private";
+			},
+			enumerable: true,
+		});
+		expectInvalid(getter);
+		expect(getterCalls).toBe(0);
+
+		const cyclic = kernel() as AutomaticCollapseEvidenceEnvelope & { cycle?: unknown };
+		cyclic.cycle = cyclic;
+		expectInvalid(cyclic);
+		const throwing = new Proxy(kernel(), {
+			ownKeys() {
+				throw new Error("trap");
+			},
+		});
+		expectInvalid(throwing);
+	});
+
+	it("uses the exact low-byte stopped boundary and rejects unmatched wait encodings", () => {
+		for (const malformed of [0x13ff, 0xff, 65, (65 << 8) | 0x7f])
+			expect(decodeLinuxWaitWord(malformed).kind).toBe("invalid");
+		expect(decodeLinuxWaitWord((19 << 8) | 0x7f)).toMatchObject({
+			kind: "stopped",
+			stopSignalNumber: 19,
+		});
+	});
+
+	it("distinguishes every present-invalid or wrong-kind slot from absence", () => {
+		const invalidKernel = kernel() as unknown as { claim: { groupDead: boolean } };
+		invalidKernel.claim.groupDead = false;
+		const invalidParent = parentRaw() as unknown as { claim: { rawWaitWord: number } };
+		invalidParent.claim.rawWaitWord = (19 << 8) | 0x7f;
+		const invalidApplication = envelope({
+			kind: "application_transition",
+			observation: "state_transition",
+			from: "running",
+			to: "stopped",
+		}) as unknown as { claim: { to: string } };
+		invalidApplication.claim.to = "invented";
+
+		const cases: Array<["kernel" | "parent" | "application", unknown]> = [
+			["kernel", invalidKernel],
+			["parent", invalidParent],
+			["application", invalidApplication],
+			["kernel", parentRaw()],
+			["parent", kernel()],
+			["application", kernel()],
+		];
+		for (const [slot, supplied] of cases) {
+			const result = correlateTerminalEvidence({ [slot]: supplied });
+			expect(result).toMatchObject({
+				kind: "invalid_evidence",
+				invalid: [{ slot }],
+			});
+			if (result.kind !== "invalid_evidence") throw new Error(`expected invalid ${slot} evidence`);
+			expect(result.invalid[0]?.errors.length).toBeGreaterThan(0);
+			expect(result.invalid[0]?.errors.length).toBeLessThanOrEqual(16);
+		}
+	});
+
+	it("preserves the full kernel mapping but admits only canonical Node callback signals 1 through 31", () => {
+		for (let signalNumber = 1; signalNumber <= 64; signalNumber += 1) {
+			expect(decodeLinuxWaitWord(signalNumber)).toMatchObject({
+				kind: "signaled",
+				signalNumber,
+				signalName: LINUX_SIGNAL_NAMES[signalNumber - 1],
+			});
+		}
+		expect(NODE_CALLBACK_SIGNAL_NAMES).toEqual(LINUX_SIGNAL_NAMES.slice(0, 31));
+		for (let signalNumber = 1; signalNumber <= 31; signalNumber += 1) {
+			const signalName = NODE_CALLBACK_SIGNAL_NAMES[signalNumber - 1];
+			expect(normalizeNodeExitCallback(null, signalName)).toMatchObject({
+				kind: "signaled",
+				signalNumber,
+				signalName,
+			});
+		}
+		for (const rejected of ["SIG32", "SIG33", "SIGRTMIN", "SIGRTMIN+1", "SIGRTMAX", "SIGIOT", "SIGPOLL", "SIGBREAK"])
+			expect(normalizeNodeExitCallback(null, rejected)).toEqual({
+				kind: "invalid",
+				reason: "invalid_signal_name",
+			});
 	});
 });

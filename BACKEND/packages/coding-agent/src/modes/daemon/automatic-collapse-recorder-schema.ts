@@ -1,30 +1,59 @@
 export const AUTOMATIC_COLLAPSE_EVIDENCE_SCHEMA_VERSION = 1 as const;
 
-export const AUTOMATIC_COLLAPSE_ROLES = [
+function frozenCopy<const T extends readonly string[]>(values: T): T {
+	return Object.freeze([...values]) as unknown as T;
+}
+
+function immutableMembership<const T extends readonly string[]>(values: T): Readonly<Record<T[number], true>> {
+	const table = Object.create(null) as Record<string, true>;
+	for (const value of values) table[value] = true;
+	return Object.freeze(table) as Readonly<Record<T[number], true>>;
+}
+
+function immutableIndex<const T extends readonly string[]>(values: T): Readonly<Record<T[number], number>> {
+	const table = Object.create(null) as Record<string, number>;
+	for (const [index, value] of values.entries()) table[value] = index;
+	return Object.freeze(table) as Readonly<Record<T[number], number>>;
+}
+
+const CANONICAL_AUTOMATIC_COLLAPSE_ROLES = Object.freeze([
 	"recorder_wrapper",
 	"supervisor",
 	"worker",
 	"forkserver",
 	"direct_kernel",
 	"forked_kernel",
-] as const;
+] as const);
+export const AUTOMATIC_COLLAPSE_ROLES = frozenCopy(CANONICAL_AUTOMATIC_COLLAPSE_ROLES);
 export type AutomaticCollapseRole = (typeof AUTOMATIC_COLLAPSE_ROLES)[number];
+const AUTOMATIC_COLLAPSE_ROLE_MEMBERS = immutableMembership(CANONICAL_AUTOMATIC_COLLAPSE_ROLES);
 
-export const EVIDENCE_PROVIDERS = ["application_transition", "linux_kernel", "authoritative_parent"] as const;
+const CANONICAL_EVIDENCE_PROVIDERS = Object.freeze([
+	"application_transition",
+	"linux_kernel",
+	"authoritative_parent",
+] as const);
+export const EVIDENCE_PROVIDERS = frozenCopy(CANONICAL_EVIDENCE_PROVIDERS);
 export type EvidenceProvider = (typeof EVIDENCE_PROVIDERS)[number];
+const EVIDENCE_PROVIDER_MEMBERS = immutableMembership(CANONICAL_EVIDENCE_PROVIDERS);
 
-export const APPLICATION_STATES = ["starting", "running", "stopping", "stopped"] as const;
+const CANONICAL_APPLICATION_STATES = Object.freeze(["starting", "running", "stopping", "stopped"] as const);
+export const APPLICATION_STATES = frozenCopy(CANONICAL_APPLICATION_STATES);
 export type ApplicationState = (typeof APPLICATION_STATES)[number];
+const APPLICATION_STATE_MEMBERS = immutableMembership(CANONICAL_APPLICATION_STATES);
 
-export const EVIDENCE_CUSTODY_STATES = [
+const CANONICAL_EVIDENCE_CUSTODY_STATES = Object.freeze([
 	"kernel_produced",
 	"linux_received",
 	"host_published",
 	"windows_committed",
-] as const;
+] as const);
+export const EVIDENCE_CUSTODY_STATES = frozenCopy(CANONICAL_EVIDENCE_CUSTODY_STATES);
 export type EvidenceCustodyState = (typeof EVIDENCE_CUSTODY_STATES)[number];
+const EVIDENCE_CUSTODY_MEMBERS = immutableMembership(CANONICAL_EVIDENCE_CUSTODY_STATES);
+const EVIDENCE_CUSTODY_INDEX = immutableIndex(CANONICAL_EVIDENCE_CUSTODY_STATES);
 
-export const LINUX_SIGNAL_NAMES = [
+const CANONICAL_LINUX_SIGNAL_NAMES = Object.freeze([
 	"SIGHUP",
 	"SIGINT",
 	"SIGQUIT",
@@ -89,108 +118,143 @@ export const LINUX_SIGNAL_NAMES = [
 	"SIGRTMIN+28",
 	"SIGRTMIN+29",
 	"SIGRTMAX",
-] as const;
+] as const);
+export const LINUX_SIGNAL_NAMES = frozenCopy(CANONICAL_LINUX_SIGNAL_NAMES);
 export type LinuxSignalName = (typeof LINUX_SIGNAL_NAMES)[number];
+const LINUX_SIGNAL_MEMBERS = immutableMembership(CANONICAL_LINUX_SIGNAL_NAMES);
 
-const SIGNAL_NAME_BY_NUMBER = new Map<number, LinuxSignalName>(
-	LINUX_SIGNAL_NAMES.map((name, index) => [index + 1, name]),
-);
-const SIGNAL_NUMBER_BY_NAME = new Map<LinuxSignalName, number>(
-	LINUX_SIGNAL_NAMES.map((name, index) => [name, index + 1]),
-);
+const CANONICAL_NODE_CALLBACK_SIGNAL_NAMES = Object.freeze([
+	"SIGHUP",
+	"SIGINT",
+	"SIGQUIT",
+	"SIGILL",
+	"SIGTRAP",
+	"SIGABRT",
+	"SIGBUS",
+	"SIGFPE",
+	"SIGKILL",
+	"SIGUSR1",
+	"SIGSEGV",
+	"SIGUSR2",
+	"SIGPIPE",
+	"SIGALRM",
+	"SIGTERM",
+	"SIGSTKFLT",
+	"SIGCHLD",
+	"SIGCONT",
+	"SIGSTOP",
+	"SIGTSTP",
+	"SIGTTIN",
+	"SIGTTOU",
+	"SIGURG",
+	"SIGXCPU",
+	"SIGXFSZ",
+	"SIGVTALRM",
+	"SIGPROF",
+	"SIGWINCH",
+	"SIGIO",
+	"SIGPWR",
+	"SIGSYS",
+] as const);
+export const NODE_CALLBACK_SIGNAL_NAMES = frozenCopy(CANONICAL_NODE_CALLBACK_SIGNAL_NAMES);
+export type NodeCallbackSignalName = (typeof NODE_CALLBACK_SIGNAL_NAMES)[number];
+const NODE_CALLBACK_SIGNAL_MEMBERS = immutableMembership(CANONICAL_NODE_CALLBACK_SIGNAL_NAMES);
+const NODE_CALLBACK_SIGNAL_NUMBER_BY_NAME = Object.freeze(
+	Object.fromEntries(CANONICAL_NODE_CALLBACK_SIGNAL_NAMES.map((name, index) => [name, index + 1])),
+) as Readonly<Record<NodeCallbackSignalName, number>>;
 
 export interface InstallationRunIdentity {
-	installationId: string;
-	runId: string;
+	readonly installationId: string;
+	readonly runId: string;
 }
 
 export interface LinuxProcessKey {
-	linuxBootId: string;
-	pidNamespaceInode: string;
-	distroPid: number;
-	procStartTicks: string;
+	readonly linuxBootId: string;
+	readonly pidNamespaceInode: string;
+	readonly distroPid: number;
+	readonly procStartTicks: string;
 }
 
 export interface KernelTaskKey {
-	linuxBootId: string;
-	initialTgid: number;
-	taskStartBootNs: string;
+	readonly linuxBootId: string;
+	readonly initialTgid: number;
+	readonly taskStartBootNs: string;
 }
 
 export interface ProcessAnchor {
-	processAnchorId: string;
-	installationRun: InstallationRunIdentity;
-	linuxProcessKey: LinuxProcessKey;
-	kernelTaskKey: KernelTaskKey;
+	readonly processAnchorId: string;
+	readonly installationRun: InstallationRunIdentity;
+	readonly linuxProcessKey: LinuxProcessKey;
+	readonly kernelTaskKey: KernelTaskKey;
 }
 
 export interface RoleAssignment {
-	assignmentId: string;
-	role: AutomaticCollapseRole;
-	processAnchorId: string;
-	expectedExecutableId: string;
-	expectedBuildId: string;
+	readonly assignmentId: string;
+	readonly role: AutomaticCollapseRole;
+	readonly processAnchorId: string;
+	readonly expectedExecutableId: string;
+	readonly expectedBuildId: string;
 }
 
 export interface SpawnOccurrence {
-	occurrenceId: string;
-	ordinal: number;
-	parentProcessAnchorId: string;
-	childProcessAnchorId: string;
+	readonly occurrenceId: string;
+	readonly ordinal: number;
+	readonly parentProcessAnchorId: string;
+	readonly childProcessAnchorId: string;
 }
 
 export interface EvidenceSourcePosition {
-	provider: EvidenceProvider;
-	epoch: string;
-	strictSequence: number;
+	readonly provider: EvidenceProvider;
+	readonly epoch: string;
+	readonly strictSequence: number;
 }
 
 export interface AgentProfileProvenance {
-	agentId: string;
-	profileVersion: string;
+	readonly agentId: string;
+	readonly profileVersion: string;
 }
 
 export type ApplicationTransitionClaim =
 	| {
-			kind: "application_transition";
-			observation: "state_transition";
-			from: ApplicationState;
-			to: ApplicationState;
+			readonly kind: "application_transition";
+			readonly observation: "state_transition";
+			readonly from: ApplicationState;
+			readonly to: ApplicationState;
 	  }
 	| {
-			kind: "application_transition";
-			observation: "signal_requested";
-			requestedSignal: LinuxSignalName;
+			readonly kind: "application_transition";
+			readonly observation: "signal_requested";
+			readonly requestedSignal: LinuxSignalName;
 	  }
 	| {
-			kind: "application_transition";
-			observation: "silence_observed";
-			silenceMs: number;
+			readonly kind: "application_transition";
+			readonly observation: "silence_observed";
+			readonly silenceMs: number;
 	  };
 
 export interface KernelExitClaim {
-	kind: "kernel_exit";
-	groupDead: true;
-	rawWaitWord: number;
+	readonly kind: "kernel_exit";
+	readonly groupDead: true;
+	readonly rawWaitWord: number;
 }
 
 export type AuthoritativeParentWaitClaim =
 	| {
-			kind: "parent_wait";
-			observation: "linux_wait_word";
-			rawWaitWord: number;
+			readonly kind: "parent_wait";
+			readonly observation: "linux_wait_word";
+			readonly rawWaitWord: number;
 	  }
 	| {
-			kind: "parent_wait";
-			observation: "node_callback";
-			code: number;
-			signal: null;
+			readonly kind: "parent_wait";
+			readonly observation: "node_callback";
+			readonly code: number;
+			readonly signal: null;
 	  }
 	| {
-			kind: "parent_wait";
-			observation: "node_callback";
-			code: null;
-			signal: LinuxSignalName;
+			readonly kind: "parent_wait";
+			readonly observation: "node_callback";
+			readonly code: null;
+			readonly signal: NodeCallbackSignalName;
 	  };
 
 export type AutomaticCollapseEvidenceClaim =
@@ -199,37 +263,37 @@ export type AutomaticCollapseEvidenceClaim =
 	| AuthoritativeParentWaitClaim;
 
 export interface AutomaticCollapseEvidenceEnvelope {
-	schemaVersion: typeof AUTOMATIC_COLLAPSE_EVIDENCE_SCHEMA_VERSION;
-	evidenceId: string;
-	processAnchor: ProcessAnchor;
-	roleAssignment: RoleAssignment;
-	spawnOccurrence: SpawnOccurrence;
-	source: EvidenceSourcePosition;
-	agentProfile: AgentProfileProvenance;
-	observedAtMonotonicNs: string;
-	custody: EvidenceCustodyState;
-	claim: AutomaticCollapseEvidenceClaim;
+	readonly schemaVersion: typeof AUTOMATIC_COLLAPSE_EVIDENCE_SCHEMA_VERSION;
+	readonly evidenceId: string;
+	readonly processAnchor: ProcessAnchor;
+	readonly roleAssignment: RoleAssignment;
+	readonly spawnOccurrence: SpawnOccurrence;
+	readonly source: EvidenceSourcePosition;
+	readonly agentProfile: AgentProfileProvenance;
+	readonly observedAtMonotonicNs: string;
+	readonly custody: EvidenceCustodyState;
+	readonly claim: AutomaticCollapseEvidenceClaim;
 }
 
 export type LinuxWaitDecode =
-	| { kind: "exited"; rawWaitWord: number; exitCode: number }
+	| { readonly kind: "exited"; readonly rawWaitWord: number; readonly exitCode: number }
 	| {
-			kind: "signaled";
-			rawWaitWord: number;
-			signalNumber: number;
-			signalName: LinuxSignalName;
-			coreDumped: boolean;
+			readonly kind: "signaled";
+			readonly rawWaitWord: number;
+			readonly signalNumber: number;
+			readonly signalName: LinuxSignalName;
+			readonly coreDumped: boolean;
 	  }
 	| {
-			kind: "stopped";
-			rawWaitWord: number;
-			stopSignalNumber: number;
-			stopSignalName: LinuxSignalName;
+			readonly kind: "stopped";
+			readonly rawWaitWord: number;
+			readonly stopSignalNumber: number;
+			readonly stopSignalName: LinuxSignalName;
 	  }
-	| { kind: "continued"; rawWaitWord: number }
+	| { readonly kind: "continued"; readonly rawWaitWord: number }
 	| {
-			kind: "invalid";
-			reason:
+			readonly kind: "invalid";
+			readonly reason:
 				| "raw_wait_word_not_integer"
 				| "raw_wait_word_out_of_range"
 				| "invalid_signal_number"
@@ -237,26 +301,26 @@ export type LinuxWaitDecode =
 	  };
 
 export type NodeExitCallbackNormalization =
-	| { kind: "exited"; exitCode: number; source: "node_callback" }
+	| { readonly kind: "exited"; readonly exitCode: number; readonly source: "node_callback" }
 	| {
-			kind: "signaled";
-			signalNumber: number;
-			signalName: LinuxSignalName;
-			coreDumped: "unknown";
-			source: "node_callback";
+			readonly kind: "signaled";
+			readonly signalNumber: number;
+			readonly signalName: NodeCallbackSignalName;
+			readonly coreDumped: "unknown";
+			readonly source: "node_callback";
 	  }
 	| {
-			kind: "invalid";
-			reason: "ambiguous_pair" | "missing_code_and_signal" | "invalid_exit_code" | "invalid_signal_name";
+			readonly kind: "invalid";
+			readonly reason: "ambiguous_pair" | "missing_code_and_signal" | "invalid_exit_code" | "invalid_signal_name";
 	  };
 
 export type TerminalDisposition =
-	| { kind: "exited"; exitCode: number }
+	| { readonly kind: "exited"; readonly exitCode: number }
 	| {
-			kind: "signaled";
-			signalNumber: number;
-			signalName: LinuxSignalName;
-			coreDumped: boolean | "unknown";
+			readonly kind: "signaled";
+			readonly signalNumber: number;
+			readonly signalName: LinuxSignalName;
+			readonly coreDumped: boolean | "unknown";
 	  };
 
 export function decodeLinuxWaitWord(rawWaitWord: unknown): LinuxWaitDecode {
@@ -265,15 +329,16 @@ export function decodeLinuxWaitWord(rawWaitWord: unknown): LinuxWaitDecode {
 	if (rawWaitWord < 0 || rawWaitWord > 0xffff) return { kind: "invalid", reason: "raw_wait_word_out_of_range" };
 	if (rawWaitWord === 0xffff) return { kind: "continued", rawWaitWord };
 
+	const lowByte = rawWaitWord & 0xff;
 	const lowSevenBits = rawWaitWord & 0x7f;
 	if (lowSevenBits === 0) return { kind: "exited", rawWaitWord, exitCode: (rawWaitWord >>> 8) & 0xff };
-	if (lowSevenBits === 0x7f) {
+	if (lowByte === 0x7f) {
 		const stopSignalNumber = (rawWaitWord >>> 8) & 0xff;
-		const stopSignalName = SIGNAL_NAME_BY_NUMBER.get(stopSignalNumber);
+		const stopSignalName = CANONICAL_LINUX_SIGNAL_NAMES[stopSignalNumber - 1];
 		if (!stopSignalName) return { kind: "invalid", reason: "invalid_stop_signal_number" };
 		return { kind: "stopped", rawWaitWord, stopSignalNumber, stopSignalName };
 	}
-	const signalName = SIGNAL_NAME_BY_NUMBER.get(lowSevenBits);
+	const signalName = CANONICAL_LINUX_SIGNAL_NAMES[lowSevenBits - 1];
 	if (!signalName) return { kind: "invalid", reason: "invalid_signal_number" };
 	return {
 		kind: "signaled",
@@ -292,12 +357,12 @@ export function normalizeNodeExitCallback(code: unknown, signal: unknown): NodeE
 			return { kind: "invalid", reason: "invalid_exit_code" };
 		return { kind: "exited", exitCode: code, source: "node_callback" };
 	}
-	if (typeof signal !== "string" || !SIGNAL_NUMBER_BY_NAME.has(signal as LinuxSignalName))
+	if (typeof signal !== "string" || !Object.hasOwn(NODE_CALLBACK_SIGNAL_MEMBERS, signal))
 		return { kind: "invalid", reason: "invalid_signal_name" };
-	const signalName = signal as LinuxSignalName;
+	const signalName = signal as NodeCallbackSignalName;
 	return {
 		kind: "signaled",
-		signalNumber: SIGNAL_NUMBER_BY_NAME.get(signalName)!,
+		signalNumber: NODE_CALLBACK_SIGNAL_NUMBER_BY_NAME[signalName],
 		signalName,
 		coreDumped: "unknown",
 		source: "node_callback",
@@ -312,7 +377,8 @@ const MAX_SILENCE_MS = 86_400_000;
 const MAX_VALIDATION_ERRORS = 16;
 const MAX_VALIDATION_NODES = 256;
 const MAX_VALIDATION_DEPTH = 12;
-const FORBIDDEN_PRIVACY_KEY_FRAGMENTS = [
+const MAX_OWN_KEY_LENGTH = 128;
+const FORBIDDEN_PRIVACY_KEY_FRAGMENTS = Object.freeze([
 	"argv",
 	"environment",
 	"stdout",
@@ -330,7 +396,7 @@ const FORBIDDEN_PRIVACY_KEY_FRAGMENTS = [
 	"token",
 	"cookie",
 	"authorization",
-] as const;
+] as const);
 
 class ValidationIssues {
 	readonly values: string[] = [];
@@ -349,38 +415,81 @@ function hasForbiddenPrivacyTerm(key: string): boolean {
 	return FORBIDDEN_PRIVACY_KEY_FRAGMENTS.some((fragment) => normalized.includes(fragment));
 }
 
-function inspectObjectGraph(value: unknown, issues: ValidationIssues): void {
+/**
+ * Captures one bounded descriptor-derived snapshot. It never invokes an input
+ * getter and validation never reads the caller-owned graph after this returns.
+ */
+function captureDataSnapshot(value: unknown, issues: ValidationIssues): unknown {
 	const seen = new WeakSet<object>();
 	let nodes = 0;
 
-	function visit(current: unknown, path: string, depth: number): void {
-		if (current === null || typeof current !== "object" || issues.values.length >= MAX_VALIDATION_ERRORS) return;
-		if (depth > MAX_VALIDATION_DEPTH) {
-			issues.add(`${path}: validation depth exceeded`);
-			return;
-		}
-		if (seen.has(current)) {
-			issues.add(`${path}: cyclic value rejected`);
-			return;
-		}
-		seen.add(current);
+	function capture(current: unknown, path: string, depth: number): unknown {
 		nodes += 1;
 		if (nodes > MAX_VALIDATION_NODES) {
 			issues.add(`${path}: validation node bound exceeded`);
-			return;
+			return undefined;
 		}
-		const descriptors = Object.getOwnPropertyDescriptors(current);
-		for (const [key, descriptor] of Object.entries(descriptors)) {
-			if (hasForbiddenPrivacyTerm(key)) issues.add(`${path}.${key}: forbidden privacy field`);
-			if (!Object.hasOwn(descriptor, "value")) {
-				issues.add(`${path}.${key}: accessor properties rejected`);
+		if (depth > MAX_VALIDATION_DEPTH) {
+			issues.add(`${path}: validation depth exceeded`);
+			return undefined;
+		}
+		if (current === null || ["string", "number", "boolean", "undefined"].includes(typeof current)) return current;
+		if (typeof current !== "object") {
+			issues.add(`${path}: non-data value rejected`);
+			return undefined;
+		}
+		if (seen.has(current)) {
+			issues.add(`${path}: cyclic or aliased value rejected`);
+			return undefined;
+		}
+		seen.add(current);
+		const prototype = Object.getPrototypeOf(current);
+		if (prototype !== Object.prototype && prototype !== null) {
+			issues.add(`${path}: expected plain data object`);
+			return undefined;
+		}
+
+		const snapshot: Record<string, unknown> = {};
+		for (const key of Reflect.ownKeys(current)) {
+			if (issues.values.length >= MAX_VALIDATION_ERRORS) break;
+			if (typeof key === "symbol") {
+				issues.add(`${path}: symbol own key rejected`);
 				continue;
 			}
-			visit(descriptor.value, `${path}.${key}`, depth + 1);
+			const childPath = `${path}.${key}`;
+			if (key.length > MAX_OWN_KEY_LENGTH) {
+				issues.add(`${childPath.slice(0, path.length + 33)}: own key length exceeded`);
+				continue;
+			}
+			if (hasForbiddenPrivacyTerm(key)) {
+				issues.add(`${childPath}: forbidden privacy field`);
+				continue;
+			}
+			const descriptor = Object.getOwnPropertyDescriptor(current, key);
+			if (!descriptor) {
+				issues.add(`${childPath}: unstable own property rejected`);
+				continue;
+			}
+			if (descriptor.enumerable !== true) {
+				issues.add(`${childPath}: non-enumerable own field rejected`);
+				continue;
+			}
+			if (!Object.hasOwn(descriptor, "value")) {
+				issues.add(`${childPath}: accessor properties rejected`);
+				continue;
+			}
+			const captured = capture(descriptor.value, childPath, depth + 1);
+			Object.defineProperty(snapshot, key, {
+				value: captured,
+				enumerable: true,
+				writable: true,
+				configurable: true,
+			});
 		}
+		return Object.freeze(snapshot);
 	}
 
-	visit(value, "$", 0);
+	return capture(value, "$", 0);
 }
 
 function asRecord(value: unknown, path: string, issues: ValidationIssues): Record<string, unknown> | undefined {
@@ -404,7 +513,12 @@ function exactKeys(
 ): void {
 	const allowed = new Set(required);
 	for (const key of required) if (!Object.hasOwn(record, key)) issues.add(`${path}.${key}: required field missing`);
-	for (const key of Object.keys(record)) if (!allowed.has(key)) issues.add(`${path}.${key}: extra field rejected`);
+	for (const key of Reflect.ownKeys(record)) {
+		if (typeof key === "symbol") issues.add(`${path}: symbol own key rejected`);
+		else if (!allowed.has(key)) issues.add(`${path}.${key}: extra field rejected`);
+		const descriptor = Object.getOwnPropertyDescriptor(record, key);
+		if (descriptor?.enumerable !== true) issues.add(`${path}.${String(key)}: non-enumerable own field rejected`);
+	}
 }
 
 function boundedId(value: unknown, path: string, issues: ValidationIssues): value is string {
@@ -415,13 +529,13 @@ function boundedId(value: unknown, path: string, issues: ValidationIssues): valu
 	return true;
 }
 
-function exactMember<const T extends readonly string[]>(
+function exactMember<T extends string>(
 	value: unknown,
-	allowlist: T,
+	membership: Readonly<Record<T, true>>,
 	path: string,
 	issues: ValidationIssues,
-): value is T[number] {
-	if (typeof value !== "string" || !allowlist.includes(value)) {
+): value is T {
+	if (typeof value !== "string" || !Object.hasOwn(membership, value)) {
 		issues.add(`${path}: value is not allowlisted`);
 		return false;
 	}
@@ -502,7 +616,7 @@ function validateRoleAssignment(value: unknown, path: string, issues: Validation
 		issues,
 	);
 	boundedId(record.assignmentId, `${path}.assignmentId`, issues);
-	exactMember(record.role, AUTOMATIC_COLLAPSE_ROLES, `${path}.role`, issues);
+	exactMember(record.role, AUTOMATIC_COLLAPSE_ROLE_MEMBERS, `${path}.role`, issues);
 	boundedId(record.processAnchorId, `${path}.processAnchorId`, issues);
 	boundedId(record.expectedExecutableId, `${path}.expectedExecutableId`, issues);
 	boundedId(record.expectedBuildId, `${path}.expectedBuildId`, issues);
@@ -522,7 +636,7 @@ function validateSource(value: unknown, path: string, issues: ValidationIssues):
 	const record = asRecord(value, path, issues);
 	if (!record) return;
 	exactKeys(record, ["provider", "epoch", "strictSequence"], path, issues);
-	exactMember(record.provider, EVIDENCE_PROVIDERS, `${path}.provider`, issues);
+	exactMember(record.provider, EVIDENCE_PROVIDER_MEMBERS, `${path}.provider`, issues);
 	boundedId(record.epoch, `${path}.epoch`, issues);
 	boundedSafeInteger(record.strictSequence, 0, Number.MAX_SAFE_INTEGER, `${path}.strictSequence`, issues);
 }
@@ -538,13 +652,13 @@ function validateAgentProfile(value: unknown, path: string, issues: ValidationIs
 function validateApplicationClaim(record: Record<string, unknown>, path: string, issues: ValidationIssues): void {
 	if (record.observation === "state_transition") {
 		exactKeys(record, ["kind", "observation", "from", "to"], path, issues);
-		exactMember(record.from, APPLICATION_STATES, `${path}.from`, issues);
-		exactMember(record.to, APPLICATION_STATES, `${path}.to`, issues);
+		exactMember(record.from, APPLICATION_STATE_MEMBERS, `${path}.from`, issues);
+		exactMember(record.to, APPLICATION_STATE_MEMBERS, `${path}.to`, issues);
 		return;
 	}
 	if (record.observation === "signal_requested") {
 		exactKeys(record, ["kind", "observation", "requestedSignal"], path, issues);
-		exactMember(record.requestedSignal, LINUX_SIGNAL_NAMES, `${path}.requestedSignal`, issues);
+		exactMember(record.requestedSignal, LINUX_SIGNAL_MEMBERS, `${path}.requestedSignal`, issues);
 		return;
 	}
 	if (record.observation === "silence_observed") {
@@ -591,16 +705,20 @@ function validateClaim(value: unknown, path: string, issues: ValidationIssues): 
 }
 
 export type AutomaticCollapseEvidenceValidation =
-	| { ok: true; value: AutomaticCollapseEvidenceEnvelope }
-	| { ok: false; errors: readonly string[] };
+	| { readonly ok: true; readonly value: AutomaticCollapseEvidenceEnvelope }
+	| { readonly ok: false; readonly errors: readonly string[] };
+
+function validationFailure(errors: readonly string[]): AutomaticCollapseEvidenceValidation {
+	return Object.freeze({ ok: false, errors: Object.freeze([...errors]) });
+}
 
 export function validateAutomaticCollapseEvidence(value: unknown): AutomaticCollapseEvidenceValidation {
 	const issues = new ValidationIssues();
 	try {
-		inspectObjectGraph(value, issues);
-		if (issues.values.length > 0) return { ok: false, errors: issues.values };
-		const record = asRecord(value, "$", issues);
-		if (!record) return { ok: false, errors: issues.values };
+		const snapshot = captureDataSnapshot(value, issues);
+		if (issues.values.length > 0) return validationFailure(issues.values);
+		const record = asRecord(snapshot, "$", issues);
+		if (!record) return validationFailure(issues.values);
 		exactKeys(
 			record,
 			[
@@ -627,7 +745,7 @@ export function validateAutomaticCollapseEvidence(value: unknown): AutomaticColl
 		validateSource(record.source, "$.source", issues);
 		validateAgentProfile(record.agentProfile, "$.agentProfile", issues);
 		decimalString(record.observedAtMonotonicNs, false, "$.observedAtMonotonicNs", issues);
-		exactMember(record.custody, EVIDENCE_CUSTODY_STATES, "$.custody", issues);
+		exactMember(record.custody, EVIDENCE_CUSTODY_MEMBERS, "$.custody", issues);
 		const expectedProvider = validateClaim(record.claim, "$.claim", issues);
 
 		const anchor = asRecord(record.processAnchor, "$.processAnchor", issues);
@@ -643,10 +761,10 @@ export function validateAutomaticCollapseEvidence(value: unknown): AutomaticColl
 		if (source && expectedProvider && source.provider !== expectedProvider)
 			issues.add("$.source.provider: claim/provider mismatch");
 
-		if (issues.values.length > 0) return { ok: false, errors: issues.values };
-		return { ok: true, value: record as unknown as AutomaticCollapseEvidenceEnvelope };
+		if (issues.values.length > 0) return validationFailure(issues.values);
+		return Object.freeze({ ok: true, value: record as unknown as AutomaticCollapseEvidenceEnvelope });
 	} catch {
-		return { ok: false, errors: ["$: validation failed safely"] };
+		return validationFailure(["$: validation failed safely"]);
 	}
 }
 
@@ -665,14 +783,12 @@ function dispositionFromRawWait(rawWaitWord: unknown): TerminalDisposition | und
 }
 
 function terminalFromKernel(evidence: AutomaticCollapseEvidenceEnvelope | undefined): TerminalDisposition | undefined {
-	if (!evidence || !validateAutomaticCollapseEvidence(evidence).ok) return undefined;
-	if (evidence.claim.kind !== "kernel_exit" || evidence.claim.groupDead !== true) return undefined;
+	if (!evidence || evidence.claim.kind !== "kernel_exit" || evidence.claim.groupDead !== true) return undefined;
 	return dispositionFromRawWait(evidence.claim.rawWaitWord);
 }
 
 function terminalFromParent(evidence: AutomaticCollapseEvidenceEnvelope | undefined): TerminalDisposition | undefined {
-	if (!evidence || !validateAutomaticCollapseEvidence(evidence).ok) return undefined;
-	if (evidence.claim.kind !== "parent_wait") return undefined;
+	if (!evidence || evidence.claim.kind !== "parent_wait") return undefined;
 	if (evidence.claim.observation === "linux_wait_word") return dispositionFromRawWait(evidence.claim.rawWaitWord);
 	const normalized = normalizeNodeExitCallback(evidence.claim.code, evidence.claim.signal);
 	if (normalized.kind === "exited") return { kind: "exited", exitCode: normalized.exitCode };
@@ -740,96 +856,152 @@ function sameDisposition(left: TerminalDisposition, right: TerminalDisposition):
 	return left.coreDumped === "unknown" || right.coreDumped === "unknown" || left.coreDumped === right.coreDumped;
 }
 
+export type TerminalEvidenceSlot = "kernel" | "parent" | "application";
+
+export interface InvalidTerminalEvidence {
+	readonly slot: TerminalEvidenceSlot;
+	readonly errors: readonly string[];
+}
+
 export type TerminalCorrelation =
-	| { kind: "no_terminal_claim" }
+	| { readonly kind: "no_terminal_claim" }
 	| {
-			kind: "kernel_only";
-			disposition: TerminalDisposition;
-			kernel: AutomaticCollapseEvidenceEnvelope;
-			gap: { kind: "authoritative_parent_wait_missing" };
+			readonly kind: "invalid_evidence";
+			readonly invalid: readonly InvalidTerminalEvidence[];
 	  }
 	| {
-			kind: "parent_only";
-			disposition: TerminalDisposition;
-			parent: AutomaticCollapseEvidenceEnvelope;
-			gap: { kind: "kernel_provider_missing" };
+			readonly kind: "kernel_only";
+			readonly disposition: TerminalDisposition;
+			readonly kernel: AutomaticCollapseEvidenceEnvelope;
+			readonly gap: { readonly kind: "authoritative_parent_wait_missing" };
 	  }
 	| {
-			kind: "matching_parent_kernel_dual";
-			disposition: TerminalDisposition;
-			kernel: AutomaticCollapseEvidenceEnvelope;
-			parent: AutomaticCollapseEvidenceEnvelope;
+			readonly kind: "parent_only";
+			readonly disposition: TerminalDisposition;
+			readonly parent: AutomaticCollapseEvidenceEnvelope;
+			readonly gap: { readonly kind: "kernel_provider_missing" };
 	  }
 	| {
-			kind: "conflict";
-			reason: "identity_mismatch" | "terminal_disposition_mismatch";
-			kernelDisposition: TerminalDisposition;
-			parentDisposition: TerminalDisposition;
-			kernel: AutomaticCollapseEvidenceEnvelope;
-			parent: AutomaticCollapseEvidenceEnvelope;
+			readonly kind: "matching_parent_kernel_dual";
+			readonly disposition: TerminalDisposition;
+			readonly kernel: AutomaticCollapseEvidenceEnvelope;
+			readonly parent: AutomaticCollapseEvidenceEnvelope;
+	  }
+	| {
+			readonly kind: "conflict";
+			readonly reason: "identity_mismatch" | "terminal_disposition_mismatch";
+			readonly kernelDisposition: TerminalDisposition;
+			readonly parentDisposition: TerminalDisposition;
+			readonly kernel: AutomaticCollapseEvidenceEnvelope;
+			readonly parent: AutomaticCollapseEvidenceEnvelope;
 	  };
 
 export interface TerminalCorrelationInput {
-	kernel?: AutomaticCollapseEvidenceEnvelope;
-	parent?: AutomaticCollapseEvidenceEnvelope;
-	application?: AutomaticCollapseEvidenceEnvelope;
+	readonly kernel?: unknown;
+	readonly parent?: unknown;
+	readonly application?: unknown;
+}
+
+function freezeOutput<T>(value: T): T {
+	if (value === null || typeof value !== "object" || Object.isFrozen(value)) return value;
+	for (const key of Reflect.ownKeys(value)) {
+		const descriptor = Object.getOwnPropertyDescriptor(value, key);
+		if (descriptor && Object.hasOwn(descriptor, "value")) freezeOutput(descriptor.value);
+	}
+	return Object.freeze(value);
+}
+
+function validateCorrelationSlot(
+	slot: TerminalEvidenceSlot,
+	supplied: unknown,
+	expectedKind: AutomaticCollapseEvidenceClaim["kind"],
+): { readonly value?: AutomaticCollapseEvidenceEnvelope; readonly invalid?: InvalidTerminalEvidence } {
+	if (supplied === undefined) return {};
+	const validated = validateAutomaticCollapseEvidence(supplied);
+	if (!validated.ok) {
+		return {
+			invalid: Object.freeze({ slot, errors: Object.freeze([...validated.errors]) }),
+		};
+	}
+	if (validated.value.claim.kind !== expectedKind) {
+		return {
+			invalid: Object.freeze({
+				slot,
+				errors: Object.freeze([`$.claim.kind: ${slot} slot requires ${expectedKind}`]),
+			}),
+		};
+	}
+	return { value: validated.value };
 }
 
 export function correlateTerminalEvidence(input: TerminalCorrelationInput): TerminalCorrelation {
-	const kernelDisposition = terminalFromKernel(input.kernel);
-	const parentDisposition = terminalFromParent(input.parent);
-	if (!kernelDisposition && !parentDisposition) return { kind: "no_terminal_claim" };
+	// Read each caller-owned slot once. All later work uses detached validation snapshots.
+	const suppliedKernel = input.kernel;
+	const suppliedParent = input.parent;
+	const suppliedApplication = input.application;
+	const kernelResult = validateCorrelationSlot("kernel", suppliedKernel, "kernel_exit");
+	const parentResult = validateCorrelationSlot("parent", suppliedParent, "parent_wait");
+	const applicationResult = validateCorrelationSlot("application", suppliedApplication, "application_transition");
+	const invalid = [kernelResult.invalid, parentResult.invalid, applicationResult.invalid].filter(
+		(value): value is InvalidTerminalEvidence => value !== undefined,
+	);
+	if (invalid.length > 0) return freezeOutput({ kind: "invalid_evidence", invalid });
+
+	const kernel = kernelResult.value;
+	const parent = parentResult.value;
+	const kernelDisposition = terminalFromKernel(kernel);
+	const parentDisposition = terminalFromParent(parent);
+	if (!kernelDisposition && !parentDisposition) return freezeOutput({ kind: "no_terminal_claim" });
 	if (kernelDisposition && !parentDisposition) {
-		return {
+		return freezeOutput({
 			kind: "kernel_only",
 			disposition: kernelDisposition,
-			kernel: input.kernel!,
+			kernel: kernel!,
 			gap: { kind: "authoritative_parent_wait_missing" },
-		};
+		});
 	}
 	if (!kernelDisposition && parentDisposition) {
-		return {
+		return freezeOutput({
 			kind: "parent_only",
 			disposition: parentDisposition,
-			parent: input.parent!,
+			parent: parent!,
 			gap: { kind: "kernel_provider_missing" },
-		};
+		});
 	}
-	const kernel = input.kernel!;
-	const parent = input.parent!;
-	if (!sameEvidenceIdentity(kernel, parent)) {
-		return {
+	if (!sameEvidenceIdentity(kernel!, parent!)) {
+		return freezeOutput({
 			kind: "conflict",
 			reason: "identity_mismatch",
 			kernelDisposition: kernelDisposition!,
 			parentDisposition: parentDisposition!,
-			kernel,
-			parent,
-		};
+			kernel: kernel!,
+			parent: parent!,
+		});
 	}
 	if (!sameDisposition(kernelDisposition!, parentDisposition!)) {
-		return {
+		return freezeOutput({
 			kind: "conflict",
 			reason: "terminal_disposition_mismatch",
 			kernelDisposition: kernelDisposition!,
 			parentDisposition: parentDisposition!,
-			kernel,
-			parent,
-		};
+			kernel: kernel!,
+			parent: parent!,
+		});
 	}
-	return {
+	return freezeOutput({
 		kind: "matching_parent_kernel_dual",
 		disposition: kernelDisposition!,
-		kernel,
-		parent,
-	};
+		kernel: kernel!,
+		parent: parent!,
+	});
 }
 
+/**
+ * Checks structural pipeline adjacency only. Custody stages are non-authoritative
+ * labels. Windows survival requires the later validated Windows-anchor receipt
+ * and commit authority; no stage string in this slice proves survival.
+ */
 export function advanceEvidenceCustody(from: EvidenceCustodyState, to: EvidenceCustodyState): boolean {
-	const fromIndex = EVIDENCE_CUSTODY_STATES.indexOf(from);
-	return fromIndex >= 0 && EVIDENCE_CUSTODY_STATES.indexOf(to) === fromIndex + 1;
-}
-
-export function windowsSurvivingCustody(state: EvidenceCustodyState): boolean {
-	return state === "windows_committed";
+	if (!Object.hasOwn(EVIDENCE_CUSTODY_INDEX, from) || !Object.hasOwn(EVIDENCE_CUSTODY_INDEX, to)) return false;
+	return EVIDENCE_CUSTODY_INDEX[to] === EVIDENCE_CUSTODY_INDEX[from] + 1;
 }
