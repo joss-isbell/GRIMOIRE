@@ -8,6 +8,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { registerSessionResourceCleanup } from "@earendil-works/pi-ai";
 import { v4 as uuid } from "uuid";
 import { Dealer, Subscriber } from "zeromq";
+import { normalizeNodeExitCallback } from "../../modes/daemon/automatic-collapse-recorder-schema.js";
 import { emitIncidentDerived } from "../../modes/daemon/incident-recorder-writer.js";
 import { recordOrphanProcessState } from "../orphan-process-journal.js";
 import { getProcessStartId } from "../session-lease.js";
@@ -56,6 +57,14 @@ const KERNEL_CONTEXT_ID_PATTERN = /^[A-Za-z0-9_.:+-]{1,256}$/;
 
 function normalizeKernelContextId(value: string | undefined): string | undefined {
 	return value !== undefined && KERNEL_CONTEXT_ID_PATTERN.test(value) ? value : undefined;
+}
+
+function emitKernelIncidentNoThrow(type: string, fields: Record<string, unknown>): void {
+	try {
+		emitIncidentDerived("recorder-events", type, fields);
+	} catch {
+		// Incident capture is observational and must never change kernel lifecycle behavior.
+	}
 }
 
 type KernelShutdownReason =
@@ -827,14 +836,19 @@ export class KernelManager {
 
 			kernel.on("exit", (code, signal) => {
 				if (this.kernel !== kernel) return;
+				const exitCode = code;
+				const exitSignal = signal;
+				const targetPid = kernel.pid;
+				const targetProcessStartId = this.kernelProcessStartId;
 				if (this.state !== "shutdown") {
-					this.appendKernelDiagnostic(`unexpected exit code=${code} signal=${signal}`);
+					this.appendKernelDiagnostic(`unexpected exit code=${exitCode} signal=${exitSignal}`);
 				}
+				this.emitDirectKernelTerminalObservation(exitCode, exitSignal, targetPid, targetProcessStartId);
 				this.transitionToShutdown(
 					"direct_child_exit",
 					"child_process_event",
 					"SIGTERM",
-					signal ?? "unavailable",
+					exitSignal ?? "unavailable",
 					"not_live",
 				);
 				this.state = "shutdown";
@@ -1608,6 +1622,50 @@ export class KernelManager {
 		await this.control.send(encode(msg, this.connection.key));
 	}
 
+	private emitDirectKernelTerminalObservation(
+		code: number | null,
+		signal: NodeJS.Signals | null,
+		targetPid: number | undefined,
+		targetProcessStartId: string | undefined,
+	): void {
+		const normalized = normalizeNodeExitCallback(code, signal);
+		if (normalized.kind === "invalid") {
+			emitKernelIncidentNoThrow("process_terminal_observation_invalid", {
+				classification: "authoritative_parent_wait_invalid",
+				origin: "node_callback",
+				role: "direct_kernel",
+				targetPid,
+				targetProcessStartId,
+				code,
+				signal,
+				reason: normalized.reason,
+				sessionId: this.options.sessionId ?? "unavailable",
+				activeSessionId: this.options.activeSessionId ?? "unavailable",
+				toolCallId: this.getCurrentToolCallId() ?? "unavailable",
+				workerPid: process.pid,
+				workerProcessStartId: this.workerProcessStartId ?? "unavailable",
+				startGeneration: this.startGeneration,
+			});
+			return;
+		}
+		emitKernelIncidentNoThrow("process_terminal_disposition", {
+			classification: "authoritative_parent_wait",
+			origin: "node_callback",
+			role: "direct_kernel",
+			targetPid,
+			targetProcessStartId,
+			code,
+			signal,
+			disposition: normalized.kind,
+			sessionId: this.options.sessionId ?? "unavailable",
+			activeSessionId: this.options.activeSessionId ?? "unavailable",
+			toolCallId: this.getCurrentToolCallId() ?? "unavailable",
+			workerPid: process.pid,
+			workerProcessStartId: this.workerProcessStartId ?? "unavailable",
+			startGeneration: this.startGeneration,
+		});
+	}
+
 	/** Records every shutdown observation before changing lifecycle state or cleaning resources. */
 	private transitionToShutdown(
 		reason: KernelShutdownReason,
@@ -1621,7 +1679,7 @@ export class KernelManager {
 			this.kernelPid === undefined ? undefined : getProcessStartId(this.kernelPid);
 		const directKernelExited =
 			this.kernel !== undefined && (this.kernel.exitCode !== null || this.kernel.signalCode !== null);
-		emitIncidentDerived("recorder-events", "kernel_shutdown_transition", {
+		emitKernelIncidentNoThrow("kernel_shutdown_transition", {
 			reason,
 			callerCategory,
 			oldState,

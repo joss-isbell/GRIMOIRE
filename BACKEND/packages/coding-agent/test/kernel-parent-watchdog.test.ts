@@ -1,18 +1,25 @@
-import { spawn, spawnSync } from "node:child_process";
+import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { cleanupSessionResources } from "@earendil-works/pi-ai";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { type ForkedKernelHandle, ForkServerUnavailable } from "../src/core/kernel/fork-server.js";
 import { KernelManager } from "../src/core/kernel/index.js";
 import { ORPHAN_PROCESS_JOURNAL_ENV } from "../src/core/orphan-process-journal.js";
 
 const incidentRecorder = vi.hoisted(() => ({
-	emitIncidentDerived: vi.fn((_source: string, _type: string, _fields: Record<string, unknown>) => ({
-		accepted: true as const,
-		occurrenceId: "test-occurrence",
-	})),
+	emitIncidentDerived: vi.fn(
+		(
+			_source: string,
+			_type: string,
+			_fields: Record<string, unknown>,
+		): { accepted: boolean; occurrenceId: string; reason?: string } => ({
+			accepted: true,
+			occurrenceId: "test-occurrence",
+		}),
+	),
 }));
 const forkKernelMock = vi.hoisted(() => vi.fn());
 const forkEnabledMock = vi.hoisted(() => vi.fn(() => false));
@@ -59,7 +66,11 @@ function readJournalRecords(path: string): JournalRecord[] {
 describe("kernel parent watchdog", () => {
 	beforeEach(() => {
 		tempDir = mkdtempSync(join(tmpdir(), "prime-agent-kernel-watchdog-"));
-		incidentRecorder.emitIncidentDerived.mockClear();
+		incidentRecorder.emitIncidentDerived.mockReset();
+		incidentRecorder.emitIncidentDerived.mockReturnValue({
+			accepted: true,
+			occurrenceId: "test-occurrence",
+		});
 	});
 
 	afterEach(() => {
@@ -134,6 +145,207 @@ describe("kernel parent watchdog", () => {
 		expect(exitInternals.kernel).toBeUndefined();
 		await exitManager.dispose();
 	});
+
+	it.each([
+		{
+			label: "exit code",
+			script: ["#!/bin/sh", "sleep 0.05", "exit 23", ""],
+			code: 23,
+			signal: null,
+			disposition: "exited",
+			observedSignal: "unavailable",
+		},
+		{
+			label: "signal",
+			script: ["#!/bin/sh", "sleep 0.05", "kill -TERM $$", ""],
+			code: null,
+			signal: "SIGTERM",
+			disposition: "signaled",
+			observedSignal: "SIGTERM",
+		},
+	])("exports exact direct-kernel parent $label before the semantic transition and cleanup", async (expected) => {
+		const python = writeFakePython(expected.script);
+		const manager = new KernelManager({
+			python,
+			cwd: tempDir,
+			sessionId: "test-session",
+			activeSessionId: "test-active-session",
+		});
+		const internals = manager as unknown as {
+			state: string;
+			kernel?: { pid?: number };
+			cleanupResources(): void;
+		};
+		const cleanup = vi.spyOn(internals, "cleanupResources");
+		const events: Array<{ type: string; fields: Record<string, unknown> }> = [];
+		incidentRecorder.emitIncidentDerived.mockImplementation((_source, type, fields) => {
+			events.push({ type, fields });
+			if (type === "process_terminal_disposition" || type === "kernel_shutdown_transition") {
+				expect(internals.state).toBe("starting");
+				expect(internals.kernel).toBeDefined();
+				expect(cleanup).not.toHaveBeenCalled();
+			}
+			return { accepted: true, occurrenceId: `direct-${type}` };
+		});
+
+		await expect(manager.execute("x")).rejects.toThrow(/Kernel exited before resolving ports/);
+
+		const terminalIndex = events.findIndex((event) => event.type === "process_terminal_disposition");
+		const transitionIndex = events.findIndex(
+			(event) => event.type === "kernel_shutdown_transition" && event.fields.reason === "direct_child_exit",
+		);
+		expect(terminalIndex).toBeGreaterThanOrEqual(0);
+		expect(transitionIndex).toBeGreaterThan(terminalIndex);
+		expect(events.filter((event) => event.type === "process_terminal_disposition")).toHaveLength(1);
+		expect(events[terminalIndex]?.fields).toMatchObject({
+			classification: "authoritative_parent_wait",
+			origin: "node_callback",
+			role: "direct_kernel",
+			targetPid: expect.any(Number),
+			targetProcessStartId: expect.any(String),
+			code: expected.code,
+			signal: expected.signal,
+			disposition: expected.disposition,
+			sessionId: "test-session",
+			activeSessionId: "test-active-session",
+			workerPid: process.pid,
+			startGeneration: 1,
+		});
+		expect(events[terminalIndex]?.fields).not.toHaveProperty("rawWaitWord");
+		expect(events[terminalIndex]?.fields).not.toHaveProperty("coreDumped");
+		expect(events[transitionIndex]?.fields).toMatchObject({
+			reason: "direct_child_exit",
+			callerCategory: "child_process_event",
+			requestedKillSignal: "SIGTERM",
+			observedSignal: expected.observedSignal,
+		});
+		expect(events[transitionIndex]?.fields).not.toHaveProperty("code");
+		expect(events[transitionIndex]?.fields).not.toHaveProperty("signal");
+		expect(events[transitionIndex]?.fields).not.toHaveProperty("disposition");
+		expect(events[transitionIndex]?.fields).not.toHaveProperty("classification");
+		expect(internals.state).toBe("shutdown");
+		expect(internals.kernel).toBeUndefined();
+		expect(cleanup).toHaveBeenCalledTimes(1);
+		await manager.dispose();
+	});
+
+	it("does not turn an invalid direct child callback pair into a terminal observation", async () => {
+		const python = writeFakePython(["#!/bin/sh", "exec sleep 60", ""]);
+		const manager = new KernelManager({ python, cwd: tempDir });
+		const internals = manager as unknown as {
+			state: string;
+			kernel?: EventEmitter;
+			cleanupResources(): void;
+		};
+		const cleanup = vi.spyOn(internals, "cleanupResources");
+		const execution = manager.execute("x");
+		execution.catch(() => {});
+		await vi.waitFor(() => expect(internals.kernel).toBeDefined());
+
+		internals.kernel?.emit("exit", 0, "SIGTERM");
+		await expect(execution).rejects.toThrow(/Kernel exited before resolving ports/);
+
+		expect(
+			incidentRecorder.emitIncidentDerived.mock.calls.filter((call) => call[1] === "process_terminal_disposition"),
+		).toHaveLength(0);
+		const invalidCalls = incidentRecorder.emitIncidentDerived.mock.calls.filter(
+			(call) => call[1] === "process_terminal_observation_invalid",
+		);
+		expect(invalidCalls).toHaveLength(1);
+		expect(invalidCalls[0]?.[2]).toMatchObject({
+			classification: "authoritative_parent_wait_invalid",
+			origin: "node_callback",
+			role: "direct_kernel",
+			targetPid: expect.any(Number),
+			targetProcessStartId: expect.any(String),
+			code: 0,
+			signal: "SIGTERM",
+			reason: "ambiguous_pair",
+		});
+		const invalidIndex = incidentRecorder.emitIncidentDerived.mock.calls.indexOf(invalidCalls[0]);
+		const transitionIndex = incidentRecorder.emitIncidentDerived.mock.calls.findIndex(
+			(call) => call[1] === "kernel_shutdown_transition" && call[2].reason === "direct_child_exit",
+		);
+		expect(transitionIndex).toBeGreaterThan(invalidIndex);
+		expect(
+			incidentRecorder.emitIncidentDerived.mock.calls.filter(
+				(call) => call[1] === "kernel_shutdown_transition" && call[2].reason === "direct_child_exit",
+			),
+		).toHaveLength(1);
+		expect(internals.state).toBe("shutdown");
+		expect(cleanup).toHaveBeenCalledTimes(1);
+		await manager.dispose();
+	});
+
+	it.each(["accepted", "rejected", "full", "throw_terminal", "throw_transition"] as const)(
+		"keeps direct child exit cleanup and journal outcomes unchanged when the recorder is %s",
+		async (recorderMode) => {
+			const python = writeFakePython(["#!/bin/sh", "sleep 0.2", "exit 23", ""]);
+			const journalPath = join(tempDir, `orphans-${recorderMode}.jsonl`);
+			process.env[ORPHAN_PROCESS_JOURNAL_ENV] = journalPath;
+			const sessionId = `test-direct-exit-${recorderMode}`;
+			const manager = new KernelManager({ python, cwd: tempDir, sessionId });
+			const internals = manager as unknown as {
+				state: string;
+				kernel?: ChildProcess;
+				cleanupResources(): void;
+			};
+			const cleanup = vi.spyOn(internals, "cleanupResources");
+			const observedTypes: string[] = [];
+			incidentRecorder.emitIncidentDerived.mockImplementation((_source, type) => {
+				observedTypes.push(type);
+				if (recorderMode === "throw_terminal" && type === "process_terminal_disposition") {
+					throw new Error("synthetic terminal recorder throw");
+				}
+				if (recorderMode === "throw_transition" && type === "kernel_shutdown_transition") {
+					throw new Error("synthetic transition recorder throw");
+				}
+				if (recorderMode === "rejected") {
+					return { accepted: false, occurrenceId: "rejected", reason: "capture_not_configured" };
+				}
+				if (recorderMode === "full") {
+					return { accepted: false, occurrenceId: "full", reason: "bounded_queue_full" };
+				}
+				return { accepted: true, occurrenceId: "accepted" };
+			});
+
+			const execution = manager.execute("x");
+			execution.catch(() => {});
+			await vi.waitFor(() => expect(internals.kernel).toBeDefined());
+			const child = internals.kernel;
+			expect(child).toBeDefined();
+			const kill = vi.spyOn(child as ChildProcess, "kill");
+			await expect(execution).rejects.toThrow(/Kernel exited before resolving ports/);
+
+			const terminalIndex = observedTypes.indexOf("process_terminal_disposition");
+			const transitionIndex = observedTypes.indexOf("kernel_shutdown_transition");
+			expect(terminalIndex).toBeGreaterThanOrEqual(0);
+			expect(transitionIndex).toBeGreaterThan(terminalIndex);
+			expect(observedTypes.filter((type) => type === "process_terminal_disposition")).toHaveLength(1);
+			expect(observedTypes.filter((type) => type === "kernel_shutdown_transition")).toHaveLength(1);
+			expect(internals.state).toBe("shutdown");
+			expect(internals.kernel).toBeUndefined();
+			expect(cleanup).toHaveBeenCalledTimes(1);
+			expect(kill).toHaveBeenCalledTimes(1);
+			expect(kill).toHaveBeenCalledWith("SIGTERM");
+			expect(readJournalRecords(journalPath)).toEqual([
+				expect.objectContaining({ pid: child?.pid, ownerPid: process.pid, active: true }),
+			]);
+
+			const observedCountBeforeSessionCleanup = observedTypes.length;
+			cleanupSessionResources(sessionId);
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(observedTypes).toHaveLength(observedCountBeforeSessionCleanup);
+			expect(cleanup).toHaveBeenCalledTimes(1);
+
+			await expect(manager.dispose()).resolves.toBeUndefined();
+			expect(internals.state).toBe("shutdown");
+			expect(cleanup).toHaveBeenCalledTimes(2);
+			expect(kill).toHaveBeenCalledTimes(1);
+			expect(readJournalRecords(journalPath)).toHaveLength(1);
+		},
+	);
 
 	it("records connection and readiness failures before their existing startup cleanup", async () => {
 		const python = writeFakePython(["#!/bin/sh", "exec sleep 60", ""]);
