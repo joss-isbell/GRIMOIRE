@@ -12,12 +12,23 @@ import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { registerSessionResourceCleanup } from "@earendil-works/pi-ai";
+import { normalizeNodeExitCallback } from "../../modes/daemon/automatic-collapse-recorder-schema.js";
+import { emitIncidentDerived } from "../../modes/daemon/incident-recorder-writer.js";
 import { recordOrphanProcessState } from "../orphan-process-journal.js";
+import { getProcessStartId } from "../session-lease.js";
 import { FORK_SERVER_SCRIPT } from "./fork-server-script.js";
 
 const READY_TIMEOUT_MS = 30_000;
 const SPAWN_TIMEOUT_MS = 10_000;
 const STDERR_TAIL_MAX = 4096;
+
+function emitForkServerIncidentNoThrow(type: string, fields: Record<string, unknown>): void {
+	try {
+		emitIncidentDerived("recorder-events", type, fields);
+	} catch {
+		// Incident capture is observational and must never change forkserver lifecycle behavior.
+	}
+}
 
 // Vars the Python interpreter consumes at startup (before any user code runs), so
 // they can't be honored post-fork via os.environ.update — the forked child inherits
@@ -105,6 +116,8 @@ export class ForkServer {
 	// startup-env guard compares against THIS, not live process.env, so a later
 	// mutation of process.env can't make a stale template look compatible.
 	private readonly launchEnv: NodeJS.ProcessEnv;
+	private readonly workerPid = process.pid;
+	private readonly workerProcessStartId = getProcessStartId(this.workerPid);
 	private proc?: ChildProcess;
 	private server?: Server;
 	private conn?: Socket;
@@ -209,13 +222,20 @@ export class ForkServer {
 					env: this.launchEnv,
 					stdio: ["ignore", "ignore", "pipe"],
 				});
+				const forkserverPid = proc.pid;
+				const forkserverProcessStartId = forkserverPid === undefined ? undefined : getProcessStartId(forkserverPid);
 				this.proc = proc;
 				if (proc.pid !== undefined) recordOrphanProcessState(proc.pid, true);
 				proc.stderr?.on("data", (buf: Buffer) => {
 					this.stderrTail = `${this.stderrTail}${buf.toString()}`.slice(-STDERR_TAIL_MAX);
 				});
 				proc.on("error", () => this.markDead());
-				proc.on("exit", () => this.markDead());
+				proc.on("exit", (code, signal) => {
+					const exitCode = code;
+					const exitSignal = signal;
+					this.emitForkServerParentWaitObservation(exitCode, exitSignal, forkserverPid, forkserverProcessStartId);
+					this.markDead();
+				});
 			});
 		});
 	}
@@ -306,6 +326,42 @@ export class ForkServer {
 	async isChildAlive(forkId: number): Promise<boolean> {
 		const msg = await this.request({ alive: forkId });
 		return msg.alive === true;
+	}
+
+	private emitForkServerParentWaitObservation(
+		code: number | null,
+		signal: NodeJS.Signals | null,
+		forkserverPid: number | undefined,
+		forkserverProcessStartId: string | undefined,
+	): void {
+		const normalized = normalizeNodeExitCallback(code, signal);
+		if (normalized.kind === "invalid") {
+			emitForkServerIncidentNoThrow("process_terminal_observation_invalid", {
+				classification: "authoritative_parent_wait_invalid",
+				origin: "node_callback",
+				role: "forkserver",
+				forkserverPid,
+				forkserverProcessStartId,
+				code,
+				signal,
+				reason: normalized.reason,
+				workerPid: this.workerPid,
+				workerProcessStartId: this.workerProcessStartId,
+			});
+			return;
+		}
+		emitForkServerIncidentNoThrow("process_terminal_disposition", {
+			classification: "authoritative_parent_wait",
+			origin: "node_callback",
+			role: "forkserver",
+			forkserverPid,
+			forkserverProcessStartId,
+			code,
+			signal,
+			disposition: normalized.kind,
+			workerPid: this.workerPid,
+			workerProcessStartId: this.workerProcessStartId,
+		});
 	}
 
 	private withStderr(message: string): string {
