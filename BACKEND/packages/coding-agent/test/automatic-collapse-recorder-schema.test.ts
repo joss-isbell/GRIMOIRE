@@ -619,3 +619,186 @@ describe("T007-A adversarial repair regressions", () => {
 			});
 	});
 });
+
+describe("T007-A correlation container second repair regressions", () => {
+	function expectSingleInvalid(input: unknown, slot: "input" | "kernel" | "parent" | "application"): void {
+		const result = correlateTerminalEvidence(input);
+		expect(result).toMatchObject({ kind: "invalid_evidence", invalid: [{ slot }] });
+		if (result.kind !== "invalid_evidence") throw new Error(`expected invalid ${slot} evidence`);
+		expect(result.invalid).toHaveLength(1);
+		expect(result.invalid[0]?.errors.length).toBeGreaterThan(0);
+		expect(result.invalid[0]?.errors.length).toBeLessThanOrEqual(16);
+		for (const forbidden of ["disposition", "gap", "kernel", "parent"])
+			expect(Object.hasOwn(result, forbidden)).toBe(false);
+		expect(Object.isFrozen(result)).toBe(true);
+		expect(Object.isFrozen(result.invalid)).toBe(true);
+		expect(Object.isFrozen(result.invalid[0]!)).toBe(true);
+		expect(Object.isFrozen(result.invalid[0]!.errors)).toBe(true);
+	}
+
+	function isDeeplyFrozen(value: unknown, seen = new WeakSet<object>()): boolean {
+		if (value === null || typeof value !== "object") return true;
+		if (seen.has(value)) return true;
+		seen.add(value);
+		if (!Object.isFrozen(value)) return false;
+		for (const key of Reflect.ownKeys(value)) {
+			const descriptor = Reflect.getOwnPropertyDescriptor(value, key);
+			if (descriptor && Object.hasOwn(descriptor, "value") && !isDeeplyFrozen(descriptor.value, seen)) return false;
+		}
+		return true;
+	}
+
+	it("distinguishes absence from each own undefined slot, including beside terminal evidence", () => {
+		expect(correlateTerminalEvidence({})).toEqual({ kind: "no_terminal_claim" });
+
+		for (const [slot, input] of [
+			["kernel", { kernel: undefined }],
+			["parent", { parent: undefined }],
+			["application", { application: undefined }],
+		] as const)
+			expectSingleInvalid(input, slot);
+
+		for (const [slot, input] of [
+			["kernel", { kernel: undefined, parent: parentRaw() }],
+			["parent", { kernel: kernel(), parent: undefined }],
+			["application", { kernel: kernel(), application: undefined }],
+		] as const)
+			expectSingleInvalid(input, slot);
+	});
+
+	it("never invokes container accessors and guards every reflection exception", () => {
+		let getterCalls = 0;
+		const getterContainer = {};
+		Object.defineProperty(getterContainer, "kernel", {
+			enumerable: true,
+			get() {
+				getterCalls += 1;
+				return kernel();
+			},
+		});
+		expectSingleInvalid(getterContainer, "input");
+		expect(getterCalls).toBe(0);
+
+		const throwingGetterContainer = {};
+		Object.defineProperty(throwingGetterContainer, "kernel", {
+			enumerable: true,
+			get() {
+				getterCalls += 1;
+				throw new Error("container getter trap");
+			},
+		});
+		expectSingleInvalid(throwingGetterContainer, "input");
+		expect(getterCalls).toBe(0);
+
+		const reflectionFailures: unknown[] = [
+			new Proxy(
+				{},
+				{
+					getPrototypeOf() {
+						throw new Error("getPrototypeOf trap");
+					},
+				},
+			),
+			new Proxy(
+				{},
+				{
+					ownKeys() {
+						throw new Error("ownKeys trap");
+					},
+				},
+			),
+			new Proxy(
+				{ kernel: kernel() },
+				{
+					getOwnPropertyDescriptor() {
+						throw new Error("descriptor trap");
+					},
+				},
+			),
+		];
+		for (const input of reflectionFailures) expectSingleInvalid(input, "input");
+	});
+
+	it("rejects every malformed container and accepts an exact null-prototype record", () => {
+		const inheritedOnly = Object.create({ kernel: kernel() }) as unknown;
+		for (const input of [
+			null,
+			undefined,
+			false,
+			7,
+			"record",
+			Symbol("record"),
+			() => undefined,
+			[],
+			new Map(),
+			new Date(),
+			inheritedOnly,
+		])
+			expectSingleInvalid(input, "input");
+
+		const nonenumerable = {};
+		Object.defineProperty(nonenumerable, "kernel", { value: kernel(), enumerable: false });
+		expectSingleInvalid(nonenumerable, "input");
+
+		const symbolContainer = {} as Record<PropertyKey, unknown>;
+		symbolContainer[Symbol("secret")] = kernel();
+		expectSingleInvalid(symbolContainer, "input");
+		expectSingleInvalid({ kernel: kernel(), extra: "not allowed" }, "input");
+
+		const missingDescriptor = new Proxy(
+			{},
+			{
+				ownKeys() {
+					return ["kernel"];
+				},
+				getOwnPropertyDescriptor() {
+					return undefined;
+				},
+			},
+		);
+		expectSingleInvalid(missingDescriptor, "input");
+
+		const nullPrototype = Object.create(null) as { kernel?: unknown };
+		nullPrototype.kernel = kernel();
+		const accepted = correlateTerminalEvidence(nullPrototype);
+		expect(accepted).toMatchObject({
+			kind: "kernel_only",
+			disposition: { kind: "exited", exitCode: 23 },
+		});
+	});
+
+	it("uses one data descriptor snapshot without ordinary reads and returns detached frozen evidence", () => {
+		const original = kernel();
+		let ordinaryGetCalls = 0;
+		let kernelDescriptorCalls = 0;
+		const container = new Proxy(
+			{ kernel: original },
+			{
+				get() {
+					ordinaryGetCalls += 1;
+					throw new Error("ordinary container get trap");
+				},
+				getOwnPropertyDescriptor(target, property) {
+					if (property === "kernel") kernelDescriptorCalls += 1;
+					return Reflect.getOwnPropertyDescriptor(target, property);
+				},
+			},
+		);
+
+		const result = correlateTerminalEvidence(container);
+		expect(result).toMatchObject({
+			kind: "kernel_only",
+			disposition: { kind: "exited", exitCode: 23 },
+			kernel: { claim: { rawWaitWord: 5888 } },
+		});
+		expect(ordinaryGetCalls).toBe(0);
+		expect(kernelDescriptorCalls).toBe(1);
+		if (result.kind !== "kernel_only") throw new Error("expected a kernel-only result");
+		expect(result.kernel).not.toBe(original);
+		original.claim = { kind: "kernel_exit", groupDead: true, rawWaitWord: 9 };
+		original.processAnchor.linuxProcessKey.procStartTicks = "changed";
+		expect(result.kernel.claim).toMatchObject({ rawWaitWord: 5888 });
+		expect(result.kernel.processAnchor.linuxProcessKey.procStartTicks).toBe("987654321");
+		expect(isDeeplyFrozen(result)).toBe(true);
+	});
+});

@@ -856,7 +856,9 @@ function sameDisposition(left: TerminalDisposition, right: TerminalDisposition):
 	return left.coreDumped === "unknown" || right.coreDumped === "unknown" || left.coreDumped === right.coreDumped;
 }
 
-export type TerminalEvidenceSlot = "kernel" | "parent" | "application";
+type EvidenceTerminalSlot = "kernel" | "parent" | "application";
+
+export type TerminalEvidenceSlot = "input" | EvidenceTerminalSlot;
 
 export interface InvalidTerminalEvidence {
 	readonly slot: TerminalEvidenceSlot;
@@ -902,6 +904,17 @@ export interface TerminalCorrelationInput {
 	readonly application?: unknown;
 }
 
+interface CapturedCorrelationSlot {
+	readonly present: boolean;
+	readonly value: unknown;
+}
+
+interface CapturedCorrelationInput {
+	readonly kernel: CapturedCorrelationSlot;
+	readonly parent: CapturedCorrelationSlot;
+	readonly application: CapturedCorrelationSlot;
+}
+
 function freezeOutput<T>(value: T): T {
 	if (value === null || typeof value !== "object" || Object.isFrozen(value)) return value;
 	for (const key of Reflect.ownKeys(value)) {
@@ -911,12 +924,49 @@ function freezeOutput<T>(value: T): T {
 	return Object.freeze(value);
 }
 
+function captureCorrelationInput(input: unknown): CapturedCorrelationInput | undefined {
+	if (input === null || typeof input !== "object") return undefined;
+	try {
+		const prototype = Reflect.getPrototypeOf(input);
+		if (prototype !== Object.prototype && prototype !== null) return undefined;
+		const keys = Reflect.ownKeys(input);
+		if (keys.length > 3) return undefined;
+
+		let kernel: CapturedCorrelationSlot = { present: false, value: undefined };
+		let parent: CapturedCorrelationSlot = { present: false, value: undefined };
+		let application: CapturedCorrelationSlot = { present: false, value: undefined };
+		for (const key of keys) {
+			if (key !== "kernel" && key !== "parent" && key !== "application") return undefined;
+			const descriptor = Reflect.getOwnPropertyDescriptor(input, key);
+			if (!descriptor || descriptor.enumerable !== true || !Object.hasOwn(descriptor, "value")) return undefined;
+			const captured = { present: true, value: descriptor.value };
+			if (key === "kernel") kernel = captured;
+			else if (key === "parent") parent = captured;
+			else application = captured;
+		}
+		return { kernel, parent, application };
+	} catch {
+		return undefined;
+	}
+}
+
+function invalidCorrelationInput(): TerminalCorrelation {
+	return freezeOutput({
+		kind: "invalid_evidence",
+		invalid: [
+			{
+				slot: "input",
+				errors: ["$: correlation input must be a plain exact own-data record"],
+			},
+		],
+	});
+}
+
 function validateCorrelationSlot(
-	slot: TerminalEvidenceSlot,
+	slot: EvidenceTerminalSlot,
 	supplied: unknown,
 	expectedKind: AutomaticCollapseEvidenceClaim["kind"],
 ): { readonly value?: AutomaticCollapseEvidenceEnvelope; readonly invalid?: InvalidTerminalEvidence } {
-	if (supplied === undefined) return {};
 	const validated = validateAutomaticCollapseEvidence(supplied);
 	if (!validated.ok) {
 		return {
@@ -934,14 +984,18 @@ function validateCorrelationSlot(
 	return { value: validated.value };
 }
 
-export function correlateTerminalEvidence(input: TerminalCorrelationInput): TerminalCorrelation {
-	// Read each caller-owned slot once. All later work uses detached validation snapshots.
-	const suppliedKernel = input.kernel;
-	const suppliedParent = input.parent;
-	const suppliedApplication = input.application;
-	const kernelResult = validateCorrelationSlot("kernel", suppliedKernel, "kernel_exit");
-	const parentResult = validateCorrelationSlot("parent", suppliedParent, "parent_wait");
-	const applicationResult = validateCorrelationSlot("application", suppliedApplication, "application_transition");
+export function correlateTerminalEvidence(input: unknown): TerminalCorrelation {
+	const captured = captureCorrelationInput(input);
+	if (!captured) return invalidCorrelationInput();
+	const kernelResult = captured.kernel.present
+		? validateCorrelationSlot("kernel", captured.kernel.value, "kernel_exit")
+		: {};
+	const parentResult = captured.parent.present
+		? validateCorrelationSlot("parent", captured.parent.value, "parent_wait")
+		: {};
+	const applicationResult = captured.application.present
+		? validateCorrelationSlot("application", captured.application.value, "application_transition")
+		: {};
 	const invalid = [kernelResult.invalid, parentResult.invalid, applicationResult.invalid].filter(
 		(value): value is InvalidTerminalEvidence => value !== undefined,
 	);
