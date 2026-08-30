@@ -48,6 +48,7 @@ import {
 	type IncidentRecorderCompactorOptions,
 	type IncidentRecorderStorageMode,
 } from "./incident-recorder-compactor.js";
+import type { IncidentRecorderSegmentPruneCursor } from "./incident-recorder-segment-store.js";
 import {
 	INCIDENT_RECORDER_CHILD_ENV,
 	INCIDENT_RECORDER_RUN_DIR_ENV,
@@ -4044,6 +4045,13 @@ export async function runIncidentRecorderService(
 	signalSource.once("SIGTERM", onSigterm);
 	signalSource.once("SIGINT", onSigint);
 	let compactorRun: Promise<void> | undefined;
+	let hasCompactorError = false;
+	let firstCompactorError: unknown;
+	const retainCompactorError = (error: unknown): void => {
+		if (hasCompactorError) return;
+		hasCompactorError = true;
+		firstCompactorError = error;
+	};
 	try {
 		activeIncidentCompactor = compactor;
 		if (shutdown.signal.aborted) return;
@@ -4055,32 +4063,50 @@ export async function runIncidentRecorderService(
 		const readerReadyPromise = new Promise<void>((resolveReady) => {
 			resolveReaderReady = resolveReady;
 		});
-		let lastStorageStatus: string | undefined;
+		let readinessGateComplete = false;
+		let lastServiceStatus: string | undefined;
+		let lastRecoveryReason: string | undefined;
+		const announceNormalReady = (): void => {
+			if (!readinessGateComplete || lastServiceStatus === "Incident recorder ready") return;
+			if (!readyNotified) {
+				notify(["READY=1", "STATUS=Incident recorder ready"]);
+				readyNotified = true;
+			} else notify(["STATUS=Incident recorder ready"]);
+			lastServiceStatus = "Incident recorder ready";
+		};
 		const announceStorageMode = (mode: IncidentRecorderStorageMode, reason?: string): void => {
 			if (mode !== "recovery-only") {
-				if (lastStorageStatus !== undefined && readyNotified) notify(["STATUS=Incident recorder ready"]);
-				lastStorageStatus = undefined;
+				lastRecoveryReason = undefined;
+				announceNormalReady();
 				return;
 			}
+			lastRecoveryReason = reason;
 			const status = `Incident recorder recovery-only: ${reason ?? "storage_unavailable"}`;
-			if (status === lastStorageStatus) return;
-			lastStorageStatus = status;
+			if (status === lastServiceStatus) return;
 			if (!readyNotified) {
 				notify(["READY=1", `STATUS=${status}`]);
 				readyNotified = true;
 			} else notify([`STATUS=${status}`]);
+			lastServiceStatus = status;
 		};
 		compactorRun = compactor.run({
 			signal: shutdown.signal,
 			storageRecoveryCadenceMs: options.storageRecoveryCadenceMs,
 			onStorageMode: announceStorageMode,
 			onRecoveryPass: () => {
+				if (compactor.storageMode !== "recovery-only")
+					throw new Error("Incident recorder recovery maintenance requires a closed recovery-only compactor");
 				const retention = runIncidentRetentionPass({
 					agentDir,
 					nowMs: Date.now(),
 					recoveryOnly: true,
 					...INCIDENT_RETENTION_SERVICE_BUDGET,
 				});
+				// Recovery segment pruning remains fail-closed until the compactor-owned
+				// continuation can restart when this proof generation changes. This
+				// callback runs only after enterStorageRecovery has closed the store;
+				// the recorder service is the external writer-start exclusion owner.
+				if (retention.deletedEntries > 0) return false;
 				return retention.moreWork;
 			},
 			onReaderReady: () => {
@@ -4089,9 +4115,19 @@ export async function runIncidentRecorderService(
 				resolveReaderReady();
 			},
 		});
-		const monitoredCompactorRun = compactorRun.then(() => {
-			if (!shutdown.signal.aborted) throw new Error("Incident recorder compactor exited unexpectedly");
-		});
+		const monitoredCompactorRun = compactorRun.then(
+			() => {
+				if (!shutdown.signal.aborted) {
+					const error = new Error("Incident recorder compactor exited unexpectedly");
+					retainCompactorError(error);
+					throw error;
+				}
+			},
+			(error: unknown) => {
+				retainCompactorError(error);
+				throw error;
+			},
+		);
 		monitoredCompactorRun.catch(() => {});
 		await Promise.race([readerReadyPromise, monitoredCompactorRun]);
 		if (shutdown.signal.aborted) return;
@@ -4099,13 +4135,19 @@ export async function runIncidentRecorderService(
 		await Promise.race([inspectIncidentRecorderRuns(agentDir).then(() => undefined), monitoredCompactorRun]);
 		if (shutdown.signal.aborted) return;
 		if (!serviceWriter.journalReady) throw new Error("Incident recorder journal writer exited before readiness");
-		if (!readyNotified) {
-			notify(["READY=1", "STATUS=Incident recorder ready"]);
-			readyNotified = true;
-		} else notify(["STATUS=Incident recorder ready"]);
+		readinessGateComplete = true;
+		announceStorageMode(compactor.storageMode, lastRecoveryReason);
 
 		let nextRetentionPassMs = 0;
+		let segmentPruneState:
+			| {
+					generation: number;
+					fingerprint: string;
+					continuation?: IncidentRecorderSegmentPruneCursor;
+			  }
+			| undefined;
 		while (!shutdown.signal.aborted) {
+			let rerunRetentionImmediately = false;
 			try {
 				await inspectIncidentRecorderRuns(agentDir);
 				const nowMs = Date.now();
@@ -4134,16 +4176,53 @@ export async function runIncidentRecorderService(
 								scannedEntries: retention.scannedEntries,
 								deletedEntries: retention.deletedEntries,
 							});
-						if (retention.deletedEntries > 0) await compactor.initializeStorageAccounting(shutdown.signal);
+						if (retention.deletedEntries > 0) {
+							segmentPruneState = undefined;
+							rerunRetentionImmediately = true;
+							moreWork = true;
+							await compactor.initializeStorageAccounting(shutdown.signal);
+						} else if (
+							!compactor.diskPaused &&
+							!retention.pendingIncident &&
+							retention.segmentPruneProtection.state === "complete"
+						) {
+							const protection = retention.segmentPruneProtection;
+							if (
+								!segmentPruneState ||
+								segmentPruneState.generation !== protection.generation ||
+								segmentPruneState.fingerprint !== protection.fingerprint
+							)
+								segmentPruneState = {
+									generation: protection.generation,
+									fingerprint: protection.fingerprint,
+								};
+							const prune = compactor.pruneSegmentHistory(
+								nowMs,
+								protection,
+								segmentPruneState.continuation,
+							);
+							moreWork ||= prune.moreWork;
+							if (prune.moreWork && !prune.continuation) {
+								segmentPruneState = undefined;
+								throw new Error("Segment prune continuation was omitted while bounded work remains");
+							}
+							segmentPruneState.continuation = prune.moreWork ? prune.continuation : undefined;
+							if (prune.requiresFullReconciliation) {
+								segmentPruneState = undefined;
+								await compactor.initializeStorageAccounting(shutdown.signal);
+							}
+						} else segmentPruneState = undefined;
 					} finally {
-						nextRetentionPassMs =
-							nowMs + incidentRetentionNextDelayMs(moreWork, serviceInspectionCadenceMs(nowMs));
+						nextRetentionPassMs = rerunRetentionImmediately
+							? 0
+							: nowMs + incidentRetentionNextDelayMs(moreWork, serviceInspectionCadenceMs(nowMs));
 					}
 				}
 			} catch {
 				// A malformed or unavailable evidence source must not stop later recorder passes.
 			}
 			if (shutdown.signal.aborted) break;
+			if (rerunRetentionImmediately) continue;
 			await Promise.race([
 				monitoredCompactorRun,
 				stopRequested,
@@ -4157,8 +4236,8 @@ export async function runIncidentRecorderService(
 		if (compactorRun) {
 			try {
 				await compactorRun;
-			} catch {
-				// Preserve the error already propagating from the monitored compactor promise.
+			} catch (error) {
+				retainCompactorError(error);
 			}
 		}
 		if (activeServiceRecorder?.writer === serviceWriter) activeServiceRecorder = undefined;
@@ -4172,7 +4251,16 @@ export async function runIncidentRecorderService(
 		serviceRunPaths.clear();
 		serviceRunCursor = 0;
 		serviceSamplingRuns.clear();
-		await serviceWriter.stop(writerStopDeadlineMs);
+		let hasWriterStopError = false;
+		let writerStopError: unknown;
+		try {
+			await serviceWriter.stop(writerStopDeadlineMs);
+		} catch (error) {
+			hasWriterStopError = true;
+			writerStopError = error;
+		}
+		if (hasCompactorError) throw firstCompactorError;
+		if (hasWriterStopError) throw writerStopError;
 	}
 }
 
