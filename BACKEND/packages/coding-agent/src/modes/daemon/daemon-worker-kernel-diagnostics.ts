@@ -25,7 +25,7 @@ import {
 	DAEMON_WORKER_ID_ENV,
 } from "./daemon-worker-protocol.js";
 
-export interface DaemonWorkerKernelDiagnosticCorrelation {
+export interface DaemonWorkerKernelDiagnosticCorrelation extends Record<string, unknown> {
 	workerId: string;
 	rootActiveSessionId: string;
 	socketPath: string;

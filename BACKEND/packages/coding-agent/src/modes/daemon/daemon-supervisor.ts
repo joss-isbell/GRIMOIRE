@@ -2964,7 +2964,8 @@ export class DaemonSupervisor {
 			throw error;
 		}
 		let pipeDiagnosticSequence = 0;
-		const kernelDiagnosticPipe = child.stdio[WORKER_KERNEL_DIAGNOSTIC_FD];
+		const childStdio = child.stdio as ReadonlyArray<Readable | Writable | null | undefined>;
+		const kernelDiagnosticPipe = childStdio[WORKER_KERNEL_DIAGNOSTIC_FD];
 		const detachWorkerKernelDiagnostics =
 			kernelDiagnosticPipe instanceof Readable
 				? attachDaemonWorkerKernelDiagnosticCapture(kernelDiagnosticPipe, kernelDiagnosticCapability, {

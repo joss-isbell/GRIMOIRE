@@ -7,14 +7,19 @@ import {
 	mkdirSync,
 	mkdtempSync,
 	readFileSync,
+	renameSync,
 	rmSync,
 	symlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
-import { IncidentRecorderCompactor } from "../src/modes/daemon/incident-recorder-compactor.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+	IncidentRecorderCompactor,
+	type IncidentRecorderRunHistoryCursor,
+	type IncidentRecorderRunHistoryResult,
+} from "../src/modes/daemon/incident-recorder-compactor.js";
 import {
 	createIncidentRecorderSegmentPruneProtection,
 	IncidentRecorderSegmentStore,
@@ -158,6 +163,28 @@ function occurrenceInput(
 	};
 }
 
+function writeLegacyOccurrence(
+	target: ReturnType<typeof fixture>,
+	occurrence: ReturnType<typeof occurrenceInput>,
+	sequence: number,
+	payload: Record<string, unknown> = occurrence.payload,
+): { directory: string; path: string } {
+	const directory = join(
+		target.agentDir,
+		"incident-recorder",
+		"refs",
+		"runs",
+		createHash("sha256").update(RUN_ID).digest("hex"),
+	);
+	mkdirSync(directory, { recursive: true, mode: 0o700 });
+	const path = join(
+		directory,
+		`seq-${String(sequence).padStart(20, "0")}-${occurrence.identityKey}.json`,
+	);
+	writeFileSync(path, `${JSON.stringify(payload)}\n`, { mode: 0o600 });
+	return { directory, path };
+}
+
 function preparePinFixture(target: ReturnType<typeof fixture>, anchor: number): {
 	incidentDir: string;
 	digest: string;
@@ -199,6 +226,21 @@ function writeScanProof(incidentDir: string, anchor: number, cursors: string[]):
 		})}\n`,
 		{ mode: 0o600 },
 	);
+}
+
+function finishRunHistoryProjection(
+	compactor: IncidentRecorderCompactor,
+	request: { runId: string; fromWallTimeMs: number; throughWallTimeMs: number },
+	maximumPasses = 32,
+	initialCursor?: IncidentRecorderRunHistoryCursor,
+): IncidentRecorderRunHistoryResult {
+	let cursor = initialCursor;
+	for (let pass = 0; pass < maximumPasses; pass += 1) {
+		const result = compactor.projectRunHistory({ ...request, ...(cursor ? { cursor } : {}) });
+		if (result.state !== "pending") return result;
+		cursor = result.cursor;
+	}
+	throw new Error("run-history projection did not finish within its bounded test passes");
 }
 
 describe("incident recorder compactor segment integration", () => {
@@ -551,6 +593,323 @@ describe("incident recorder compactor segment integration", () => {
 			target.internal.closeSegmentStore();
 		},
 	);
+
+	it("projects a segment-only multipage history through an explicit pending continuation", async () => {
+		const target = fixture();
+		const anchor = Date.now();
+		const pin = preparePinFixture(target, anchor);
+		await initialize(target.compactor);
+		for (let index = 1; index <= 65; index += 1) {
+			target.internal.appendSegmentRecord(occurrenceInput(index, anchor, pin.digest, pin.casPath).input);
+		}
+		const request = { runId: RUN_ID, fromWallTimeMs: anchor, throughWallTimeMs: anchor + 1_000 };
+		const first = target.compactor.projectRunHistory(request);
+		expect(first.state).toBe("pending");
+		if (first.state !== "pending") throw new Error("expected a projection continuation");
+		expect(first.projection.events).toHaveLength(64);
+		const callerOwnedEvent = first.projection.events[0];
+		if (!callerOwnedEvent) throw new Error("expected a detached pending event");
+		callerOwnedEvent.metadata = { poisonedByCaller: true };
+		callerOwnedEvent.wrapperOrder[0] = "999999";
+		(callerOwnedEvent.transportIdentity as Record<string, unknown>).poisonedByCaller = true;
+		callerOwnedEvent.cas.path = "poisoned-by-caller";
+		if (typeof callerOwnedEvent.occurrenceReference !== "string") {
+			(callerOwnedEvent.occurrenceReference.locator as { payloadSha256: string }).payloadSha256 =
+				"0".repeat(64);
+		}
+		const late = occurrenceInput(66, anchor, pin.digest, pin.casPath);
+		target.internal.appendSegmentRecord(late.input);
+		const result = finishRunHistoryProjection(target.compactor, request, 16, first.cursor);
+		expect(result.state).toBe("complete");
+		if (result.state !== "complete") throw new Error("expected a complete projection");
+		expect(result.projection.events).toHaveLength(65);
+		expect(result.projection.events[0]?.eventWallTimeMs).toBe(String(anchor + 1));
+		expect(result.projection.events[0]?.metadata).toEqual({});
+		expect(result.projection.events[0]?.wrapperOrder).toEqual(["2"]);
+		expect(result.projection.events[0]?.transportIdentity).toEqual({});
+		expect(result.projection.events[0]?.cas.path).toBe(pin.casPath);
+		expect(result.projection.events.some((event) => event.identityKey === late.identityKey)).toBe(false);
+		expect(result.projection.events.at(-1)?.eventWallTimeMs).toBe(String(anchor + 65));
+		expect(result.projection.evidence).toEqual([]);
+		expect(result.snapshot).toMatchObject({ segmentRecordCount: 65, legacyOccurrenceCount: 0 });
+		target.internal.closeSegmentStore();
+	});
+
+	it("merges and semantically deduplicates matching v1 and v2 run history", async () => {
+		const target = fixture();
+		const anchor = Date.now();
+		const pin = preparePinFixture(target, anchor);
+		const occurrence = occurrenceInput(1, anchor, pin.digest, pin.casPath);
+		const legacyDirectory = join(
+			target.agentDir,
+			"incident-recorder",
+			"refs",
+			"runs",
+			createHash("sha256").update(RUN_ID).digest("hex"),
+		);
+		mkdirSync(legacyDirectory, { recursive: true, mode: 0o700 });
+		writeFileSync(
+			join(legacyDirectory, `seq-${"1".padStart(20, "0")}-${occurrence.identityKey}.json`),
+			`${JSON.stringify(occurrence.payload)}\n`,
+			{ mode: 0o600 },
+		);
+		await initialize(target.compactor);
+		target.internal.appendSegmentRecord(occurrence.input);
+		const result = finishRunHistoryProjection(target.compactor, {
+			runId: RUN_ID,
+			fromWallTimeMs: anchor,
+			throughWallTimeMs: anchor + 1_000,
+		});
+		expect(result.state).toBe("complete");
+		if (result.state !== "complete") throw new Error("expected a complete merged projection");
+		expect(result.projection.events).toHaveLength(1);
+		expect(result.snapshot).toMatchObject({ segmentRecordCount: 1, legacyOccurrenceCount: 1 });
+		target.internal.closeSegmentStore();
+	});
+
+	it("detects a conflicting legacy duplicate before applying the requested time window", async () => {
+		const target = fixture();
+		const anchor = Date.now();
+		const pin = preparePinFixture(target, anchor);
+		const occurrence = occurrenceInput(1, anchor, pin.digest, pin.casPath);
+		writeLegacyOccurrence(target, occurrence, 1, {
+			...occurrence.payload,
+			eventWallTimeMs: String(anchor + 2_000),
+		});
+		await initialize(target.compactor);
+		target.internal.appendSegmentRecord(occurrence.input);
+		const result = finishRunHistoryProjection(target.compactor, {
+			runId: RUN_ID,
+			fromWallTimeMs: anchor,
+			throughWallTimeMs: anchor + 1_000,
+		});
+		expect(result.state).toBe("incomplete");
+		if (result.state !== "incomplete") throw new Error("expected a semantic conflict");
+		expect(result.reason).toBe("run_history_duplicate_occurrence_semantic_conflict");
+		expect(result.projection.evidence[0]).toMatchObject({ kind: "corrupt" });
+		target.internal.closeSegmentStore();
+	});
+
+	it("fails a legacy projection when its canonical directory is swapped between bounded pages", async () => {
+		const target = fixture();
+		const anchor = Date.now();
+		const pin = preparePinFixture(target, anchor);
+		let legacyDirectory = "";
+		for (let index = 1; index <= 64; index += 1) {
+			legacyDirectory = writeLegacyOccurrence(
+				target,
+				occurrenceInput(index, anchor, pin.digest, pin.casPath),
+				index,
+			).directory;
+		}
+		await initialize(target.compactor);
+		const request = { runId: RUN_ID, fromWallTimeMs: anchor, throughWallTimeMs: anchor + 1_000 };
+		let result = target.compactor.projectRunHistory(request);
+		for (let pass = 0; pass < 8 && result.state === "pending" && result.projection.events.length < 64; pass += 1) {
+			result = target.compactor.projectRunHistory({ ...request, cursor: result.cursor });
+		}
+		expect(result.state).toBe("pending");
+		if (result.state !== "pending") throw new Error("expected a legacy directory continuation");
+		expect(result.projection.events).toHaveLength(64);
+		renameSync(legacyDirectory, `${legacyDirectory}.replaced`);
+		mkdirSync(legacyDirectory, { mode: 0o700 });
+		const resumed = target.compactor.projectRunHistory({ ...request, cursor: result.cursor });
+		expect(resumed.state).toBe("incomplete");
+		if (resumed.state !== "incomplete") throw new Error("expected a changed-directory projection");
+		expect(resumed.reason).toBe("run_history_legacy_snapshot_changed");
+		expect(resumed.projection.evidence[0]).toMatchObject({ kind: "corrupt" });
+		target.internal.closeSegmentStore();
+	});
+
+	it("sweeps abandoned projection cursors before capacity admission", async () => {
+		const target = fixture();
+		const anchor = Date.now();
+		await initialize(target.compactor);
+		const clock = vi.spyOn(Date, "now").mockReturnValue(anchor);
+		try {
+			for (let index = 0; index < 4; index += 1) {
+				const result = target.compactor.projectRunHistory({
+					runId: RUN_ID,
+					fromWallTimeMs: anchor,
+					throughWallTimeMs: anchor + 1_000,
+					deadlineMs: anchor + 10,
+				});
+				expect(result.state).toBe("pending");
+			}
+			clock.mockReturnValue(anchor + 20);
+			const admitted = target.compactor.projectRunHistory({
+				runId: RUN_ID,
+				fromWallTimeMs: anchor,
+				throughWallTimeMs: anchor + 1_000,
+				deadlineMs: anchor + 30,
+			});
+			expect(admitted.state).toBe("pending");
+			if (admitted.state === "pending") expect(target.compactor.cancelRunHistoryProjection(admitted.cursor)).toBe(true);
+		} finally {
+			clock.mockRestore();
+		}
+		target.internal.closeSegmentStore();
+	});
+
+	it("rejects invalid deadlines and supports explicit projection cancellation", async () => {
+		const target = fixture();
+		const anchor = Date.now();
+		await initialize(target.compactor);
+		expect(() =>
+			target.compactor.projectRunHistory({
+				runId: RUN_ID,
+				fromWallTimeMs: anchor,
+				throughWallTimeMs: anchor + 1_000,
+				deadlineMs: Number.NaN,
+			}),
+		).toThrow(/Invalid incident run-history projection request/);
+		const request = { runId: RUN_ID, fromWallTimeMs: anchor, throughWallTimeMs: anchor + 1_000 };
+		const first = target.compactor.projectRunHistory(request);
+		expect(first.state).toBe("pending");
+		if (first.state !== "pending") throw new Error("expected a cancellable projection");
+		expect(target.compactor.cancelRunHistoryProjection(first.cursor)).toBe(true);
+		expect(target.compactor.cancelRunHistoryProjection(first.cursor)).toBe(false);
+		const resumed = target.compactor.projectRunHistory({ ...request, cursor: first.cursor });
+		expect(resumed.state).toBe("incomplete");
+		if (resumed.state === "incomplete") {
+			expect(resumed.reason).toBe("run_history_continuation_missing_or_expired");
+		}
+		target.internal.closeSegmentStore();
+	});
+
+	it("never returns a serialized projection above its explicit byte bound", async () => {
+		const target = fixture();
+		const anchor = Date.now();
+		const pin = preparePinFixture(target, anchor);
+		const recordCount = 6_400;
+		for (let index = 1; index <= recordCount; index += 1) {
+			const occurrence = occurrenceInput(index, anchor, pin.digest, pin.casPath);
+			writeLegacyOccurrence(target, occurrence, index, {
+				...occurrence.payload,
+				eventMonotonicNs: "1",
+				wrapperOrder: ["1"],
+				producerOrder: ["1"],
+				cursors: ["c"],
+			});
+		}
+		await initialize(target.compactor);
+		const result = finishRunHistoryProjection(
+			target.compactor,
+			{
+				runId: RUN_ID,
+				fromWallTimeMs: anchor,
+				throughWallTimeMs: anchor + recordCount + 1,
+			},
+			160,
+		);
+		expect(result.state).toBe("incomplete");
+		if (result.state !== "incomplete") throw new Error("expected explicit returned-result truncation");
+		expect(result.reason).toBe("run_history_projection_serialized_bound_exceeded");
+		expect(result.projection.evidence).toEqual([
+			{
+				kind: "truncated",
+				reason: "serialized_projection_result_exceeded_explicit_byte_bound",
+			},
+		]);
+		expect(Buffer.byteLength(JSON.stringify(result) ?? "", "utf8")).toBeLessThanOrEqual(8 * 1024 * 1024);
+		target.internal.closeSegmentStore();
+	});
+
+	it("turns a pruned segment projection snapshot into explicit incomplete evidence", async () => {
+		const target = fixture();
+		const anchor = Date.now();
+		const pin = preparePinFixture(target, anchor);
+		await initialize(target.compactor);
+		for (let index = 1; index <= 64; index += 1) {
+			target.internal.appendSegmentRecord(occurrenceInput(index, anchor, pin.digest, pin.casPath).input);
+		}
+		target.internal.segmentStore?.seal("projection-first-generation");
+		target.internal.appendSegmentRecord(occurrenceInput(65, anchor, pin.digest, pin.casPath).input);
+		target.internal.segmentStore?.seal("projection-anchor");
+		const request = { runId: RUN_ID, fromWallTimeMs: anchor, throughWallTimeMs: anchor + 1_000 };
+		const first = target.compactor.projectRunHistory(request);
+		expect(first.state).toBe("pending");
+		if (first.state !== "pending") throw new Error("expected a projection continuation");
+		target.compactor.pruneSegmentHistory(
+			anchor + 4 * DAY,
+			createIncidentRecorderSegmentPruneProtection(0, []),
+		);
+		const resumed = target.compactor.projectRunHistory({ ...request, cursor: first.cursor });
+		expect(resumed.state).toBe("incomplete");
+		if (resumed.state !== "incomplete") throw new Error("expected an incomplete stale projection");
+		expect(resumed.reason).toBe("run_history_segment_snapshot_stale_or_corrupt");
+		expect(resumed.projection.evidence[0]).toMatchObject({ kind: "corrupt" });
+		target.internal.closeSegmentStore();
+	});
+
+	it.each(["gap", "corrupt-legacy"] as const)(
+		"never completes a run history containing %s evidence",
+		async (kind) => {
+			const target = fixture();
+			const anchor = Date.now();
+			await initialize(target.compactor);
+			if (kind === "gap") {
+				target.internal.appendSegmentRecord({
+					idempotencyKey: "gap:projection-gap",
+					runId: RUN_ID,
+					sourceId: "gap",
+					observedAtMs: anchor,
+					order: "1",
+					metadata: { reason: "projection-test-gap" },
+					payload: Buffer.from('{"reason":"projection-test-gap"}\n'),
+				});
+			} else {
+				const identity = occurrenceIdentity(1);
+				const legacyDirectory = join(
+					target.agentDir,
+					"incident-recorder",
+					"refs",
+					"runs",
+					createHash("sha256").update(RUN_ID).digest("hex"),
+				);
+				mkdirSync(legacyDirectory, { recursive: true, mode: 0o700 });
+				writeFileSync(
+					join(legacyDirectory, `seq-${"1".padStart(20, "0")}-${identity.identityKey}.json`),
+					"{truncated",
+					{ mode: 0o600 },
+				);
+			}
+			const result = finishRunHistoryProjection(target.compactor, {
+				runId: RUN_ID,
+				fromWallTimeMs: anchor,
+				throughWallTimeMs: anchor + 1_000,
+			});
+			expect(result.state).toBe("incomplete");
+			if (result.state !== "incomplete") throw new Error("expected explicit loss evidence");
+			expect(result.projection.evidence[0]?.kind).toBe(kind === "gap" ? "gap" : "corrupt");
+			target.internal.closeSegmentStore();
+		},
+	);
+
+	it("retains ordered terminal facts as explicit finalization barriers", async () => {
+		const target = fixture();
+		const anchor = Date.now();
+		const pin = preparePinFixture(target, anchor);
+		await initialize(target.compactor);
+		target.internal.appendSegmentRecord(occurrenceInput(1, anchor, pin.digest, pin.casPath).input);
+		const result = finishRunHistoryProjection(target.compactor, {
+			runId: RUN_ID,
+			fromWallTimeMs: anchor,
+			throughWallTimeMs: anchor + 1_000,
+		});
+		expect(result.state).toBe("complete");
+		if (result.state !== "complete") throw new Error("expected terminal projection completion");
+		expect(result.projection.events[0]).toMatchObject({
+			type: "kernel_unexpected_exit",
+			terminal: true,
+		});
+		expect(result.projection.terminalEvents).toEqual(result.projection.finalizationBarriers);
+		expect(result.projection.finalizationBarriers[0]).toMatchObject({
+			type: "kernel_unexpected_exit",
+			basis: "terminal_flag",
+		});
+		target.internal.closeSegmentStore();
+	});
 
 	it("turns a pruned query snapshot into explicit incomplete evidence instead of a partial manifest", async () => {
 		const target = fixture();

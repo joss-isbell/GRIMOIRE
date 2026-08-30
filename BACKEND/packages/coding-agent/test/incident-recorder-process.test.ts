@@ -186,27 +186,28 @@ describe("incident recorder isolated fault evidence", () => {
 			{ mode: 0o600 },
 		);
 
-    const result = await record(target);
-    expect(result.classification).not.toBe("normal");
-    const incidentDir = finalizeIncidentRecorderRun(
-      {
-        agentDir: target.agentDir,
-        socketPath: target.socketPath,
-        launch: {
-          command: process.execPath,
-          args: [target.script],
-          cwd: target.root,
-        },
-      },
-      result.runDir,
-      {
-        code: result.code,
-        signal: result.signal,
-        classification: result.classification,
-      },
-    );
-    expect(incidentDir).toBeDefined();
-    const manifestPath = join(incidentDir, "raw-manifest.json");
+		const result = await record(target);
+		expect(result.classification).not.toBe("normal");
+		const incidentDir = finalizeIncidentRecorderRun(
+			{
+				agentDir: target.agentDir,
+				socketPath: target.socketPath,
+				launch: {
+					command: process.execPath,
+					args: [target.script],
+				},
+				cwd: target.root,
+			},
+			result.runDir,
+			{
+				code: result.code,
+				signal: result.signal,
+				classification: result.classification,
+			},
+		);
+		expect(incidentDir).toBeDefined();
+		if (!incidentDir) throw new Error("incident finalization did not produce an artifact directory");
+		const manifestPath = join(incidentDir, "raw-manifest.json");
 		const manifest = readFileSync(manifestPath, "utf8");
 		expect(manifest).toContain("worker.json");
 		const forbidden = [

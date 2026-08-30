@@ -126,8 +126,9 @@ describe("daemon worker kernel diagnostic bridge", () => {
 			},
 			stdio: ["ignore", "pipe", "pipe", "pipe", "ignore", "ignore", "pipe"],
 		});
-		const startupGate = child.stdio[3];
-		const diagnosticPipe = child.stdio[6];
+		const childStdio = child.stdio as ReadonlyArray<Readable | Writable | null | undefined>;
+		const startupGate = childStdio[3];
+		const diagnosticPipe = childStdio[6];
 		expect(startupGate).toBeInstanceOf(Writable);
 		expect(diagnosticPipe).toBeInstanceOf(Readable);
 		const capture = captureSinks();

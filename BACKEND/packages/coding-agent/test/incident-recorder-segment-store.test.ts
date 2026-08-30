@@ -1,9 +1,11 @@
 import { createHash } from "node:crypto";
 import {
 	appendFileSync,
+	chmodSync,
 	closeSync,
 	existsSync,
 	lstatSync,
+	mkdirSync,
 	mkdtempSync,
 	openSync,
 	readSync,
@@ -881,6 +883,8 @@ describe("incident recorder segment store", () => {
 				payload: Buffer.from("record-" + String(index)),
 			});
 		}
+		const readSnapshot = target.store.createReadSnapshot();
+		expect(Object.isFrozen(readSnapshot)).toBe(true);
 		const first = target.store.queryRunWindowPage({
 			runId: "paged",
 			sourceId: "kernel",
@@ -888,6 +892,7 @@ describe("incident recorder segment store", () => {
 			throughObservedAtMs: 10,
 			maxRecords: 1,
 			maxBytes: 1024,
+			readSnapshot,
 		});
 		expect(first.records.map((record) => record.order)).toEqual(["1"]);
 		expect(first.complete).toBe(false);
@@ -912,6 +917,7 @@ describe("incident recorder segment store", () => {
 				throughObservedAtMs: 10,
 				maxRecords: 1,
 				maxBytes: 1024,
+				readSnapshot,
 				after: cursor,
 			});
 			observed.push(...page.records);
@@ -920,6 +926,17 @@ describe("incident recorder segment store", () => {
 		}
 		expect(observed.map((record) => record.order)).toEqual(["1", "3", "5"]);
 		expect(new Set(observed.map((record) => `${record.locator.segmentSequence}:${record.locator.ordinal}`)).size).toBe(3);
+		const otherFilter = target.store.queryRunWindowPage({
+			runId: "paged",
+			sourceId: "daemon",
+			fromObservedAtMs: 0,
+			throughObservedAtMs: 10,
+			maxRecords: 3,
+			maxBytes: 4 * 1024,
+			readSnapshot,
+		});
+		expect(otherFilter.complete).toBe(true);
+		expect(otherFilter.records.map((record) => record.order)).toEqual(["0", "2", "4"]);
 
 		const staleFirst = target.store.queryRunWindowPage({
 			runId: "paged",
@@ -947,6 +964,7 @@ describe("incident recorder segment store", () => {
 				after: staleFirst.nextCursor!,
 			}),
 		).toThrow(/snapshot is stale.*restart required/);
+		expect(() => target.store.assertReadSnapshotUsable(readSnapshot)).toThrow(/snapshot is stale.*restart required/);
 		target.store.close();
 	});
 
@@ -1624,6 +1642,7 @@ describe("incident recorder segment store", () => {
 		const plan = planIncidentRecorderSegmentStoreOpen(directory);
 		expect(existsSync(directory)).toBe(false);
 		expect(plan).toMatchObject({ peakAdditionalEntries: 5, peakAdditionalInodes: 4 });
+		mkdtempSync(join(parent, "unrelated-sibling-"));
 		const results: Array<{
 			phase: string;
 			complete: boolean;
@@ -1671,6 +1690,41 @@ describe("incident recorder segment store", () => {
 			}),
 		).toThrow(/admission denied/);
 		expect(existsSync(blockedDirectory)).toBe(false);
+
+		const existingDirectory = join(parent, "existing-store");
+		const existingStore = new IncidentRecorderSegmentStore({ directory: existingDirectory });
+		existingStore.close();
+		const existingPlan = planIncidentRecorderSegmentStoreOpen(existingDirectory);
+		mkdtempSync(join(parent, "another-unrelated-sibling-"));
+		const reopenedExisting = new IncidentRecorderSegmentStore({
+			directory: existingDirectory,
+			openPlan: existingPlan,
+		});
+		reopenedExisting.close();
+
+		const changedDirectory = join(parent, "changed-after-plan");
+		const changedPlan = planIncidentRecorderSegmentStoreOpen(changedDirectory);
+		mkdirSync(changedDirectory, { mode: 0o700 });
+		expect(
+			() => new IncidentRecorderSegmentStore({ directory: changedDirectory, openPlan: changedPlan }),
+		).toThrow(/open plan is stale/);
+
+		const parentMode = lstatSync(parent).mode & 0o777;
+		const admissionChangedDirectory = join(parent, "parent-changed-during-admission");
+		const admissionChangedPlan = planIncidentRecorderSegmentStoreOpen(admissionChangedDirectory);
+		try {
+			expect(
+				() =>
+					new IncidentRecorderSegmentStore({
+						directory: admissionChangedDirectory,
+						openPlan: admissionChangedPlan,
+						onOpenAdmission: () => chmodSync(parent, parentMode === 0o711 ? 0o700 : 0o711),
+					}),
+			).toThrow(/open state changed during admission/);
+			expect(existsSync(admissionChangedDirectory)).toBe(false);
+		} finally {
+			chmodSync(parent, parentMode);
+		}
 	});
 
 	it("requires a full dev/inode reconciliation after successful stale owner and temporary cleanup", () => {

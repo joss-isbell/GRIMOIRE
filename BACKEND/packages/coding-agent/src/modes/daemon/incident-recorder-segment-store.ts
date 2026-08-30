@@ -144,8 +144,21 @@ export interface IncidentRecorderSegmentQuerySnapshot {
 	filterSha256: string;
 }
 
+/**
+ * A filter-independent, immutable view of the records that existed when it was
+ * created. Callers may reuse it across differently filtered page queries.
+ */
+export interface IncidentRecorderSegmentReadSnapshot {
+	readonly version: 1;
+	readonly id: string;
+	readonly generation: number;
+	readonly highWaterSegmentSequence: number;
+	readonly highWaterOrdinal: number;
+}
+
 export interface IncidentRecorderSegmentPageQuery extends IncidentRecorderSegmentQuery {
 	after?: IncidentRecorderSegmentQueryCursor;
+	readSnapshot?: IncidentRecorderSegmentReadSnapshot;
 	maxRecords?: number;
 	maxBytes?: number;
 }
@@ -486,7 +499,7 @@ function sha256(value: Uint8Array): string {
 }
 
 function pruneProtectionFingerprint(generation: number, protectedRunIds: readonly string[]): string {
-	return sha256(Buffer.from(canonicalJson({ generation, protectedRunIds }), "utf8"));
+	return sha256(Buffer.from(canonicalJson({ generation, protectedRunIds: [...protectedRunIds] }), "utf8"));
 }
 
 const PROTECTION_MAX_ENTRIES = 65_536;
@@ -1371,17 +1384,19 @@ function ownerClaimsEqual(left: OwnerClaim, right: OwnerClaim): boolean {
 
 const OPEN_PLAN_TOKENS = new Set<string>();
 
-function openPathFingerprint(path: string): string {
+function openPathFingerprint(path: string, identityOnly = false): string {
 	const status = pathStatus(path);
 	if (!status) return "missing";
 	const bigintStatus = lstatSync(path, { bigint: true });
-	return [
+	const identity = [
 		bigintStatus.dev.toString(),
 		bigintStatus.ino.toString(),
 		bigintStatus.mode.toString(),
-		bigintStatus.size.toString(),
-		bigintStatus.mtimeNs.toString(),
-	].join(":");
+	];
+	return (identityOnly
+		? identity
+		: [...identity, bigintStatus.size.toString(), bigintStatus.mtimeNs.toString()]
+	).join(":");
 }
 
 function openStateFingerprint(directory: string): string {
@@ -1389,7 +1404,9 @@ function openStateFingerprint(directory: string): string {
 		Buffer.from(
 			[
 				directory,
-				openPathFingerprint(dirname(directory)),
+				// Sibling churn must not invalidate a plan, but replacing or
+				// changing the type/mode of the parent still must.
+				openPathFingerprint(dirname(directory), true),
 				openPathFingerprint(directory),
 				openPathFingerprint(join(directory, "active")),
 				openPathFingerprint(join(directory, "sealed")),
@@ -2979,6 +2996,51 @@ export class IncidentRecorderSegmentStore {
 		};
 	}
 
+	createReadSnapshot(): IncidentRecorderSegmentReadSnapshot {
+		this.#assertUsable();
+		let highWaterSegmentSequence = 0;
+		let highWaterOrdinal = 0;
+		const consider = (segmentSequence: number, ordinal: number): void => {
+			if (
+				segmentSequence > highWaterSegmentSequence ||
+				(segmentSequence === highWaterSegmentSequence && ordinal > highWaterOrdinal)
+			) {
+				highWaterSegmentSequence = segmentSequence;
+				highWaterOrdinal = ordinal;
+			}
+		};
+		for (const summary of this.#sealed) {
+			consider(summary.header.segmentSequence, summary.footer.recordCount + summary.footer.gapCount);
+		}
+		for (const corrupt of this.#corrupt) {
+			if (corrupt.summary) {
+				consider(
+					corrupt.summary.header.segmentSequence,
+					corrupt.summary.footer.recordCount + corrupt.summary.footer.gapCount,
+				);
+			}
+		}
+		if (this.#active) consider(this.#active.header.segmentSequence, this.#active.nextOrdinal - 1);
+		return Object.freeze({
+			version: 1 as const,
+			id: this.#instanceId,
+			generation: this.#generation,
+			highWaterSegmentSequence,
+			highWaterOrdinal,
+		});
+	}
+
+	assertReadSnapshotUsable(snapshot: IncidentRecorderSegmentReadSnapshot): void {
+		this.#assertUsable();
+		if (snapshot.version !== 1) throw new Error("segment read snapshot version is unsupported");
+		assertSafeNonNegativeInteger(snapshot.generation, "segment read snapshot generation");
+		assertSafeNonNegativeInteger(snapshot.highWaterSegmentSequence, "segment read snapshot segment sequence");
+		assertSafeNonNegativeInteger(snapshot.highWaterOrdinal, "segment read snapshot ordinal");
+		if (snapshot.id !== this.#instanceId || snapshot.generation !== this.#generation) {
+			throw new Error("segment read snapshot is stale; restart required");
+		}
+	}
+
 	queryRunWindowPage(query: IncidentRecorderSegmentPageQuery): IncidentRecorderSegmentQueryPage {
 		this.#assertUsable();
 		assertIdentifier(query.runId, "query runId");
@@ -2999,11 +3061,25 @@ export class IncidentRecorderSegmentStore {
 		);
 		const pageMaxRecords = positiveInteger(query.maxRecords, this.#maxQueryRecords, "page maxRecords", this.#maxQueryRecords);
 		const pageMaxBytes = positiveInteger(query.maxBytes, this.#maxQueryBytes, "page maxBytes", this.#maxQueryBytes);
+		const readSnapshot: IncidentRecorderSegmentReadSnapshot = query.readSnapshot
+			? query.readSnapshot
+			: query.after
+				? {
+						version: 1,
+						id: query.after.snapshotId,
+						generation: query.after.generation,
+						highWaterSegmentSequence: query.after.highWaterSegmentSequence,
+						highWaterOrdinal: query.after.highWaterOrdinal,
+					}
+				: this.createReadSnapshot();
+		this.assertReadSnapshotUsable(readSnapshot);
 		if (query.after) {
 			if (query.after.version !== 1) throw new Error("query cursor version is unsupported");
 			if (
-				query.after.snapshotId !== this.#instanceId ||
-				query.after.generation !== this.#generation ||
+				query.after.snapshotId !== readSnapshot.id ||
+				query.after.generation !== readSnapshot.generation ||
+				query.after.highWaterSegmentSequence !== readSnapshot.highWaterSegmentSequence ||
+				query.after.highWaterOrdinal !== readSnapshot.highWaterOrdinal ||
 				query.after.filterSha256 !== filterSha256
 			) {
 				throw new Error("query snapshot is stale or does not match the frozen filter; restart required");
@@ -3011,38 +3087,12 @@ export class IncidentRecorderSegmentStore {
 			assertSafeNonNegativeInteger(query.after.segmentSequence, "query cursor segment sequence");
 			assertSafeNonNegativeInteger(query.after.ordinal, "query cursor ordinal");
 		}
-		let highWaterSegmentSequence = 0;
-		let highWaterOrdinal = 0;
-		const considerHighWater = (segmentSequence: number, ordinal: number): void => {
-			if (
-				segmentSequence > highWaterSegmentSequence ||
-				(segmentSequence === highWaterSegmentSequence && ordinal > highWaterOrdinal)
-			) {
-				highWaterSegmentSequence = segmentSequence;
-				highWaterOrdinal = ordinal;
-			}
-		};
-		if (query.after) {
-			highWaterSegmentSequence = query.after.highWaterSegmentSequence;
-			highWaterOrdinal = query.after.highWaterOrdinal;
-		} else {
-			for (const summary of this.#sealed) {
-				considerHighWater(summary.header.segmentSequence, summary.footer.recordCount + summary.footer.gapCount);
-			}
-			for (const corrupt of this.#corrupt) {
-				if (corrupt.summary) {
-					considerHighWater(
-						corrupt.summary.header.segmentSequence,
-						corrupt.summary.footer.recordCount + corrupt.summary.footer.gapCount,
-					);
-				}
-			}
-			if (this.#active) considerHighWater(this.#active.header.segmentSequence, this.#active.nextOrdinal - 1);
-		}
+		const highWaterSegmentSequence = readSnapshot.highWaterSegmentSequence;
+		const highWaterOrdinal = readSnapshot.highWaterOrdinal;
 		const snapshot: IncidentRecorderSegmentQuerySnapshot = {
 			version: 1,
-			id: this.#instanceId,
-			generation: this.#generation,
+			id: readSnapshot.id,
+			generation: readSnapshot.generation,
 			highWaterSegmentSequence,
 			highWaterOrdinal,
 			filterSha256,
@@ -3258,8 +3308,8 @@ export class IncidentRecorderSegmentStore {
 					sealedBeforeMs: input.sealedBeforeMs,
 					protectionGeneration: protection.generation,
 					protectionFingerprint: protection.fingerprint,
-					protectedRunIds: protection.protectedRunIds,
-					protectedSegmentIds: protectedSegments.sorted,
+					protectedRunIds: [...protection.protectedRunIds],
+					protectedSegmentIds: [...protectedSegments.sorted],
 				}),
 				"utf8",
 			),
@@ -3655,8 +3705,8 @@ export function pruneIncidentRecorderSealedHistoryForRecovery(
 				sealedBeforeMs: options.sealedBeforeMs,
 				protectionGeneration: protection.generation,
 				protectionFingerprint: protection.fingerprint,
-				protectedRunIds: protection.protectedRunIds,
-				protectedSegmentIds: protectedSegments.sorted,
+				protectedRunIds: [...protection.protectedRunIds],
+				protectedSegmentIds: [...protectedSegments.sorted],
 			}),
 			"utf8",
 		),

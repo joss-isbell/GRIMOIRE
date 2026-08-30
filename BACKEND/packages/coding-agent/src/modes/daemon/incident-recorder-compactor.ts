@@ -46,6 +46,7 @@ import {
 	type IncidentRecorderSegmentPruneCursor,
 	type IncidentRecorderSegmentPruneResult,
 	type IncidentRecorderSegmentQueryCursor,
+	type IncidentRecorderSegmentReadSnapshot,
 	type IncidentRecorderSegmentRecord,
 } from "./incident-recorder-segment-store.js";
 import {
@@ -105,6 +106,7 @@ const SEGMENT_QUERY_PAGE_RECORDS = 64;
 const SEGMENT_QUERY_PAGE_BYTES = 8 * 1024 * 1024;
 const SEGMENT_PRUNE_MAX_SEGMENTS = 16;
 const SEGMENT_PRUNE_MAX_BYTES = 128 * 1024 * 1024;
+const RUN_HISTORY_RESULT_MAX_BYTES = 8 * 1024 * 1024;
 
 type JournalFields = Readonly<Record<string, Buffer>>;
 
@@ -161,12 +163,167 @@ interface PinTraversal {
 	pinCasDir?: string;
 }
 
-interface SegmentOccurrenceReference {
+export interface SegmentOccurrenceReference {
 	kind: "segment";
 	locator: IncidentRecorderSegmentLocator;
 }
 
-type JournalOccurrenceReference = string | SegmentOccurrenceReference;
+export type JournalOccurrenceReference = string | SegmentOccurrenceReference;
+
+export interface IncidentRecorderRunHistoryEvent {
+	identityKey: string;
+	semanticFingerprint: string;
+	occurrenceReference: JournalOccurrenceReference;
+	source: string;
+	type: string;
+	encoding: string;
+	payloadKind: "exact-bytes" | "derived-scalar" | "loss" | "control";
+	terminal: boolean;
+	metadata: IncidentJournalLine["metadata"];
+	eventWallTimeMs: string;
+	eventMonotonicNs: string;
+	wrapperOrder: string[];
+	producerOrder: string[];
+	cursors: string[];
+	transportIdentity: Readonly<Record<string, unknown>>;
+	cas: { digest: string; bytes: number; path: string };
+}
+
+export interface IncidentRecorderRunHistoryEvidence {
+	kind: "gap" | "incomplete" | "corrupt" | "truncated";
+	reason: string;
+	reference?: JournalOccurrenceReference | IncidentRecorderSegmentLocator;
+}
+
+export interface IncidentRecorderRunHistoryProjection {
+	version: 1;
+	runId: string;
+	fromWallTimeMs: number;
+	throughWallTimeMs: number;
+	events: IncidentRecorderRunHistoryEvent[];
+	terminalEvents: Array<{
+		identityKey: string;
+		type: string;
+		source: string;
+		eventWallTimeMs: string;
+		basis: "terminal_flag";
+	}>;
+	finalizationBarriers: Array<{
+		identityKey: string;
+		type: string;
+		source: string;
+		eventWallTimeMs: string;
+		basis: "terminal_flag";
+	}>;
+	evidence: IncidentRecorderRunHistoryEvidence[];
+}
+
+export interface IncidentRecorderRunHistoryCursor {
+	version: 1;
+	token: string;
+	requestFingerprint: string;
+}
+
+export interface IncidentRecorderRunHistorySnapshot {
+	version: 1;
+	fingerprint: string;
+	segmentRecordCount: number;
+	legacyOccurrenceCount: number;
+}
+
+export type IncidentRecorderRunHistoryResult =
+	| {
+			state: "pending";
+			cursor: IncidentRecorderRunHistoryCursor;
+			projection: IncidentRecorderRunHistoryProjection;
+	  }
+	| {
+			state: "complete";
+			projection: IncidentRecorderRunHistoryProjection;
+			snapshot: IncidentRecorderRunHistorySnapshot;
+	  }
+	| {
+			state: "incomplete";
+			reason: string;
+			projection: IncidentRecorderRunHistoryProjection;
+	  };
+
+interface StableFilesystemIdentity {
+	dev: bigint;
+	ino: bigint;
+	mode: bigint;
+	nlink: bigint;
+	size: bigint;
+	mtimeNs: bigint;
+	ctimeNs: bigint;
+}
+
+interface RunHistoryTraversal {
+	token: string;
+	requestFingerprint: string;
+	runId: string;
+	fromWallTimeMs: number;
+	throughWallTimeMs: number;
+	deadlineMs: number;
+	phase: "segment-occurrences" | "segment-run-gaps" | "segment-run-incomplete" | "segment-global-gaps" | "legacy";
+	segmentReadSnapshot?: IncidentRecorderSegmentReadSnapshot;
+	segmentCursor?: IncidentRecorderSegmentQueryCursor;
+	segmentRecordCount: number;
+	legacyOccurrenceCount: number;
+	legacyEntriesScanned: number;
+	legacyBytesRead: number;
+	directory?: ReturnType<typeof opendirSync>;
+	legacyDirectoryPath?: string;
+	legacyDirectoryDescriptor?: number;
+	legacyDirectoryIdentity?: StableFilesystemIdentity;
+	legacyNamespacePath?: string;
+	legacyNamespaceDescriptor?: number;
+	legacyNamespaceIdentity?: StableFilesystemIdentity;
+	semanticFingerprints: Map<string, string>;
+	events: Map<string, IncidentRecorderRunHistoryEvent>;
+	memoryBytes: number;
+	evidence: IncidentRecorderRunHistoryEvidence[];
+	snapshotFacts: string[];
+}
+
+function stableFilesystemIdentity(stats: BigIntStats): StableFilesystemIdentity {
+	return {
+		dev: stats.dev,
+		ino: stats.ino,
+		mode: stats.mode,
+		nlink: stats.nlink,
+		size: stats.size,
+		mtimeNs: stats.mtimeNs,
+		ctimeNs: stats.ctimeNs,
+	};
+}
+
+function sameStableFilesystemIdentity(
+	left: StableFilesystemIdentity,
+	right: StableFilesystemIdentity,
+): boolean {
+	return (
+		left.dev === right.dev &&
+		left.ino === right.ino &&
+		left.mode === right.mode &&
+		left.nlink === right.nlink &&
+		left.size === right.size &&
+		left.mtimeNs === right.mtimeNs &&
+		left.ctimeNs === right.ctimeNs
+	);
+}
+
+function serializableFilesystemIdentity(identity: StableFilesystemIdentity): Record<string, string> {
+	return {
+		dev: identity.dev.toString(),
+		ino: identity.ino.toString(),
+		mode: identity.mode.toString(),
+		nlink: identity.nlink.toString(),
+		size: identity.size.toString(),
+		mtimeNs: identity.mtimeNs.toString(),
+		ctimeNs: identity.ctimeNs.toString(),
+	};
+}
 
 interface PinOccurrenceMatch {
 	identityKey: string;
@@ -831,6 +988,7 @@ export class IncidentRecorderCompactor {
 	private checkpointDisposition: "valid" | "missing" | "invalid" = "missing";
 	private readonly activePinScans = new Set<string>();
 	private activePinTraversal?: PinTraversal;
+	private readonly runHistoryTraversals = new Map<string, RunHistoryTraversal>();
 	private journalManifestValidation?: JournalManifestValidation;
 	private readonly stoppedTargetStreams = new Map<string, StoppedTargetArtifactStream>();
 
@@ -1069,7 +1227,7 @@ export class IncidentRecorderCompactor {
 		return added;
 	}
 
-	private accountRemovedStorageEntry(metadata: ReturnType<typeof lstatSync>): void {
+	private accountRemovedStorageEntry(metadata: NonNullable<ReturnType<typeof lstatSync>>): void {
 		const identity = `${String(metadata.dev)}:${String(metadata.ino)}`;
 		this.storageEntries = Math.max(0, this.storageEntries - 1);
 		if (this.storageScanInProgress) this.storageScanConcurrentEntries -= 1;
@@ -1129,7 +1287,11 @@ export class IncidentRecorderCompactor {
 		}
 	}
 
-	private verifyCasFile(path: string, digest: string, bytes: number): ReturnType<typeof lstatSync> {
+	private verifyCasFile(
+		path: string,
+		digest: string,
+		bytes: number,
+	): NonNullable<ReturnType<typeof lstatSync>> {
 		const metadata = lstatSync(path);
 		if (
 			!metadata.isFile() ||
@@ -1413,6 +1575,7 @@ export class IncidentRecorderCompactor {
 			this.segmentOpenRequiresReconciliation = true;
 			this.storageRecoveryReasonState = "segment_store_close_failed";
 		}
+		this.discardRunHistoryTraversals();
 		this.discardStoppedTargetStreams();
 	}
 
@@ -1723,6 +1886,7 @@ export class IncidentRecorderCompactor {
 				examinedSegments: 0,
 				deletedBytes: 0,
 				locatorsInvalidated: false,
+				requiresFullReconciliation: false,
 				moreWork: false,
 			};
 		}
@@ -2097,6 +2261,7 @@ export class IncidentRecorderCompactor {
 				segmentCloseError = error;
 				this.segmentOpenRequiresReconciliation = true;
 			}
+			this.discardRunHistoryTraversals();
 			this.discardTransientJournalState();
 			this.discardTransientFileState();
 			if (segmentCloseError && !signal.aborted) throw segmentCloseError;
@@ -4082,10 +4247,10 @@ export class IncidentRecorderCompactor {
 		};
 	}
 
-	private readStableLegacyOccurrence(path: string): { value: unknown; bytes: number } {
-		let before: ReturnType<typeof lstatSync>;
+	private readStableLegacyOccurrence(path: string, canonicalPath = path): { value: unknown; bytes: number } {
+		let before: BigIntStats;
 		try {
-			before = lstatSync(path);
+			before = lstatSync(path, { bigint: true });
 		} catch (error) {
 			throw new Error(
 				`legacy_occurrence_reference_unavailable: ${error instanceof Error ? error.message : String(error)}`,
@@ -4095,43 +4260,59 @@ export class IncidentRecorderCompactor {
 		if (
 			!before.isFile() ||
 			before.isSymbolicLink() ||
-			!Number.isSafeInteger(before.size) ||
-			before.size < 1 ||
-			before.size > PIN_LEGACY_REFERENCE_MAX_BYTES
+			before.size < 1n ||
+			before.size > BigInt(PIN_LEGACY_REFERENCE_MAX_BYTES)
 		) {
 			throw new Error("legacy_occurrence_reference_metadata_invalid");
 		}
+		const beforeIdentity = stableFilesystemIdentity(before);
+		if (canonicalPath !== path) {
+			const canonicalBefore = lstatSync(canonicalPath, { bigint: true });
+			if (
+				!canonicalBefore.isFile() ||
+				canonicalBefore.isSymbolicLink() ||
+				!sameStableFilesystemIdentity(beforeIdentity, stableFilesystemIdentity(canonicalBefore))
+			) {
+				throw new Error("legacy_occurrence_reference_canonical_path_changed_before_read");
+			}
+		}
 		const descriptor = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
 		try {
-			const opened = fstatSync(descriptor);
+			const opened = fstatSync(descriptor, { bigint: true });
+			const openedIdentity = stableFilesystemIdentity(opened);
 			if (
 				!opened.isFile() ||
-				opened.dev !== before.dev ||
-				opened.ino !== before.ino ||
-				opened.size !== before.size ||
-				opened.mtimeMs !== before.mtimeMs ||
-				opened.ctimeMs !== before.ctimeMs ||
-				opened.nlink !== before.nlink
+				!sameStableFilesystemIdentity(openedIdentity, beforeIdentity)
 			) {
 				throw new Error("legacy_occurrence_reference_changed_before_read");
 			}
-			const bytes = Buffer.alloc(opened.size);
+			const byteLength = Number(opened.size);
+			const bytes = Buffer.alloc(byteLength);
 			let offset = 0;
 			while (offset < bytes.length) {
 				const count = readSync(descriptor, bytes, offset, bytes.length - offset, offset);
 				if (count <= 0) throw new Error("legacy_occurrence_reference_truncated");
 				offset += count;
 			}
-			const after = fstatSync(descriptor);
+			const after = fstatSync(descriptor, { bigint: true });
 			if (
-				after.dev !== opened.dev ||
-				after.ino !== opened.ino ||
-				after.size !== opened.size ||
-				after.mtimeMs !== opened.mtimeMs ||
-				after.ctimeMs !== opened.ctimeMs ||
-				after.nlink !== opened.nlink
+				!after.isFile() ||
+				!sameStableFilesystemIdentity(stableFilesystemIdentity(after), openedIdentity)
 			) {
 				throw new Error("legacy_occurrence_reference_changed_during_read");
+			}
+			const authorityAfter = lstatSync(path, { bigint: true });
+			const canonicalAfter =
+				canonicalPath === path ? authorityAfter : lstatSync(canonicalPath, { bigint: true });
+			if (
+				!authorityAfter.isFile() ||
+				authorityAfter.isSymbolicLink() ||
+				!canonicalAfter.isFile() ||
+				canonicalAfter.isSymbolicLink() ||
+				!sameStableFilesystemIdentity(stableFilesystemIdentity(authorityAfter), openedIdentity) ||
+				!sameStableFilesystemIdentity(stableFilesystemIdentity(canonicalAfter), openedIdentity)
+			) {
+				throw new Error("legacy_occurrence_reference_canonical_path_changed_during_read");
 			}
 			return { value: JSON.parse(bytes.toString("utf8")) as unknown, bytes: bytes.length };
 		} finally {
@@ -4197,6 +4378,692 @@ export class IncidentRecorderCompactor {
 			throw new Error("manifest_occurrence_reference_semantic_mismatch");
 		}
 		state.resolvedOccurrenceCount += 1;
+	}
+
+	private parseRunHistoryEvent(
+		value: unknown,
+		occurrenceReference: JournalOccurrenceReference,
+		runId: string,
+		segmentRecord?: IncidentRecorderSegmentRecord,
+	): IncidentRecorderRunHistoryEvent | undefined {
+		const match = this.parsePinOccurrence(value, occurrenceReference, runId, segmentRecord);
+		if (!match || !value || typeof value !== "object" || Array.isArray(value)) return undefined;
+		const reference = value as Record<string, unknown>;
+		return {
+			identityKey: match.identityKey,
+			semanticFingerprint: match.semanticFingerprint,
+			occurrenceReference,
+			source: reference.source as string,
+			type: reference.type as string,
+			encoding: reference.encoding as string,
+			payloadKind: reference.payloadKind as IncidentRecorderRunHistoryEvent["payloadKind"],
+			terminal: reference.terminal as boolean,
+			metadata: { ...(reference.metadata as IncidentJournalLine["metadata"]) },
+			eventWallTimeMs: reference.eventWallTimeMs as string,
+			eventMonotonicNs: reference.eventMonotonicNs as string,
+			wrapperOrder: [...(reference.wrapperOrder as string[])],
+			producerOrder: [...(reference.producerOrder as string[])],
+			cursors: [...match.cursors],
+			transportIdentity: { ...(reference.transportIdentity as Record<string, unknown>) },
+			cas: { ...match.cas },
+		};
+	}
+
+	private compareRunHistoryEvents(
+		left: IncidentRecorderRunHistoryEvent,
+		right: IncidentRecorderRunHistoryEvent,
+	): number {
+		const leftWall = BigInt(left.eventWallTimeMs);
+		const rightWall = BigInt(right.eventWallTimeMs);
+		if (leftWall !== rightWall) return leftWall < rightWall ? -1 : 1;
+		const leftOrder = BigInt(left.wrapperOrder[0] ?? "0");
+		const rightOrder = BigInt(right.wrapperOrder[0] ?? "0");
+		if (leftOrder !== rightOrder) return leftOrder < rightOrder ? -1 : 1;
+		return left.identityKey.localeCompare(right.identityKey);
+	}
+
+	private detachRunHistoryValue<T>(value: T): T {
+		return JSON.parse(canonicalJson(value)) as T;
+	}
+
+	private runHistoryProjection(state: RunHistoryTraversal): IncidentRecorderRunHistoryProjection {
+		const events = [...state.events.values()].sort((left, right) => this.compareRunHistoryEvents(left, right));
+		const terminalEvents = events
+			.filter((event) => event.terminal)
+			.map((event) => ({
+				identityKey: event.identityKey,
+				type: event.type,
+				source: event.source,
+				eventWallTimeMs: event.eventWallTimeMs,
+				basis: "terminal_flag" as const,
+			}));
+		return this.detachRunHistoryValue({
+			version: 1,
+			runId: state.runId,
+			fromWallTimeMs: state.fromWallTimeMs,
+			throughWallTimeMs: state.throughWallTimeMs,
+			events,
+			terminalEvents,
+			finalizationBarriers: terminalEvents.map((event) => ({ ...event })),
+			evidence: state.evidence.map((evidence) => ({ ...evidence })),
+		});
+	}
+
+	private discardRunHistoryTraversal(state: RunHistoryTraversal): void {
+		try {
+			state.directory?.closeSync();
+		} catch {}
+		state.directory = undefined;
+		for (const key of ["legacyDirectoryDescriptor", "legacyNamespaceDescriptor"] as const) {
+			const descriptor = state[key];
+			state[key] = undefined;
+			if (descriptor === undefined) continue;
+			try {
+				closeSync(descriptor);
+			} catch {}
+		}
+		this.runHistoryTraversals.delete(state.token);
+	}
+
+	private discardRunHistoryTraversals(): void {
+		for (const state of this.runHistoryTraversals.values()) this.discardRunHistoryTraversal(state);
+	}
+
+	private incompleteRunHistory(
+		state: RunHistoryTraversal,
+		reason: string,
+		evidence: IncidentRecorderRunHistoryEvidence,
+	): IncidentRecorderRunHistoryResult {
+		state.evidence.push(evidence);
+		const projection = this.runHistoryProjection(state);
+		return this.boundedRunHistoryResult(state, { state: "incomplete", reason, projection }, true);
+	}
+
+	private boundedRunHistoryResult(
+		state: RunHistoryTraversal,
+		result: IncidentRecorderRunHistoryResult,
+		discardOnSuccess: boolean,
+	): IncidentRecorderRunHistoryResult {
+		const detached = this.detachRunHistoryValue(result);
+		const serialized = JSON.stringify(detached);
+		if (serialized !== undefined && Buffer.byteLength(serialized, "utf8") <= RUN_HISTORY_RESULT_MAX_BYTES) {
+			if (discardOnSuccess) this.discardRunHistoryTraversal(state);
+			return detached;
+		}
+		const truncated: IncidentRecorderRunHistoryResult = {
+			state: "incomplete",
+			reason: "run_history_projection_serialized_bound_exceeded",
+			projection: {
+				version: 1,
+				runId: state.runId,
+				fromWallTimeMs: state.fromWallTimeMs,
+				throughWallTimeMs: state.throughWallTimeMs,
+				events: [],
+				terminalEvents: [],
+				finalizationBarriers: [],
+				evidence: [
+					{
+						kind: "truncated",
+						reason: "serialized_projection_result_exceeded_explicit_byte_bound",
+					},
+				],
+			},
+		};
+		this.discardRunHistoryTraversal(state);
+		return this.detachRunHistoryValue(truncated);
+	}
+
+	private observeRunHistorySemanticFingerprint(
+		state: RunHistoryTraversal,
+		event: IncidentRecorderRunHistoryEvent,
+	): string | undefined {
+		const existing = state.semanticFingerprints.get(event.identityKey);
+		if (existing) {
+			return existing === event.semanticFingerprint
+				? undefined
+				: "run_history_duplicate_occurrence_semantic_conflict";
+		}
+		const addedBytes = retainedBytes({
+			identityKey: event.identityKey,
+			semanticFingerprint: event.semanticFingerprint,
+		});
+		if (
+			state.semanticFingerprints.size >= PENDING_ENTRY_MAX_COUNT ||
+			state.memoryBytes + addedBytes > PENDING_ENTRY_MAX_BYTES
+		) {
+			return "run_history_projection_truncated_by_explicit_bound";
+		}
+		state.semanticFingerprints.set(event.identityKey, event.semanticFingerprint);
+		state.memoryBytes += addedBytes;
+		return undefined;
+	}
+
+	private addRunHistoryEvent(
+		state: RunHistoryTraversal,
+		event: IncidentRecorderRunHistoryEvent,
+	): string | undefined {
+		const semanticConflict = this.observeRunHistorySemanticFingerprint(state, event);
+		if (semanticConflict) return semanticConflict;
+		const existing = state.events.get(event.identityKey);
+		if (existing) {
+			return existing.semanticFingerprint === event.semanticFingerprint
+				? undefined
+				: "run_history_duplicate_occurrence_semantic_conflict";
+		}
+		const addedBytes = retainedBytes(event);
+		if (state.events.size >= PENDING_ENTRY_MAX_COUNT || state.memoryBytes + addedBytes > PENDING_ENTRY_MAX_BYTES) {
+			return "run_history_projection_truncated_by_explicit_bound";
+		}
+		state.events.set(event.identityKey, event);
+		state.memoryBytes += addedBytes;
+		return undefined;
+	}
+
+	private runHistoryCursor(state: RunHistoryTraversal): IncidentRecorderRunHistoryCursor {
+		return { version: 1, token: state.token, requestFingerprint: state.requestFingerprint };
+	}
+
+	private pendingRunHistory(state: RunHistoryTraversal): IncidentRecorderRunHistoryResult {
+		return this.boundedRunHistoryResult(
+			state,
+			{ state: "pending", cursor: this.runHistoryCursor(state), projection: this.runHistoryProjection(state) },
+			false,
+		);
+	}
+
+	private advanceRunHistorySegmentPhase(state: RunHistoryTraversal): IncidentRecorderRunHistoryResult | undefined {
+		const phase = state.phase;
+		if (phase === "legacy") return undefined;
+		const sourceId =
+			phase === "segment-occurrences"
+				? SEGMENT_SOURCE_OCCURRENCE
+				: phase === "segment-run-incomplete"
+					? SEGMENT_SOURCE_INCOMPLETE
+					: SEGMENT_SOURCE_GAP;
+		const runId = phase === "segment-global-gaps" ? "__recorder__" : state.runId;
+		const evidencePhase = phase !== "segment-occurrences";
+		try {
+			const store = this.ensureSegmentStore();
+			state.segmentReadSnapshot ??= store.createReadSnapshot();
+			const page = store.queryRunWindowPage({
+				runId,
+				sourceId,
+				fromObservedAtMs: evidencePhase && sourceId === SEGMENT_SOURCE_GAP ? 0 : state.fromWallTimeMs,
+				throughObservedAtMs:
+					evidencePhase && sourceId === SEGMENT_SOURCE_GAP
+						? Number.MAX_SAFE_INTEGER
+						: state.throughWallTimeMs,
+				maxRecords: SEGMENT_QUERY_PAGE_RECORDS,
+				maxBytes: SEGMENT_QUERY_PAGE_BYTES,
+				readSnapshot: state.segmentReadSnapshot,
+				...(state.segmentCursor ? { after: state.segmentCursor } : {}),
+			});
+			for (const record of page.records) {
+				state.segmentRecordCount += 1;
+				const snapshotFact = canonicalJson({ sourceId, runId, locator: record.locator });
+				if (
+					state.segmentRecordCount > PENDING_ENTRY_MAX_COUNT ||
+					state.memoryBytes + Buffer.byteLength(snapshotFact) > PENDING_ENTRY_MAX_BYTES
+				) {
+					return this.incompleteRunHistory(state, "run_history_segment_snapshot_truncated", {
+						kind: "truncated",
+						reason: "segment_record_or_byte_bound_exceeded",
+						reference: record.locator,
+					});
+				}
+				state.snapshotFacts.push(snapshotFact);
+				state.memoryBytes += Buffer.byteLength(snapshotFact);
+				if (sourceId !== SEGMENT_SOURCE_OCCURRENCE) {
+					let detail = sourceId;
+					try {
+						detail = canonicalJson(JSON.parse(record.payload.toString("utf8")) as unknown);
+					} catch {}
+					return this.incompleteRunHistory(state, `run_history_${sourceId}_evidence`, {
+						kind: sourceId === SEGMENT_SOURCE_GAP ? "gap" : "incomplete",
+						reason: detail,
+						reference: record.locator,
+					});
+				}
+				let value: unknown;
+				try {
+					value = JSON.parse(record.payload.toString("utf8")) as unknown;
+				} catch {
+					return this.incompleteRunHistory(state, "run_history_segment_occurrence_corrupt", {
+						kind: "corrupt",
+						reason: "segment_occurrence_payload_invalid_json",
+						reference: record.locator,
+					});
+				}
+				const event = this.parseRunHistoryEvent(
+					value,
+					this.segmentOccurrenceReference(record.locator),
+					state.runId,
+					record,
+				);
+				if (!event) {
+					return this.incompleteRunHistory(state, "run_history_segment_occurrence_corrupt", {
+						kind: "corrupt",
+						reason: "segment_occurrence_semantic_validation_failed",
+						reference: record.locator,
+					});
+				}
+				const conflict = this.addRunHistoryEvent(state, event);
+				if (conflict) {
+					return this.incompleteRunHistory(state, conflict, {
+						kind: conflict.includes("truncated") ? "truncated" : "corrupt",
+						reason: conflict,
+						reference: event.occurrenceReference,
+					});
+				}
+			}
+			if (!page.complete) {
+				if (!page.nextCursor) {
+					return this.incompleteRunHistory(state, "run_history_segment_continuation_missing", {
+						kind: "truncated",
+						reason: "segment_snapshot_page_did_not_return_continuation",
+					});
+				}
+				state.segmentCursor = page.nextCursor;
+				return this.pendingRunHistory(state);
+			}
+			state.segmentCursor = undefined;
+			if (phase === "segment-occurrences") state.phase = "segment-run-gaps";
+			else if (phase === "segment-run-gaps") state.phase = "segment-run-incomplete";
+			else if (phase === "segment-run-incomplete") state.phase = "segment-global-gaps";
+			else state.phase = "legacy";
+			return this.pendingRunHistory(state);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOSPC") throw error;
+			return this.incompleteRunHistory(state, "run_history_segment_snapshot_stale_or_corrupt", {
+				kind: "corrupt",
+				reason: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+
+	private openStableRunHistoryDirectory(path: string): {
+		descriptor: number;
+		identity: StableFilesystemIdentity;
+	} {
+		const before = lstatSync(path, { bigint: true });
+		if (!before.isDirectory() || before.isSymbolicLink()) {
+			throw new Error("legacy_run_reference_directory_invalid");
+		}
+		const identity = stableFilesystemIdentity(before);
+		const descriptor = openSync(
+			path,
+			fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
+		);
+		try {
+			const opened = fstatSync(descriptor, { bigint: true });
+			if (
+				!opened.isDirectory() ||
+				!sameStableFilesystemIdentity(identity, stableFilesystemIdentity(opened))
+			) {
+				throw new Error("legacy_run_reference_directory_changed_before_open");
+			}
+			return { descriptor, identity };
+		} catch (error) {
+			closeSync(descriptor);
+			throw error;
+		}
+	}
+
+	private openRunHistoryNamespaceFence(path: string): {
+		path: string;
+		descriptor: number;
+		identity: StableFilesystemIdentity;
+	} {
+		let candidate = dirname(path);
+		for (;;) {
+			try {
+				return { path: candidate, ...this.openStableRunHistoryDirectory(candidate) };
+			} catch (error) {
+				const parent = dirname(candidate);
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT" || parent === candidate) throw error;
+				candidate = parent;
+			}
+		}
+	}
+
+	private assertRunHistoryDirectoryStable(
+		path: string | undefined,
+		descriptor: number | undefined,
+		identity: StableFilesystemIdentity | undefined,
+	): void {
+		if (path === undefined || descriptor === undefined || identity === undefined) {
+			throw new Error("legacy_directory_stability_fence_missing");
+		}
+		const opened = fstatSync(descriptor, { bigint: true });
+		const canonical = lstatSync(path, { bigint: true });
+		if (
+			!opened.isDirectory() ||
+			!canonical.isDirectory() ||
+			canonical.isSymbolicLink() ||
+			!sameStableFilesystemIdentity(identity, stableFilesystemIdentity(opened)) ||
+			!sameStableFilesystemIdentity(identity, stableFilesystemIdentity(canonical))
+		) {
+			throw new Error("legacy_directory_identity_changed_during_projection");
+		}
+	}
+
+	private advanceRunHistoryLegacy(state: RunHistoryTraversal): IncidentRecorderRunHistoryResult {
+		if (!state.directory) {
+			const path = join(this.root, "refs", "runs", sha256(state.runId));
+			try {
+				const namespace = this.openRunHistoryNamespaceFence(path);
+				state.legacyNamespacePath = namespace.path;
+				state.legacyNamespaceDescriptor = namespace.descriptor;
+				state.legacyNamespaceIdentity = namespace.identity;
+				let targetExists = true;
+				try {
+					lstatSync(path, { bigint: true });
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+					targetExists = false;
+				}
+				if (!targetExists) {
+					this.assertRunHistoryDirectoryStable(
+						state.legacyNamespacePath,
+						state.legacyNamespaceDescriptor,
+						state.legacyNamespaceIdentity,
+					);
+					try {
+						lstatSync(path, { bigint: true });
+						throw new Error("legacy_run_reference_directory_appeared_during_absence_check");
+					} catch (error) {
+						if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+					}
+					state.snapshotFacts.push(
+						canonicalJson({
+							legacyDirectoryAbsent: path,
+							namespace: serializableFilesystemIdentity(namespace.identity),
+						}),
+					);
+					return this.completeRunHistory(state);
+				}
+				const authority = this.openStableRunHistoryDirectory(path);
+				state.legacyDirectoryPath = path;
+				state.legacyDirectoryDescriptor = authority.descriptor;
+				state.legacyDirectoryIdentity = authority.identity;
+				this.assertRunHistoryDirectoryStable(
+					state.legacyNamespacePath,
+					state.legacyNamespaceDescriptor,
+					state.legacyNamespaceIdentity,
+				);
+				state.directory = opendirSync(`/proc/self/fd/${authority.descriptor}`);
+			} catch (error) {
+				return this.incompleteRunHistory(state, "run_history_legacy_directory_corrupt", {
+					kind: "corrupt",
+					reason: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
+		const directory = state.directory;
+		if (!directory) return this.completeRunHistory(state);
+		for (let count = 0; count < PIN_REFERENCE_BATCH_COUNT; count += 1) {
+			if (Date.now() > state.deadlineMs) {
+				return this.incompleteRunHistory(state, "run_history_deadline_exceeded", {
+					kind: "truncated",
+					reason: "legacy_snapshot_deadline_exceeded",
+				});
+			}
+			let entry: Dirent | null;
+			try {
+				entry = directory.readSync();
+			} catch (error) {
+				return this.incompleteRunHistory(state, "run_history_legacy_directory_corrupt", {
+					kind: "corrupt",
+					reason: error instanceof Error ? error.message : String(error),
+				});
+			}
+			if (!entry) {
+				try {
+					directory.closeSync();
+				} catch {}
+				state.directory = undefined;
+				try {
+					this.assertRunHistoryDirectoryStable(
+						state.legacyDirectoryPath,
+						state.legacyDirectoryDescriptor,
+						state.legacyDirectoryIdentity,
+					);
+					this.assertRunHistoryDirectoryStable(
+						state.legacyNamespacePath,
+						state.legacyNamespaceDescriptor,
+						state.legacyNamespaceIdentity,
+					);
+				} catch (error) {
+					return this.incompleteRunHistory(state, "run_history_legacy_snapshot_changed", {
+						kind: "corrupt",
+						reason: error instanceof Error ? error.message : String(error),
+					});
+				}
+				const before = state.legacyDirectoryIdentity;
+				if (!before) {
+					return this.incompleteRunHistory(state, "run_history_legacy_snapshot_changed", {
+						kind: "corrupt",
+						reason: "legacy_directory_identity_missing_during_projection",
+					});
+				}
+				state.snapshotFacts.push(
+					canonicalJson({ legacyDirectory: serializableFilesystemIdentity(before) }),
+				);
+				return this.completeRunHistory(state);
+			}
+			state.legacyEntriesScanned += 1;
+			if (state.legacyEntriesScanned > PENDING_ENTRY_MAX_COUNT) {
+				return this.incompleteRunHistory(state, "run_history_legacy_entry_bound_exceeded", {
+					kind: "truncated",
+					reason: "legacy_directory_entry_bound_exceeded",
+				});
+			}
+			if (!/^seq-\d{20}-[0-9a-f]{64}\.json$/.test(entry.name)) continue;
+			const authorityPath = join(directory.path, entry.name);
+			const canonicalPath = join(state.legacyDirectoryPath ?? "", entry.name);
+			try {
+				const { value, bytes } = this.readStableLegacyOccurrence(authorityPath, canonicalPath);
+				state.legacyBytesRead += bytes;
+				if (state.legacyBytesRead > PENDING_ENTRY_MAX_BYTES) {
+					return this.incompleteRunHistory(state, "run_history_legacy_byte_bound_exceeded", {
+						kind: "truncated",
+						reason: "legacy_reference_byte_bound_exceeded",
+					});
+				}
+				const event = this.parseRunHistoryEvent(value, canonicalPath, state.runId);
+				if (!event) throw new Error("legacy_occurrence_semantic_validation_failed");
+				const semanticConflict = this.observeRunHistorySemanticFingerprint(state, event);
+				if (semanticConflict) {
+					return this.incompleteRunHistory(state, semanticConflict, {
+						kind: semanticConflict.includes("truncated") ? "truncated" : "corrupt",
+						reason: semanticConflict,
+						reference: canonicalPath,
+					});
+				}
+				const wall = segmentObservedAtMs(event.eventWallTimeMs);
+				if (wall < state.fromWallTimeMs || wall > state.throughWallTimeMs) continue;
+				state.legacyOccurrenceCount += 1;
+				const conflict = this.addRunHistoryEvent(state, event);
+				if (conflict) {
+					return this.incompleteRunHistory(state, conflict, {
+						kind: conflict.includes("truncated") ? "truncated" : "corrupt",
+						reason: conflict,
+						reference: canonicalPath,
+					});
+				}
+			} catch (error) {
+				return this.incompleteRunHistory(state, "run_history_legacy_reference_corrupt", {
+					kind: error instanceof Error && error.message.includes("truncated") ? "truncated" : "corrupt",
+					reason: error instanceof Error ? error.message : String(error),
+					reference: canonicalPath,
+				});
+			}
+		}
+		return this.pendingRunHistory(state);
+	}
+
+	private completeRunHistory(state: RunHistoryTraversal): IncidentRecorderRunHistoryResult {
+		if (state.evidence.length > 0) {
+			return this.incompleteRunHistory(state, "run_history_contains_loss_evidence", {
+				kind: "incomplete",
+				reason: "projection_cannot_complete_with_loss_evidence",
+			});
+		}
+		try {
+			if (!state.segmentReadSnapshot) throw new Error("segment_read_snapshot_missing");
+			this.ensureSegmentStore().assertReadSnapshotUsable(state.segmentReadSnapshot);
+		} catch (error) {
+			return this.incompleteRunHistory(state, "run_history_segment_snapshot_stale_or_corrupt", {
+				kind: "corrupt",
+				reason: error instanceof Error ? error.message : String(error),
+			});
+		}
+		const projection = this.runHistoryProjection(state);
+		const snapshot: IncidentRecorderRunHistorySnapshot = {
+			version: 1,
+			fingerprint: sha256(
+				canonicalJson({
+					requestFingerprint: state.requestFingerprint,
+					segmentReadSnapshot: state.segmentReadSnapshot,
+					snapshotFacts: state.snapshotFacts,
+					events: projection.events.map((event) => ({
+						identityKey: event.identityKey,
+						semanticFingerprint: event.semanticFingerprint,
+					})),
+				}),
+			),
+			segmentRecordCount: state.segmentRecordCount,
+			legacyOccurrenceCount: state.legacyOccurrenceCount,
+		};
+		return this.boundedRunHistoryResult(state, { state: "complete", projection, snapshot }, true);
+	}
+
+	private sweepExpiredRunHistoryTraversals(nowMs: number): void {
+		for (const state of this.runHistoryTraversals.values()) {
+			if (nowMs > state.deadlineMs) this.discardRunHistoryTraversal(state);
+		}
+	}
+
+	cancelRunHistoryProjection(cursor: IncidentRecorderRunHistoryCursor): boolean {
+		if (
+			cursor.version !== 1 ||
+			!/^[0-9a-f]{64}$/.test(cursor.token) ||
+			!/^[0-9a-f]{64}$/.test(cursor.requestFingerprint)
+		) {
+			throw new Error("Invalid incident run-history continuation cursor");
+		}
+		this.sweepExpiredRunHistoryTraversals(Date.now());
+		const state = this.runHistoryTraversals.get(cursor.token);
+		if (!state || state.requestFingerprint !== cursor.requestFingerprint) return false;
+		this.discardRunHistoryTraversal(state);
+		return true;
+	}
+
+	projectRunHistory(input: {
+		runId: string;
+		fromWallTimeMs: number;
+		throughWallTimeMs: number;
+		cursor?: IncidentRecorderRunHistoryCursor;
+		deadlineMs?: number;
+	}): IncidentRecorderRunHistoryResult {
+		if (
+			!isCanonicalUuid(input.runId) ||
+			!Number.isSafeInteger(input.fromWallTimeMs) ||
+			input.fromWallTimeMs < 0 ||
+			!Number.isSafeInteger(input.throughWallTimeMs) ||
+			input.throughWallTimeMs < input.fromWallTimeMs ||
+			(input.deadlineMs !== undefined &&
+				(!Number.isFinite(input.deadlineMs) ||
+					!Number.isSafeInteger(input.deadlineMs) ||
+					input.deadlineMs < 0))
+		) {
+			throw new Error("Invalid incident run-history projection request");
+		}
+		const nowMs = Date.now();
+		this.sweepExpiredRunHistoryTraversals(nowMs);
+		const requestFingerprint = sha256(
+			canonicalJson({
+				runId: input.runId,
+				fromWallTimeMs: input.fromWallTimeMs,
+				throughWallTimeMs: input.throughWallTimeMs,
+			}),
+		);
+		let state: RunHistoryTraversal | undefined;
+		if (input.cursor) {
+			if (
+				input.cursor.version !== 1 ||
+				!/^[0-9a-f]{64}$/.test(input.cursor.token) ||
+				input.cursor.requestFingerprint !== requestFingerprint
+			) {
+				throw new Error("Invalid incident run-history continuation cursor");
+			}
+			state = this.runHistoryTraversals.get(input.cursor.token);
+			if (!state || state.requestFingerprint !== requestFingerprint) {
+				const empty: RunHistoryTraversal = {
+					token: input.cursor.token,
+					requestFingerprint,
+					runId: input.runId,
+					fromWallTimeMs: input.fromWallTimeMs,
+					throughWallTimeMs: input.throughWallTimeMs,
+					deadlineMs: Date.now(),
+					phase: "segment-occurrences",
+					segmentRecordCount: 0,
+					legacyOccurrenceCount: 0,
+					legacyEntriesScanned: 0,
+					legacyBytesRead: 0,
+					semanticFingerprints: new Map(),
+					events: new Map(),
+					memoryBytes: 0,
+					evidence: [
+						{
+							kind: "truncated",
+							reason: "run_history_continuation_missing_or_expired",
+						},
+					],
+					snapshotFacts: [],
+				};
+				return {
+					state: "incomplete",
+					reason: "run_history_continuation_missing_or_expired",
+					projection: this.runHistoryProjection(empty),
+				};
+			}
+		} else {
+			if (this.runHistoryTraversals.size >= 4) {
+				throw new Error("Incident run-history projection capacity is saturated");
+			}
+			const token = sha256(`${requestFingerprint}\0${process.pid}\0${process.hrtime.bigint()}`);
+			state = {
+				token,
+				requestFingerprint,
+				runId: input.runId,
+				fromWallTimeMs: input.fromWallTimeMs,
+				throughWallTimeMs: input.throughWallTimeMs,
+				deadlineMs: Math.min(
+					input.deadlineMs ?? nowMs + PIN_SCAN_DEADLINE_MS,
+					nowMs + PIN_SCAN_DEADLINE_MS,
+				),
+				phase: "segment-occurrences",
+				segmentRecordCount: 0,
+				legacyOccurrenceCount: 0,
+				legacyEntriesScanned: 0,
+				legacyBytesRead: 0,
+				semanticFingerprints: new Map(),
+				events: new Map(),
+				memoryBytes: 0,
+				evidence: [],
+				snapshotFacts: [],
+			};
+			this.runHistoryTraversals.set(token, state);
+		}
+		if (Date.now() > state.deadlineMs) {
+			return this.incompleteRunHistory(state, "run_history_deadline_exceeded", {
+				kind: "truncated",
+				reason: "projection_deadline_exceeded",
+			});
+		}
+		if (state.phase !== "legacy") return this.advanceRunHistorySegmentPhase(state) ?? this.pendingRunHistory(state);
+		return this.advanceRunHistoryLegacy(state);
 	}
 
 	private failPinTraversal(state: PinTraversal, reason: string, evidence: Record<string, unknown> = {}): void {
