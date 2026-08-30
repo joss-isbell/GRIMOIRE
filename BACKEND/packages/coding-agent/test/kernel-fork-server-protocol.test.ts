@@ -30,6 +30,8 @@ const STUB_KERNELAPP = [
 	"    def start(self):",
 	"        # Env knob: lets tests fork a child that exits immediately (the",
 	"        # per-kernel env is applied in the child before start()).",
+	"        if os.environ.get('STUB_KERNEL_EXIT_CODE'):",
+	"            os._exit(int(os.environ['STUB_KERNEL_EXIT_CODE']))",
 	"        if os.environ.get('STUB_KERNEL_EXIT'):",
 	"            return",
 	"        while True:",
@@ -118,6 +120,7 @@ describeIf("forkserver kill/liveness protocol (stub python)", () => {
 		// A fork id the forkserver never issued: nothing may be signaled.
 		expect(await server!.killChild(999_999, "TERM")).toBe("unknown-pid");
 		expect(await server!.isChildAlive(999_999)).toBe(false);
+		expect(await server!.childExitStatus(999_999)).toEqual({ state: "unknown" });
 	}, 15_000);
 
 	it("liveness reflects the reap table on external child death", async () => {
@@ -129,6 +132,23 @@ describeIf("forkserver kill/liveness protocol (stub python)", () => {
 		await vi.waitFor(async () => {
 			expect(await handle.isAlive()).toBe(false);
 		});
+	}, 15_000);
+
+	it("preserves exact exit status and the launch-time process identity after reap", async () => {
+		const exited = await spawnStubKernel(server!, { STUB_KERNEL_EXIT_CODE: "42" });
+		expect(exited.processStartId).toMatch(/^proc:\d+$/);
+		await vi.waitFor(async () => {
+			expect(await exited.exitStatus?.()).toEqual({ state: "exited", code: 42, signal: null });
+		});
+
+		const signaled = await spawnStubKernel();
+		const processStartId = signaled.processStartId;
+		expect(processStartId).toMatch(/^proc:\d+$/);
+		process.kill(signaled.pid, "SIGABRT");
+		await vi.waitFor(async () => {
+			expect(await signaled.exitStatus?.()).toEqual({ state: "exited", code: null, signal: "SIGABRT" });
+		});
+		expect(signaled.processStartId).toBe(processStartId);
 	}, 15_000);
 
 	it("kill outcomes stay correct while sibling children churn and get reaped", async () => {
@@ -179,6 +199,7 @@ describeIf("forkserver kill/liveness protocol (stub python)", () => {
 			// Three entries against a bound of 2: the oldest id has been evicted.
 			expect(await oldest.kill("TERM")).toBe("unknown-pid");
 			expect(await oldest.isAlive()).toBe(false);
+			expect(await oldest.exitStatus?.()).toEqual({ state: "unknown" });
 			for (const handle of [middle, newest]) {
 				await vi.waitFor(async () => {
 					expect(await handle.kill("TERM")).toBe("already-exited");
@@ -229,6 +250,7 @@ describeIf("forkserver kill/liveness protocol (stub python)", () => {
 		server!.dispose();
 		await expect(handle.kill("TERM")).rejects.toBeInstanceOf(ForkServerUnavailable);
 		await expect(handle.isAlive()).rejects.toBeInstanceOf(ForkServerUnavailable);
+		await expect(handle.exitStatus?.()).rejects.toBeInstanceOf(ForkServerUnavailable);
 	}, 15_000);
 
 	describe("forkserver orphan journal", () => {

@@ -8,8 +8,20 @@ import { registerSessionResourceCleanup } from "@earendil-works/pi-ai";
 import { v4 as uuid } from "uuid";
 import { Dealer, Subscriber } from "zeromq";
 import { recordOrphanProcessState } from "../orphan-process-journal.js";
+import { getProcessStartId } from "../session-lease.js";
 import { ensureKernelPython, type KernelBootstrapProgressHandler, type KernelPythonSkill } from "./bootstrap.js";
-import { type ForkedKernelHandle, ForkServerUnavailable, forkKernel, isForkServerEnabled } from "./fork-server.js";
+import {
+	type ForkedKernelExitStatus,
+	type ForkedKernelHandle,
+	ForkServerUnavailable,
+	forkKernel,
+	isForkServerEnabled,
+} from "./fork-server.js";
+import {
+	type KernelCrashPhase,
+	type KernelDiagnosticIdentity,
+	publishKernelDiagnostic,
+} from "./diagnostics.js";
 import {
 	buildListNamesCode,
 	buildRestoreCode,
@@ -49,6 +61,7 @@ const KERNEL_ABORT_GRACE_MS = 1000;
 const KERNEL_BUSY_REUSE_WAIT_MS = 5000;
 const KERNEL_BUSY_INTERRUPT_INTERVAL_MS = 500;
 const MAX_LATE_SENT_AGENT_MESSAGE_HANDLERS = 256;
+const KERNEL_DIAGNOSTIC_STDERR_TAIL_BYTES = 16 * 1024;
 const KERNEL_BUSY_AFTER_INTERRUPT_MESSAGE =
 	"IPython kernel is still running the previously interrupted cell. Wait and try again, or kill the IPython kernel to start fresh.";
 
@@ -609,7 +622,11 @@ export class KernelManager {
 	private readonly pendingControlReplies = new Map<string, (message: JupyterMessage) => void>();
 	private connection?: ConnectionInfo;
 	private tempDir?: string;
-	private kernelStderr = "";
+	private kernelStderrTail = Buffer.alloc(0);
+	private kernelStderrBytes = 0;
+	private kernelDiagnosticIdentity?: KernelDiagnosticIdentity;
+	private kernelCrashPhase: KernelCrashPhase = "resolving_ports";
+	private unexpectedExitReportedFor?: string;
 	/** Serializes execute() calls — Jupyter shell channel is request/reply. */
 	private executionQueue: Promise<unknown> = Promise.resolve();
 	private activeExecution?: ActiveExecution;
@@ -645,8 +662,120 @@ export class KernelManager {
 		return this.options.sessionId;
 	}
 
+	private get kernelStderr(): string {
+		return this.kernelStderrTail.toString();
+	}
+
+	private set kernelStderr(value: string) {
+		this.kernelStderrTail = Buffer.alloc(0);
+		this.kernelStderrBytes = 0;
+		this.appendKernelStderr(value);
+	}
+
+	private appendKernelStderr(chunk: Buffer | string): void {
+		const bytes = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+		this.kernelStderrBytes += bytes.byteLength;
+		if (bytes.byteLength === 0) return;
+		if (bytes.byteLength >= KERNEL_DIAGNOSTIC_STDERR_TAIL_BYTES) {
+			this.kernelStderrTail = Buffer.from(bytes.subarray(-KERNEL_DIAGNOSTIC_STDERR_TAIL_BYTES));
+			return;
+		}
+		const retainedBytes = Math.min(
+			this.kernelStderrTail.byteLength,
+			KERNEL_DIAGNOSTIC_STDERR_TAIL_BYTES - bytes.byteLength,
+		);
+		this.kernelStderrTail = Buffer.concat(
+			[this.kernelStderrTail.subarray(this.kernelStderrTail.byteLength - retainedBytes), bytes],
+			retainedBytes + bytes.byteLength,
+		);
+	}
+
 	private appendKernelDiagnostic(message: string): void {
-		this.kernelStderr += `[kernel] ${message.endsWith("\n") ? message : `${message}\n`}`;
+		this.appendKernelStderr(`[kernel] ${message.endsWith("\n") ? message : `${message}\n`}`);
+	}
+
+	private startKernelDiagnostics(
+		launchMode: KernelDiagnosticIdentity["launchMode"],
+		kernelPid: number,
+		kernelProcessStartId: string | undefined,
+	): void {
+		const identity: KernelDiagnosticIdentity = {
+			...(this.options.sessionId ? { sessionId: this.options.sessionId } : {}),
+			kernelInstanceId: uuid(),
+			kernelPid,
+			...(kernelProcessStartId ? { kernelProcessStartId } : {}),
+			launchMode,
+		};
+		this.kernelDiagnosticIdentity = identity;
+		this.kernelCrashPhase = "resolving_ports";
+		this.unexpectedExitReportedFor = undefined;
+		publishKernelDiagnostic({ ...identity, type: "kernel_process_started", phase: "resolving_ports" });
+	}
+
+	private markKernelReady(): void {
+		const identity = this.kernelDiagnosticIdentity;
+		if (!identity) return;
+		this.kernelCrashPhase = "idle";
+		publishKernelDiagnostic({ ...identity, type: "kernel_ready", phase: "idle" });
+	}
+
+	private markKernelExecutionStarted(requestMsgId: string): void {
+		const identity = this.kernelDiagnosticIdentity;
+		if (!identity) return;
+		this.kernelCrashPhase = "executing";
+		publishKernelDiagnostic({ ...identity, type: "kernel_execute_started", phase: "executing", requestMsgId });
+	}
+
+	private reportKernelChannelFault(channel: "shell" | "iopub" | "control", reason: string): void {
+		const identity = this.kernelDiagnosticIdentity;
+		if (!identity) return;
+		const requestMsgId = this.activeExecution?.requestMsgId;
+		publishKernelDiagnostic({
+			...identity,
+			type: "kernel_channel_fault",
+			channel,
+			crashPhase: this.kernelCrashPhase,
+			...(requestMsgId ? { requestMsgId } : {}),
+			reason: reason.slice(0, 1024),
+		});
+	}
+
+	private reportUnexpectedKernelExit(
+		code: number | null,
+		signal: NodeJS.Signals | null,
+		reason: "process_exit" | "forkserver_unavailable",
+	): void {
+		const identity = this.kernelDiagnosticIdentity;
+		if (!identity || this.unexpectedExitReportedFor === identity.kernelInstanceId) return;
+		this.unexpectedExitReportedFor = identity.kernelInstanceId;
+		const requestMsgId = this.activeExecution?.requestMsgId;
+		const stderrTail = identity.launchMode === "direct" ? Buffer.from(this.kernelStderrTail) : Buffer.alloc(0);
+		const stderrBytes = identity.launchMode === "direct" ? this.kernelStderrBytes : 0;
+		publishKernelDiagnostic({
+			...identity,
+			type: "kernel_unexpected_exit",
+			crashPhase: this.kernelCrashPhase,
+			...(requestMsgId ? { requestMsgId } : {}),
+			code,
+			signal,
+			reason,
+			...(stderrTail.length > 0 ? { stderrTail } : {}),
+			stderrBytes,
+			sourceTruncated: stderrBytes > stderrTail.length,
+		});
+	}
+
+	private async reportForkedKernelExit(probed: ForkedKernelHandle): Promise<boolean> {
+		let status: ForkedKernelExitStatus = { state: "unknown" };
+		try {
+			status = probed.exitStatus ? await probed.exitStatus() : status;
+		} catch {
+			// A dead forkserver cannot provide the child's retained wait status.
+		}
+		if (this.forkedKernel !== probed || status.state === "alive") return false;
+		if (status.state === "exited") this.reportUnexpectedKernelExit(status.code, status.signal, "process_exit");
+		else this.reportUnexpectedKernelExit(null, null, "forkserver_unavailable");
+		return true;
 	}
 
 	async start(options: KernelStartOptions = {}): Promise<void> {
@@ -716,6 +845,11 @@ export class KernelManager {
 					throw new Error("Kernel start superseded");
 				}
 				this.forkedKernel = handle;
+				this.startKernelDiagnostics(
+					"fork",
+					handle.pid,
+					handle.processStartId ?? getProcessStartId(handle.pid),
+				);
 				recordOrphanProcessState(handle.pid, true);
 				forked = true;
 			} catch (err) {
@@ -746,11 +880,13 @@ export class KernelManager {
 				stdio: ["ignore", "pipe", "pipe"],
 			});
 			this.kernel = kernel;
-			if (kernel.pid !== undefined) recordOrphanProcessState(kernel.pid, true);
+			if (kernel.pid !== undefined) {
+				this.startKernelDiagnostics("direct", kernel.pid, getProcessStartId(kernel.pid));
+				recordOrphanProcessState(kernel.pid, true);
+			}
 
 			kernel.stderr?.on("data", (buf: Buffer) => {
-				const s = buf.toString();
-				this.kernelStderr += s;
+				this.appendKernelStderr(buf);
 			});
 
 			kernel.on("error", (err) => {
@@ -765,6 +901,7 @@ export class KernelManager {
 				if (this.kernel !== kernel) return;
 				if (this.state !== "shutdown") {
 					this.appendKernelDiagnostic(`unexpected exit code=${code} signal=${signal}`);
+					this.reportUnexpectedKernelExit(code, signal, "process_exit");
 				}
 				this.state = "shutdown";
 				liveKernels.delete(this);
@@ -778,6 +915,7 @@ export class KernelManager {
 			conn = await this.waitForResolvedConnection(connectionPath);
 			if (this.startStale(generation)) throw new Error("Kernel start superseded");
 			this.connection = conn;
+			this.kernelCrashPhase = "ready_probe";
 		} catch (e) {
 			if (this.startStale(generation)) throw e; // never tear down a newer start's kernel
 			const canRetryStartup = (this.state as string) !== "shutdown";
@@ -814,6 +952,7 @@ export class KernelManager {
 		}
 
 		this.state = "running";
+		this.markKernelReady();
 		this.startForkedLivenessMonitor();
 	}
 
@@ -835,13 +974,17 @@ export class KernelManager {
 	private async checkForkedKernelDeath(): Promise<void> {
 		if (this.state !== "running" || this.forkedLivenessProbeInFlight) return;
 		const probed = this.forkedKernel;
+		let dead = false;
 		this.forkedLivenessProbeInFlight = true;
 		try {
-			if (!(await this.forkedKernelDead(probed))) return;
+			dead = await this.forkedKernelDead(probed);
 		} finally {
 			this.forkedLivenessProbeInFlight = false;
 		}
+		if (!dead || !probed) return;
 		// Re-check after the await: teardown or a restart may have raced this poll.
+		if (this.state !== "running" || this.forkedKernel !== probed) return;
+		if (!(await this.reportForkedKernelExit(probed))) return;
 		if (this.state !== "running" || this.forkedKernel !== probed) return;
 		this.appendKernelDiagnostic("forked kernel exited unexpectedly");
 		this.state = "shutdown";
@@ -871,10 +1014,12 @@ export class KernelManager {
 		const startedAt = Date.now();
 		while (Date.now() - startedAt < PORTS_RESOLVE_TIMEOUT_MS) {
 			const remainingBudget = PORTS_RESOLVE_TIMEOUT_MS - (Date.now() - startedAt);
-			if (
-				(this.state as string) === "shutdown" ||
-				(await this.forkedKernelDead(this.forkedKernel, remainingBudget))
-			) {
+			const probed = this.forkedKernel;
+			const forkedDead = await this.forkedKernelDead(probed, remainingBudget);
+			if ((this.state as string) === "shutdown" || forkedDead) {
+				if (forkedDead && (this.state as string) !== "shutdown" && probed && this.forkedKernel === probed) {
+					await this.reportForkedKernelExit(probed);
+				}
 				const tail = this.kernelStderr.slice(-1024);
 				throw new Error(`Kernel exited before resolving ports. stderr:\n${tail || "(empty)"}`);
 			}
@@ -899,22 +1044,24 @@ export class KernelManager {
 
 		const msg = buildMessage("kernel_info_request", {}, this.session, this.options.username);
 		const requestMsgId = msg.header.msg_id;
-		await this.translateSocketClosure(shell.send(encode(msg, conn.key)));
+		await this.translateSocketClosure(shell.send(encode(msg, conn.key)), "shell");
 
 		const startedAt = Date.now();
 		while (Date.now() - startedAt < READY_TIMEOUT_MS) {
 			const remainingBudget = READY_TIMEOUT_MS - (Date.now() - startedAt);
-			if (
-				(this.state as string) === "shutdown" ||
-				(await this.forkedKernelDead(this.forkedKernel, remainingBudget))
-			) {
+			const probed = this.forkedKernel;
+			const forkedDead = await this.forkedKernelDead(probed, remainingBudget);
+			if ((this.state as string) === "shutdown" || forkedDead) {
+				if (forkedDead && (this.state as string) !== "shutdown" && probed && this.forkedKernel === probed) {
+					await this.reportForkedKernelExit(probed);
+				}
 				const tail = this.kernelStderr.slice(-1024);
 				throw new Error(`Kernel exited during startup. stderr:\n${tail || "(empty)"}`);
 			}
 
 			const remaining = READY_TIMEOUT_MS - (Date.now() - startedAt);
 			const winner = await Promise.race([
-				this.translateSocketClosure(shell.receive()).then((frames) => ({ kind: "frames" as const, frames })),
+				this.translateSocketClosure(shell.receive(), "shell").then((frames) => ({ kind: "frames" as const, frames })),
 				sleep(remaining).then(() => ({ kind: "timeout" as const })),
 			]);
 			if (winner.kind === "timeout") break;
@@ -938,11 +1085,17 @@ export class KernelManager {
 	 * EAGAIN text ("Operation was not possible or timed out"); surface the kernel
 	 * lifecycle instead so callers see an actionable, retriable failure.
 	 */
-	private async translateSocketClosure<T>(operation: Promise<T>): Promise<T> {
+	private async translateSocketClosure<T>(
+		operation: Promise<T>,
+		diagnosticChannel?: "shell" | "iopub" | "control",
+	): Promise<T> {
 		try {
 			return await operation;
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
+			if (diagnosticChannel && (this.state as string) !== "shutdown") {
+				this.reportKernelChannelFault(diagnosticChannel, message);
+			}
 			if (message.includes("not possible or timed out") || message.includes("Socket is closed")) {
 				const tail = this.kernelStderr.slice(-1024);
 				throw new Error(
@@ -1080,6 +1233,7 @@ export class KernelManager {
 
 		try {
 			this.activeExecution = execution;
+			this.markKernelExecutionStarted(requestMsgId);
 			opts.signal?.addEventListener("abort", onAbort, { once: true });
 			if (opts.signal?.aborted) {
 				onAbort();
@@ -1088,7 +1242,7 @@ export class KernelManager {
 				this.lastCellCode = code;
 			}
 			try {
-				const sendPromise = this.translateSocketClosure(shell.send(encode(msg, conn.key)));
+				const sendPromise = this.translateSocketClosure(shell.send(encode(msg, conn.key)), "shell");
 				sendPromise.catch(() => undefined);
 				await Promise.race([sendPromise, result.promise.then(() => undefined)]);
 				if (this.activeExecution === execution && execution.status !== "aborted") {
@@ -1097,6 +1251,7 @@ export class KernelManager {
 			} catch (error) {
 				if (this.activeExecution === execution) {
 					this.activeExecution = undefined;
+					if (this.state === "running") this.kernelCrashPhase = "idle";
 				}
 				throw error instanceof Error ? error : new Error(String(error));
 			}
@@ -1125,6 +1280,7 @@ export class KernelManager {
 			}
 		} catch (error) {
 			if ((this.state as string) !== "shutdown") {
+				this.reportKernelChannelFault("control", errorMessage(error));
 				this.appendKernelDiagnostic(`control pump failed: ${errorMessage(error)}`);
 			}
 		} finally {
@@ -1195,6 +1351,7 @@ export class KernelManager {
 			}
 		} catch (error) {
 			if ((this.state as string) !== "shutdown") {
+				this.reportKernelChannelFault("iopub", errorMessage(error));
 				this.appendKernelDiagnostic(`iopub pump failed: ${errorMessage(error)}`);
 				this.rejectActiveExecution(new Error(`Kernel IOPub channel failed: ${errorMessage(error)}`));
 			}
@@ -1314,6 +1471,7 @@ export class KernelManager {
 			});
 		}
 		if (didClearActive) {
+			if (this.state === "running") this.kernelCrashPhase = "idle";
 			this.notifyActiveExecutionIdle();
 		}
 	}
@@ -1354,6 +1512,7 @@ export class KernelManager {
 		}
 		this.activeExecution = undefined;
 		execution.reject(error);
+		if (this.state === "running") this.kernelCrashPhase = "idle";
 		this.notifyActiveExecutionIdle();
 	}
 
@@ -1505,13 +1664,16 @@ export class KernelManager {
 			throw new Error("Kernel channel is not connected");
 		}
 		const msg = buildMessage("comm_msg", { comm_id: commId, data }, this.session, this.options.username);
-		await channel.send(encode(msg, this.connection.key));
+		await this.translateSocketClosure(
+			channel.send(encode(msg, this.connection.key)),
+			this.control ? "control" : "shell",
+		);
 	}
 
 	private async interrupt(): Promise<void> {
 		if (!this.control || !this.connection) return;
 		const msg = buildMessage("interrupt_request", {}, this.session, this.options.username);
-		await this.control.send(encode(msg, this.connection.key));
+		await this.translateSocketClosure(this.control.send(encode(msg, this.connection.key)), "control");
 	}
 
 	private cleanupResources(killSignal: NodeJS.Signals = "SIGTERM"): void {
@@ -1559,6 +1721,8 @@ export class KernelManager {
 		this.kernel = undefined;
 		this.forkedKernel = undefined;
 		this.connection = undefined;
+		this.kernelDiagnosticIdentity = undefined;
+		this.kernelCrashPhase = "resolving_ports";
 		if (this.tempDir) {
 			try {
 				rmSync(this.tempDir, { recursive: true, force: true });

@@ -8,6 +8,7 @@ import {
 	type DaemonWorkerFrameHeader,
 	isDaemonWorkerFrameHeader,
 } from "./daemon-worker-protocol.js";
+import { appendSupervisorDiagnosticBytes, appendSupervisorDiagnosticEvent } from "./incident-recorder.js";
 
 type DistributiveOmit<T, K extends keyof T> = T extends unknown ? Omit<T, K> : never;
 type DaemonCommandBody = DistributiveOmit<DaemonCommand, "id">;
@@ -40,22 +41,57 @@ export class DaemonWorkerClient {
 		timeout: ReturnType<typeof setTimeout>;
 	}>();
 
-	constructor(private readonly socketPath: string) {}
+	constructor(
+		private readonly socketPath: string,
+		private readonly diagnosticContext: Record<string, unknown> = {},
+	) {}
 
 	async connect(timeoutMs = 3000): Promise<void> {
 		if (this.socket) {
 			throw new Error("Daemon worker client is already connected");
 		}
+		appendSupervisorDiagnosticEvent("worker_socket_connect_start", {
+			...this.diagnosticContext,
+			socketPath: this.socketPath,
+			timeoutMs,
+		});
 		const socket = createConnection(this.socketPath);
 		this.socket = socket;
-		this.channel = new PrivateFramedChannel(socket, isDaemonWorkerFrameHeader);
+		this.channel = new PrivateFramedChannel(socket, isDaemonWorkerFrameHeader, undefined, {
+			onInboundBytes: (bytes) =>
+				appendSupervisorDiagnosticBytes("worker_transport_inbound", bytes, {
+					...this.diagnosticContext,
+					socketPath: this.socketPath,
+					transportFraming: "exact-private-frame-stream-bytes",
+				}),
+			onOutboundBytes: (bytes) =>
+				appendSupervisorDiagnosticBytes("worker_transport_outbound", bytes, {
+					...this.diagnosticContext,
+					socketPath: this.socketPath,
+					transportFraming: "exact-private-frame-stream-bytes",
+				}),
+			onOutboundWriteOutcome: (bytes, outcome) =>
+				appendSupervisorDiagnosticEvent("worker_transport_outbound_write_outcome", {
+					...this.diagnosticContext,
+					socketPath: this.socketPath,
+					outcome,
+					attemptedBytes: bytes.length,
+				}),
+		});
 		this.channel.onFrame((frame) => this.handleFrame(frame));
 
 		await new Promise<void>((resolve, reject) => {
 			const timeout = setTimeout(() => {
 				cleanup();
+				const error = new Error(`Timed out connecting to daemon worker socket: ${this.socketPath}`);
+				appendSupervisorDiagnosticEvent("worker_socket_connect_timeout", {
+					...this.diagnosticContext,
+					socketPath: this.socketPath,
+					timeoutMs,
+					error,
+				});
 				socket.destroy();
-				reject(new Error(`Timed out connecting to daemon worker socket: ${this.socketPath}`));
+				reject(error);
 			}, timeoutMs);
 			const cleanup = () => {
 				clearTimeout(timeout);
@@ -64,10 +100,23 @@ export class DaemonWorkerClient {
 			};
 			const onConnect = () => {
 				cleanup();
+				appendSupervisorDiagnosticEvent("worker_socket_connected", {
+					...this.diagnosticContext,
+					socketPath: this.socketPath,
+					localAddress: socket.localAddress,
+					localPort: socket.localPort,
+					remoteAddress: socket.remoteAddress,
+					remotePort: socket.remotePort,
+				});
 				resolve();
 			};
 			const onError = (error: Error) => {
 				cleanup();
+				appendSupervisorDiagnosticEvent("worker_socket_connect_error", {
+					...this.diagnosticContext,
+					socketPath: this.socketPath,
+					error,
+				});
 				reject(error);
 			};
 			socket.once("connect", onConnect);
@@ -133,23 +182,42 @@ export class DaemonWorkerClient {
 
 	private async requestWire(command: DaemonWorkerWireCommandBody, timeoutMs: number): Promise<DaemonResponse> {
 		if (!this.channel || !this.socket || this.socket.destroyed) {
-			throw new Error("Daemon worker client is not connected");
+			const error = new Error("Daemon worker client is not connected");
+			appendSupervisorDiagnosticEvent("worker_request_unavailable", {
+				...this.diagnosticContext,
+				socketPath: this.socketPath,
+				command,
+				timeoutMs,
+				error,
+			});
+			throw error;
 		}
+		const diagnosticStarted = process.hrtime.bigint();
 		const id = `worker_${++this.requestId}`;
 		const fullCommand = { ...command, id } as DaemonWorkerWireCommand;
+		const frameHeader = { kind: "command" as const, requestId: id, commandType: command.type };
+		const wirePayload = Buffer.from(serializeJsonLine(fullCommand));
+		const diagnosticRequest = {
+			...this.diagnosticContext,
+			socketPath: this.socketPath,
+			requestId: id,
+			requestType: command.type,
+			timeoutMs,
+		};
+		appendSupervisorDiagnosticEvent("worker_request_start", diagnosticRequest);
 		const response = new Promise<DaemonResponse>((resolve, reject) => {
 			const timeout = setTimeout(() => {
 				this.pending.delete(id);
-				reject(new Error(`Timed out waiting for daemon worker response to ${command.type}`));
+				const error = new Error(`Timed out waiting for daemon worker response to ${command.type}`);
+				appendSupervisorDiagnosticEvent("worker_request_timeout", { ...diagnosticRequest, error });
+				reject(error);
 			}, timeoutMs);
 			this.pending.set(id, { resolve, reject, timeout });
 		});
 		try {
-			await this.channel.send(
-				{ kind: "command", requestId: id, commandType: command.type },
-				Buffer.from(serializeJsonLine(fullCommand)),
-			);
+			await this.channel.send(frameHeader, wirePayload);
 		} catch (error) {
+			appendSupervisorDiagnosticEvent("worker_request_send_error", { ...diagnosticRequest, error });
 			const pending = this.pending.get(id);
 			if (pending) {
 				clearTimeout(pending.timeout);
@@ -157,7 +225,35 @@ export class DaemonWorkerClient {
 				pending.reject(error instanceof Error ? error : new Error(String(error)));
 			}
 		}
-		return response;
+		try {
+			const result = await response;
+			const durationMs = Number(process.hrtime.bigint() - diagnosticStarted) / 1_000_000;
+			const completed = {
+				...diagnosticRequest,
+				durationMs,
+				outcome: result.success ? "success" : "failure",
+			};
+			appendSupervisorDiagnosticEvent("worker_request_end", completed);
+			if (
+				durationMs > 250 &&
+				(command.type === "list" || command.type === "get_state" || command.type === "get_connection_state")
+			) {
+				appendSupervisorDiagnosticEvent("list_status_latency_trigger", {
+					...completed,
+					thresholdMs: 250,
+					providerBurstDeferred: true,
+				});
+			}
+			return result;
+		} catch (error) {
+			appendSupervisorDiagnosticEvent("worker_request_end", {
+				...diagnosticRequest,
+				durationMs: Number(process.hrtime.bigint() - diagnosticStarted) / 1_000_000,
+				outcome: error instanceof Error && error.message.startsWith("Timed out") ? "timeout" : "error",
+				error,
+			});
+			throw error;
+		}
 	}
 
 	private handleFrame(frame: PrivateFrame<DaemonWorkerFrameHeader>): void {
@@ -171,6 +267,12 @@ export class DaemonWorkerClient {
 				try {
 					response = JSON.parse(frame.payload.toString("utf8"));
 				} catch (error) {
+					appendSupervisorDiagnosticEvent("worker_response_parse_error", {
+						...this.diagnosticContext,
+						socketPath: this.socketPath,
+						header: frame.header,
+						error,
+					});
 					clearTimeout(pending.timeout);
 					this.pending.delete(frame.header.requestId);
 					pending.reject(new Error(`Invalid daemon worker response: ${String(error)}`));
@@ -195,7 +297,13 @@ export class DaemonWorkerClient {
 						waiter.resolve(parsed);
 					}
 				}
-			} catch {
+			} catch (error) {
+				appendSupervisorDiagnosticEvent("worker_hello_parse_error", {
+					...this.diagnosticContext,
+					socketPath: this.socketPath,
+					header: frame.header,
+					error,
+				});
 				// Invalid hello payloads are rejected by the timeout.
 			}
 		}
@@ -223,6 +331,13 @@ export class DaemonWorkerClient {
 		}
 		this.socket = undefined;
 		this.channel = undefined;
+		appendSupervisorDiagnosticEvent("worker_socket_closed", {
+			...this.diagnosticContext,
+			socketPath: this.socketPath,
+			error,
+			pendingRequestIds: [...this.pending.keys()],
+			helloWaiterCount: this.helloWaiters.size,
+		});
 		this.rejectAll(error);
 		for (const listener of [...this.closeListeners]) {
 			listener(error);

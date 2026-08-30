@@ -16,6 +16,13 @@ export const DAEMON_WORKER_ACTIVE_SESSION_ID_ENV = "PRIME_AGENT_INTERNAL_DAEMON_
 export const DAEMON_WORKER_SUPERVISOR_SOCKET_ENV = "PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_SOCKET";
 export const DAEMON_WORKER_RECOVERY_JOURNAL_ENV = "PRIME_AGENT_INTERNAL_DAEMON_WORKER_RECOVERY_JOURNAL";
 export const DAEMON_WORKER_STARTUP_GATE_FD_ENV = "PRIME_AGENT_INTERNAL_DAEMON_WORKER_STARTUP_GATE_FD";
+export const DAEMON_WORKER_KERNEL_DIAGNOSTIC_FD_ENV =
+	"PRIME_AGENT_INTERNAL_DAEMON_WORKER_KERNEL_DIAGNOSTIC_FD";
+export const DAEMON_WORKER_KERNEL_DIAGNOSTIC_CAPABILITY_ENV =
+	"PRIME_AGENT_INTERNAL_DAEMON_WORKER_KERNEL_DIAGNOSTIC_CAPABILITY";
+export const DAEMON_WORKER_KERNEL_DIAGNOSTIC_SOCKET_ENV =
+	"PRIME_AGENT_INTERNAL_DAEMON_WORKER_KERNEL_DIAGNOSTIC_SOCKET";
+export const DAEMON_WORKER_ID_ENV = "PRIME_AGENT_INTERNAL_DAEMON_WORKER_ID";
 export const DAEMON_WORKER_STARTUP_GATE_COMMIT = "start\n";
 export type DaemonWorkerLifecycle = "starting" | "ready" | "recovering" | "stopping" | "failed";
 
@@ -107,6 +114,13 @@ export interface DaemonWorkerDescriptor {
 	orphanProcessJournalPath?: string;
 	supervisorSocketPath: string;
 	authenticationToken: string;
+	diagnosticProtocolVersion?: 1;
+	diagnosticSocketPath?: string;
+	diagnosticSocketDevice?: string;
+	diagnosticSocketInode?: string;
+	diagnosticSecretPath?: string;
+	diagnosticSecretDevice?: string;
+	diagnosticSecretInode?: string;
 	rootActiveSessionId: string;
 	/** Stable protocol client that owns this worker. Omitted for resident sessions. */
 	ownerClientId?: string;
@@ -151,6 +165,27 @@ export function durableDaemonWorkerDescriptor(descriptor: DaemonWorkerDescriptor
 			: {}),
 		supervisorSocketPath: descriptor.supervisorSocketPath,
 		authenticationToken: descriptor.authenticationToken,
+		...(descriptor.diagnosticProtocolVersion !== undefined
+			? { diagnosticProtocolVersion: descriptor.diagnosticProtocolVersion }
+			: {}),
+		...(descriptor.diagnosticSocketPath !== undefined
+			? { diagnosticSocketPath: descriptor.diagnosticSocketPath }
+			: {}),
+		...(descriptor.diagnosticSocketDevice !== undefined
+			? { diagnosticSocketDevice: descriptor.diagnosticSocketDevice }
+			: {}),
+		...(descriptor.diagnosticSocketInode !== undefined
+			? { diagnosticSocketInode: descriptor.diagnosticSocketInode }
+			: {}),
+		...(descriptor.diagnosticSecretPath !== undefined
+			? { diagnosticSecretPath: descriptor.diagnosticSecretPath }
+			: {}),
+		...(descriptor.diagnosticSecretDevice !== undefined
+			? { diagnosticSecretDevice: descriptor.diagnosticSecretDevice }
+			: {}),
+		...(descriptor.diagnosticSecretInode !== undefined
+			? { diagnosticSecretInode: descriptor.diagnosticSecretInode }
+			: {}),
 		rootActiveSessionId: descriptor.rootActiveSessionId,
 		...(descriptor.ownerClientId !== undefined ? { ownerClientId: descriptor.ownerClientId } : {}),
 		...(descriptor.rootSessionId !== undefined ? { rootSessionId: descriptor.rootSessionId } : {}),

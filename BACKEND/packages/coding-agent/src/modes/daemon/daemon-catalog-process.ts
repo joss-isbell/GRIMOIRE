@@ -320,10 +320,25 @@ export class DaemonCatalogClient {
 
 	private async spawnCatalog(): Promise<void> {
 		const launch = createCliSubprocessLaunchSpec(["--version"]);
+		const environment = createCliSubprocessEnv({ ...process.env, [DAEMON_CATALOG_ROLE_ENV]: "1" });
+		for (const name of [
+			"PRIME_AGENT_INTERNAL_INCIDENT_RECORDER_CHILD",
+			"PRIME_AGENT_INTERNAL_INCIDENT_RECORDER_RUN_DIR",
+			"PRIME_AGENT_INTERNAL_INCIDENT_RECORDER_SOCKET",
+			"PRIME_INCIDENT_RECORDER_CAPTURE_FD",
+			"PRIME_INCIDENT_RECORDER_ROOT_FD",
+			"PRIME_INCIDENT_RECORDER_CAPTURE_OWNER_PID",
+			"PRIME_INCIDENT_RECORDER_CAPTURE_OWNER_START_ID",
+			"PRIME_INCIDENT_RECORDER_RUN_ID",
+			"PRIME_INCIDENT_RECORDER_RUN_TOKEN",
+		])
+			delete environment[name];
 		const child = spawn(launch.command, launch.args, {
 			cwd: process.cwd(),
-			env: createCliSubprocessEnv({ ...process.env, [DAEMON_CATALOG_ROLE_ENV]: "1" }),
-			stdio: ["ignore", "ignore", "ignore", "ipc"],
+			env: environment,
+			// The supervisor-owned fd4 capture channel and fd5 recorder-root capability
+			// must never reach this controlled catalog descendant.
+			stdio: ["ignore", "ignore", "ignore", "ipc", "ignore", "ignore"],
 		});
 		this.child = child;
 		child.on("message", (value: unknown) => this.handleMessage(value));

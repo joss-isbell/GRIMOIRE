@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { registerSessionResourceCleanup } from "@earendil-works/pi-ai";
 import { recordOrphanProcessState } from "../orphan-process-journal.js";
+import { getProcessStartId } from "../session-lease.js";
 import { FORK_SERVER_SCRIPT } from "./fork-server-script.js";
 
 const READY_TIMEOUT_MS = 30_000;
@@ -70,6 +71,10 @@ interface SpawnParams {
 
 export type ForkedKernelKillSignal = "TERM" | "KILL";
 export type ForkedKernelKillOutcome = "signaled" | "already-exited" | "unknown-pid";
+export type ForkedKernelExitStatus =
+	| { state: "alive" }
+	| { state: "exited"; code: number | null; signal: NodeJS.Signals | null }
+	| { state: "unknown" };
 
 /**
  * Handle to a forkserver-forked kernel: signaling/liveness go through the
@@ -78,16 +83,22 @@ export type ForkedKernelKillOutcome = "signaled" | "already-exited" | "unknown-p
  */
 export interface ForkedKernelHandle {
 	readonly pid: number;
+	readonly processStartId?: string;
 	kill(signal: ForkedKernelKillSignal): Promise<ForkedKernelKillOutcome>;
 	isAlive(): Promise<boolean>;
+	exitStatus?(): Promise<ForkedKernelExitStatus>;
 }
 
 interface ForkServerReply {
 	id: number;
 	pid?: number;
+	processStartId?: string;
 	error?: string;
 	outcome?: string;
 	alive?: boolean;
+	state?: string;
+	exitCode?: number | null;
+	signal?: string | null;
 }
 
 type PendingRequest = {
@@ -287,10 +298,13 @@ export class ForkServer {
 		}
 		const pid = msg.pid;
 		const forkId = msg.id;
+		const processStartId = msg.processStartId ?? getProcessStartId(pid);
 		return {
 			pid,
+			...(processStartId ? { processStartId } : {}),
 			kill: (signal) => this.killChild(forkId, signal),
 			isAlive: () => this.isChildAlive(forkId),
+			exitStatus: () => this.childExitStatus(forkId),
 		};
 	}
 
@@ -306,6 +320,15 @@ export class ForkServer {
 	async isChildAlive(forkId: number): Promise<boolean> {
 		const msg = await this.request({ alive: forkId });
 		return msg.alive === true;
+	}
+
+	async childExitStatus(forkId: number): Promise<ForkedKernelExitStatus> {
+		const msg = await this.request({ status: forkId });
+		if (msg.state === "alive") return { state: "alive" };
+		if (msg.state !== "exited") return { state: "unknown" };
+		const code = typeof msg.exitCode === "number" && Number.isInteger(msg.exitCode) ? msg.exitCode : null;
+		const signal = typeof msg.signal === "string" && msg.signal.startsWith("SIG") ? (msg.signal as NodeJS.Signals) : null;
+		return { state: "exited", code, signal };
 	}
 
 	private withStderr(message: string): string {

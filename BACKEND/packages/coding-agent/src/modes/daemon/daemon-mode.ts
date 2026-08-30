@@ -181,7 +181,13 @@ import {
 } from "./daemon-socket.js";
 import { assertDaemonSupervisorOwnerCurrent, isDaemonShutdownAdmissionActive } from "./daemon-supervisor-ownership.js";
 import {
+	type DaemonWorkerKernelDiagnosticBridgeCleanup,
+	installDaemonWorkerKernelDiagnosticBridge,
+} from "./daemon-worker-kernel-diagnostics.js";
+import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
+	DAEMON_WORKER_KERNEL_DIAGNOSTIC_CAPABILITY_ENV,
+	DAEMON_WORKER_KERNEL_DIAGNOSTIC_FD_ENV,
 	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
 	DAEMON_WORKER_ROLE_ENV,
 	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
@@ -192,6 +198,11 @@ import {
 	SESSION_LEASE_OWNER_ID_ENV,
 	SESSION_LEASES_ENABLED_ENV,
 } from "./daemon-worker-protocol.js";
+import {
+	INCIDENT_RECORDER_CHILD_ENV,
+	INCIDENT_RECORDER_RUN_DIR_ENV,
+	INCIDENT_RECORDER_SOCKET_ENV,
+} from "./incident-recorder-env.js";
 import { MutationDrainLatch } from "./mutation-drain-latch.js";
 import {
 	createRlmLedgerRegistrySeedSource,
@@ -559,6 +570,7 @@ export class AgentDaemon {
 		},
 	);
 	private readonly recoveryJournal?: WorkerRecoveryJournal;
+	private readonly closeKernelDiagnosticBridge?: DaemonWorkerKernelDiagnosticBridgeCleanup;
 	private rlmSpawnLedgerInstance?: RlmSpawnLedger;
 	/** In-flight admission spawn appends, awaited (and consumed) by createRlmSubagentRuntime. */
 	private readonly pendingRlmSpawnAppends = new Map<string, Promise<void>>();
@@ -571,6 +583,9 @@ export class AgentDaemon {
 			throw new Error("Daemon config is missing agentDir");
 		}
 		this.agentDir = options.defaultSessionConfig.agentDir;
+		if (options.worker) {
+			this.closeKernelDiagnosticBridge = installDaemonWorkerKernelDiagnosticBridge();
+		}
 		this.cronStore = options.worker
 			? AgentCronJobStore.forSessionArtifacts()
 			: new AgentCronJobStore(getCronJobsPath(this.agentDir));
@@ -655,6 +670,16 @@ export class AgentDaemon {
 		} catch (error) {
 			this.cleanupSocketPath();
 			throw error;
+		}
+
+		if (this.closeKernelDiagnosticBridge) {
+			try {
+				await this.closeKernelDiagnosticBridge.startReconnectServer((claim, fingerprint) =>
+					this.assertSupervisorClaimCurrent(claim, fingerprint),
+				);
+			} catch (error) {
+				this.log(`Could not start worker kernel diagnostic listener: ${String(error)}`);
+			}
 		}
 
 		this.registerSignalHandlers();
@@ -854,9 +879,14 @@ export class AgentDaemon {
 			}
 			const launch = createCliSubprocessLaunchSpec(["--mode", "daemon", "--daemon-socket", supervisorSocketPath]);
 			const environment = createCliSubprocessEnv();
+			delete environment[INCIDENT_RECORDER_CHILD_ENV];
+			delete environment[INCIDENT_RECORDER_RUN_DIR_ENV];
+			delete environment[INCIDENT_RECORDER_SOCKET_ENV];
 			delete environment[DAEMON_WORKER_ROLE_ENV];
 			delete environment[DAEMON_WORKER_TOKEN_ENV];
 			delete environment[DAEMON_WORKER_ACTIVE_SESSION_ID_ENV];
+			delete environment[DAEMON_WORKER_KERNEL_DIAGNOSTIC_CAPABILITY_ENV];
+			delete environment[DAEMON_WORKER_KERNEL_DIAGNOSTIC_FD_ENV];
 			delete environment[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
 			delete environment[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
 			delete environment[ORPHAN_PROCESS_JOURNAL_ENV];
@@ -7084,6 +7114,7 @@ export class AgentDaemon {
 		for (const state of [...this.sessions.values()]) {
 			await this.closeSession(state, closingReason);
 		}
+		await this.closeKernelDiagnosticBridge?.();
 		for (const client of this.clients) {
 			client.detachInput();
 			client.socket.end();

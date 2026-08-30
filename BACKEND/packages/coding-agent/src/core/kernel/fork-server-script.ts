@@ -11,11 +11,13 @@
 //   -> { "id": <n>, "connectionPath": "<abs path>" }   spawn request from Node
 //   -> { "id": <n>, "kill": <fork-id>, "signal": "TERM"|"KILL" }  kill a forked child
 //   -> { "id": <n>, "alive": <fork-id> }               liveness query for a child
+//   -> { "id": <n>, "status": <fork-id> }              exact retained exit status
 //   <- { "type": "ready" }                             once, after imports finish
-//   <- { "id": <n>, "pid": <pid> }                     fork succeeded
+//   <- { "id": <n>, "pid": <pid>, "processStartId": "proc:<ticks>" }  fork succeeded
 //   <- { "id": <n>, "error": "<message>" }             fork failed
 //   <- { "id": <n>, "outcome": "signaled"|"already-exited"|"unknown-pid" }  kill reply
 //   <- { "id": <n>, "alive": true|false }              alive reply
+//   <- { "id": <n>, "state": "alive"|"exited"|"unknown", ... }  status reply
 //
 // Kill/alive are keyed by the never-reused fork request id, so a handle can only
 // name the one child incarnation it forked (a recycled pid can't alias), and the
@@ -30,7 +32,8 @@ import sys
 import threading
 import time
 
-# fork id -> [pid, alive]; _pid_to_id holds un-reaped, un-evicted children only.
+# fork id -> [pid, alive, wait_status, process_start_id].
+# _pid_to_id holds un-reaped, un-evicted children only.
 # Only the main thread mutates these (the SIGCHLD handler runs between its bytecodes).
 _children = {}
 _pid_to_id = {}
@@ -44,12 +47,13 @@ def _reap_children(*_args):
     # the accept loop. Safe under PEP 475: the interrupted socket read auto-retries.
     try:
         while True:
-            pid, _status = os.waitpid(-1, os.WNOHANG)
+            pid, status = os.waitpid(-1, os.WNOHANG)
             if pid == 0:
                 break
             child_id = _pid_to_id.pop(pid, None)
             if child_id is not None:
                 _children[child_id][1] = False
+                _children[child_id][2] = status
     except ChildProcessError:
         pass
 
@@ -61,6 +65,17 @@ def _watch_parent(original_ppid):
         if os.getppid() != original_ppid:
             os._exit(1)
         time.sleep(1.0)
+
+
+def _process_start_id(pid):
+    try:
+        with open("/proc/%d/stat" % pid, "r", encoding="utf-8") as stat_file:
+            value = stat_file.read()
+        command_end = value.rfind(")")
+        start_time = value[command_end + 2:].split(" ")[19]
+        return "proc:" + start_time if start_time else None
+    except (IndexError, OSError):
+        return None
 
 
 def _import_template():
@@ -162,7 +177,7 @@ def _serve(control_path):
             try:
                 entry = _children.get(kill_id)
                 if entry is None:
-                        outcome = "unknown-pid"
+                    outcome = "unknown-pid"
                 elif not entry[1]:
                     outcome = "already-exited"
                 else:
@@ -182,6 +197,31 @@ def _serve(control_path):
         if alive_id is not None:
             entry = _children.get(alive_id)
             f.write(json.dumps({"id": req_id, "alive": bool(entry and entry[1])}).encode() + b"\n")
+            f.flush()
+            continue
+
+        status_id = req.get("status")
+        if status_id is not None:
+            entry = _children.get(status_id)
+            if entry is None:
+                reply = {"id": req_id, "state": "unknown"}
+            elif entry[1]:
+                reply = {"id": req_id, "state": "alive"}
+            else:
+                wait_status = entry[2]
+                exit_code = os.WEXITSTATUS(wait_status) if wait_status is not None and os.WIFEXITED(wait_status) else None
+                signal_number = os.WTERMSIG(wait_status) if wait_status is not None and os.WIFSIGNALED(wait_status) else None
+                try:
+                    signal_name = signal.Signals(signal_number).name if signal_number is not None else None
+                except ValueError:
+                    signal_name = None
+                reply = {
+                    "id": req_id,
+                    "state": "exited",
+                    "exitCode": exit_code,
+                    "signal": signal_name,
+                }
+            f.write(json.dumps(reply).encode() + b"\n")
             f.flush()
             continue
 
@@ -221,7 +261,8 @@ def _serve(control_path):
             os._exit(0)
 
         # Parent: stay pristine (no loop/threads/ZMQ ever) so the next fork is clean.
-        _children[req_id] = [pid, True]
+        process_start_id = _process_start_id(pid)
+        _children[req_id] = [pid, True, None, process_start_id]
         _pid_to_id[pid] = req_id
         # FIFO-evict only exited entries: dropping a live child would make its
         # liveness read false and its kill unroutable — the exact leak this
@@ -232,7 +273,7 @@ def _serve(control_path):
                     break
                 _children.pop(evicted_id)
         signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGCHLD})
-        f.write(json.dumps({"id": req_id, "pid": pid}).encode() + b"\n")
+        f.write(json.dumps({"id": req_id, "pid": pid, "processStartId": process_start_id}).encode() + b"\n")
         f.flush()
 
 

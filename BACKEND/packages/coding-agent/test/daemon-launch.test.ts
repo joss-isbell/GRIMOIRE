@@ -212,6 +212,7 @@ describe("shouldStartDaemonEarly", () => {
 
 	it.each([
 		["daemon process", ["--mode", "daemon"]],
+		["incident recorder service", ["--incident-recorder-service", "--agent-dir", "/tmp/prime-agent"]],
 		["help", ["--help"]],
 		["version", ["--version"]],
 		["model listing", ["--list-models"]],
