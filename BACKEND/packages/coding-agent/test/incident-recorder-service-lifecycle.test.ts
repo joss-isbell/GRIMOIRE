@@ -33,6 +33,38 @@ class TestSignalSource implements IncidentRecorderServiceSignalSource {
 	}
 }
 
+class FaultingSignalSource implements IncidentRecorderServiceSignalSource {
+	private readonly listeners = new Map<RecorderSignal, () => void>();
+	readonly calls: string[] = [];
+
+	constructor(
+		private readonly onceFailures = new Map<RecorderSignal, unknown>(),
+		private readonly offFailures = new Map<RecorderSignal, unknown>(),
+	) {}
+
+	once(signal: RecorderSignal, listener: () => void): void {
+		this.calls.push(`once:${signal}`);
+		this.listeners.set(signal, listener);
+		if (this.onceFailures.has(signal)) throw this.onceFailures.get(signal);
+	}
+
+	off(signal: RecorderSignal, listener: () => void): void {
+		this.calls.push(`off:${signal}`);
+		if (this.offFailures.has(signal)) throw this.offFailures.get(signal);
+		if (this.listeners.get(signal) === listener) this.listeners.delete(signal);
+	}
+
+	emit(signal: RecorderSignal): void {
+		const listener = this.listeners.get(signal);
+		this.listeners.delete(signal);
+		listener?.();
+	}
+
+	has(signal: RecorderSignal): boolean {
+		return this.listeners.has(signal);
+	}
+}
+
 const roots: string[] = [];
 const originalStorageHealthySentinel = process.env.PRIME_TEST_STORAGE_HEALTHY_SENTINEL;
 
@@ -74,6 +106,38 @@ function withTimeout<T>(promise: Promise<T>, milliseconds = 5_000): Promise<T> {
 				reject(error);
 			},
 		);
+	});
+}
+
+async function captureRejection(promise: Promise<unknown>): Promise<unknown> {
+	try {
+		await promise;
+	} catch (error) {
+		return error;
+	}
+	throw new Error("expected recorder service rejection");
+}
+
+function waitForAbort(signal: AbortSignal): Promise<void> {
+	return new Promise<void>((resolve) => {
+		if (signal.aborted) resolve();
+		else signal.addEventListener("abort", () => resolve(), { once: true });
+	});
+}
+
+function mockReadyServiceCompactor(close: () => Promise<void> | void = () => {}): void {
+	vi.spyOn(IncidentRecorderWriter.prototype, "start").mockResolvedValue(undefined);
+	vi.spyOn(IncidentRecorderWriter.prototype, "journalReady", "get").mockReturnValue(true);
+	vi.spyOn(IncidentRecorderCompactor.prototype, "storageMode", "get").mockReturnValue("normal");
+	vi.spyOn(IncidentRecorderCompactor.prototype, "run").mockImplementation(async function (
+		this: IncidentRecorderCompactor,
+		...args: Parameters<IncidentRecorderCompactor["run"]>
+	) {
+		const [runOptions] = args;
+		runOptions.onStorageMode?.("normal");
+		runOptions.onReaderReady?.();
+		await waitForAbort(runOptions.signal);
+		await close();
 	});
 }
 
@@ -357,6 +421,108 @@ describe("incident recorder service lifecycle", () => {
 			signals.emit("SIGTERM");
 			await withTimeout(running);
 		} finally {
+			if (signals.size > 0) signals.emit("SIGTERM");
+			if (running) await withTimeout(running).catch(() => undefined);
+			if (previousPath === undefined) delete process.env.PATH;
+			else process.env.PATH = previousPath;
+			if (previousEvents === undefined) delete process.env.PRIME_TEST_RECORDER_SERVICE_EVENTS;
+			else process.env.PRIME_TEST_RECORDER_SERVICE_EVENTS = previousEvents;
+		}
+	}, 10_000);
+
+	it("defers a read-snapshot-blocked prune without losing its revisit anchor", async () => {
+		const target = fixture();
+		writeExecutable(join(target.binDir, "systemd-cat"), fakeSystemdCatSource());
+		const journalctlPath = join(target.binDir, "journalctl");
+		writeExecutable(journalctlPath, fakeJournalctlSource());
+		const previousPath = process.env.PATH;
+		const previousEvents = process.env.PRIME_TEST_RECORDER_SERVICE_EVENTS;
+		process.env.PATH = `${target.binDir}${delimiter}${previousPath ?? ""}`;
+		process.env.PRIME_TEST_RECORDER_SERVICE_EVENTS = target.eventsPath;
+		const revisitAnchor = {
+			version: 1 as const,
+			sessionId: "read-snapshot-revisit",
+			storeInstanceId: "store-instance",
+			highWaterSegmentSequence: 10,
+			filterSha256: "b".repeat(64),
+			segmentSequence: 1,
+		};
+		const observedContinuations: unknown[] = [];
+		let pruneCalls = 0;
+		let releaseReadSnapshot = false;
+		let deletedAfterRelease = false;
+		vi.spyOn(IncidentRecorderCompactor.prototype, "pruneSegmentHistory").mockImplementation(
+			(_nowMs, _protection, suppliedContinuation) => {
+				observedContinuations.push(suppliedContinuation);
+				pruneCalls += 1;
+				if (pruneCalls === 1)
+					return {
+						deletedSegmentIds: [],
+						corruptSegmentIds: [],
+						examinedSegments: 1,
+						deletedBytes: 0,
+						blockedByReadSnapshot: false,
+						locatorsInvalidated: false,
+						requiresFullReconciliation: false,
+						moreWork: true,
+						continuation: revisitAnchor,
+					};
+				if (!releaseReadSnapshot)
+					return {
+						deletedSegmentIds: [],
+						corruptSegmentIds: [],
+						examinedSegments: 1,
+						deletedBytes: 0,
+						blockedByReadSnapshot: true,
+						locatorsInvalidated: false,
+						requiresFullReconciliation: false,
+						moreWork: true,
+					};
+				deletedAfterRelease = true;
+				return {
+					deletedSegmentIds: ["released-segment"],
+					corruptSegmentIds: [],
+					examinedSegments: 1,
+					deletedBytes: 4096,
+					blockedByReadSnapshot: false,
+					locatorsInvalidated: true,
+					requiresFullReconciliation: true,
+					moreWork: false,
+				};
+			},
+		);
+		const signals = new TestSignalSource();
+		let resolveReady: () => void = () => {};
+		const ready = new Promise<void>((resolve) => {
+			resolveReady = resolve;
+		});
+		let running: Promise<void> | undefined;
+		try {
+			running = runIncidentRecorderService(target.agentDir, {
+				journalctlPath,
+				compactorOptions: { freeReserveBytes: 0 },
+				notify: (fields) => {
+					if (fields.includes("READY=1")) resolveReady();
+				},
+				signalSource: signals,
+				writerStopDeadlineMs: 1_000,
+			});
+			running.catch(() => {});
+			await withTimeout(ready);
+			await waitForCondition(() => pruneCalls >= 2, "read-snapshot-blocked segment prune");
+			const callsWhileBlocked = pruneCalls;
+			await new Promise<void>((resolve) => setTimeout(resolve, 50));
+			expect(pruneCalls).toBe(callsWhileBlocked);
+			expect(deletedAfterRelease).toBe(false);
+			releaseReadSnapshot = true;
+			await waitForCondition(() => deletedAfterRelease, "released read-snapshot segment revisit");
+			expect(observedContinuations[0]).toBeUndefined();
+			expect(observedContinuations[1]).toEqual(revisitAnchor);
+			expect(observedContinuations[2]).toEqual(revisitAnchor);
+			signals.emit("SIGTERM");
+			await withTimeout(running);
+		} finally {
+			releaseReadSnapshot = true;
 			if (signals.size > 0) signals.emit("SIGTERM");
 			if (running) await withTimeout(running).catch(() => undefined);
 			if (previousPath === undefined) delete process.env.PATH;
@@ -666,6 +832,157 @@ describe("incident recorder service lifecycle", () => {
 			else process.env.PRIME_TEST_RECORDER_SERVICE_EVENTS = previousEvents;
 		}
 	}, 10_000);
+
+	it("rolls back every attempted signal registration and preserves rollback detail", async () => {
+		const target = fixture();
+		const registrationError = new Error("SIGINT registration rejected");
+		const rollbackError = new Error("SIGINT rollback rejected");
+		const signals = new FaultingSignalSource(
+			new Map<RecorderSignal, unknown>([["SIGINT", registrationError]]),
+			new Map<RecorderSignal, unknown>([["SIGINT", rollbackError]]),
+		);
+		const writerStart = vi.spyOn(IncidentRecorderWriter.prototype, "start");
+
+		const rejection = await captureRejection(
+			runIncidentRecorderService(target.agentDir, {
+				notify: () => {},
+				signalSource: signals,
+			}),
+		);
+
+		expect(rejection).toBeInstanceOf(AggregateError);
+		expect((rejection as AggregateError).errors).toEqual([registrationError, rollbackError]);
+		expect((rejection as Error).message).toContain("signalSource.off(SIGINT)");
+		expect(signals.calls).toEqual(["once:SIGTERM", "once:SIGINT", "off:SIGINT", "off:SIGTERM"]);
+		expect(signals.has("SIGTERM")).toBe(false);
+		expect(signals.has("SIGINT")).toBe(true);
+		expect(writerStart).not.toHaveBeenCalled();
+	});
+
+	it("rethrows signal registration unchanged when rollback succeeds", async () => {
+		const target = fixture();
+		const registrationError = new Error("SIGINT registration rejected cleanly");
+		const signals = new FaultingSignalSource(
+			new Map<RecorderSignal, unknown>([["SIGINT", registrationError]]),
+		);
+
+		const rejection = await captureRejection(
+			runIncidentRecorderService(target.agentDir, {
+				notify: () => {},
+				signalSource: signals,
+			}),
+		);
+
+		expect(rejection).toBe(registrationError);
+		expect(signals.calls).toEqual(["once:SIGTERM", "once:SIGINT", "off:SIGINT", "off:SIGTERM"]);
+		expect(signals.has("SIGTERM")).toBe(false);
+		expect(signals.has("SIGINT")).toBe(false);
+	});
+
+	it("attempts every shutdown cleanup when both signal removals throw", async () => {
+		const target = fixture();
+		const sigtermRemovalError = new Error("SIGTERM removal rejected");
+		const sigintRemovalError = new Error("SIGINT removal rejected");
+		const signals = new FaultingSignalSource(
+			new Map<RecorderSignal, unknown>(),
+			new Map<RecorderSignal, unknown>([
+				["SIGTERM", sigtermRemovalError],
+				["SIGINT", sigintRemovalError],
+			]),
+		);
+		mockReadyServiceCompactor();
+		const writerStop = vi.spyOn(IncidentRecorderWriter.prototype, "stop").mockResolvedValue(undefined);
+
+		const rejection = await captureRejection(
+			runIncidentRecorderService(target.agentDir, {
+				notify: (fields) => {
+					if (fields.includes("READY=1")) signals.emit("SIGTERM");
+				},
+				signalSource: signals,
+				writerStopDeadlineMs: 1_000,
+			}),
+		);
+
+		expect(rejection).toBeInstanceOf(AggregateError);
+		expect((rejection as AggregateError).errors).toEqual([sigtermRemovalError, sigintRemovalError]);
+		expect(signals.calls).toEqual(["once:SIGTERM", "once:SIGINT", "off:SIGTERM", "off:SIGINT"]);
+		expect(writerStop).toHaveBeenCalledOnce();
+		expect(writerStop).toHaveBeenCalledWith(1_000);
+	});
+
+	it("keeps a compactor thrown undefined ahead of writer and signal cleanup failures", async () => {
+		const target = fixture();
+		const writerStopError = new Error("writer stop should lose to compactor");
+		const removalError = new Error("signal cleanup should lose to compactor");
+		const signals = new FaultingSignalSource(
+			new Map<RecorderSignal, unknown>(),
+			new Map<RecorderSignal, unknown>([["SIGTERM", removalError]]),
+		);
+		mockReadyServiceCompactor(() => Promise.reject(undefined));
+		const writerStop = vi.spyOn(IncidentRecorderWriter.prototype, "stop").mockRejectedValue(writerStopError);
+
+		const rejection = await captureRejection(
+			runIncidentRecorderService(target.agentDir, {
+				notify: (fields) => {
+					if (fields.includes("READY=1")) signals.emit("SIGTERM");
+				},
+				signalSource: signals,
+				writerStopDeadlineMs: 1_000,
+			}),
+		);
+
+		expect(rejection).toBeUndefined();
+		expect(signals.calls).toEqual(["once:SIGTERM", "once:SIGINT", "off:SIGTERM", "off:SIGINT"]);
+		expect(writerStop).toHaveBeenCalledOnce();
+	});
+
+	it("keeps a writer-stop thrown undefined ahead of a run and signal cleanup failure", async () => {
+		const target = fixture();
+		const runError = new Error("writer start rejected");
+		const removalError = new Error("signal cleanup should lose to writer stop");
+		const signals = new FaultingSignalSource(
+			new Map<RecorderSignal, unknown>(),
+			new Map<RecorderSignal, unknown>([["SIGTERM", removalError]]),
+		);
+		vi.spyOn(IncidentRecorderWriter.prototype, "start").mockRejectedValue(runError);
+		const writerStop = vi.spyOn(IncidentRecorderWriter.prototype, "stop").mockRejectedValue(undefined);
+
+		const rejection = await captureRejection(
+			runIncidentRecorderService(target.agentDir, {
+				notify: () => {},
+				signalSource: signals,
+				writerStopDeadlineMs: 1_000,
+			}),
+		);
+
+		expect(rejection).toBeUndefined();
+		expect(signals.calls).toEqual(["once:SIGTERM", "once:SIGINT", "off:SIGTERM", "off:SIGINT"]);
+		expect(writerStop).toHaveBeenCalledOnce();
+	});
+
+	it("keeps the run failure ahead of signal cleanup while still draining the writer", async () => {
+		const target = fixture();
+		const runError = new Error("writer start rejected before readiness");
+		const removalError = new Error("signal cleanup should lose to run failure");
+		const signals = new FaultingSignalSource(
+			new Map<RecorderSignal, unknown>(),
+			new Map<RecorderSignal, unknown>([["SIGTERM", removalError]]),
+		);
+		vi.spyOn(IncidentRecorderWriter.prototype, "start").mockRejectedValue(runError);
+		const writerStop = vi.spyOn(IncidentRecorderWriter.prototype, "stop").mockResolvedValue(undefined);
+
+		const rejection = await captureRejection(
+			runIncidentRecorderService(target.agentDir, {
+				notify: () => {},
+				signalSource: signals,
+				writerStopDeadlineMs: 1_000,
+			}),
+		);
+
+		expect(rejection).toBe(runError);
+		expect(signals.calls).toEqual(["once:SIGTERM", "once:SIGINT", "off:SIGTERM", "off:SIGINT"]);
+		expect(writerStop).toHaveBeenCalledOnce();
+	});
 
 	it("reaches degraded readiness and remains stoppable when storage starts recovery-only", async () => {
 		const target = fixture();

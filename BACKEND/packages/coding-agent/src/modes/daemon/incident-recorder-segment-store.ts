@@ -8,13 +8,15 @@ import {
 	ftruncateSync,
 	linkSync,
 	lstatSync,
-	statfsSync,
 	mkdirSync,
 	openSync,
 	opendirSync,
 	readFileSync,
+	readlinkSync,
 	readSync,
+	realpathSync,
 	renameSync,
+	statfsSync,
 	unlinkSync,
 	writeSync,
 } from "node:fs";
@@ -47,10 +49,24 @@ const DEFAULT_MAX_STARTUP_ENTRIES = 8_192;
 const DEFAULT_MAX_STARTUP_CATALOG_BYTES = 64 * MEBIBYTE;
 const DEFAULT_MAX_QUERY_RECORDS = 4_096;
 const DEFAULT_MAX_QUERY_BYTES = 32 * MEBIBYTE;
+const DEFAULT_MAX_QUERY_SCANNED_SEGMENTS = 16;
+const DEFAULT_MAX_QUERY_SCANNED_RECORDS = 4_096;
+const DEFAULT_MAX_QUERY_SCANNED_GAPS = 4_096;
+const DEFAULT_MAX_QUERY_SCANNED_INDEX_BYTES = 32 * MEBIBYTE;
+const MAX_ACTIVE_READ_LEASES = 8;
 const DEFAULT_MAX_IDEMPOTENCY_LOOKUP_SEGMENTS = DEFAULT_MAX_STARTUP_ENTRIES;
 const DEFAULT_MAX_IDEMPOTENCY_LOOKUP_RECORDS = 1_048_576;
 const DEFAULT_MAX_PRUNE_SEGMENTS = 16;
 const DEFAULT_MAX_PRUNE_BYTES = 64 * MEBIBYTE;
+const MAX_ACTIVE_PRUNE_CURSORS = 32;
+const PRUNE_CURSOR_TTL_MS = 5 * 60 * 1000;
+const PROC_SUPER_MAGIC = 0x9fa0n;
+const PROC_FDINFO_MAX_BYTES = 4 * 1024;
+const PROC_ROOT_PATH = "/proc";
+const PROC_THREAD_SELF_PATH = "/proc/thread-self";
+const PROC_THREAD_FD_DIRECTORY = "/proc/thread-self/fd";
+const PROC_THREAD_FDINFO_DIRECTORY = "/proc/thread-self/fdinfo";
+const PROC_THREAD_SELF_TARGET_PATTERN = /^[1-9][0-9]*\/task\/[1-9][0-9]*$/;
 const MAX_UNSIGNED_64 = (1n << 64n) - 1n;
 const OWNER_FILE_NAME = ".writer-owner.json";
 const IDEMPOTENCY_BLOOM_BYTES = 8 * 1024;
@@ -156,11 +172,29 @@ export interface IncidentRecorderSegmentReadSnapshot {
 	readonly highWaterOrdinal: number;
 }
 
+/**
+ * A process-local retention lease for one immutable read frontier. The exact
+ * frozen object must remain registered with the store for every leased query.
+ */
+export interface IncidentRecorderSegmentReadLease {
+	readonly version: 1;
+	readonly storeInstanceId: string;
+	readonly token: string;
+	readonly acquiredAtMs: number;
+	readonly expiresAtMs: number;
+	readonly highWaterSegmentSequence: number;
+	readonly highWaterOrdinal: number;
+}
+
 export interface IncidentRecorderSegmentPageQuery extends IncidentRecorderSegmentQuery {
 	after?: IncidentRecorderSegmentQueryCursor;
 	readSnapshot?: IncidentRecorderSegmentReadSnapshot;
+	readLease?: IncidentRecorderSegmentReadLease;
 	maxRecords?: number;
 	maxBytes?: number;
+	maxScannedSegments?: number;
+	maxScannedRecords?: number;
+	maxScannedIndexBytes?: number;
 }
 
 export interface IncidentRecorderSegmentQueryPage {
@@ -168,6 +202,33 @@ export interface IncidentRecorderSegmentQueryPage {
 	complete: boolean;
 	nextCursor?: IncidentRecorderSegmentQueryCursor;
 	selectedFrameBytes: number;
+	scannedSegments: number;
+	scannedRecords: number;
+	scannedIndexBytes: number;
+	snapshot: IncidentRecorderSegmentQuerySnapshot;
+}
+
+export type IncidentRecorderSegmentRecoveryGapQueryCursor = IncidentRecorderSegmentQueryCursor;
+
+export interface IncidentRecorderSegmentRecoveryGapPageQuery {
+	after?: IncidentRecorderSegmentRecoveryGapQueryCursor;
+	readSnapshot?: IncidentRecorderSegmentReadSnapshot;
+	readLease?: IncidentRecorderSegmentReadLease;
+	maxGaps?: number;
+	maxBytes?: number;
+	maxScannedSegments?: number;
+	maxScannedGaps?: number;
+	maxScannedIndexBytes?: number;
+}
+
+export interface IncidentRecorderSegmentRecoveryGapQueryPage {
+	gaps: IncidentRecorderSegmentRecoveryGap[];
+	complete: boolean;
+	nextCursor?: IncidentRecorderSegmentRecoveryGapQueryCursor;
+	selectedBytes: number;
+	scannedSegments: number;
+	scannedGaps: number;
+	scannedIndexBytes: number;
 	snapshot: IncidentRecorderSegmentQuerySnapshot;
 }
 
@@ -194,7 +255,17 @@ export type IncidentRecorderSegmentFaultPoint =
 	| "after-record-write-before-fsync"
 	| "after-recovery-gap-fsync-before-truncate"
 	| "after-sealed-link-before-directory-fsync"
-	| "after-prune-unlink-before-directory-fsync";
+	| "before-prune-unlink-after-verify"
+	| "after-prune-unlink-before-directory-fsync"
+	| "after-prune-index-handle-close"
+	| "after-prune-verifier-failure-handle-close"
+	| "after-recovery-catalog-directory-close"
+	| "after-recovery-owner-claim-handle-close"
+	| "after-recovery-root-directory-close"
+	| "after-owner-claim-handle-close"
+	| "before-close-root-accounting"
+	| "after-poison-active-handle-close"
+	| "after-prune-protected-handle-close";
 
 export interface IncidentRecorderSegmentDurableWrite {
 	eventId: string;
@@ -275,12 +346,12 @@ export type IncidentRecorderSegmentPruneProtection =
 	| IncidentRecorderSegmentPruneProtectionComplete;
 
 export interface IncidentRecorderSegmentPruneCursor {
-	version: 1;
-	sessionId: string;
-	storeInstanceId: string;
-	highWaterSegmentSequence: number;
-	filterSha256: string;
-	segmentSequence: number;
+	readonly version: 1;
+	readonly sessionId: string;
+	readonly storeInstanceId: string;
+	readonly highWaterSegmentSequence: number;
+	readonly filterSha256: string;
+	readonly segmentSequence: number;
 }
 
 export interface IncidentRecorderSegmentAppendStorageEstimate {
@@ -333,6 +404,7 @@ export interface IncidentRecorderSegmentStoreOptions {
 	onDurableWrite?: (event: IncidentRecorderSegmentDurableWrite) => void;
 	onIndexRead?: (segmentId: string) => void;
 	onRecoveryRead?: (bytes: number) => void;
+	onPruneExpiryCleanupDiagnostic?: (diagnostic: IncidentRecorderPruneExpiryCleanupDiagnostic) => void;
 	faultInjector?: (point: IncidentRecorderSegmentFaultPoint) => void;
 	ownerIdentity?: IncidentRecorderSegmentOwnerIdentity;
 	isOwnerAlive?: (identity: IncidentRecorderSegmentOwnerIdentity) => boolean;
@@ -364,11 +436,28 @@ export interface IncidentRecorderSegmentPruneResult {
 	corruptSegmentIds: string[];
 	examinedSegments: number;
 	deletedBytes: number;
+	blockedByReadSnapshot?: boolean;
 	locatorsInvalidated: boolean;
 	requiresFullReconciliation: boolean;
 	moreWork: boolean;
 	continuation?: IncidentRecorderSegmentPruneCursor;
 	requiredBytes?: number;
+}
+
+export type IncidentRecorderSegmentPruneMutationResult = Readonly<
+	Omit<IncidentRecorderSegmentPruneResult, "deletedSegmentIds" | "corruptSegmentIds"> & {
+		readonly deletedSegmentIds: readonly string[];
+		readonly corruptSegmentIds: readonly string[];
+	}
+>;
+
+export type IncidentRecorderSegmentDirectoryDurability = "unknown" | "confirmed";
+
+export interface IncidentRecorderPruneExpiryCleanupDiagnostic {
+	readonly kind: "prune-cursor-expiry-cleanup-failed";
+	readonly cursor: IncidentRecorderSegmentPruneCursor;
+	readonly scopeFingerprint: string;
+	readonly error: unknown;
 }
 
 export interface IncidentRecorderSegmentRecoveryPruneOptions extends IncidentRecorderSegmentPruneInput {
@@ -378,6 +467,8 @@ export interface IncidentRecorderSegmentRecoveryPruneOptions extends IncidentRec
 	maxStartupCatalogBytes?: number;
 	isOwnerAlive?: (identity: IncidentRecorderSegmentOwnerIdentity) => boolean;
 	onOwnershipTransitionCheck?: () => void;
+	onPruneExpiryCleanupDiagnostic?: (diagnostic: IncidentRecorderPruneExpiryCleanupDiagnostic) => void;
+	faultInjector?: (point: IncidentRecorderSegmentFaultPoint) => void;
 }
 
 interface SegmentHeader {
@@ -477,13 +568,484 @@ interface OwnerClaim extends IncidentRecorderSegmentOwnerIdentity {
 	nonce: string;
 }
 
+interface PruneCursorCapability {
+	readonly cursor: IncidentRecorderSegmentPruneCursor;
+	readonly scopeFingerprint: string;
+	readonly scopeLease?: RecoveryPruneStorageScopeLease;
+	readonly expiresAtMs: number;
+	readonly cleanupTimer: ReturnType<typeof setTimeout>;
+	readonly expiryDiagnosticSink?: (diagnostic: IncidentRecorderPruneExpiryCleanupDiagnostic) => void;
+}
+
+const RECOVERY_PRUNE_CURSOR_CAPABILITIES = new Map<string, PruneCursorCapability>();
+const PRUNE_CURSOR_ASYNC_EXPIRY_FAILURES = new WeakMap<
+	IncidentRecorderSegmentPruneCursor,
+	IncidentRecorderPrimaryFailure
+>();
+
 class InvalidFrameError extends Error {}
+
+class SegmentCatalogBudgetExceededError extends Error {}
+
+class IncidentRecorderIndexObserverError extends Error {
+	constructor(cause: unknown) {
+		super(`incident recorder index observer failed: ${errorText(cause)}`, { cause });
+		this.name = "IncidentRecorderIndexObserverError";
+	}
+}
+
+class IncidentRecorderSegmentUnlinkMutationError extends Error {
+	readonly previousAllocation: StorageState;
+	readonly directoryDurability: IncidentRecorderSegmentDirectoryDurability;
+
+	constructor(
+		cause: unknown,
+		previousAllocation: StorageState,
+		directoryDurability: IncidentRecorderSegmentDirectoryDurability,
+	) {
+		super(`sealed segment was unlinked but post-commit validation failed: ${errorText(cause)}`, { cause });
+		this.name = "IncidentRecorderSegmentUnlinkMutationError";
+		this.previousAllocation = previousAllocation;
+		this.directoryDurability = directoryDurability;
+	}
+}
+
+export class IncidentRecorderDescriptorCleanupError extends Error {
+	readonly primaryError: unknown;
+	readonly cleanupErrors: readonly unknown[];
+
+	constructor(primaryError: unknown, cleanupErrors: readonly unknown[]) {
+		super(
+			`${errorText(primaryError)}; descriptor cleanup also failed: ${cleanupErrors.map(errorText).join("; ")}`,
+			{ cause: primaryError },
+		);
+		this.name = "IncidentRecorderDescriptorCleanupError";
+		this.primaryError = primaryError;
+		this.cleanupErrors = Object.freeze([...cleanupErrors]);
+	}
+}
+
+export class IncidentRecorderSegmentPruneMutationError extends Error {
+	readonly result: IncidentRecorderSegmentPruneMutationResult;
+	readonly directoryDurability: IncidentRecorderSegmentDirectoryDurability;
+
+	constructor(input: {
+		cause: unknown;
+		result: IncidentRecorderSegmentPruneMutationResult;
+		directoryDurability: IncidentRecorderSegmentDirectoryDurability;
+	}) {
+		super(
+			`incident recorder prune mutated storage and requires reconciliation; directory durability is ${input.directoryDurability}: ${errorText(input.cause)}`,
+			{ cause: input.cause },
+		);
+		this.name = "IncidentRecorderSegmentPruneMutationError";
+		this.result = input.result;
+		this.directoryDurability = input.directoryDurability;
+	}
+}
+
+function pruneMutationErrorIn(error: unknown): IncidentRecorderSegmentPruneMutationError | undefined {
+	let candidate = error;
+	const visited = new Set<unknown>();
+	while (candidate instanceof IncidentRecorderDescriptorCleanupError && !visited.has(candidate)) {
+		visited.add(candidate);
+		candidate = candidate.primaryError;
+	}
+	return candidate instanceof IncidentRecorderSegmentPruneMutationError ? candidate : undefined;
+}
+
+function unlinkMutationErrorIn(error: unknown): IncidentRecorderSegmentUnlinkMutationError | undefined {
+	let candidate = error;
+	const visited = new Set<unknown>();
+	while (candidate instanceof IncidentRecorderDescriptorCleanupError && !visited.has(candidate)) {
+		visited.add(candidate);
+		candidate = candidate.primaryError;
+	}
+	return candidate instanceof IncidentRecorderSegmentUnlinkMutationError ? candidate : undefined;
+}
+
+function indexObserverErrorIn(error: unknown): IncidentRecorderIndexObserverError | undefined {
+	let candidate = error;
+	const visited = new Set<unknown>();
+	while (candidate instanceof IncidentRecorderDescriptorCleanupError && !visited.has(candidate)) {
+		visited.add(candidate);
+		candidate = candidate.primaryError;
+	}
+	return candidate instanceof IncidentRecorderIndexObserverError ? candidate : undefined;
+}
 
 export class IncidentRecorderSegmentStorePoisonedError extends Error {
 	constructor(cause: unknown) {
 		super(`incident recorder segment store is poisoned: ${errorText(cause)}`, { cause });
 		this.name = "IncidentRecorderSegmentStorePoisonedError";
 	}
+}
+
+export type IncidentRecorderSegmentPageBudgetFrameKind = "record-index" | "recovery-gap-index";
+
+export class IncidentRecorderSegmentPageBudgetExceededError extends Error {
+	readonly segmentId: string;
+	readonly frameKind: IncidentRecorderSegmentPageBudgetFrameKind;
+	readonly requiredBytes: number;
+	readonly configuredBytes: number;
+
+	constructor(input: {
+		segmentId: string;
+		frameKind: IncidentRecorderSegmentPageBudgetFrameKind;
+		requiredBytes: number;
+		configuredBytes: number;
+	}) {
+		super(
+			`segment ${input.segmentId} index frame requires ${String(input.requiredBytes)} bytes but maxScannedIndexBytes is ${String(input.configuredBytes)}`,
+		);
+		this.name = "IncidentRecorderSegmentPageBudgetExceededError";
+		this.segmentId = input.segmentId;
+		this.frameKind = input.frameKind;
+		this.requiredBytes = input.requiredBytes;
+		this.configuredBytes = input.configuredBytes;
+	}
+}
+
+interface IncidentRecorderPrimaryFailure {
+	readonly error: unknown;
+}
+
+type IncidentRecorderOutcome<T> =
+	| { readonly ok: true; readonly value: T }
+	| { readonly ok: false; readonly failure: IncidentRecorderPrimaryFailure };
+
+function captureIncidentRecorderOutcome<T>(operation: () => T): IncidentRecorderOutcome<T> {
+	try {
+		return { ok: true, value: operation() };
+	} catch (error) {
+		return { ok: false, failure: { error } };
+	}
+}
+
+function combinePrimaryAndCleanupErrors(primaryError: unknown, cleanupErrors: readonly unknown[]): unknown {
+	return cleanupErrors.length === 0
+		? primaryError
+		: new IncidentRecorderDescriptorCleanupError(primaryError, cleanupErrors);
+}
+
+function runCleanupActionsAttemptAll(actions: readonly (() => void)[]): unknown[] {
+	const cleanupErrors: unknown[] = [];
+	for (const action of actions) {
+		try {
+			action();
+		} catch (error) {
+			cleanupErrors.push(error);
+		}
+	}
+	return cleanupErrors;
+}
+
+function settleIncidentRecorderOutcome<T>(outcome: IncidentRecorderOutcome<T>, cleanupErrors: readonly unknown[]): T {
+	if (!outcome.ok) throw combinePrimaryAndCleanupErrors(outcome.failure.error, cleanupErrors);
+	if (cleanupErrors.length > 0) {
+		throw new IncidentRecorderDescriptorCleanupError(cleanupErrors[0], cleanupErrors.slice(1));
+	}
+	return outcome.value;
+}
+
+function closeDescriptorsAttemptAll(
+	descriptors: readonly number[],
+	primaryFailure?: IncidentRecorderPrimaryFailure,
+	closeDescriptor: (descriptor: number) => void = closeSync,
+): void {
+	const cleanupErrors: unknown[] = [];
+	for (const descriptor of descriptors) {
+		if (descriptor < 0) continue;
+		try {
+			closeDescriptor(descriptor);
+		} catch (error) {
+			cleanupErrors.push(error);
+		}
+	}
+	if (primaryFailure) {
+		throw combinePrimaryAndCleanupErrors(primaryFailure.error, cleanupErrors);
+	}
+	if (cleanupErrors.length > 0) {
+		throw combinePrimaryAndCleanupErrors(cleanupErrors[0], cleanupErrors.slice(1));
+	}
+}
+
+function closeDescriptorsPreservingFailure(descriptors: readonly number[], error: unknown): never {
+	closeDescriptorsAttemptAll(descriptors, { error });
+	throw error;
+}
+
+function runCleanupPreservingFailure(error: unknown, cleanup: () => void): never {
+	throw combinePrimaryAndCleanupErrors(error, runCleanupActionsAttemptAll([cleanup]));
+}
+
+function runPruneExpiryCleanup(cleanup: () => void, onFailure?: (error: unknown) => void): void {
+	try {
+		cleanup();
+	} catch (error) {
+		// Expiry is asynchronous and has no caller. The registry entry is already
+		// consumed and attempt-all close has run; emit bounded evidence without
+		// letting either cleanup or its diagnostic observer escape into the daemon.
+		try {
+			onFailure?.(error);
+		} catch {
+			// A diagnostic observer is never mutation authority and cannot trigger retry.
+		}
+	}
+}
+
+/** @internal Exercises the exact production attempt-all close primitive. */
+export function closeIncidentRecorderDescriptorsForTest(
+	descriptors: readonly number[],
+	primaryFailure: IncidentRecorderPrimaryFailure | undefined,
+	afterClose?: (descriptor: number) => void,
+): void {
+	closeDescriptorsAttemptAll(descriptors, primaryFailure, (descriptor) => {
+		closeSync(descriptor);
+		afterClose?.(descriptor);
+	});
+}
+
+/** @internal Exercises the non-throwing production expiry boundary. */
+export function runIncidentRecorderPruneExpiryCleanupForTest(
+	cleanup: () => void,
+	onFailure?: (error: unknown) => void,
+): void {
+	runPruneExpiryCleanup(cleanup, onFailure);
+}
+
+function pruneCursorCapabilityKey(cursor: IncidentRecorderSegmentPruneCursor): string {
+	return `${cursor.storeInstanceId}\u0000${cursor.sessionId}`;
+}
+
+interface PruneCursorCapabilityRelease {
+	readonly removed: boolean;
+	readonly cleanupErrors: readonly unknown[];
+}
+
+function releasePruneCursorCapability(
+	registry: Map<string, PruneCursorCapability>,
+	key: string,
+	expectedCursor?: IncidentRecorderSegmentPruneCursor,
+): PruneCursorCapabilityRelease {
+	const capability = registry.get(key);
+	if (!capability || (expectedCursor && capability.cursor !== expectedCursor)) {
+		return { removed: false, cleanupErrors: [] };
+	}
+	registry.delete(key);
+	clearTimeout(capability.cleanupTimer);
+	const scopeLease = capability.scopeLease;
+	const cleanupErrors = scopeLease
+		? runCleanupActionsAttemptAll([() => closeRecoveryPruneStorageScope(scopeLease)])
+		: [];
+	return { removed: true, cleanupErrors };
+}
+
+function removePruneCursorCapability(
+	registry: Map<string, PruneCursorCapability>,
+	key: string,
+	expectedCursor?: IncidentRecorderSegmentPruneCursor,
+): boolean {
+	const release = releasePruneCursorCapability(registry, key, expectedCursor);
+	if (release.cleanupErrors.length > 0) {
+		throw combinePrimaryAndCleanupErrors(release.cleanupErrors[0], release.cleanupErrors.slice(1));
+	}
+	return release.removed;
+}
+
+
+function sweepExpiredPruneCursorCapabilities(
+	registry: Map<string, PruneCursorCapability>,
+	now: number,
+	retainedCapability?: PruneCursorCapability,
+): void {
+	const cleanupErrors: unknown[] = [];
+	for (const [key, capability] of registry) {
+		if (capability === retainedCapability) continue;
+		if (capability.expiresAtMs <= now) {
+			cleanupErrors.push(...releasePruneCursorCapability(registry, key, capability.cursor).cleanupErrors);
+		}
+	}
+	if (cleanupErrors.length > 0) {
+		throw combinePrimaryAndCleanupErrors(cleanupErrors[0], cleanupErrors.slice(1));
+	}
+}
+
+function assertPruneCursorShape(cursor: IncidentRecorderSegmentPruneCursor): void {
+	if (!cursor || typeof cursor !== "object" || cursor.version !== 1) {
+		throw new Error("prune continuation version is unsupported");
+	}
+	if (!Object.isFrozen(cursor)) throw new Error("prune continuation must be the exact frozen registered object");
+	if (typeof cursor.sessionId !== "string" || cursor.sessionId.length === 0) {
+		throw new Error("prune continuation session is invalid");
+	}
+	if (typeof cursor.storeInstanceId !== "string" || cursor.storeInstanceId.length === 0) {
+		throw new Error("prune continuation store instance is invalid");
+	}
+	if (!/^[a-f0-9]{64}$/.test(cursor.filterSha256)) throw new Error("prune continuation filter is invalid");
+	assertSafeNonNegativeInteger(cursor.highWaterSegmentSequence, "prune continuation high-water segment sequence");
+	assertSafeNonNegativeInteger(cursor.segmentSequence, "prune continuation segment sequence");
+	if (cursor.segmentSequence > cursor.highWaterSegmentSequence) {
+		throw new Error("prune continuation frontier exceeds its frozen high-water mark");
+	}
+}
+
+function assertPruneCursorCapability(
+	registry: Map<string, PruneCursorCapability>,
+	cursor: IncidentRecorderSegmentPruneCursor,
+	storeInstanceId: string,
+	filterSha256: string,
+	scopeFingerprint: string,
+	now: number,
+): PruneCursorCapability {
+	assertPruneCursorShape(cursor);
+	if (cursor.storeInstanceId !== storeInstanceId || cursor.filterSha256 !== filterSha256) {
+		throw new Error("prune continuation is stale or does not match its frozen arguments");
+	}
+	const asynchronousExpiryFailure = PRUNE_CURSOR_ASYNC_EXPIRY_FAILURES.get(cursor);
+	if (asynchronousExpiryFailure) {
+		PRUNE_CURSOR_ASYNC_EXPIRY_FAILURES.delete(cursor);
+		throw combinePrimaryAndCleanupErrors(new Error("prune continuation expired"), [asynchronousExpiryFailure.error]);
+	}
+	const key = pruneCursorCapabilityKey(cursor);
+	const capability = registry.get(key);
+	if (!capability) throw new Error("prune continuation is not an active process-local capability");
+	if (capability.cursor !== cursor) throw new Error("prune continuation is not the exact registered object");
+	if (capability.scopeFingerprint !== scopeFingerprint) {
+		throw new Error("prune continuation storage identity changed; restart required");
+	}
+	if (capability.expiresAtMs <= now) {
+		const expiredError = new Error("prune continuation expired");
+		const release = releasePruneCursorCapability(registry, key, cursor);
+		throw combinePrimaryAndCleanupErrors(expiredError, release.cleanupErrors);
+	}
+	return capability;
+}
+
+function registerPruneCursorCapability(
+	registry: Map<string, PruneCursorCapability>,
+	cursor: IncidentRecorderSegmentPruneCursor,
+	scopeFingerprint: string,
+	now: number,
+	scopeLease?: RecoveryPruneStorageScopeLease,
+	expectedPrevious?: PruneCursorCapability,
+	expiryDiagnosticSink?: (diagnostic: IncidentRecorderPruneExpiryCleanupDiagnostic) => void,
+): PruneCursorCapability {
+	assertSafeNonNegativeInteger(now, "prune continuation registry time");
+	const key = pruneCursorCapabilityKey(cursor);
+	sweepExpiredPruneCursorCapabilities(registry, now, expectedPrevious);
+	const existing = registry.get(key);
+	if (expectedPrevious) {
+		if (existing !== expectedPrevious) {
+			throw new Error("prune continuation predecessor changed before atomic rotation");
+		}
+	} else if (existing) {
+		throw new Error("prune continuation session already exists");
+	}
+	if (!existing && registry.size >= MAX_ACTIVE_PRUNE_CURSORS) {
+		throw new Error(`prune continuation registry exceeds the ${String(MAX_ACTIVE_PRUNE_CURSORS)}-cursor ceiling`);
+	}
+	if (existing?.scopeLease && scopeLease && existing.scopeLease !== scopeLease) {
+		throw new Error("prune continuation storage scope cannot change within a session");
+	}
+	const retainedScopeLease = scopeLease ?? existing?.scopeLease;
+	const retainedExpiryDiagnosticSink = existing?.expiryDiagnosticSink ?? expiryDiagnosticSink;
+	let cleanupTimer: ReturnType<typeof setTimeout> | undefined;
+	let capability: PruneCursorCapability;
+	try {
+		cleanupTimer = setTimeout(() => {
+			runPruneExpiryCleanup(
+				() => {
+					const release = releasePruneCursorCapability(registry, key, cursor);
+					if (release.cleanupErrors.length > 0) {
+						throw combinePrimaryAndCleanupErrors(release.cleanupErrors[0], release.cleanupErrors.slice(1));
+					}
+				},
+				(error) => {
+					PRUNE_CURSOR_ASYNC_EXPIRY_FAILURES.set(cursor, { error });
+					retainedExpiryDiagnosticSink?.(
+						Object.freeze({
+							kind: "prune-cursor-expiry-cleanup-failed" as const,
+							cursor,
+							scopeFingerprint,
+							error,
+						}),
+					);
+				},
+			);
+		}, PRUNE_CURSOR_TTL_MS);
+		cleanupTimer.unref();
+		capability = {
+			cursor,
+			scopeFingerprint,
+			...(retainedScopeLease ? { scopeLease: retainedScopeLease } : {}),
+			...(retainedExpiryDiagnosticSink ? { expiryDiagnosticSink: retainedExpiryDiagnosticSink } : {}),
+			expiresAtMs: Math.min(Number.MAX_SAFE_INTEGER, now + PRUNE_CURSOR_TTL_MS),
+			cleanupTimer,
+		};
+		registry.set(key, capability);
+	} catch (error) {
+		if (cleanupTimer) clearTimeout(cleanupTimer);
+		throw error;
+	}
+	if (existing) clearTimeout(existing.cleanupTimer);
+	return capability;
+}
+
+function frozenPruneCursor(input: Omit<IncidentRecorderSegmentPruneCursor, "version">): IncidentRecorderSegmentPruneCursor {
+	return Object.freeze({ version: 1 as const, ...input });
+}
+
+function pruneMutationResultSnapshot(
+	result: IncidentRecorderSegmentPruneResult,
+): IncidentRecorderSegmentPruneMutationResult {
+	const snapshot: IncidentRecorderSegmentPruneMutationResult = {
+		deletedSegmentIds: Object.freeze([...result.deletedSegmentIds]),
+		corruptSegmentIds: Object.freeze([...result.corruptSegmentIds]),
+		examinedSegments: result.examinedSegments,
+		deletedBytes: result.deletedBytes,
+		locatorsInvalidated: true,
+		requiresFullReconciliation: true,
+		moreWork: true,
+		...(result.blockedByReadSnapshot === undefined
+			? {}
+			: { blockedByReadSnapshot: result.blockedByReadSnapshot }),
+		...(result.requiredBytes === undefined ? {} : { requiredBytes: result.requiredBytes }),
+	};
+	return Object.freeze(snapshot);
+}
+
+function classifyPruneFailure(error: unknown, result: IncidentRecorderSegmentPruneResult): unknown {
+	const existingMutation = pruneMutationErrorIn(error);
+	if (existingMutation) {
+		return error === existingMutation
+			? error
+			: new IncidentRecorderSegmentPruneMutationError({
+					cause: error,
+					result: existingMutation.result,
+					directoryDurability: existingMutation.directoryDurability,
+				});
+	}
+	return result.deletedSegmentIds.length === 0
+		? error
+		: new IncidentRecorderSegmentPruneMutationError({
+				cause: error,
+				result: pruneMutationResultSnapshot(result),
+				directoryDurability: "confirmed",
+			});
+}
+
+function attachCleanupToPruneFailure(error: unknown, cleanupErrors: readonly unknown[]): unknown {
+	if (cleanupErrors.length === 0) return error;
+	const cleanupCause = combinePrimaryAndCleanupErrors(error, cleanupErrors);
+	const mutation = pruneMutationErrorIn(error);
+	return mutation
+		? new IncidentRecorderSegmentPruneMutationError({
+				cause: cleanupCause,
+				result: mutation.result,
+				directoryDurability: mutation.directoryDurability,
+			})
+		: cleanupCause;
 }
 
 function errorText(error: unknown): string {
@@ -651,6 +1213,28 @@ function positiveInteger(value: number | undefined, fallback: number, name: stri
 	if (!Number.isSafeInteger(resolved) || resolved <= 0) throw new Error(`${name} must be a positive safe integer`);
 	if (maximum !== undefined && resolved > maximum) throw new Error(`${name} exceeds the fixed format maximum`);
 	return resolved;
+}
+
+function firstOrdinalAfter<T extends { ordinal: number }>(entries: readonly T[], ordinal: number): number {
+	let low = 0;
+	let high = entries.length;
+	while (low < high) {
+		const middle = low + Math.floor((high - low) / 2);
+		if ((entries[middle]?.ordinal ?? Number.MAX_SAFE_INTEGER) <= ordinal) low = middle + 1;
+		else high = middle;
+	}
+	return low;
+}
+
+function firstSegmentAtOrAfter(summaries: readonly SegmentSummary[], segmentSequence: number): number {
+	let low = 0;
+	let high = summaries.length;
+	while (low < high) {
+		const middle = low + Math.floor((high - low) / 2);
+		if ((summaries[middle]?.header.segmentSequence ?? Number.MAX_SAFE_INTEGER) < segmentSequence) low = middle + 1;
+		else high = middle;
+	}
+	return low;
 }
 
 function assertIdentifier(value: string, name: string): void {
@@ -905,6 +1489,48 @@ interface StorageState {
 	allocatedBytes: number;
 }
 
+interface VerifiedSegmentIdentity extends StorageState {
+	mode: string;
+	fileSha256: string;
+}
+
+interface VerifiedSegmentHandle {
+	fileDescriptor: number;
+	identity: VerifiedSegmentIdentity;
+}
+
+interface RecoveryPruneStorageScope {
+	sealedDirectory: string;
+	fingerprint: string;
+}
+
+interface RecoveryPruneStorageScopeLease extends RecoveryPruneStorageScope {
+	rootDescriptor: number;
+	sealedDescriptor: number;
+	procFdAuthority: AuthenticatedProcFdRoute;
+}
+
+interface DirectoryIdentity {
+	deviceId: string;
+	inodeId: string;
+	mode: string;
+}
+
+interface AuthenticatedProcFdRoute {
+	procRootDescriptor: number;
+	fdDirectoryDescriptor: number;
+	procRootIdentity: DirectoryIdentity;
+	fdDirectoryIdentity: DirectoryIdentity;
+	threadSelfTarget: string;
+	procMountId: bigint;
+}
+
+interface ProcFdParentWitness {
+	aliasPath: string;
+	canonicalTarget: string;
+	identity: DirectoryIdentity;
+}
+
 function fileAllocation(fileDescriptor: number): StorageState {
 	const status = fstatSync(fileDescriptor, { bigint: true });
 	return {
@@ -914,6 +1540,542 @@ function fileAllocation(fileDescriptor: number): StorageState {
 		logicalBytes: Number(status.size),
 		allocatedBytes: Number(status.blocks * 512n),
 	};
+}
+
+function verifiedSegmentIdentity(fileDescriptor: number, expectedBytes: number): VerifiedSegmentIdentity {
+	const allocation = fileAllocation(fileDescriptor);
+	const status = fstatSync(fileDescriptor, { bigint: true });
+	if (allocation.logicalBytes !== expectedBytes) {
+		throw new InvalidFrameError("sealed prune target size changed after verification");
+	}
+	return {
+		...allocation,
+		mode: status.mode.toString(),
+		fileSha256: hashFileRange(fileDescriptor, 0, expectedBytes),
+	};
+}
+
+function assertVerifiedSegmentIdentity(
+	fileDescriptor: number,
+	path: string,
+	expected: VerifiedSegmentIdentity,
+): StorageState {
+	assertPrivateRegularFile(fileDescriptor, path);
+	const actual = verifiedSegmentIdentity(fileDescriptor, expected.logicalBytes);
+	if (
+		actual.deviceId !== expected.deviceId ||
+		actual.inodeId !== expected.inodeId ||
+		actual.mode !== expected.mode ||
+		actual.logicalBytes !== expected.logicalBytes ||
+		actual.fileSha256 !== expected.fileSha256
+	) {
+		throw new InvalidFrameError("sealed prune target identity changed after verification");
+	}
+	return actual;
+}
+
+function directoryIdentity(fileDescriptor: number, label: string): DirectoryIdentity {
+	const status = fstatSync(fileDescriptor, { bigint: true });
+	if (!status.isDirectory()) throw new Error(`${label} is not a directory`);
+	return {
+		deviceId: status.dev.toString(),
+		inodeId: status.ino.toString(),
+		mode: status.mode.toString(),
+	};
+}
+
+function assertDirectoryPathIdentity(path: string, expected: DirectoryIdentity, label: string): void {
+	const status = lstatSync(path, { bigint: true });
+	if (
+		!status.isDirectory() ||
+		status.isSymbolicLink() ||
+		status.dev.toString() !== expected.deviceId ||
+		status.ino.toString() !== expected.inodeId ||
+		status.mode.toString() !== expected.mode
+	) {
+		throw new Error(`${label} identity changed`);
+	}
+}
+
+function parseProcMountIdContent(content: Buffer): bigint {
+	if (content.byteLength > PROC_FDINFO_MAX_BYTES) {
+		throw new Error("proc fdinfo exceeds its fixed read bound");
+	}
+	const text = content.toString("utf8");
+	if (text.includes("\u0000")) throw new Error("proc fdinfo contains an embedded NUL");
+	const candidates = text.split("\n").filter((line) => line.startsWith("mnt_id"));
+	if (candidates.length !== 1) throw new Error("proc fdinfo has no unique strict mnt_id");
+	const match = /^mnt_id:\s+([1-9][0-9]{0,19})\s*$/.exec(candidates[0] ?? "");
+	if (!match?.[1]) throw new Error("proc fdinfo mnt_id is malformed");
+	const mountId = BigInt(match[1]);
+	if (mountId > MAX_UNSIGNED_64) throw new Error("proc fdinfo mnt_id is out of range");
+	return mountId;
+}
+
+/** @internal Pure test seam for the production fdinfo parser. */
+export function parseIncidentRecorderProcFdInfoMountIdForTest(content: string | Buffer): bigint {
+	return parseProcMountIdContent(typeof content === "string" ? Buffer.from(content, "utf8") : Buffer.from(content));
+}
+
+function assertMatchingProcMountIds(expected: bigint, observed: readonly bigint[], message: string): void {
+	if (observed.length === 0 || observed.some((mountId) => mountId !== expected)) {
+		throw new Error(message);
+	}
+}
+
+/** @internal Pure test seam for the production proc-route mount comparison. */
+export function assertIncidentRecorderProcFdMountIdsForTest(
+	expected: bigint,
+	observed: readonly bigint[],
+): void {
+	assertMatchingProcMountIds(expected, observed, "proc fd route mount identity changed");
+}
+
+function readProcMountId(fileDescriptor: number): bigint {
+	const path = join(PROC_THREAD_FDINFO_DIRECTORY, String(fileDescriptor));
+	assertProcFsType(path);
+	const fdinfoDescriptor = openSync(
+		path,
+		constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+	);
+	const outcome = captureIncidentRecorderOutcome(() => {
+		const content = Buffer.alloc(PROC_FDINFO_MAX_BYTES + 1);
+		let bytes = 0;
+		for (;;) {
+			const read = readSync(fdinfoDescriptor, content, bytes, content.byteLength - bytes, null);
+			if (read === 0) break;
+			bytes += read;
+			if (bytes > PROC_FDINFO_MAX_BYTES) throw new Error("proc fdinfo exceeds its fixed read bound");
+		}
+		return parseProcMountIdContent(content.subarray(0, bytes));
+	});
+	return settleIncidentRecorderOutcome(
+		outcome,
+		runCleanupActionsAttemptAll([() => closeSync(fdinfoDescriptor)]),
+	);
+}
+
+function assertProcFsType(path: string): void {
+	if (statfsSync(path, { bigint: true }).type !== PROC_SUPER_MAGIC) {
+		throw new Error("descriptor-relative deletion requires a genuine procfs route");
+	}
+}
+
+function sameDirectoryIdentity(left: DirectoryIdentity, right: DirectoryIdentity): boolean {
+	return left.deviceId === right.deviceId && left.inodeId === right.inodeId && left.mode === right.mode;
+}
+
+function assertAuthenticatedProcFdRoute(route: AuthenticatedProcFdRoute): void {
+	assertProcFsType(PROC_ROOT_PATH);
+	assertProcFsType(PROC_THREAD_FD_DIRECTORY);
+	assertProcFsType(PROC_THREAD_FDINFO_DIRECTORY);
+	if (readlinkSync(PROC_THREAD_SELF_PATH) !== route.threadSelfTarget) {
+		throw new Error("proc thread-self identity changed");
+	}
+	if (!PROC_THREAD_SELF_TARGET_PATTERN.test(route.threadSelfTarget)) {
+		throw new Error("proc thread-self identity is invalid");
+	}
+	const heldProcRootIdentity = directoryIdentity(route.procRootDescriptor, "held proc root");
+	if (!sameDirectoryIdentity(heldProcRootIdentity, route.procRootIdentity) || heldProcRootIdentity.inodeId !== "1") {
+		throw new Error("held proc root identity changed");
+	}
+	const heldFdDirectoryIdentity = directoryIdentity(route.fdDirectoryDescriptor, "held proc fd directory");
+	if (!sameDirectoryIdentity(heldFdDirectoryIdentity, route.fdDirectoryIdentity)) {
+		throw new Error("held proc fd directory identity changed");
+	}
+	let freshProcRootDescriptor = -1;
+	let freshFdDirectoryDescriptor = -1;
+	const outcome = captureIncidentRecorderOutcome(() => {
+		freshProcRootDescriptor = openSync(
+			PROC_ROOT_PATH,
+			constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+		);
+		freshFdDirectoryDescriptor = openSync(
+			PROC_THREAD_FD_DIRECTORY,
+			constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+		);
+		const freshRootIdentity = directoryIdentity(freshProcRootDescriptor, "current proc root");
+		const freshFdDirectoryIdentity = directoryIdentity(
+			freshFdDirectoryDescriptor,
+			"current proc thread fd directory",
+		);
+		if (!sameDirectoryIdentity(freshRootIdentity, route.procRootIdentity) || freshRootIdentity.inodeId !== "1") {
+			throw new Error("current proc root differs from held authority");
+		}
+		if (!sameDirectoryIdentity(freshFdDirectoryIdentity, route.fdDirectoryIdentity)) {
+			throw new Error("current proc fd route differs from held authority");
+		}
+		assertDirectoryPathIdentity(PROC_ROOT_PATH, freshRootIdentity, "proc root");
+		assertDirectoryPathIdentity(
+			PROC_THREAD_FD_DIRECTORY,
+			freshFdDirectoryIdentity,
+			"proc thread fd directory",
+		);
+		assertMatchingProcMountIds(
+			route.procMountId,
+			[
+				route.procRootDescriptor,
+				route.fdDirectoryDescriptor,
+				freshProcRootDescriptor,
+				freshFdDirectoryDescriptor,
+			].map((descriptor) => readProcMountId(descriptor)),
+			"proc fd route mount identity changed",
+		);
+		if (readlinkSync(PROC_THREAD_SELF_PATH) !== route.threadSelfTarget) {
+			throw new Error("proc thread-self identity changed during route validation");
+		}
+	});
+	settleIncidentRecorderOutcome(
+		outcome,
+		runCleanupActionsAttemptAll([
+			() => {
+				if (freshFdDirectoryDescriptor >= 0) closeSync(freshFdDirectoryDescriptor);
+			},
+			() => {
+				if (freshProcRootDescriptor >= 0) closeSync(freshProcRootDescriptor);
+			},
+		]),
+	);
+}
+
+function openAuthenticatedProcFdRoute(): AuthenticatedProcFdRoute {
+	let procRootDescriptor = -1;
+	let fdDirectoryDescriptor = -1;
+	try {
+		assertProcFsType(PROC_ROOT_PATH);
+		const threadSelfTarget = readlinkSync(PROC_THREAD_SELF_PATH);
+		if (!PROC_THREAD_SELF_TARGET_PATTERN.test(threadSelfTarget)) {
+			throw new Error("proc thread-self identity is invalid");
+		}
+		procRootDescriptor = openSync(
+			PROC_ROOT_PATH,
+			constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+		);
+		const procRootIdentity = directoryIdentity(procRootDescriptor, "proc root");
+		if (procRootIdentity.inodeId !== "1") throw new Error("proc root inode is not canonical");
+		fdDirectoryDescriptor = openSync(
+			PROC_THREAD_FD_DIRECTORY,
+			constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+		);
+		const fdDirectoryIdentity = directoryIdentity(fdDirectoryDescriptor, "proc thread fd directory");
+		const procMountId = readProcMountId(procRootDescriptor);
+		assertMatchingProcMountIds(
+			procMountId,
+			[readProcMountId(fdDirectoryDescriptor)],
+			"proc root and fd route have different mount identities",
+		);
+		const route: AuthenticatedProcFdRoute = {
+			procRootDescriptor,
+			fdDirectoryDescriptor,
+			procRootIdentity,
+			fdDirectoryIdentity,
+			threadSelfTarget,
+			procMountId,
+		};
+		assertAuthenticatedProcFdRoute(route);
+		return route;
+	} catch (error) {
+		return closeDescriptorsPreservingFailure([fdDirectoryDescriptor, procRootDescriptor], error);
+	}
+}
+
+function closeAuthenticatedProcFdRoute(route: AuthenticatedProcFdRoute): void {
+	closeDescriptorsAttemptAll([route.fdDirectoryDescriptor, route.procRootDescriptor]);
+}
+
+function captureProcFdParentWitness(
+	route: AuthenticatedProcFdRoute,
+	directoryDescriptor: number,
+	expectedPath: string,
+): ProcFdParentWitness {
+	assertAuthenticatedProcFdRoute(route);
+	const aliasPath = join(PROC_THREAD_FD_DIRECTORY, String(directoryDescriptor));
+	const canonicalTarget = realpathSync(expectedPath);
+	if (readlinkSync(aliasPath) !== canonicalTarget) {
+		throw new Error("proc fd parent link does not match its exact canonical path");
+	}
+	const identity = directoryIdentity(directoryDescriptor, "descriptor-relative parent");
+	const aliasDescriptor = openSync(aliasPath, constants.O_RDONLY | constants.O_DIRECTORY);
+	const outcome = captureIncidentRecorderOutcome(() => {
+		const aliasIdentity = directoryIdentity(aliasDescriptor, "proc fd parent alias");
+		if (
+			aliasIdentity.deviceId !== identity.deviceId ||
+			aliasIdentity.inodeId !== identity.inodeId ||
+			aliasIdentity.mode !== identity.mode
+		) {
+			throw new Error("proc fd parent alias resolves to a different directory identity");
+		}
+	});
+	settleIncidentRecorderOutcome(outcome, runCleanupActionsAttemptAll([() => closeSync(aliasDescriptor)]));
+	return { aliasPath, canonicalTarget, identity };
+}
+
+function assertProcFdParentWitness(
+	route: AuthenticatedProcFdRoute,
+	directoryDescriptor: number,
+	witness: ProcFdParentWitness,
+): void {
+	assertAuthenticatedProcFdRoute(route);
+	if (readlinkSync(witness.aliasPath) !== witness.canonicalTarget) {
+		throw new Error("proc fd parent link changed during descriptor-relative operation");
+	}
+	const identity = directoryIdentity(directoryDescriptor, "descriptor-relative parent");
+	if (
+		identity.deviceId !== witness.identity.deviceId ||
+		identity.inodeId !== witness.identity.inodeId ||
+		identity.mode !== witness.identity.mode
+	) {
+		throw new Error("descriptor-relative parent identity changed during operation");
+	}
+	const aliasDescriptor = openSync(witness.aliasPath, constants.O_RDONLY | constants.O_DIRECTORY);
+	const outcome = captureIncidentRecorderOutcome(() => {
+		const aliasIdentity = directoryIdentity(aliasDescriptor, "proc fd parent alias");
+		if (!sameDirectoryIdentity(aliasIdentity, witness.identity)) {
+			throw new Error("proc fd parent alias identity changed during operation");
+		}
+	});
+	settleIncidentRecorderOutcome(outcome, runCleanupActionsAttemptAll([() => closeSync(aliasDescriptor)]));
+}
+
+function procFdChildPath(witness: ProcFdParentWitness, childName: string): string {
+	if (childName.length === 0 || basename(childName) !== childName || childName === "." || childName === "..") {
+		throw new Error("descriptor-relative child name is invalid");
+	}
+	return join(witness.aliasPath, childName);
+}
+
+function recoveryPruneStorageFingerprint(root: DirectoryIdentity, sealed: DirectoryIdentity): string {
+	return canonicalJson({
+		root: {
+			deviceId: root.deviceId,
+			inodeId: root.inodeId,
+			mode: root.mode,
+		},
+		sealedEntry: {
+			name: "sealed",
+			parentDeviceId: root.deviceId,
+			parentInodeId: root.inodeId,
+			targetDeviceId: sealed.deviceId,
+			targetInodeId: sealed.inodeId,
+			targetMode: sealed.mode,
+		},
+	});
+}
+
+function openDirectoryChildAtDescriptor(
+	route: AuthenticatedProcFdRoute,
+	directoryDescriptor: number,
+	directoryPath: string,
+	childName: string,
+): number {
+	let childDescriptor = -1;
+	try {
+		const parentWitness = captureProcFdParentWitness(route, directoryDescriptor, directoryPath);
+		childDescriptor = openSync(
+			procFdChildPath(parentWitness, childName),
+			constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+		);
+		assertProcFdParentWitness(route, directoryDescriptor, parentWitness);
+		const result = childDescriptor;
+		childDescriptor = -1;
+		return result;
+	} catch (error) {
+		return closeDescriptorsPreservingFailure([childDescriptor], error);
+	}
+}
+
+function assertDirectoryChildIdentityAtDescriptor(
+	route: AuthenticatedProcFdRoute,
+	directoryDescriptor: number,
+	directoryPath: string,
+	childName: string,
+	expected: DirectoryIdentity,
+	label: string,
+): void {
+	const parentWitness = captureProcFdParentWitness(route, directoryDescriptor, directoryPath);
+	assertDirectoryPathIdentity(procFdChildPath(parentWitness, childName), expected, label);
+	assertProcFdParentWitness(route, directoryDescriptor, parentWitness);
+}
+
+function assertRecoveryPruneStorageScopeLease(
+	scope: RecoveryPruneStorageScopeLease,
+	directory: string,
+	expectedFingerprint: string,
+): void {
+	const sealedDirectory = join(directory, "sealed");
+	if (scope.sealedDirectory !== sealedDirectory) {
+		throw new Error("recovery prune storage path changed");
+	}
+	const rootIdentity = directoryIdentity(scope.rootDescriptor, "recovery root descriptor");
+	const sealedIdentity = directoryIdentity(scope.sealedDescriptor, "sealed recovery descriptor");
+	if (
+		recoveryPruneStorageFingerprint(rootIdentity, sealedIdentity) !== scope.fingerprint ||
+		scope.fingerprint !== expectedFingerprint
+	) {
+		throw new Error("recovery prune storage descriptor identity changed");
+	}
+	assertDirectoryPathIdentity(directory, rootIdentity, "recovery root");
+	assertDirectoryChildIdentityAtDescriptor(
+		scope.procFdAuthority,
+		scope.rootDescriptor,
+		directory,
+		"sealed",
+		sealedIdentity,
+		"sealed recovery entry",
+	);
+	assertDirectoryPathIdentity(sealedDirectory, sealedIdentity, "sealed recovery path");
+}
+
+// Node 22 has no inode-conditional unlink. The proc/fdinfo witness also cannot
+// close a privileged concurrent mount race. Callers must retain their stable
+// mount-namespace plus single-writer or externalWriterExcluded premise across
+// this final compare/unlink sequence.
+function unlinkVerifiedSegmentAtPath(
+	route: AuthenticatedProcFdRoute,
+	directoryDescriptor: number,
+	directoryPath: string,
+	childName: string,
+	verifiedHandle: VerifiedSegmentHandle,
+	afterUnlinkBeforeDirectoryFsync?: () => void,
+): StorageState {
+	let deleteDescriptor = -1;
+	let previousAllocation: StorageState | undefined;
+	let parentWitness: ProcFdParentWitness | undefined;
+	let path = "";
+	try {
+		parentWitness = captureProcFdParentWitness(route, directoryDescriptor, directoryPath);
+		path = procFdChildPath(parentWitness, childName);
+		deleteDescriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+		assertProcFdParentWitness(route, directoryDescriptor, parentWitness);
+		previousAllocation = assertVerifiedSegmentIdentity(
+			deleteDescriptor,
+			path,
+			verifiedHandle.identity,
+		);
+		assertProcFdParentWitness(route, directoryDescriptor, parentWitness);
+		const pathStatus = lstatSync(path, { bigint: true });
+		const descriptorStatus = fstatSync(deleteDescriptor, { bigint: true });
+		if (
+			!pathStatus.isFile() ||
+			pathStatus.isSymbolicLink() ||
+			pathStatus.dev !== descriptorStatus.dev ||
+			pathStatus.ino !== descriptorStatus.ino ||
+			pathStatus.mode !== descriptorStatus.mode
+		) {
+			throw new InvalidFrameError("sealed prune target path changed immediately before unlink");
+		}
+		unlinkSync(path);
+	} catch (error) {
+		return closeDescriptorsPreservingFailure([deleteDescriptor], error);
+	}
+	const committedAllocation = previousAllocation ?? verifiedHandle.identity;
+	const committedParentWitness = parentWitness;
+	let directoryDurability: IncidentRecorderSegmentDirectoryDurability = "unknown";
+	const postCommitErrors: unknown[] =
+		previousAllocation && committedParentWitness
+			? []
+			: [new Error("sealed prune unlink completed without its verified mutation evidence")];
+	const capturePostCommitError = (error: unknown): void => {
+		postCommitErrors.push(error);
+	};
+	try {
+		afterUnlinkBeforeDirectoryFsync?.();
+	} catch (error) {
+		// This seam models an abrupt stop at the named crash boundary. Crossing it
+		// with a directory fsync would erase the durability uncertainty under test.
+		const mutationCause = combinePrimaryAndCleanupErrors(
+			error,
+			runCleanupActionsAttemptAll([() => closeSync(deleteDescriptor)]),
+		);
+		throw new IncidentRecorderSegmentUnlinkMutationError(mutationCause, committedAllocation, "unknown");
+	}
+	try {
+		fsyncSync(directoryDescriptor);
+		directoryDurability = "confirmed";
+	} catch (error) {
+		capturePostCommitError(error);
+	}
+	try {
+		const heldStatus = fstatSync(verifiedHandle.fileDescriptor, { bigint: true });
+		if (Number(heldStatus.nlink) !== committedAllocation.linkCount - 1) {
+			throw new InvalidFrameError("sealed prune target link count did not decrease after unlink");
+		}
+		if (committedParentWitness) {
+			assertProcFdParentWitness(route, directoryDescriptor, committedParentWitness);
+		}
+	} catch (error) {
+		capturePostCommitError(error);
+	}
+	try {
+		closeSync(deleteDescriptor);
+	} catch (error) {
+		capturePostCommitError(error);
+	}
+	if (postCommitErrors.length > 0) {
+		throw new IncidentRecorderSegmentUnlinkMutationError(
+			combinePrimaryAndCleanupErrors(postCommitErrors[0], postCommitErrors.slice(1)),
+			committedAllocation,
+			directoryDurability,
+		);
+	}
+	return committedAllocation;
+}
+
+function openRecoveryPruneStorageScope(directory: string): RecoveryPruneStorageScopeLease {
+	const sealedDirectory = join(directory, "sealed");
+	let rootDescriptor = -1;
+	let sealedDescriptor = -1;
+	let procFdAuthority: AuthenticatedProcFdRoute | undefined;
+	try {
+		procFdAuthority = openAuthenticatedProcFdRoute();
+		rootDescriptor = openSync(directory, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+		const rootIdentity = directoryIdentity(rootDescriptor, "recovery root");
+		sealedDescriptor = openDirectoryChildAtDescriptor(procFdAuthority, rootDescriptor, directory, "sealed");
+		const sealedIdentity = directoryIdentity(sealedDescriptor, "sealed recovery path");
+		assertDirectoryPathIdentity(directory, rootIdentity, "recovery root");
+		assertDirectoryChildIdentityAtDescriptor(
+			procFdAuthority,
+			rootDescriptor,
+			directory,
+			"sealed",
+			sealedIdentity,
+			"sealed recovery entry",
+		);
+		assertDirectoryPathIdentity(sealedDirectory, sealedIdentity, "sealed recovery path");
+		const scope = {
+			sealedDirectory,
+			fingerprint: recoveryPruneStorageFingerprint(rootIdentity, sealedIdentity),
+		};
+		return { ...scope, rootDescriptor, sealedDescriptor, procFdAuthority };
+	} catch (error) {
+		return closeDescriptorsPreservingFailure(
+			[
+				sealedDescriptor,
+				rootDescriptor,
+				procFdAuthority?.fdDirectoryDescriptor ?? -1,
+				procFdAuthority?.procRootDescriptor ?? -1,
+			],
+			error,
+		);
+	}
+}
+
+function closeRecoveryPruneStorageScope(scope: RecoveryPruneStorageScopeLease): void {
+	closeDescriptorsAttemptAll([
+		scope.sealedDescriptor,
+		scope.rootDescriptor,
+		scope.procFdAuthority.fdDirectoryDescriptor,
+		scope.procFdAuthority.procRootDescriptor,
+	]);
+}
+
+function captureRecoveryPruneStorageScope(directory: string): RecoveryPruneStorageScope {
+	const scope = openRecoveryPruneStorageScope(directory);
+	try {
+		return { sealedDirectory: scope.sealedDirectory, fingerprint: scope.fingerprint };
+	} finally {
+		closeRecoveryPruneStorageScope(scope);
+	}
 }
 
 function pathAllocation(path: string): StorageState {
@@ -929,13 +2091,15 @@ function pathAllocation(path: string): StorageState {
 function pathStorageState(path: string, directory: boolean): StorageState {
 	const flags = constants.O_RDONLY | constants.O_NOFOLLOW | (directory ? constants.O_DIRECTORY : 0);
 	const fileDescriptor = openSync(path, flags);
-	try {
+	const outcome = captureIncidentRecorderOutcome(() => {
 		const status = fstatSync(fileDescriptor);
 		if (directory ? !status.isDirectory() : !status.isFile()) throw new Error("storage accounting path type changed");
 		return fileAllocation(fileDescriptor);
-	} finally {
-		closeSync(fileDescriptor);
-	}
+	});
+	return settleIncidentRecorderOutcome(
+		outcome,
+		runCleanupActionsAttemptAll([() => closeSync(fileDescriptor)]),
+	);
 }
 
 function conservativeAllocatedBytes(logicalBytes: number): number {
@@ -1487,12 +2651,15 @@ export class IncidentRecorderSegmentStore {
 	readonly #onDurableWrite?: (event: IncidentRecorderSegmentDurableWrite) => void;
 	readonly #onIndexRead?: (segmentId: string) => void;
 	readonly #onRecoveryRead?: (bytes: number) => void;
+	readonly #onPruneExpiryCleanupDiagnostic?: (diagnostic: IncidentRecorderPruneExpiryCleanupDiagnostic) => void;
 	readonly #faultInjector?: (point: IncidentRecorderSegmentFaultPoint) => void;
 	readonly #ownerIdentity: IncidentRecorderSegmentOwnerIdentity;
 	readonly #isOwnerAlive: (identity: IncidentRecorderSegmentOwnerIdentity) => boolean;
 	readonly #onOpenStorageResult?: (result: IncidentRecorderSegmentOpenResult) => void;
 	#sealed: SegmentSummary[] = [];
 	#corrupt: CorruptSegment[] = [];
+	#readCatalog: SegmentSummary[] = [];
+	#hasUncataloguedCorruptSegment = false;
 	#active: ActiveSegment | undefined;
 	#ownerClaim: OwnerClaim | undefined;
 	#nextSequence = 0;
@@ -1504,6 +2671,8 @@ export class IncidentRecorderSegmentStore {
 	#generation = 0;
 	#stateRevision = 0;
 	#appendPlans = new Map<string, FrozenAppendPlan>();
+	#readLeases = new Map<string, IncidentRecorderSegmentReadLease>();
+	#pruneCursorCapabilities = new Map<string, PruneCursorCapability>();
 	#accountingSequence = 0;
 	#validatedIdempotencyBloomSegmentIds = new Set<string>();
 	#openRemovedPreexistingEntry = false;
@@ -1584,6 +2753,7 @@ export class IncidentRecorderSegmentStore {
 		this.#onDurableWrite = options.onDurableWrite;
 		this.#onIndexRead = options.onIndexRead;
 		this.#onRecoveryRead = options.onRecoveryRead;
+		this.#onPruneExpiryCleanupDiagnostic = options.onPruneExpiryCleanupDiagnostic;
 		this.#faultInjector = options.faultInjector;
 		this.#ownerIdentity = options.ownerIdentity ?? defaultOwnerIdentity();
 		this.#isOwnerAlive = options.isOwnerAlive ?? defaultIsOwnerAlive;
@@ -1709,33 +2879,59 @@ export class IncidentRecorderSegmentStore {
 	}
 
 	#poison(error: unknown): never {
-		if (!this.#poisoned) this.#poisoned = new IncidentRecorderSegmentStorePoisonedError(error);
-		this.#closeActiveDescriptor();
+		if (!this.#poisoned) {
+			const cleanupErrors = [
+				...this.#closeActiveDescriptor(() => this.#faultInjector?.("after-poison-active-handle-close")),
+				...runCleanupActionsAttemptAll(
+					Array.from(this.#pruneCursorCapabilities.keys(), (key) => () =>
+						removePruneCursorCapability(this.#pruneCursorCapabilities, key),
+					),
+				),
+			];
+			this.#poisoned = new IncidentRecorderSegmentStorePoisonedError(
+				attachCleanupToPruneFailure(error, cleanupErrors),
+			);
+		} else {
+			this.#closeActiveDescriptor();
+		}
 		throw this.#poisoned;
 	}
 
-	#closeActiveDescriptor(): void {
-		if (!this.#active || this.#active.fileDescriptor < 0) return;
-		try {
-			closeSync(this.#active.fileDescriptor);
-		} catch {
-			// The first operation error remains authoritative once the store is poisoned.
-		}
+	#closeActiveDescriptor(afterClose?: () => void): readonly unknown[] {
+		if (!this.#active || this.#active.fileDescriptor < 0) return [];
+		const fileDescriptor = this.#active.fileDescriptor;
+		// A failed close has platform-dependent descriptor ownership. Consume the
+		// number before the one attempt so recovery never blind-retries a reused FD.
 		this.#active.fileDescriptor = -1;
+		const cleanupErrors: unknown[] = [];
+		try {
+			closeSync(fileDescriptor);
+			afterClose?.();
+		} catch (error) {
+			cleanupErrors.push(error);
+		}
+		return cleanupErrors;
 	}
 
 	#readOwnerClaim(path: string): OwnerClaim {
 		const fileDescriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
-		try {
+		const outcome = captureIncidentRecorderOutcome(() => {
 			assertPrivateRegularFile(fileDescriptor, path);
 			const status = fstatSync(fileDescriptor);
 			if (status.size <= 0 || status.size > 4096) throw new Error("writer ownership claim is malformed");
 			const bytes = Buffer.alloc(status.size);
 			readFully(fileDescriptor, bytes, 0);
 			return parseOwnerClaim(parseJson(bytes, "writer ownership claim"));
-		} finally {
-			closeSync(fileDescriptor);
-		}
+		});
+		return settleIncidentRecorderOutcome(
+			outcome,
+			runCleanupActionsAttemptAll([
+				() => {
+					closeSync(fileDescriptor);
+					this.#faultInjector?.("after-owner-claim-handle-close");
+				},
+			]),
+		);
 	}
 
 	#acquireOwnership(): void {
@@ -1827,7 +3023,7 @@ export class IncidentRecorderSegmentStore {
 			throw new Error("segment directory exceeds maxStartupEntries");
 		}
 		if (this.#startupCatalogBytes > this.#maxStartupCatalogBytes) {
-			throw new Error("segment catalog exceeds maxStartupCatalogBytes");
+			throw new SegmentCatalogBudgetExceededError("segment catalog exceeds maxStartupCatalogBytes");
 		}
 	}
 
@@ -1838,7 +3034,7 @@ export class IncidentRecorderSegmentStore {
 			encodeJson(summary.footer).byteLength +
 			384;
 		if (this.#startupCatalogBytes > this.#maxStartupCatalogBytes) {
-			throw new Error("segment catalog exceeds maxStartupCatalogBytes");
+			throw new SegmentCatalogBudgetExceededError("segment catalog exceeds maxStartupCatalogBytes");
 		}
 	}
 
@@ -1860,7 +3056,7 @@ export class IncidentRecorderSegmentStore {
 
 	#readSealedSummary(path: string): SegmentSummary {
 		const fileDescriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
-		try {
+		const outcome = captureIncidentRecorderOutcome(() => {
 			assertPrivateRegularFile(fileDescriptor, path);
 			const fileBytes = fstatSync(fileDescriptor).size;
 			if (
@@ -1894,9 +3090,11 @@ export class IncidentRecorderSegmentStore {
 				throw new InvalidFrameError("sealed footer identity or bounds are invalid");
 			}
 			return { header, footer, path, fileBytes };
-		} finally {
-			closeSync(fileDescriptor);
-		}
+		});
+		return settleIncidentRecorderOutcome(
+			outcome,
+			runCleanupActionsAttemptAll([() => closeSync(fileDescriptor)]),
+		);
 	}
 
 	#loadSegments(): void {
@@ -1923,6 +3121,13 @@ export class IncidentRecorderSegmentStore {
 				this.#accountSummary(summary);
 				this.#sealed.push(summary);
 			} catch (error) {
+				if (
+					error instanceof SegmentCatalogBudgetExceededError ||
+					error instanceof IncidentRecorderDescriptorCleanupError ||
+					errnoCode(error) !== undefined
+				) {
+					throw error;
+				}
 				this.#corrupt.push({ segmentId: name.slice(0, -".segment".length), path, reason: errorText(error) });
 			}
 		}
@@ -1961,6 +3166,15 @@ export class IncidentRecorderSegmentStore {
 		if (this.#active) sequences.push(this.#active.header.segmentSequence);
 		if (new Set(sequences).size !== sequences.length) throw new InvalidFrameError("duplicate segment sequence");
 		this.#nextSequence = sequences.length === 0 ? 0 : Math.max(...sequences) + 1;
+		this.#refreshReadCatalog();
+	}
+
+	#refreshReadCatalog(): void {
+		this.#hasUncataloguedCorruptSegment = this.#corrupt.some((segment) => !segment.summary);
+		this.#readCatalog = [
+			...this.#sealed,
+			...this.#corrupt.flatMap((segment) => (segment.summary ? [segment.summary] : [])),
+		].sort((left, right) => left.header.segmentSequence - right.header.segmentSequence);
 	}
 
 	#validateIndex(
@@ -1986,28 +3200,34 @@ export class IncidentRecorderSegmentStore {
 		const positions: Array<{ ordinal: number; offset: number }> = [];
 		let minimum: number | null = null;
 		let maximum: number | null = null;
+		let lastRecordOrdinal = 0;
 		for (const entry of index.records) {
 			if (
 				entry.segmentId !== header.segmentId ||
 				entry.segmentSequence !== header.segmentSequence ||
+				entry.ordinal <= lastRecordOrdinal ||
 				entry.offset < FRAME_OVERHEAD_BYTES ||
 				entry.offset + entry.frameBytes > footer.indexOffset
 			) {
 				throw new InvalidFrameError("sealed index record bounds or identity are invalid");
 			}
+			lastRecordOrdinal = entry.ordinal;
 			positions.push({ ordinal: entry.ordinal, offset: entry.offset });
 			minimum = minimum === null ? entry.observedAtMs : Math.min(minimum, entry.observedAtMs);
 			maximum = maximum === null ? entry.observedAtMs : Math.max(maximum, entry.observedAtMs);
 		}
+		let lastGapOrdinal = 0;
 		for (const gap of index.recoveryGaps) {
 			if (
 				gap.segmentId !== header.segmentId ||
 				gap.segmentSequence !== header.segmentSequence ||
+				gap.ordinal <= lastGapOrdinal ||
 				gap.invalidOffset < FRAME_OVERHEAD_BYTES ||
 				gap.invalidOffset >= footer.indexOffset
 			) {
 				throw new InvalidFrameError("sealed index gap bounds or identity are invalid");
 			}
+			lastGapOrdinal = gap.ordinal;
 			positions.push({ ordinal: gap.ordinal, offset: gap.invalidOffset });
 		}
 		positions.sort((left, right) => left.ordinal - right.ordinal);
@@ -2026,9 +3246,10 @@ export class IncidentRecorderSegmentStore {
 		}
 	}
 
-	#readIndex(summary: SegmentSummary): SegmentIndexDocument {
+	#readIndex(summary: SegmentSummary, poisonOnObserverFailure = true): SegmentIndexDocument {
 		const fileDescriptor = openSync(summary.path, constants.O_RDONLY | constants.O_NOFOLLOW);
-		try {
+		let observerFailed = false;
+		const outcome = captureIncidentRecorderOutcome(() => {
 			assertPrivateRegularFile(fileDescriptor, summary.path);
 			const status = fstatSync(fileDescriptor);
 			if (status.size !== summary.fileBytes) throw new InvalidFrameError("sealed segment size changed after cataloging");
@@ -2045,11 +3266,24 @@ export class IncidentRecorderSegmentStore {
 					}
 				}
 			} catch (error) {
-				return this.#poison(error);
+				observerFailed = true;
+				throw poisonOnObserverFailure ? error : new IncidentRecorderIndexObserverError(error);
 			}
 			return index;
-		} finally {
-			closeSync(fileDescriptor);
+		});
+		try {
+			return settleIncidentRecorderOutcome(
+				outcome,
+				runCleanupActionsAttemptAll([
+					() => {
+						closeSync(fileDescriptor);
+						if (!poisonOnObserverFailure) this.#faultInjector?.("after-prune-index-handle-close");
+					},
+				]),
+			);
+		} catch (error) {
+			if (observerFailed && poisonOnObserverFailure) return this.#poison(error);
+			throw error;
 		}
 	}
 
@@ -2334,7 +3568,7 @@ export class IncidentRecorderSegmentStore {
 	#sealActive(reason: string, sealedAtMs = this.#now()): void {
 		const active = this.#active;
 		if (!active) return;
-		if (active.fileDescriptor < 0) return this.#poison("active segment descriptor is unavailable");
+		if (active.fileDescriptor < 0) this.#poison("active segment descriptor is unavailable");
 		const indexDocument: SegmentIndexDocument = {
 			version: 2,
 			kind: "segment-index",
@@ -2393,6 +3627,7 @@ export class IncidentRecorderSegmentStore {
 			if (existingIndex >= 0) this.#sealed[existingIndex] = summary;
 			else this.#sealed.push(summary);
 			this.#sealed.sort((left, right) => left.header.segmentSequence - right.header.segmentSequence);
+			this.#refreshReadCatalog();
 			try {
 				const allocation = pathAllocation(summary.path);
 				this.#emitDurable({
@@ -2420,10 +3655,10 @@ export class IncidentRecorderSegmentStore {
 					],
 				});
 			} catch (error) {
-				return this.#poison(error);
+				this.#poison(error);
 			}
 		} catch (error) {
-			return this.#poison(error);
+			this.#poison(error);
 		}
 	}
 
@@ -2996,8 +4231,7 @@ export class IncidentRecorderSegmentStore {
 		};
 	}
 
-	createReadSnapshot(): IncidentRecorderSegmentReadSnapshot {
-		this.#assertUsable();
+	#readHighWater(): { highWaterSegmentSequence: number; highWaterOrdinal: number } {
 		let highWaterSegmentSequence = 0;
 		let highWaterOrdinal = 0;
 		const consider = (segmentSequence: number, ordinal: number): void => {
@@ -3009,18 +4243,15 @@ export class IncidentRecorderSegmentStore {
 				highWaterOrdinal = ordinal;
 			}
 		};
-		for (const summary of this.#sealed) {
-			consider(summary.header.segmentSequence, summary.footer.recordCount + summary.footer.gapCount);
-		}
-		for (const corrupt of this.#corrupt) {
-			if (corrupt.summary) {
-				consider(
-					corrupt.summary.header.segmentSequence,
-					corrupt.summary.footer.recordCount + corrupt.summary.footer.gapCount,
-				);
-			}
-		}
+		const latest = this.#readCatalog.at(-1);
+		if (latest) consider(latest.header.segmentSequence, latest.footer.recordCount + latest.footer.gapCount);
 		if (this.#active) consider(this.#active.header.segmentSequence, this.#active.nextOrdinal - 1);
+		return { highWaterSegmentSequence, highWaterOrdinal };
+	}
+
+	createReadSnapshot(): IncidentRecorderSegmentReadSnapshot {
+		this.#assertUsable();
+		const { highWaterSegmentSequence, highWaterOrdinal } = this.#readHighWater();
 		return Object.freeze({
 			version: 1 as const,
 			id: this.#instanceId,
@@ -3028,6 +4259,90 @@ export class IncidentRecorderSegmentStore {
 			highWaterSegmentSequence,
 			highWaterOrdinal,
 		});
+	}
+
+	#sweepExpiredReadLeases(now = this.#now()): void {
+		for (const [token, lease] of this.#readLeases) {
+			if (lease.expiresAtMs <= now) this.#readLeases.delete(token);
+		}
+	}
+
+	#assertReadLeaseShape(lease: IncidentRecorderSegmentReadLease): void {
+		if (!lease || lease.version !== 1) throw new Error("segment read lease version is unsupported");
+		if (!Object.isFrozen(lease)) throw new Error("segment read lease must be the exact frozen registered object");
+		if (typeof lease.storeInstanceId !== "string" || lease.storeInstanceId.length === 0) {
+			throw new Error("segment read lease store instance is invalid");
+		}
+		if (typeof lease.token !== "string" || lease.token.length === 0) {
+			throw new Error("segment read lease token is invalid");
+		}
+		assertSafeNonNegativeInteger(lease.acquiredAtMs, "segment read lease acquisition time");
+		assertSafeNonNegativeInteger(lease.expiresAtMs, "segment read lease expiry time");
+		if (lease.expiresAtMs <= lease.acquiredAtMs) {
+			throw new Error("segment read lease expiry must follow acquisition");
+		}
+		assertSafeNonNegativeInteger(lease.highWaterSegmentSequence, "segment read lease segment sequence");
+		assertSafeNonNegativeInteger(lease.highWaterOrdinal, "segment read lease ordinal");
+	}
+
+	acquireReadLease(expiresAtMs: number): IncidentRecorderSegmentReadLease {
+		this.#assertUsable();
+		const acquiredAtMs = this.#now();
+		assertSafeNonNegativeInteger(acquiredAtMs, "segment read lease acquisition time");
+		assertSafeNonNegativeInteger(expiresAtMs, "segment read lease expiry time");
+		if (expiresAtMs <= acquiredAtMs) throw new Error("segment read lease expiry must be in the future");
+		this.#sweepExpiredReadLeases(acquiredAtMs);
+		if (this.#readLeases.size >= MAX_ACTIVE_READ_LEASES) {
+			throw new Error(`segment read lease registry exceeds the ${String(MAX_ACTIVE_READ_LEASES)}-lease ceiling`);
+		}
+		const { highWaterSegmentSequence, highWaterOrdinal } = this.#readHighWater();
+		const lease = Object.freeze({
+			version: 1 as const,
+			storeInstanceId: this.#instanceId,
+			token: randomUUID(),
+			acquiredAtMs,
+			expiresAtMs,
+			highWaterSegmentSequence,
+			highWaterOrdinal,
+		});
+		this.#readLeases.set(lease.token, lease);
+		return lease;
+	}
+
+	assertReadLeaseUsable(lease: IncidentRecorderSegmentReadLease): void {
+		this.#assertUsable();
+		this.#assertReadLeaseShape(lease);
+		if (lease.storeInstanceId !== this.#instanceId) {
+			throw new Error("segment read lease belongs to a different store instance");
+		}
+		const registered = this.#readLeases.get(lease.token);
+		if (!registered) throw new Error("segment read lease is not active");
+		if (registered !== lease) {
+			throw new Error("segment read lease is not the exact registered object");
+		}
+		if (registered.expiresAtMs <= this.#now()) {
+			this.#readLeases.delete(lease.token);
+			throw new Error("segment read lease expired");
+		}
+	}
+
+	releaseReadLease(lease: IncidentRecorderSegmentReadLease): boolean {
+		if (this.#closed) return false;
+		this.#assertUsable();
+		this.#assertReadLeaseShape(lease);
+		if (lease.storeInstanceId !== this.#instanceId) {
+			throw new Error("segment read lease belongs to a different store instance");
+		}
+		const registered = this.#readLeases.get(lease.token);
+		if (!registered) return false;
+		if (registered !== lease) {
+			throw new Error("segment read lease is not the exact registered object");
+		}
+		if (registered.expiresAtMs <= this.#now()) {
+			this.#readLeases.delete(lease.token);
+			return false;
+		}
+		return this.#readLeases.delete(lease.token);
 	}
 
 	assertReadSnapshotUsable(snapshot: IncidentRecorderSegmentReadSnapshot): void {
@@ -3061,18 +4376,51 @@ export class IncidentRecorderSegmentStore {
 		);
 		const pageMaxRecords = positiveInteger(query.maxRecords, this.#maxQueryRecords, "page maxRecords", this.#maxQueryRecords);
 		const pageMaxBytes = positiveInteger(query.maxBytes, this.#maxQueryBytes, "page maxBytes", this.#maxQueryBytes);
-		const readSnapshot: IncidentRecorderSegmentReadSnapshot = query.readSnapshot
-			? query.readSnapshot
-			: query.after
-				? {
-						version: 1,
-						id: query.after.snapshotId,
-						generation: query.after.generation,
-						highWaterSegmentSequence: query.after.highWaterSegmentSequence,
-						highWaterOrdinal: query.after.highWaterOrdinal,
-					}
-				: this.createReadSnapshot();
-		this.assertReadSnapshotUsable(readSnapshot);
+		const pageMaxScannedSegments = positiveInteger(
+			query.maxScannedSegments,
+			DEFAULT_MAX_QUERY_SCANNED_SEGMENTS,
+			"page maxScannedSegments",
+			DEFAULT_MAX_QUERY_SCANNED_SEGMENTS,
+		);
+		const pageMaxScannedRecords = positiveInteger(
+			query.maxScannedRecords,
+			DEFAULT_MAX_QUERY_SCANNED_RECORDS,
+			"page maxScannedRecords",
+			DEFAULT_MAX_QUERY_SCANNED_RECORDS,
+		);
+		const pageMaxScannedIndexBytes = positiveInteger(
+			query.maxScannedIndexBytes,
+			DEFAULT_MAX_QUERY_SCANNED_INDEX_BYTES,
+			"page maxScannedIndexBytes",
+			DEFAULT_MAX_QUERY_SCANNED_INDEX_BYTES,
+		);
+		if (query.readSnapshot && query.readLease) {
+			throw new Error("query cannot combine a read snapshot descriptor with a live read lease");
+		}
+		let readSnapshot: IncidentRecorderSegmentReadSnapshot;
+		if (query.readLease) {
+			this.assertReadLeaseUsable(query.readLease);
+			readSnapshot = {
+				version: 1,
+				id: query.readLease.token,
+				generation: 0,
+				highWaterSegmentSequence: query.readLease.highWaterSegmentSequence,
+				highWaterOrdinal: query.readLease.highWaterOrdinal,
+			};
+		} else {
+			readSnapshot = query.readSnapshot
+				? query.readSnapshot
+				: query.after
+					? {
+							version: 1,
+							id: query.after.snapshotId,
+							generation: query.after.generation,
+							highWaterSegmentSequence: query.after.highWaterSegmentSequence,
+							highWaterOrdinal: query.after.highWaterOrdinal,
+						}
+					: this.createReadSnapshot();
+			this.assertReadSnapshotUsable(readSnapshot);
+		}
 		if (query.after) {
 			if (query.after.version !== 1) throw new Error("query cursor version is unsupported");
 			if (
@@ -3086,6 +4434,13 @@ export class IncidentRecorderSegmentStore {
 			}
 			assertSafeNonNegativeInteger(query.after.segmentSequence, "query cursor segment sequence");
 			assertSafeNonNegativeInteger(query.after.ordinal, "query cursor ordinal");
+			if (
+				query.after.segmentSequence > readSnapshot.highWaterSegmentSequence ||
+				(query.after.segmentSequence === readSnapshot.highWaterSegmentSequence &&
+					query.after.ordinal > readSnapshot.highWaterOrdinal)
+			) {
+				throw new Error("query cursor lies beyond the frozen snapshot frontier");
+			}
 		}
 		const highWaterSegmentSequence = readSnapshot.highWaterSegmentSequence;
 		const highWaterOrdinal = readSnapshot.highWaterOrdinal;
@@ -3097,24 +4452,23 @@ export class IncidentRecorderSegmentStore {
 			highWaterOrdinal,
 			filterSha256,
 		};
-		if (this.#corrupt.some((segment) => !segment.summary)) {
+		if (this.#hasUncataloguedCorruptSegment) {
 			throw new InvalidFrameError("an uncatalogued corrupt segment prevents an exact query");
 		}
-		const summaries = [
-			...this.#sealed,
-			...this.#corrupt.flatMap((segment) => (segment.summary ? [segment.summary] : [])),
-		].sort((left, right) => left.header.segmentSequence - right.header.segmentSequence);
 		const records: IncidentRecorderSegmentRecord[] = [];
 		let selectedFrameBytes = 0;
+		let scannedSegments = 0;
+		let scannedRecords = 0;
+		let scannedIndexBytes = 0;
 		let complete = true;
-		const isAfterCursor = (entry: SegmentIndexEntry): boolean =>
-			(!query.after ||
-				entry.segmentSequence > query.after.segmentSequence ||
-				(entry.segmentSequence === query.after.segmentSequence && entry.ordinal > query.after.ordinal)) &&
+		let frontierSegmentSequence = query.after?.segmentSequence ?? 0;
+		let frontierOrdinal = query.after?.ordinal ?? 0;
+		const isAfterFrontier = (entry: SegmentIndexEntry): boolean =>
+			(entry.segmentSequence > frontierSegmentSequence ||
+				(entry.segmentSequence === frontierSegmentSequence && entry.ordinal > frontierOrdinal)) &&
 			(entry.segmentSequence < highWaterSegmentSequence ||
 				(entry.segmentSequence === highWaterSegmentSequence && entry.ordinal <= highWaterOrdinal));
 		const matches = (entry: SegmentIndexEntry): boolean =>
-			isAfterCursor(entry) &&
 			entry.runId === query.runId &&
 			(query.sourceId === undefined || entry.sourceId === query.sourceId) &&
 			entry.observedAtMs >= query.fromObservedAtMs &&
@@ -3128,22 +4482,81 @@ export class IncidentRecorderSegmentStore {
 			selectedFrameBytes += entry.frameBytes;
 			return true;
 		};
-
-		for (const summary of summaries) {
-			if (!complete) break;
+		const advanceFrontier = (segmentSequence: number, ordinal: number): void => {
 			if (
-				summary.footer.recordCount === 0 ||
-				(summary.footer.maxObservedAtMs ?? -1) < query.fromObservedAtMs ||
-				(summary.footer.minObservedAtMs ?? Number.MAX_SAFE_INTEGER) > query.throughObservedAtMs ||
-				(query.after !== undefined && summary.header.segmentSequence < query.after.segmentSequence)
+				segmentSequence > frontierSegmentSequence ||
+				(segmentSequence === frontierSegmentSequence && ordinal > frontierOrdinal)
+			) {
+				frontierSegmentSequence = segmentSequence;
+				frontierOrdinal = ordinal;
+			}
+		};
+		const frozenOrdinalFor = (segmentSequence: number, availableOrdinal: number): number =>
+			segmentSequence === highWaterSegmentSequence
+				? Math.min(availableOrdinal, highWaterOrdinal)
+				: availableOrdinal;
+
+		const firstSummaryIndex = firstSegmentAtOrAfter(this.#readCatalog, frontierSegmentSequence);
+		for (let summaryIndex = firstSummaryIndex; summaryIndex < this.#readCatalog.length; summaryIndex += 1) {
+			const summary = this.#readCatalog[summaryIndex];
+			if (!summary) break;
+			if (!complete) break;
+			if (summary.header.segmentSequence > highWaterSegmentSequence) break;
+			const frozenOrdinal = frozenOrdinalFor(
+				summary.header.segmentSequence,
+				summary.footer.recordCount + summary.footer.gapCount,
+			);
+			if (
+				summary.header.segmentSequence < frontierSegmentSequence ||
+				(summary.header.segmentSequence === frontierSegmentSequence && frozenOrdinal <= frontierOrdinal)
 			) {
 				continue;
 			}
+			if (scannedSegments >= pageMaxScannedSegments) {
+				complete = false;
+				break;
+			}
+			scannedSegments += 1;
+			if (
+				summary.footer.recordCount === 0 ||
+				(summary.footer.maxObservedAtMs ?? -1) < query.fromObservedAtMs ||
+				(summary.footer.minObservedAtMs ?? Number.MAX_SAFE_INTEGER) > query.throughObservedAtMs
+			) {
+				advanceFrontier(summary.header.segmentSequence, frozenOrdinal);
+				continue;
+			}
+			if (summary.footer.indexFrameBytes > pageMaxScannedIndexBytes) {
+				throw new IncidentRecorderSegmentPageBudgetExceededError({
+					segmentId: summary.header.segmentId,
+					frameKind: "record-index",
+					requiredBytes: summary.footer.indexFrameBytes,
+					configuredBytes: pageMaxScannedIndexBytes,
+				});
+			}
+			if (scannedIndexBytes + summary.footer.indexFrameBytes > pageMaxScannedIndexBytes) {
+				complete = false;
+				break;
+			}
 			const index = this.#readIndex(summary);
+			scannedIndexBytes += summary.footer.indexFrameBytes;
 			let fileDescriptor = -1;
 			try {
-				for (const entry of index.records) {
-					if (!matches(entry)) continue;
+				const firstRecordIndex =
+					summary.header.segmentSequence === frontierSegmentSequence
+						? firstOrdinalAfter(index.records, frontierOrdinal)
+						: 0;
+				for (let recordIndex = firstRecordIndex; recordIndex < index.records.length; recordIndex += 1) {
+					const entry = index.records[recordIndex];
+					if (!entry || !isAfterFrontier(entry)) continue;
+					if (scannedRecords >= pageMaxScannedRecords) {
+						complete = false;
+						break;
+					}
+					scannedRecords += 1;
+					if (!matches(entry)) {
+						advanceFrontier(entry.segmentSequence, entry.ordinal);
+						continue;
+					}
 					if (!canTake(entry)) break;
 					if (fileDescriptor < 0) {
 						fileDescriptor = openSync(summary.path, constants.O_RDONLY | constants.O_NOFOLLOW);
@@ -3152,14 +4565,42 @@ export class IncidentRecorderSegmentStore {
 					records.push(
 						this.#readRecordAt(fileDescriptor, summary.fileBytes, summary.header, entry),
 					);
+					advanceFrontier(entry.segmentSequence, entry.ordinal);
 				}
 			} finally {
 				if (fileDescriptor >= 0) closeSync(fileDescriptor);
 			}
+			if (complete) advanceFrontier(summary.header.segmentSequence, frozenOrdinal);
 		}
 		if (complete && this.#active) {
-			for (const entry of this.#active.records) {
-				if (!matches(entry)) continue;
+			const activeSequence = this.#active.header.segmentSequence;
+			const frozenOrdinal = frozenOrdinalFor(activeSequence, this.#active.nextOrdinal - 1);
+			const activeRemains =
+				activeSequence <= highWaterSegmentSequence &&
+				(activeSequence > frontierSegmentSequence ||
+					(activeSequence === frontierSegmentSequence && frozenOrdinal > frontierOrdinal));
+			if (activeRemains && scannedSegments >= pageMaxScannedSegments) complete = false;
+			if (complete && activeRemains) scannedSegments += 1;
+			const firstActiveRecordIndex =
+				activeSequence === frontierSegmentSequence
+					? firstOrdinalAfter(this.#active.records, frontierOrdinal)
+					: 0;
+			for (
+				let recordIndex = firstActiveRecordIndex;
+				recordIndex < this.#active.records.length;
+				recordIndex += 1
+			) {
+				const entry = this.#active.records[recordIndex];
+				if (!entry || !complete || !isAfterFrontier(entry)) continue;
+				if (scannedRecords >= pageMaxScannedRecords) {
+					complete = false;
+					break;
+				}
+				scannedRecords += 1;
+				if (!matches(entry)) {
+					advanceFrontier(entry.segmentSequence, entry.ordinal);
+					continue;
+				}
 				if (!canTake(entry)) break;
 				records.push(
 					this.#readRecordAt(
@@ -3169,15 +4610,19 @@ export class IncidentRecorderSegmentStore {
 						entry,
 					),
 				);
+				advanceFrontier(entry.segmentSequence, entry.ordinal);
 			}
+			if (complete && activeRemains) advanceFrontier(activeSequence, frozenOrdinal);
 		}
-		const last = records.at(-1)?.locator;
 		return {
 			records,
 			complete,
 			selectedFrameBytes,
+			scannedSegments,
+			scannedRecords,
+			scannedIndexBytes,
 			snapshot,
-			...(complete || !last
+			...(complete
 				? {}
 				: {
 						nextCursor: {
@@ -3187,8 +4632,8 @@ export class IncidentRecorderSegmentStore {
 							highWaterSegmentSequence: snapshot.highWaterSegmentSequence,
 							highWaterOrdinal: snapshot.highWaterOrdinal,
 							filterSha256: snapshot.filterSha256,
-							segmentSequence: last.segmentSequence,
-							ordinal: last.ordinal,
+							segmentSequence: frontierSegmentSequence,
+							ordinal: frontierOrdinal,
 						},
 					}),
 		};
@@ -3196,8 +4641,235 @@ export class IncidentRecorderSegmentStore {
 
 	queryRunWindow(query: IncidentRecorderSegmentQuery): IncidentRecorderSegmentRecord[] {
 		const page = this.queryRunWindowPage(query);
-		if (!page.complete) throw new Error("selected full frame bytes exceed maxQueryBytes or records exceed maxQueryRecords");
+		if (!page.complete) throw new Error("query exceeds the configured output or examined-work bounds");
 		return page.records;
+	}
+
+	queryRecoveryGapsPage(
+		query: IncidentRecorderSegmentRecoveryGapPageQuery,
+	): IncidentRecorderSegmentRecoveryGapQueryPage {
+		this.#assertUsable();
+		const filterSha256 = sha256(
+			Buffer.from(canonicalJson({ kind: "global-recovery-gaps", version: 1 }), "utf8"),
+		);
+		const pageMaxGaps = positiveInteger(query.maxGaps, this.#maxQueryRecords, "page maxGaps", this.#maxQueryRecords);
+		const pageMaxBytes = positiveInteger(query.maxBytes, this.#maxQueryBytes, "page maxBytes", this.#maxQueryBytes);
+		const pageMaxScannedSegments = positiveInteger(
+			query.maxScannedSegments,
+			DEFAULT_MAX_QUERY_SCANNED_SEGMENTS,
+			"page maxScannedSegments",
+			DEFAULT_MAX_QUERY_SCANNED_SEGMENTS,
+		);
+		const pageMaxScannedGaps = positiveInteger(
+			query.maxScannedGaps,
+			DEFAULT_MAX_QUERY_SCANNED_GAPS,
+			"page maxScannedGaps",
+			DEFAULT_MAX_QUERY_SCANNED_GAPS,
+		);
+		const pageMaxScannedIndexBytes = positiveInteger(
+			query.maxScannedIndexBytes,
+			DEFAULT_MAX_QUERY_SCANNED_INDEX_BYTES,
+			"page maxScannedIndexBytes",
+			DEFAULT_MAX_QUERY_SCANNED_INDEX_BYTES,
+		);
+		if (query.readSnapshot && query.readLease) {
+			throw new Error("recovery-gap query cannot combine a read snapshot descriptor with a live read lease");
+		}
+		let readSnapshot: IncidentRecorderSegmentReadSnapshot;
+		if (query.readLease) {
+			this.assertReadLeaseUsable(query.readLease);
+			readSnapshot = {
+				version: 1,
+				id: query.readLease.token,
+				generation: 0,
+				highWaterSegmentSequence: query.readLease.highWaterSegmentSequence,
+				highWaterOrdinal: query.readLease.highWaterOrdinal,
+			};
+		} else {
+			readSnapshot = query.readSnapshot
+				? query.readSnapshot
+				: query.after
+					? {
+							version: 1,
+							id: query.after.snapshotId,
+							generation: query.after.generation,
+							highWaterSegmentSequence: query.after.highWaterSegmentSequence,
+							highWaterOrdinal: query.after.highWaterOrdinal,
+						}
+					: this.createReadSnapshot();
+			this.assertReadSnapshotUsable(readSnapshot);
+		}
+		if (query.after) {
+			if (query.after.version !== 1) throw new Error("recovery-gap query cursor version is unsupported");
+			if (
+				query.after.snapshotId !== readSnapshot.id ||
+				query.after.generation !== readSnapshot.generation ||
+				query.after.highWaterSegmentSequence !== readSnapshot.highWaterSegmentSequence ||
+				query.after.highWaterOrdinal !== readSnapshot.highWaterOrdinal ||
+				query.after.filterSha256 !== filterSha256
+			) {
+				throw new Error("recovery-gap query snapshot is stale or does not match the frozen filter; restart required");
+			}
+			assertSafeNonNegativeInteger(query.after.segmentSequence, "recovery-gap query cursor segment sequence");
+			assertSafeNonNegativeInteger(query.after.ordinal, "recovery-gap query cursor ordinal");
+			if (
+				query.after.segmentSequence > readSnapshot.highWaterSegmentSequence ||
+				(query.after.segmentSequence === readSnapshot.highWaterSegmentSequence &&
+					query.after.ordinal > readSnapshot.highWaterOrdinal)
+			) {
+				throw new Error("recovery-gap query cursor lies beyond the frozen snapshot frontier");
+			}
+		}
+		const highWaterSegmentSequence = readSnapshot.highWaterSegmentSequence;
+		const highWaterOrdinal = readSnapshot.highWaterOrdinal;
+		const snapshot: IncidentRecorderSegmentQuerySnapshot = {
+			version: 1,
+			id: readSnapshot.id,
+			generation: readSnapshot.generation,
+			highWaterSegmentSequence,
+			highWaterOrdinal,
+			filterSha256,
+		};
+		if (this.#hasUncataloguedCorruptSegment) {
+			throw new InvalidFrameError("an uncatalogued corrupt segment prevents an exact recovery-gap query");
+		}
+		const gaps: IncidentRecorderSegmentRecoveryGap[] = [];
+		let selectedBytes = 0;
+		let scannedSegments = 0;
+		let scannedGaps = 0;
+		let scannedIndexBytes = 0;
+		let complete = true;
+		let frontierSegmentSequence = query.after?.segmentSequence ?? 0;
+		let frontierOrdinal = query.after?.ordinal ?? 0;
+		const advanceFrontier = (segmentSequence: number, ordinal: number): void => {
+			if (
+				segmentSequence > frontierSegmentSequence ||
+				(segmentSequence === frontierSegmentSequence && ordinal > frontierOrdinal)
+			) {
+				frontierSegmentSequence = segmentSequence;
+				frontierOrdinal = ordinal;
+			}
+		};
+		const frozenOrdinalFor = (segmentSequence: number, availableOrdinal: number): number =>
+			segmentSequence === highWaterSegmentSequence
+				? Math.min(availableOrdinal, highWaterOrdinal)
+				: availableOrdinal;
+		const gapIsAfterFrontier = (gap: IncidentRecorderSegmentRecoveryGap): boolean =>
+			(gap.segmentSequence > frontierSegmentSequence ||
+				(gap.segmentSequence === frontierSegmentSequence && gap.ordinal > frontierOrdinal)) &&
+			(gap.segmentSequence < highWaterSegmentSequence ||
+				(gap.segmentSequence === highWaterSegmentSequence && gap.ordinal <= highWaterOrdinal));
+		const admitGap = (gap: IncidentRecorderSegmentRecoveryGap): boolean => {
+			const detached = { ...gap };
+			const bytes = encodeJson(detached).byteLength;
+			if (gaps.length + 1 > pageMaxGaps || selectedBytes + bytes > pageMaxBytes) {
+				if (gaps.length === 0) throw new Error("next recovery gap exceeds the configured page output bounds");
+				complete = false;
+				return false;
+			}
+			selectedBytes += bytes;
+			gaps.push(detached);
+			advanceFrontier(gap.segmentSequence, gap.ordinal);
+			return true;
+		};
+
+		const firstSummaryIndex = firstSegmentAtOrAfter(this.#readCatalog, frontierSegmentSequence);
+		for (let summaryIndex = firstSummaryIndex; summaryIndex < this.#readCatalog.length; summaryIndex += 1) {
+			const summary = this.#readCatalog[summaryIndex];
+			if (!summary || !complete || summary.header.segmentSequence > highWaterSegmentSequence) break;
+			const frozenOrdinal = frozenOrdinalFor(
+				summary.header.segmentSequence,
+				summary.footer.recordCount + summary.footer.gapCount,
+			);
+			if (
+				summary.header.segmentSequence < frontierSegmentSequence ||
+				(summary.header.segmentSequence === frontierSegmentSequence && frozenOrdinal <= frontierOrdinal)
+			) {
+				continue;
+			}
+			if (scannedSegments >= pageMaxScannedSegments) {
+				complete = false;
+				break;
+			}
+			scannedSegments += 1;
+			if (summary.footer.indexFrameBytes > pageMaxScannedIndexBytes) {
+				throw new IncidentRecorderSegmentPageBudgetExceededError({
+					segmentId: summary.header.segmentId,
+					frameKind: "recovery-gap-index",
+					requiredBytes: summary.footer.indexFrameBytes,
+					configuredBytes: pageMaxScannedIndexBytes,
+				});
+			}
+			if (scannedIndexBytes + summary.footer.indexFrameBytes > pageMaxScannedIndexBytes) {
+				complete = false;
+				break;
+			}
+			const index = this.#readIndex(summary);
+			scannedIndexBytes += summary.footer.indexFrameBytes;
+			const firstGapIndex =
+				summary.header.segmentSequence === frontierSegmentSequence
+					? firstOrdinalAfter(index.recoveryGaps, frontierOrdinal)
+					: 0;
+			for (let gapIndex = firstGapIndex; gapIndex < index.recoveryGaps.length; gapIndex += 1) {
+				const gap = index.recoveryGaps[gapIndex];
+				if (!gap || !gapIsAfterFrontier(gap)) continue;
+				if (scannedGaps >= pageMaxScannedGaps) {
+					complete = false;
+					break;
+				}
+				scannedGaps += 1;
+				if (!admitGap(gap)) break;
+			}
+			if (complete) advanceFrontier(summary.header.segmentSequence, frozenOrdinal);
+		}
+		if (complete && this.#active) {
+			const activeSequence = this.#active.header.segmentSequence;
+			const frozenOrdinal = frozenOrdinalFor(activeSequence, this.#active.nextOrdinal - 1);
+			const activeRemains =
+				activeSequence <= highWaterSegmentSequence &&
+				(activeSequence > frontierSegmentSequence ||
+					(activeSequence === frontierSegmentSequence && frozenOrdinal > frontierOrdinal));
+			if (activeRemains && scannedSegments >= pageMaxScannedSegments) complete = false;
+			if (complete && activeRemains) scannedSegments += 1;
+			const firstGapIndex =
+				activeSequence === frontierSegmentSequence
+					? firstOrdinalAfter(this.#active.recoveryGaps, frontierOrdinal)
+					: 0;
+			for (let gapIndex = firstGapIndex; gapIndex < this.#active.recoveryGaps.length; gapIndex += 1) {
+				const gap = this.#active.recoveryGaps[gapIndex];
+				if (!gap || !complete || !gapIsAfterFrontier(gap)) continue;
+				if (scannedGaps >= pageMaxScannedGaps) {
+					complete = false;
+					break;
+				}
+				scannedGaps += 1;
+				if (!admitGap(gap)) break;
+			}
+			if (complete && activeRemains) advanceFrontier(activeSequence, frozenOrdinal);
+		}
+		return {
+			gaps,
+			complete,
+			selectedBytes,
+			scannedSegments,
+			scannedGaps,
+			scannedIndexBytes,
+			snapshot,
+			...(complete
+				? {}
+				: {
+						nextCursor: {
+							version: 1 as const,
+							snapshotId: snapshot.id,
+							generation: snapshot.generation,
+							highWaterSegmentSequence: snapshot.highWaterSegmentSequence,
+							highWaterOrdinal: snapshot.highWaterOrdinal,
+							filterSha256: snapshot.filterSha256,
+							segmentSequence: frontierSegmentSequence,
+							ordinal: frontierOrdinal,
+						},
+					}),
+		};
 	}
 
 	getRecoveryGaps(): IncidentRecorderSegmentRecoveryGap[] {
@@ -3228,7 +4900,7 @@ export class IncidentRecorderSegmentStore {
 		);
 	}
 
-	#verifySegment(summary: SegmentSummary, index: SegmentIndexDocument): void {
+	#openVerifiedSegment(summary: SegmentSummary, index: SegmentIndexDocument): VerifiedSegmentHandle {
 		const fresh = this.#readSealedSummary(summary.path);
 		if (
 			fresh.header.segmentId !== summary.header.segmentId ||
@@ -3240,7 +4912,7 @@ export class IncidentRecorderSegmentStore {
 			throw new InvalidFrameError("sealed segment changed after cataloging");
 		}
 		const fileDescriptor = openSync(summary.path, constants.O_RDONLY | constants.O_NOFOLLOW);
-		try {
+		const outcome = captureIncidentRecorderOutcome(() => {
 			assertPrivateRegularFile(fileDescriptor, summary.path);
 			if (hashFileRange(fileDescriptor, 0, summary.footer.contentBytes) !== summary.footer.contentSha256) {
 				throw new InvalidFrameError("sealed segment content checksum mismatch");
@@ -3274,9 +4946,19 @@ export class IncidentRecorderSegmentStore {
 			if (expectedOffset !== summary.footer.indexOffset) {
 				throw new InvalidFrameError("sealed content does not terminate at its index");
 			}
-		} finally {
-			closeSync(fileDescriptor);
-		}
+			const identity = verifiedSegmentIdentity(fileDescriptor, summary.fileBytes);
+			return { fileDescriptor, identity };
+		});
+		if (outcome.ok) return outcome.value;
+		return settleIncidentRecorderOutcome(
+			outcome,
+			runCleanupActionsAttemptAll([
+				() => {
+					closeSync(fileDescriptor);
+					this.#faultInjector?.("after-prune-verifier-failure-handle-close");
+				},
+			]),
+		);
 	}
 
 	#markCorrupt(summary: SegmentSummary, error: unknown): void {
@@ -3289,11 +4971,15 @@ export class IncidentRecorderSegmentStore {
 				summary,
 			});
 		}
+		this.#refreshReadCatalog();
 		this.#stateRevision += 1;
 	}
 
 	pruneSealedSegments(input: IncidentRecorderSegmentPruneInput): IncidentRecorderSegmentPruneResult {
 		this.#assertUsable();
+		const pruneNow = this.#now();
+		assertSafeNonNegativeInteger(pruneNow, "prune continuation registry time");
+		this.#sweepExpiredReadLeases(pruneNow);
 		assertSafeNonNegativeInteger(input.sealedBeforeMs, "sealedBeforeMs");
 		const maxSegments = positiveInteger(input.maxSegments, DEFAULT_MAX_PRUNE_SEGMENTS, "maxSegments", 1024);
 		const maxDeletes = positiveInteger(input.maxDeletes, maxSegments, "maxDeletes", maxSegments);
@@ -3314,40 +5000,62 @@ export class IncidentRecorderSegmentStore {
 				"utf8",
 			),
 		);
+		const continuation = input.continuation;
+		let sessionCapability: PruneCursorCapability | undefined;
+		if (continuation) {
+			sessionCapability = assertPruneCursorCapability(
+				this.#pruneCursorCapabilities,
+				continuation,
+				this.#instanceId,
+				pruneFilterSha256,
+				this.#instanceId,
+				pruneNow,
+			);
+			sweepExpiredPruneCursorCapabilities(this.#pruneCursorCapabilities, pruneNow, sessionCapability);
+		} else {
+			sweepExpiredPruneCursorCapabilities(this.#pruneCursorCapabilities, pruneNow);
+		}
 		const availableHighWater = this.#sealed.reduce(
 			(highWater, summary) => Math.max(highWater, summary.header.segmentSequence),
 			0,
 		);
-		if (input.continuation) {
-			if (input.continuation.version !== 1) throw new Error("prune continuation version is unsupported");
-			assertSafeNonNegativeInteger(input.continuation.segmentSequence, "prune continuation segment sequence");
-			if (
-				input.continuation.storeInstanceId !== this.#instanceId ||
-				input.continuation.filterSha256 !== pruneFilterSha256
-			) {
-				throw new Error("prune continuation is stale or does not match its frozen arguments");
-			}
-		}
 		const pruneSession = {
-			sessionId: input.continuation?.sessionId ?? randomUUID(),
+			sessionId: continuation?.sessionId ?? randomUUID(),
 			storeInstanceId: this.#instanceId,
-			highWaterSegmentSequence: input.continuation?.highWaterSegmentSequence ?? availableHighWater,
+			highWaterSegmentSequence: continuation?.highWaterSegmentSequence ?? availableHighWater,
 			filterSha256: pruneFilterSha256,
 		};
-		const continuationFor = (segmentSequence: number): IncidentRecorderSegmentPruneCursor => ({
-			version: 1,
-			...pruneSession,
-			segmentSequence,
-		});
+		const sessionReservation =
+			continuation ?? frozenPruneCursor({ ...pruneSession, segmentSequence: 0 });
+		if (!continuation) {
+			sessionCapability = registerPruneCursorCapability(
+				this.#pruneCursorCapabilities,
+				sessionReservation,
+				this.#instanceId,
+				this.#now(),
+				undefined,
+				undefined,
+				this.#onPruneExpiryCleanupDiagnostic,
+			);
+		}
+		if (!sessionCapability) throw new Error("live prune session capability was not registered");
+		let ownedSessionCapability = sessionCapability;
+		const continuationFor = (segmentSequence: number): IncidentRecorderSegmentPruneCursor =>
+			frozenPruneCursor({ ...pruneSession, segmentSequence });
 		const result: IncidentRecorderSegmentPruneResult = {
 			deletedSegmentIds: [],
 			corruptSegmentIds: [],
 			examinedSegments: 0,
 			deletedBytes: 0,
+			blockedByReadSnapshot: false,
 			locatorsInvalidated: false,
 			requiresFullReconciliation: false,
 			moreWork: false,
 		};
+		const leasedHighWaterSegmentSequence = Array.from(this.#readLeases.values()).reduce(
+			(highWater, lease) => Math.max(highWater, lease.highWaterSegmentSequence),
+			-1,
+		);
 		let examinedBytes = 0;
 		const sequenceAnchorId =
 			this.#active || this.#sealed.length === 0
@@ -3361,13 +5069,21 @@ export class IncidentRecorderSegmentStore {
 				(summary) =>
 					summary.footer.sealedAtMs < input.sealedBeforeMs &&
 					summary.header.segmentSequence <= pruneSession.highWaterSegmentSequence &&
-					(!input.continuation || summary.header.segmentSequence > input.continuation.segmentSequence),
+					(!continuation || summary.header.segmentSequence > continuation.segmentSequence),
 			);
+		try {
 		for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex += 1) {
 			const summary = candidates[candidateIndex];
 			if (!summary) continue;
 			if (result.examinedSegments >= maxSegments) {
 				result.moreWork = true;
+				break;
+			}
+			if (summary.header.segmentSequence <= leasedHighWaterSegmentSequence) {
+				result.blockedByReadSnapshot = true;
+				result.examinedSegments += 1;
+				result.moreWork = true;
+				result.continuation = continuation;
 				break;
 			}
 			if (protectedSegmentIds.has(summary.header.segmentId) || summary.header.segmentId === sequenceAnchorId) {
@@ -3382,66 +5098,172 @@ export class IncidentRecorderSegmentStore {
 			if (examinedBytes + summary.fileBytes > maxBytes) {
 				result.moreWork = true;
 				result.requiredBytes = summary.fileBytes;
+				result.continuation = continuation;
 				break;
 			}
 			result.examinedSegments += 1;
 			examinedBytes += summary.fileBytes;
 			result.continuation = continuationFor(summary.header.segmentSequence);
 			let index: SegmentIndexDocument;
+			let verifiedHandle: VerifiedSegmentHandle;
 			try {
-				index = this.#readIndex(summary);
-				this.#verifySegment(summary, index);
+				index = this.#readIndex(summary, false);
+				verifiedHandle = this.#openVerifiedSegment(summary, index);
 			} catch (error) {
-				if (this.#poisoned) throw this.#poisoned;
+				if (
+					indexObserverErrorIn(error) ||
+					error instanceof IncidentRecorderDescriptorCleanupError ||
+					errnoCode(error) !== undefined
+				) {
+					throw error;
+				}
 				this.#markCorrupt(summary, error);
 				result.corruptSegmentIds.push(summary.header.segmentId);
 				continue;
 			}
-			if (index.records.some((entry) => protectedRunIds.has(entry.runId))) continue;
-			try {
-				const before = lstatSync(summary.path);
-				if (!before.isFile() || before.isSymbolicLink()) throw new Error("sealed prune target is not a regular file");
-				const previousAllocation = pathAllocation(summary.path);
-				const pruneParentBefore = pathStorageState(this.#sealedDirectory, true);
-				unlinkSync(summary.path);
-				this.#faultInjector?.("after-prune-unlink-before-directory-fsync");
-				syncDirectory(this.#sealedDirectory);
-				this.#sealed = this.#sealed.filter(
-					(candidate) => candidate.header.segmentId !== summary.header.segmentId,
+			if (index.records.some((entry) => protectedRunIds.has(entry.runId))) {
+				closeDescriptorsAttemptAll(
+					[verifiedHandle.fileDescriptor],
+					undefined,
+					(descriptor) => {
+						closeSync(descriptor);
+						this.#faultInjector?.("after-prune-protected-handle-close");
+					},
 				);
+				continue;
+			}
+			let sealedDescriptor = -1;
+			let procFdAuthority: AuthenticatedProcFdRoute | undefined;
+			const operationOutcome = captureIncidentRecorderOutcome(() => {
+				if (dirname(summary.path) !== this.#sealedDirectory) {
+					throw new InvalidFrameError("sealed prune target escaped its cataloged directory");
+				}
+				sealedDescriptor = openSync(
+					this.#sealedDirectory,
+					constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+				);
+				const sealedIdentity = directoryIdentity(sealedDescriptor, "sealed segment directory");
+				procFdAuthority = openAuthenticatedProcFdRoute();
+				this.#faultInjector?.("before-prune-unlink-after-verify");
+				assertDirectoryPathIdentity(this.#sealedDirectory, sealedIdentity, "sealed segment directory");
+				const pruneParentBefore = fileAllocation(sealedDescriptor);
+				let previousAllocation: StorageState = verifiedHandle.identity;
+				let unlinkMutationError: IncidentRecorderSegmentUnlinkMutationError | undefined;
+				let unlinkFailure: unknown;
+				try {
+					previousAllocation = unlinkVerifiedSegmentAtPath(
+						procFdAuthority,
+						sealedDescriptor,
+						this.#sealedDirectory,
+						basename(summary.path),
+						verifiedHandle,
+						() => this.#faultInjector?.("after-prune-unlink-before-directory-fsync"),
+					);
+				} catch (error) {
+					unlinkMutationError = unlinkMutationErrorIn(error);
+					if (!unlinkMutationError) throw error;
+					unlinkFailure = error;
+					previousAllocation = unlinkMutationError.previousAllocation;
+				}
 				result.deletedSegmentIds.push(summary.header.segmentId);
 				result.deletedBytes += summary.fileBytes;
 				result.locatorsInvalidated = true;
-				this.#generation += 1;
-				this.#stateRevision += 1;
-				this.#emitDurable({
-					kind: "pruned",
-					segmentId: summary.header.segmentId,
-					path: summary.path,
-					entryChange: "removed",
-					entryDelta: -1,
-					inodeDelta: previousAllocation.linkCount === 1 ? -1 : 0,
-					deviceId: previousAllocation.deviceId,
-					inodeId: previousAllocation.inodeId,
-					linkCount: Math.max(0, previousAllocation.linkCount - 1),
-					previousLogicalBytes: previousAllocation.logicalBytes,
-					previousAllocatedBytes: previousAllocation.allocatedBytes,
-					logicalBytes: previousAllocation.linkCount === 1 ? 0 : previousAllocation.logicalBytes,
-					allocatedBytes: previousAllocation.linkCount === 1 ? 0 : previousAllocation.allocatedBytes,
-					parentEffects: [
-						parentDirectoryEffect(
-							this.#sealedDirectory,
-							pruneParentBefore,
-							pathStorageState(this.#sealedDirectory, true),
-						),
-					],
-				});
-			} catch (error) {
-				return this.#poison(error);
-			}
+				const postCommitErrors: unknown[] = unlinkMutationError ? [unlinkFailure] : [];
+				try {
+					this.#sealed = this.#sealed.filter(
+						(candidate) => candidate.header.segmentId !== summary.header.segmentId,
+					);
+					this.#refreshReadCatalog();
+					this.#generation += 1;
+					this.#stateRevision += 1;
+					if (!unlinkMutationError) {
+						this.#emitDurable({
+							kind: "pruned",
+							segmentId: summary.header.segmentId,
+							path: summary.path,
+							entryChange: "removed",
+							entryDelta: -1,
+							inodeDelta: previousAllocation.linkCount === 1 ? -1 : 0,
+							deviceId: previousAllocation.deviceId,
+							inodeId: previousAllocation.inodeId,
+							linkCount: Math.max(0, previousAllocation.linkCount - 1),
+							previousLogicalBytes: previousAllocation.logicalBytes,
+							previousAllocatedBytes: previousAllocation.allocatedBytes,
+							logicalBytes: previousAllocation.linkCount === 1 ? 0 : previousAllocation.logicalBytes,
+							allocatedBytes:
+								previousAllocation.linkCount === 1 ? 0 : previousAllocation.allocatedBytes,
+							parentEffects: [
+								parentDirectoryEffect(
+									this.#sealedDirectory,
+									pruneParentBefore,
+									fileAllocation(sealedDescriptor),
+								),
+							],
+						});
+					}
+				} catch (error) {
+					postCommitErrors.push(error);
+				}
+				if (postCommitErrors.length > 0) {
+					throw new IncidentRecorderSegmentPruneMutationError({
+						cause: combinePrimaryAndCleanupErrors(postCommitErrors[0], postCommitErrors.slice(1)),
+						result: pruneMutationResultSnapshot(result),
+						directoryDurability: unlinkMutationError?.directoryDurability ?? "confirmed",
+					});
+				}
+			});
+			settleIncidentRecorderOutcome(
+				operationOutcome,
+				runCleanupActionsAttemptAll([
+					() => {
+						if (procFdAuthority) closeAuthenticatedProcFdRoute(procFdAuthority);
+					},
+					() => {
+						if (sealedDescriptor >= 0) closeSync(sealedDescriptor);
+					},
+					() => closeSync(verifiedHandle.fileDescriptor),
+				]),
+			);
 		}
-		if (!result.moreWork) delete result.continuation;
+			if (!result.moreWork) {
+				delete result.continuation;
+				removePruneCursorCapability(
+					this.#pruneCursorCapabilities,
+					pruneCursorCapabilityKey(sessionReservation),
+					ownedSessionCapability.cursor,
+				);
+			} else if (result.continuation && result.continuation !== sessionReservation) {
+				ownedSessionCapability = registerPruneCursorCapability(
+					this.#pruneCursorCapabilities,
+					result.continuation,
+					this.#instanceId,
+					this.#now(),
+					undefined,
+					ownedSessionCapability,
+					this.#onPruneExpiryCleanupDiagnostic,
+				);
+			} else if (!continuation) {
+				removePruneCursorCapability(
+					this.#pruneCursorCapabilities,
+					pruneCursorCapabilityKey(sessionReservation),
+					sessionReservation,
+				);
+			}
 		return result;
+		} catch (error) {
+			let surfacedError = classifyPruneFailure(error, result);
+			const cursorCleanupErrors = runCleanupActionsAttemptAll([
+				() => {
+					removePruneCursorCapability(
+						this.#pruneCursorCapabilities,
+						pruneCursorCapabilityKey(sessionReservation),
+						ownedSessionCapability.cursor,
+					);
+				},
+			]);
+			surfacedError = attachCleanupToPruneFailure(surfacedError, cursorCleanupErrors);
+			return this.#poison(surfacedError);
+		}
 	}
 
 	getStats(): IncidentRecorderSegmentStoreStats {
@@ -3464,51 +5286,84 @@ export class IncidentRecorderSegmentStore {
 
 	close(): void {
 		if (this.#closed) return;
-		let closeError: unknown;
+		const closeErrors: unknown[] = [];
+		const recordCloseFailure = (error: unknown): void => {
+			closeErrors.push(error);
+		};
 		if (this.#active && this.#active.fileDescriptor >= 0) {
+			const syncOutcome = captureIncidentRecorderOutcome(() => fsyncSync(this.#active?.fileDescriptor ?? -1));
 			try {
-				fsyncSync(this.#active.fileDescriptor);
-				closeSync(this.#active.fileDescriptor);
-				this.#active.fileDescriptor = -1;
+				settleIncidentRecorderOutcome(syncOutcome, this.#closeActiveDescriptor());
 			} catch (error) {
-				closeError = error;
-				this.#closeActiveDescriptor();
+				recordCloseFailure(error);
 			}
 		}
-		const closeParentBefore = pathStorageState(this.#directory, true);
+		let closeParentBefore: StorageState | undefined;
+		if (this.#onOpenStorageResult) {
+			const accountingOutcome = captureIncidentRecorderOutcome(() => {
+				this.#faultInjector?.("before-close-root-accounting");
+				return pathStorageState(this.#directory, true);
+			});
+			if (accountingOutcome.ok) closeParentBefore = accountingOutcome.value;
+			else recordCloseFailure(accountingOutcome.failure.error);
+		}
 		try {
 			this.#releaseOwnership();
 		} catch (error) {
-			closeError ??= error;
-		}
-		try {
-			this.#onOpenStorageResult?.({
-				phase: "closed",
-				complete: closeError === undefined,
-				reconciliation:
-					closeError === undefined ? "incremental-complete" : "full-dev-inode-required",
-				entries: captureOpenStorageEntries(this.#directory, {
-					root: false,
-					active: false,
-					sealed: false,
-					owner: false,
-				}),
-				parentEffects: [
-					parentDirectoryEffect(
-						this.#directory,
-						closeParentBefore,
-						pathStorageState(this.#directory, true),
-					),
-				],
-				...(closeError === undefined ? {} : { error: errorText(closeError) }),
-			});
-		} catch (error) {
-			closeError ??= error;
+			recordCloseFailure(error);
 		}
 		this.#closed = true;
 		this.#appendPlans.clear();
-		if (closeError) {
-			this.#poisoned ??= new IncidentRecorderSegmentStorePoisonedError(closeError);
+		this.#readLeases.clear();
+		const cursorCleanupErrors = runCleanupActionsAttemptAll(
+			Array.from(this.#pruneCursorCapabilities.keys(), (key) => () =>
+				removePruneCursorCapability(this.#pruneCursorCapabilities, key),
+			),
+		);
+		for (const error of cursorCleanupErrors) {
+			recordCloseFailure(error);
+		}
+		try {
+			if (this.#onOpenStorageResult) {
+				const closeError =
+					closeErrors.length === 0
+						? undefined
+						: combinePrimaryAndCleanupErrors(closeErrors[0], closeErrors.slice(1));
+				this.#onOpenStorageResult({
+					phase: "closed",
+					complete: closeErrors.length === 0,
+					reconciliation: closeErrors.length === 0 ? "incremental-complete" : "full-dev-inode-required",
+					entries: captureOpenStorageEntries(this.#directory, {
+						root: false,
+						active: false,
+						sealed: false,
+						owner: false,
+					}),
+					parentEffects: closeParentBefore
+						? [
+								parentDirectoryEffect(
+									this.#directory,
+									closeParentBefore,
+									pathStorageState(this.#directory, true),
+								),
+							]
+						: [],
+					...(closeErrors.length === 0 ? {} : { error: errorText(closeError) }),
+				});
+			}
+		} catch (error) {
+			recordCloseFailure(error);
+		}
+		if (closeErrors.length > 0) {
+			if (this.#poisoned) {
+				this.#poisoned = new IncidentRecorderSegmentStorePoisonedError(
+					attachCleanupToPruneFailure(this.#poisoned.cause, closeErrors),
+				);
+			} else {
+				this.#poisoned = new IncidentRecorderSegmentStorePoisonedError(
+					combinePrimaryAndCleanupErrors(closeErrors[0], closeErrors.slice(1)),
+				);
+			}
 			throw this.#poisoned;
 		}
 	}
@@ -3516,7 +5371,7 @@ export class IncidentRecorderSegmentStore {
 
 function readRecoverySealedSummary(path: string): SegmentSummary {
 	const fileDescriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
-	try {
+	const outcome = captureIncidentRecorderOutcome(() => {
 		assertPrivateRegularFile(fileDescriptor, path);
 		const fileBytes = fstatSync(fileDescriptor).size;
 		if (
@@ -3550,25 +5405,34 @@ function readRecoverySealedSummary(path: string): SegmentSummary {
 			throw new InvalidFrameError("sealed footer identity or bounds are invalid");
 		}
 		return { header, footer, path, fileBytes };
-	} finally {
-		closeSync(fileDescriptor);
-	}
+	});
+	return settleIncidentRecorderOutcome(
+		outcome,
+		runCleanupActionsAttemptAll([() => closeSync(fileDescriptor)]),
+	);
 }
 
-function readRecoveryOwnerClaim(directory: string): OwnerClaim | undefined {
+function readRecoveryOwnerClaim(directory: string, afterClose?: () => void): OwnerClaim | undefined {
 	const ownerPath = join(directory, OWNER_FILE_NAME);
 	if (!pathStatus(ownerPath)) return undefined;
 	const fileDescriptor = openSync(ownerPath, constants.O_RDONLY | constants.O_NOFOLLOW);
-	try {
+	const outcome = captureIncidentRecorderOutcome(() => {
 		assertPrivateRegularFile(fileDescriptor, ownerPath);
 		const status = fstatSync(fileDescriptor);
 		if (status.size <= 0 || status.size > 4096) throw new Error("writer ownership claim is malformed");
 		const content = Buffer.alloc(status.size);
 		readFully(fileDescriptor, content, 0);
 		return parseOwnerClaim(parseJson(content, "writer ownership claim"));
-	} finally {
-		closeSync(fileDescriptor);
-	}
+	});
+	return settleIncidentRecorderOutcome(
+		outcome,
+		runCleanupActionsAttemptAll([
+			() => {
+				closeSync(fileDescriptor);
+				afterClose?.();
+			},
+		]),
+	);
 }
 
 function recoveryOwnerSnapshot(
@@ -3576,11 +5440,13 @@ function recoveryOwnerSnapshot(
 	isOwnerAlive: (identity: IncidentRecorderSegmentOwnerIdentity) => boolean,
 	maxEntries: number,
 	maxCatalogBytes: number,
+	afterRootClose?: () => void,
+	afterOwnerClaimClose?: () => void,
 ): { snapshot: string; entries: number; catalogBytes: number } {
 	const root = opendirSync(directory);
 	let entries = 0;
 	let catalogBytes = 0;
-	try {
+	const scanOutcome = captureIncidentRecorderOutcome(() => {
 		for (;;) {
 			const entry = root.readSync();
 			if (!entry) break;
@@ -3592,10 +5458,17 @@ function recoveryOwnerSnapshot(
 				throw new Error("writer ownership transition is in progress");
 			}
 		}
-	} finally {
-		root.closeSync();
-	}
-	const claim = readRecoveryOwnerClaim(directory);
+	});
+	settleIncidentRecorderOutcome(
+		scanOutcome,
+		runCleanupActionsAttemptAll([
+			() => {
+				root.closeSync();
+				afterRootClose?.();
+			},
+		]),
+	);
+	const claim = readRecoveryOwnerClaim(directory, afterOwnerClaimClose);
 	if (!claim) return { snapshot: "absent", entries, catalogBytes };
 	if (isOwnerAlive(claim)) throw new Error("incident recorder segment store is already owned by a live writer");
 	return { snapshot: JSON.stringify(claim), entries, catalogBytes };
@@ -3604,16 +5477,20 @@ function recoveryOwnerSnapshot(
 function recoveryOwnerFingerprint(
 	directory: string,
 	isOwnerAlive: (identity: IncidentRecorderSegmentOwnerIdentity) => boolean,
+	afterOwnerClaimClose?: () => void,
 ): string {
-	const claim = readRecoveryOwnerClaim(directory);
+	const claim = readRecoveryOwnerClaim(directory, afterOwnerClaimClose);
 	if (!claim) return "absent";
 	if (isOwnerAlive(claim)) throw new Error("incident recorder segment store is already owned by a live writer");
 	return JSON.stringify(claim);
 }
 
-function readAndVerifyRecoveryIndex(summary: SegmentSummary): SegmentIndexDocument {
+function openAndVerifyRecoverySegment(
+	summary: SegmentSummary,
+	afterFailureClose?: () => void,
+): VerifiedSegmentHandle & { index: SegmentIndexDocument } {
 	const fileDescriptor = openSync(summary.path, constants.O_RDONLY | constants.O_NOFOLLOW);
-	try {
+	const outcome = captureIncidentRecorderOutcome(() => {
 		assertPrivateRegularFile(fileDescriptor, summary.path);
 		const status = fstatSync(fileDescriptor);
 		if (status.size !== summary.fileBytes) throw new InvalidFrameError("sealed segment size changed during recovery prune");
@@ -3663,10 +5540,19 @@ function readAndVerifyRecoveryIndex(summary: SegmentSummary): SegmentIndexDocume
 		if (expectedOffset !== summary.footer.indexOffset) {
 			throw new InvalidFrameError("sealed segment content does not end at its index");
 		}
-		return index;
-	} finally {
-		closeSync(fileDescriptor);
-	}
+		const identity = verifiedSegmentIdentity(fileDescriptor, summary.fileBytes);
+		return { fileDescriptor, identity, index };
+	});
+	if (outcome.ok) return outcome.value;
+	return settleIncidentRecorderOutcome(
+		outcome,
+		runCleanupActionsAttemptAll([
+			() => {
+				closeSync(fileDescriptor);
+				afterFailureClose?.();
+			},
+		]),
+	);
 }
 
 // This recovery seam never creates a filesystem entry. Its owner checks detect
@@ -3698,7 +5584,20 @@ export function pruneIncidentRecorderSealedHistoryForRecovery(
 	const protectedRunIds = protection.protectedRunIdSet;
 	const protectedSegments = snapshotProtectedSegmentIds(options.protectedSegmentIds);
 	const protectedSegmentIds = protectedSegments.set;
-	const recoveryStoreInstanceId = "recovery:" + sha256(Buffer.from(options.directory, "utf8"));
+	const continuation = options.continuation;
+	let recoveryPruneCleanupCursor = continuation;
+	let recoveryPruneOwnedCapability: PruneCursorCapability | undefined;
+	try {
+	const storageScope = captureRecoveryPruneStorageScope(options.directory);
+	const sealedDirectory = storageScope.sealedDirectory;
+	const recoveryStoreInstanceId =
+		"recovery:" +
+		sha256(
+			Buffer.from(
+				canonicalJson({ directory: options.directory, storageFingerprint: storageScope.fingerprint }),
+				"utf8",
+			),
+		);
 	const pruneFilterSha256 = sha256(
 		Buffer.from(
 			canonicalJson({
@@ -3711,23 +5610,35 @@ export function pruneIncidentRecorderSealedHistoryForRecovery(
 			"utf8",
 		),
 	);
-	if (options.continuation) {
-		if (options.continuation.version !== 1) throw new Error("prune continuation version is unsupported");
-		assertSafeNonNegativeInteger(options.continuation.segmentSequence, "prune continuation segment sequence");
-		if (
-			options.continuation.storeInstanceId !== recoveryStoreInstanceId ||
-			options.continuation.filterSha256 !== pruneFilterSha256
-		) {
-			throw new Error("prune continuation is stale or does not match its frozen arguments");
+	const pruneNow = Date.now();
+		let admittedContinuationCapability: PruneCursorCapability | undefined;
+		if (continuation) {
+			admittedContinuationCapability = assertPruneCursorCapability(
+				RECOVERY_PRUNE_CURSOR_CAPABILITIES,
+				continuation,
+				recoveryStoreInstanceId,
+				pruneFilterSha256,
+				storageScope.fingerprint,
+				pruneNow,
+			);
+			recoveryPruneOwnedCapability = admittedContinuationCapability;
+			sweepExpiredPruneCursorCapabilities(
+				RECOVERY_PRUNE_CURSOR_CAPABILITIES,
+				pruneNow,
+				admittedContinuationCapability,
+			);
+		} else {
+			sweepExpiredPruneCursorCapabilities(RECOVERY_PRUNE_CURSOR_CAPABILITIES, pruneNow);
 		}
-	}
-	const rootStatus = lstatSync(options.directory);
-	if (!rootStatus.isDirectory() || rootStatus.isSymbolicLink()) throw new Error("recovery root is not a directory");
-	const sealedDirectory = join(options.directory, "sealed");
-	const sealedStatus = lstatSync(sealedDirectory);
-	if (!sealedStatus.isDirectory() || sealedStatus.isSymbolicLink()) throw new Error("sealed recovery path is not a directory");
 	const isOwnerAlive = options.isOwnerAlive ?? defaultIsOwnerAlive;
-	const ownerScan = recoveryOwnerSnapshot(options.directory, isOwnerAlive, maxEntries, maxCatalogBytes);
+	const ownerScan = recoveryOwnerSnapshot(
+		options.directory,
+		isOwnerAlive,
+		maxEntries,
+		maxCatalogBytes,
+		() => options.faultInjector?.("after-recovery-root-directory-close"),
+		() => options.faultInjector?.("after-recovery-owner-claim-handle-close"),
+	);
 	const ownerSnapshot = ownerScan.snapshot;
 	const summaries: SegmentSummary[] = [];
 	const result: IncidentRecorderSegmentPruneResult = {
@@ -3735,6 +5646,7 @@ export function pruneIncidentRecorderSealedHistoryForRecovery(
 		corruptSegmentIds: [],
 		examinedSegments: 0,
 		deletedBytes: 0,
+		blockedByReadSnapshot: false,
 		locatorsInvalidated: false,
 		requiresFullReconciliation: false,
 		moreWork: false,
@@ -3742,7 +5654,7 @@ export function pruneIncidentRecorderSealedHistoryForRecovery(
 	let entries = ownerScan.entries;
 	let catalogBytes = ownerScan.catalogBytes;
 	const directory = opendirSync(sealedDirectory);
-	try {
+	const catalogOutcome = captureIncidentRecorderOutcome(() => {
 		for (;;) {
 			const entry = directory.readSync();
 			if (!entry) break;
@@ -3752,20 +5664,41 @@ export function pruneIncidentRecorderSealedHistoryForRecovery(
 			if (catalogBytes > maxCatalogBytes) throw new Error("segment catalog exceeds maxStartupCatalogBytes");
 			if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}\.segment$/.test(entry.name)) continue;
 			const path = join(sealedDirectory, entry.name);
+			let summary: SegmentSummary;
 			try {
-				const summary = readRecoverySealedSummary(path);
-				catalogBytes +=
-					Buffer.byteLength(path, "utf8") + encodeJson(summary.header).byteLength + encodeJson(summary.footer).byteLength + 384;
-				if (catalogBytes > maxCatalogBytes) throw new Error("segment catalog exceeds maxStartupCatalogBytes");
-				summaries.push(summary);
-			} catch {
+				summary = readRecoverySealedSummary(path);
+			} catch (error) {
+				if (error instanceof IncidentRecorderDescriptorCleanupError || errnoCode(error) !== undefined) throw error;
 				result.corruptSegmentIds.push(entry.name.slice(0, -".segment".length));
+				continue;
 			}
+			catalogBytes +=
+				Buffer.byteLength(path, "utf8") + encodeJson(summary.header).byteLength + encodeJson(summary.footer).byteLength + 384;
+			if (catalogBytes > maxCatalogBytes) {
+				throw new SegmentCatalogBudgetExceededError("segment catalog exceeds maxStartupCatalogBytes");
+			}
+			summaries.push(summary);
 		}
-	} finally {
-		directory.closeSync();
-	}
+	});
+	settleIncidentRecorderOutcome(
+		catalogOutcome,
+		runCleanupActionsAttemptAll([
+			() => {
+				directory.closeSync();
+				options.faultInjector?.("after-recovery-catalog-directory-close");
+			},
+		]),
+	);
 	summaries.sort((left, right) => left.header.segmentSequence - right.header.segmentSequence);
+	for (let summaryIndex = 1; summaryIndex < summaries.length; summaryIndex += 1) {
+		const previous = summaries[summaryIndex - 1];
+		const current = summaries[summaryIndex];
+		if (previous && current && previous.header.segmentSequence === current.header.segmentSequence) {
+			throw new InvalidFrameError(
+				`duplicate sealed segment sequence ${String(current.header.segmentSequence)} prevents recovery pruning`,
+			);
+		}
+	}
 	const sequenceAnchorId =
 		summaries.length === 0
 			? undefined
@@ -3777,70 +5710,216 @@ export function pruneIncidentRecorderSealedHistoryForRecovery(
 		0,
 	);
 	const pruneSession = {
-		sessionId: options.continuation?.sessionId ?? randomUUID(),
+		sessionId: continuation?.sessionId ?? randomUUID(),
 		storeInstanceId: recoveryStoreInstanceId,
-		highWaterSegmentSequence: options.continuation?.highWaterSegmentSequence ?? availableHighWater,
+		highWaterSegmentSequence: continuation?.highWaterSegmentSequence ?? availableHighWater,
 		filterSha256: pruneFilterSha256,
 	};
-	const continuationFor = (segmentSequence: number): IncidentRecorderSegmentPruneCursor => ({
-		version: 1,
-		...pruneSession,
-		segmentSequence,
-	});
+	const sessionReservation = continuation ?? frozenPruneCursor({ ...pruneSession, segmentSequence: 0 });
+	recoveryPruneCleanupCursor = sessionReservation;
+	let sessionCapability: PruneCursorCapability;
+	if (continuation) {
+		if (!admittedContinuationCapability) {
+			throw new Error("recovery prune continuation lost its admitted capability");
+		}
+		sessionCapability = admittedContinuationCapability;
+		if (!sessionCapability.scopeLease) {
+			throw new Error("recovery prune continuation lost its storage scope lease");
+		}
+		assertRecoveryPruneStorageScopeLease(
+			sessionCapability.scopeLease,
+			options.directory,
+			storageScope.fingerprint,
+		);
+	} else {
+		const scopeLease = openRecoveryPruneStorageScope(options.directory);
+		try {
+			assertRecoveryPruneStorageScopeLease(scopeLease, options.directory, storageScope.fingerprint);
+			sessionCapability = registerPruneCursorCapability(
+				RECOVERY_PRUNE_CURSOR_CAPABILITIES,
+				sessionReservation,
+				storageScope.fingerprint,
+				Date.now(),
+				scopeLease,
+				undefined,
+				options.onPruneExpiryCleanupDiagnostic,
+			);
+			recoveryPruneOwnedCapability = sessionCapability;
+		} catch (error) {
+			return runCleanupPreservingFailure(error, () => closeRecoveryPruneStorageScope(scopeLease));
+		}
+	}
+	const sessionScopeLease = sessionCapability.scopeLease;
+	if (!sessionScopeLease) throw new Error("recovery prune session has no storage scope lease");
+	const continuationFor = (segmentSequence: number): IncidentRecorderSegmentPruneCursor =>
+		frozenPruneCursor({ ...pruneSession, segmentSequence });
 	const candidates = summaries.filter(
 		(summary) =>
 			summary.footer.sealedAtMs < options.sealedBeforeMs &&
 			summary.header.segmentSequence <= pruneSession.highWaterSegmentSequence &&
-			(!options.continuation || summary.header.segmentSequence > options.continuation.segmentSequence),
+			(!continuation || summary.header.segmentSequence > continuation.segmentSequence),
 	);
 	let examinedBytes = 0;
-	for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex += 1) {
-		const summary = candidates[candidateIndex];
-		if (!summary) continue;
-		if (result.examinedSegments >= maxSegments) {
-			result.moreWork = true;
-			break;
-		}
-		if (protectedSegmentIds.has(summary.header.segmentId) || summary.header.segmentId === sequenceAnchorId) {
+	try {
+		for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex += 1) {
+			const summary = candidates[candidateIndex];
+			if (!summary) continue;
+			if (result.examinedSegments >= maxSegments) {
+				result.moreWork = true;
+				break;
+			}
+			if (protectedSegmentIds.has(summary.header.segmentId) || summary.header.segmentId === sequenceAnchorId) {
+				result.examinedSegments += 1;
+				result.continuation = continuationFor(summary.header.segmentSequence);
+				continue;
+			}
+			if (result.deletedSegmentIds.length >= maxDeletes) {
+				result.moreWork = true;
+				break;
+			}
+			if (examinedBytes + summary.fileBytes > maxBytes) {
+				result.moreWork = true;
+				result.requiredBytes = summary.fileBytes;
+				result.continuation = continuation;
+				break;
+			}
 			result.examinedSegments += 1;
+			examinedBytes += summary.fileBytes;
 			result.continuation = continuationFor(summary.header.segmentSequence);
-			continue;
+			let verifiedHandle: VerifiedSegmentHandle & { index: SegmentIndexDocument };
+			try {
+				verifiedHandle = openAndVerifyRecoverySegment(summary, () =>
+					options.faultInjector?.("after-prune-verifier-failure-handle-close"),
+				);
+			} catch (error) {
+				if (error instanceof IncidentRecorderDescriptorCleanupError || errnoCode(error) !== undefined) throw error;
+				result.corruptSegmentIds.push(summary.header.segmentId);
+				continue;
+			}
+			if (verifiedHandle.index.records.some((entry) => protectedRunIds.has(entry.runId))) {
+				closeDescriptorsAttemptAll([verifiedHandle.fileDescriptor]);
+				continue;
+			}
+			const candidateOutcome = captureIncidentRecorderOutcome(() => {
+				options.onOwnershipTransitionCheck?.();
+				if (
+					recoveryOwnerFingerprint(
+						options.directory,
+						isOwnerAlive,
+						() => options.faultInjector?.("after-recovery-owner-claim-handle-close"),
+					) !== ownerSnapshot
+				) {
+					throw new Error("writer ownership changed during recovery pruning");
+				}
+				assertRecoveryPruneStorageScopeLease(
+					sessionScopeLease,
+					options.directory,
+					storageScope.fingerprint,
+				);
+				if (dirname(summary.path) !== sealedDirectory) {
+					throw new InvalidFrameError("sealed recovery prune target escaped its cataloged directory");
+				}
+				try {
+					unlinkVerifiedSegmentAtPath(
+						sessionScopeLease.procFdAuthority,
+						sessionScopeLease.sealedDescriptor,
+						sealedDirectory,
+						basename(summary.path),
+						verifiedHandle,
+					);
+				} catch (error) {
+					const unlinkMutationError = unlinkMutationErrorIn(error);
+					if (!unlinkMutationError) throw error;
+					result.deletedSegmentIds.push(summary.header.segmentId);
+					result.deletedBytes += summary.fileBytes;
+					result.locatorsInvalidated = true;
+					result.requiresFullReconciliation = true;
+					throw new IncidentRecorderSegmentPruneMutationError({
+						cause: error,
+						result: pruneMutationResultSnapshot(result),
+						directoryDurability: unlinkMutationError.directoryDurability,
+					});
+				}
+				result.deletedSegmentIds.push(summary.header.segmentId);
+				result.deletedBytes += summary.fileBytes;
+				result.locatorsInvalidated = true;
+				result.requiresFullReconciliation = true;
+				try {
+					options.onOwnershipTransitionCheck?.();
+					if (
+						recoveryOwnerFingerprint(
+							options.directory,
+							isOwnerAlive,
+							() => options.faultInjector?.("after-recovery-owner-claim-handle-close"),
+						) !== ownerSnapshot
+					) {
+						throw new Error("writer ownership changed during recovery pruning");
+					}
+				} catch (error) {
+					throw new IncidentRecorderSegmentPruneMutationError({
+						cause: error,
+						result: pruneMutationResultSnapshot(result),
+						directoryDurability: "confirmed",
+					});
+				}
+			});
+			settleIncidentRecorderOutcome(
+				candidateOutcome,
+				runCleanupActionsAttemptAll([() => closeSync(verifiedHandle.fileDescriptor)]),
+			);
 		}
-		if (result.deletedSegmentIds.length >= maxDeletes) {
-			result.moreWork = true;
-			break;
+		if (!result.moreWork) {
+			delete result.continuation;
+			removePruneCursorCapability(
+				RECOVERY_PRUNE_CURSOR_CAPABILITIES,
+				pruneCursorCapabilityKey(sessionReservation),
+				sessionCapability.cursor,
+			);
+		} else if (result.continuation && result.continuation !== sessionReservation) {
+			sessionCapability = registerPruneCursorCapability(
+				RECOVERY_PRUNE_CURSOR_CAPABILITIES,
+				result.continuation,
+				storageScope.fingerprint,
+				Date.now(),
+				sessionScopeLease,
+				sessionCapability,
+				options.onPruneExpiryCleanupDiagnostic,
+			);
+			recoveryPruneOwnedCapability = sessionCapability;
+		} else if (!continuation) {
+			removePruneCursorCapability(
+				RECOVERY_PRUNE_CURSOR_CAPABILITIES,
+				pruneCursorCapabilityKey(sessionReservation),
+				sessionCapability.cursor,
+			);
 		}
-		if (examinedBytes + summary.fileBytes > maxBytes) {
-			result.moreWork = true;
-			result.requiredBytes = summary.fileBytes;
-			break;
-		}
-		result.examinedSegments += 1;
-		examinedBytes += summary.fileBytes;
-		result.continuation = continuationFor(summary.header.segmentSequence);
-		let index: SegmentIndexDocument;
-		try {
-			index = readAndVerifyRecoveryIndex(summary);
-		} catch {
-			result.corruptSegmentIds.push(summary.header.segmentId);
-			continue;
-		}
-		if (index.records.some((entry) => protectedRunIds.has(entry.runId))) continue;
-		options.onOwnershipTransitionCheck?.();
-		if (recoveryOwnerFingerprint(options.directory, isOwnerAlive) !== ownerSnapshot) {
-			throw new Error("writer ownership changed during recovery pruning");
-		}
-		unlinkSync(summary.path);
-		syncDirectory(sealedDirectory);
-		options.onOwnershipTransitionCheck?.();
-		if (recoveryOwnerFingerprint(options.directory, isOwnerAlive) !== ownerSnapshot) {
-			throw new Error("writer ownership changed during recovery pruning");
-		}
-		result.deletedSegmentIds.push(summary.header.segmentId);
-		result.deletedBytes += summary.fileBytes;
-		result.locatorsInvalidated = true;
-		result.requiresFullReconciliation = true;
+		return result;
+	} catch (error) {
+		const surfacedError = classifyPruneFailure(error, result);
+		const cleanupErrors = runCleanupActionsAttemptAll([
+			() => {
+				removePruneCursorCapability(
+					RECOVERY_PRUNE_CURSOR_CAPABILITIES,
+					pruneCursorCapabilityKey(sessionReservation),
+					sessionCapability.cursor,
+				);
+			},
+		]);
+		throw attachCleanupToPruneFailure(surfacedError, cleanupErrors);
 	}
-	if (!result.moreWork) delete result.continuation;
-	return result;
+	} catch (error) {
+		const cleanupCursor = recoveryPruneOwnedCapability?.cursor ?? recoveryPruneCleanupCursor;
+		const cleanupErrors = cleanupCursor
+			? runCleanupActionsAttemptAll([
+					() => {
+						removePruneCursorCapability(
+							RECOVERY_PRUNE_CURSOR_CAPABILITIES,
+							pruneCursorCapabilityKey(cleanupCursor),
+							cleanupCursor,
+						);
+					},
+				])
+			: [];
+		throw attachCleanupToPruneFailure(error, cleanupErrors);
+	}
 }
