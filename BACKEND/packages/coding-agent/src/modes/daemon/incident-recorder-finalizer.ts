@@ -16,6 +16,7 @@ import {
 	writeSync,
 } from "node:fs";
 import { basename, dirname, join } from "node:path";
+import type { IncidentCasRelativePath, IncidentCasRootMutation } from "./incident-recorder-cas-transaction.js";
 import type {
 	IncidentRecorderRunHistoryEvent,
 	IncidentRecorderRunHistoryResult,
@@ -4865,6 +4866,355 @@ export type IncidentFinalizationSealPersistenceResult =
 	| { state: "applied" | "noop"; authoritativeBytesMatch: true }
 	| { state: "conflict"; authoritativeBytesMatch: false }
 	| { state: "ambiguous"; authoritativeBytesMatch: boolean };
+
+export interface IncidentFinalizationSealStorageFootprint {
+	readonly payloadBytes: number;
+	/** One parent-directory allocation block for each staged and final entry. */
+	readonly metadataBlocks: number;
+	readonly entries: number;
+	readonly inodes: number;
+}
+
+export interface IncidentFinalizationSealPrepared {
+	/** Canonical UTF-8 bytes represented as an immutable string. */
+	readonly bytes: string;
+	readonly byteLength: number;
+	readonly peakStorageFootprint: IncidentFinalizationSealStorageFootprint;
+}
+
+export interface IncidentFinalizationStorageAccountingMetadata {
+	readonly dev: number | bigint;
+	readonly ino: number | bigint;
+	readonly size: number | bigint;
+	readonly blocks?: number | bigint;
+	readonly nlink: number | bigint;
+}
+
+export type IncidentFinalizationStorageAccountingEffect =
+	| {
+			kind: "account";
+			metadata: IncidentFinalizationStorageAccountingMetadata;
+			entryCreated: boolean;
+	  }
+	| {
+			kind: "remove";
+			metadata: IncidentFinalizationStorageAccountingMetadata;
+			releaseOwnedInode: boolean;
+	  };
+
+export type IncidentFinalizationSealWithinRootPersistenceResult =
+	| {
+			state: "applied" | "noop";
+			authoritativeBytesMatch: true;
+			peakStorageBytes: number;
+			effects: readonly IncidentFinalizationStorageAccountingEffect[];
+	  }
+	| {
+			state: "conflict";
+			authoritativeBytesMatch: false;
+			peakStorageBytes: number;
+			effects: readonly IncidentFinalizationStorageAccountingEffect[];
+	  }
+	| {
+			state: "ambiguous";
+			authoritativeBytesMatch: boolean;
+			peakStorageBytes: number;
+			effects: readonly IncidentFinalizationStorageAccountingEffect[];
+	  };
+
+const FINALIZATION_SEAL_METADATA_BLOCKS = 2;
+const FINALIZATION_SEAL_PEAK_ENTRIES = 2;
+const FINALIZATION_SEAL_PEAK_INODES = 1;
+
+function preparedFinalizationSealBytes(prepared: IncidentFinalizationSealPrepared): Buffer {
+	if (!prepared || typeof prepared !== "object" || typeof prepared.bytes !== "string") {
+		throw new TypeError("Incident finalization seal preparation is invalid");
+	}
+	const bytes = Buffer.from(prepared.bytes, "utf8");
+	if (
+		bytes.length > MAX_FINALIZATION_FILE_BYTES ||
+		prepared.byteLength !== bytes.length ||
+		!Number.isSafeInteger(prepared.byteLength) ||
+		!prepared.peakStorageFootprint ||
+		prepared.peakStorageFootprint.payloadBytes !== bytes.length ||
+		prepared.peakStorageFootprint.metadataBlocks !== FINALIZATION_SEAL_METADATA_BLOCKS ||
+		prepared.peakStorageFootprint.entries !== FINALIZATION_SEAL_PEAK_ENTRIES ||
+		prepared.peakStorageFootprint.inodes !== FINALIZATION_SEAL_PEAK_INODES
+	) {
+		throw new TypeError("Incident finalization seal preparation does not match its canonical bytes");
+	}
+	return bytes;
+}
+
+export function prepareIncidentFinalizationSeal(value: unknown): IncidentFinalizationSealPrepared {
+	const bytes = jsonBytes(value);
+	if (bytes.length > MAX_FINALIZATION_FILE_BYTES) {
+		throw new Error("Incident finalization seal exceeds its immutable file bound");
+	}
+	return Object.freeze({
+		bytes: bytes.toString("utf8"),
+		byteLength: bytes.length,
+		peakStorageFootprint: Object.freeze({
+			payloadBytes: bytes.length,
+			metadataBlocks: FINALIZATION_SEAL_METADATA_BLOCKS,
+			entries: FINALIZATION_SEAL_PEAK_ENTRIES,
+			inodes: FINALIZATION_SEAL_PEAK_INODES,
+		}),
+	});
+}
+
+function finalizationSealStorageMetadata(stat: BigIntStats): IncidentFinalizationStorageAccountingMetadata {
+	return {
+		dev: stat.dev,
+		ino: stat.ino,
+		size: stat.size,
+		...(stat.blocks === undefined ? {} : { blocks: stat.blocks }),
+		nlink: stat.nlink,
+	};
+}
+
+function finalizationSealPrivateFile(
+	stat: BigIntStats | undefined,
+	maximum: number,
+	allowedLinks: readonly bigint[],
+): stat is BigIntStats {
+	return stat !== undefined && privateRegularFile(stat, maximum, allowedLinks);
+}
+
+function readRootFinalizationSealPublishedExact(
+	root: IncidentCasRootMutation,
+	path: IncidentCasRelativePath,
+	temporaryPaths: readonly IncidentCasRelativePath[],
+): Buffer | undefined {
+	const before = root.lstat(path);
+	if (!finalizationSealPrivateFile(before, MAX_FINALIZATION_FILE_BYTES, [1n, 2n])) return undefined;
+	let bytes: Buffer;
+	try {
+		bytes = root.readFile(path, MAX_FINALIZATION_FILE_BYTES);
+	} catch {
+		return undefined;
+	}
+	const after = root.lstat(path);
+	if (!after || !sameStableFileIdentity(before, after)) return undefined;
+	if (after.nlink === 1n) return bytes;
+	for (const temporary of temporaryPaths) {
+		const staged = root.lstat(temporary);
+		if (
+			finalizationSealPrivateFile(staged, MAX_FINALIZATION_FILE_BYTES, [2n]) &&
+			staged.dev === after.dev &&
+			staged.ino === after.ino
+		)
+			return bytes;
+	}
+	return undefined;
+}
+
+function readRootFinalizationSealStagingExact(
+	root: IncidentCasRootMutation,
+	temporary: IncidentCasRelativePath,
+	destination: IncidentCasRelativePath,
+): Buffer | undefined {
+	const before = root.lstat(temporary);
+	if (!finalizationSealPrivateFile(before, MAX_FINALIZATION_FILE_BYTES, [1n, 2n])) return undefined;
+	let bytes: Buffer;
+	try {
+		bytes = root.readFile(temporary, MAX_FINALIZATION_FILE_BYTES);
+	} catch {
+		return undefined;
+	}
+	const after = root.lstat(temporary);
+	if (!after || !sameStableFileIdentity(before, after)) return undefined;
+	if (after.nlink === 1n) return bytes;
+	const published = root.lstat(destination);
+	return finalizationSealPrivateFile(published, MAX_FINALIZATION_FILE_BYTES, [2n]) &&
+		published.dev === after.dev &&
+		published.ino === after.ino
+		? bytes
+		: undefined;
+}
+
+function finalizationSealRootBlockSize(root: IncidentCasRootMutation): number {
+	const observed = Number(root.statfs(root.relative()).bsize);
+	if (!Number.isSafeInteger(observed) || observed <= 0) {
+		throw new Error("Incident finalization filesystem allocation unit is invalid");
+	}
+	return Math.max(4096, observed);
+}
+
+function finalizationSealRootPeakStorageBytes(bytes: number, blockSize: number): number {
+	const fileBytes = Math.ceil(bytes / blockSize) * blockSize;
+	const result = fileBytes + FINALIZATION_SEAL_METADATA_BLOCKS * blockSize;
+	if (!Number.isSafeInteger(result)) throw new Error("Incident finalization storage footprint exceeded safe bounds");
+	return result;
+}
+
+function finalizationSealRootResult(
+	state: "applied" | "noop" | "conflict" | "ambiguous",
+	authoritativeBytesMatch: boolean,
+	peakStorageBytes: number,
+	effects: readonly IncidentFinalizationStorageAccountingEffect[] = [],
+): IncidentFinalizationSealWithinRootPersistenceResult {
+	return {
+		state,
+		authoritativeBytesMatch,
+		peakStorageBytes,
+		effects: Object.freeze([...effects]),
+	} as IncidentFinalizationSealWithinRootPersistenceResult;
+}
+
+export function persistIncidentFinalizationSealWithinRoot(
+	runRoot: IncidentCasRootMutation,
+	name: string,
+	prepared: IncidentFinalizationSealPrepared,
+): IncidentFinalizationSealWithinRootPersistenceResult {
+	if (!SAFE_INCIDENT_ID.test(name) || name === "." || name === "..") {
+		throw new TypeError("Incident finalization control name is not a simple relative file name");
+	}
+	const bytes = preparedFinalizationSealBytes(prepared);
+	let peakStorageBytes = 0;
+	let destination: IncidentCasRelativePath | undefined;
+	let temporaryPaths: IncidentCasRelativePath[] = [];
+	try {
+		const parent = runRoot.relative();
+		const blockSize = finalizationSealRootBlockSize(runRoot);
+		peakStorageBytes = finalizationSealRootPeakStorageBytes(bytes.length, blockSize);
+		destination = runRoot.relative(name);
+		temporaryPaths = immutableStagingFileNames(name, bytes).map((candidate) => runRoot.relative(candidate));
+		const effects: IncidentFinalizationStorageAccountingEffect[] = [];
+		const destinationMetadata = runRoot.lstat(destination);
+		if (destinationMetadata) {
+			const existing = readRootFinalizationSealPublishedExact(runRoot, destination, temporaryPaths);
+			if (!existing?.equals(bytes)) return finalizationSealRootResult("conflict", false, peakStorageBytes);
+			let cleaned = false;
+			for (const temporary of temporaryPaths) {
+				const staged = readRootFinalizationSealStagingExact(runRoot, temporary, destination);
+				if (!staged?.equals(bytes)) continue;
+				const metadata = runRoot.lstat(temporary);
+				if (!metadata) continue;
+				runRoot.unlinkFile(temporary);
+				effects.push({
+					kind: "remove",
+					metadata: finalizationSealStorageMetadata(metadata),
+					releaseOwnedInode: false,
+				});
+				cleaned = true;
+			}
+			runRoot.fsyncDirectory(parent);
+			if (cleaned)
+				effects.push({
+					kind: "account",
+					metadata: finalizationSealStorageMetadata(runRoot.stat(parent)),
+					entryCreated: false,
+				});
+			return finalizationSealRootResult("noop", true, peakStorageBytes, effects);
+		}
+
+		let temporary: IncidentCasRelativePath | undefined;
+		for (const candidate of temporaryPaths) {
+			const existingStage = readRootFinalizationSealStagingExact(runRoot, candidate, destination);
+			if (existingStage?.equals(bytes)) {
+				temporary = candidate;
+				runRoot.fsyncFile(candidate);
+				break;
+			}
+			try {
+				runRoot.writeFileExclusive(candidate, bytes, 0o600);
+				const created = runRoot.lstat(candidate);
+				if (
+					!finalizationSealPrivateFile(created, MAX_FINALIZATION_FILE_BYTES, [1n]) ||
+					created.size !== BigInt(bytes.length)
+				)
+					throw new Error("Incident finalization staging file did not verify");
+				effects.push({ kind: "account", metadata: finalizationSealStorageMetadata(created), entryCreated: true });
+				effects.push({
+					kind: "account",
+					metadata: finalizationSealStorageMetadata(runRoot.stat(parent)),
+					entryCreated: false,
+				});
+				runRoot.fsyncFile(candidate);
+				runRoot.fsyncDirectory(parent);
+				temporary = candidate;
+				break;
+			} catch (error) {
+				if (errno(error) !== "EEXIST") throw error;
+				const raced = readRootFinalizationSealStagingExact(runRoot, candidate, destination);
+				if (!raced?.equals(bytes)) continue;
+				runRoot.fsyncFile(candidate);
+				temporary = candidate;
+				break;
+			}
+		}
+		if (!temporary) return finalizationSealRootResult("conflict", false, peakStorageBytes, effects);
+
+		try {
+			runRoot.hardLink(temporary, destination);
+		} catch (error) {
+			if (errno(error) !== "EEXIST") throw error;
+			const existing = readRootFinalizationSealPublishedExact(runRoot, destination, temporaryPaths);
+			const leftover = runRoot.lstat(temporary);
+			if (leftover) {
+				runRoot.unlinkFile(temporary);
+				effects.push({
+					kind: "remove",
+					metadata: finalizationSealStorageMetadata(leftover),
+					releaseOwnedInode: false,
+				});
+				effects.push({
+					kind: "account",
+					metadata: finalizationSealStorageMetadata(runRoot.stat(parent)),
+					entryCreated: false,
+				});
+				runRoot.fsyncDirectory(parent);
+			}
+			return existing?.equals(bytes)
+				? finalizationSealRootResult("noop", true, peakStorageBytes, effects)
+				: finalizationSealRootResult("conflict", false, peakStorageBytes, effects);
+		}
+
+		const stagedMetadata = runRoot.lstat(temporary);
+		const linkedMetadata = runRoot.lstat(destination);
+		if (
+			!finalizationSealPrivateFile(stagedMetadata, MAX_FINALIZATION_FILE_BYTES, [2n]) ||
+			!finalizationSealPrivateFile(linkedMetadata, MAX_FINALIZATION_FILE_BYTES, [2n]) ||
+			stagedMetadata.dev !== linkedMetadata.dev ||
+			stagedMetadata.ino !== linkedMetadata.ino
+		)
+			throw new Error("Incident finalization publication identity conflict");
+		effects.push({ kind: "account", metadata: finalizationSealStorageMetadata(linkedMetadata), entryCreated: true });
+		effects.push({
+			kind: "account",
+			metadata: finalizationSealStorageMetadata(runRoot.stat(parent)),
+			entryCreated: false,
+		});
+		runRoot.fsyncDirectory(parent);
+		const linkedTemporaryMetadata = runRoot.lstat(temporary);
+		if (!linkedTemporaryMetadata) throw new Error("Incident finalization staging file disappeared");
+		runRoot.unlinkFile(temporary);
+		effects.push({
+			kind: "remove",
+			metadata: finalizationSealStorageMetadata(linkedTemporaryMetadata),
+			releaseOwnedInode: false,
+		});
+		effects.push({
+			kind: "account",
+			metadata: finalizationSealStorageMetadata(runRoot.stat(parent)),
+			entryCreated: false,
+		});
+		runRoot.fsyncDirectory(parent);
+		return finalizationSealRootResult("applied", true, peakStorageBytes, effects);
+	} catch {
+		let authoritativeBytesMatch = false;
+		try {
+			if (!destination) destination = runRoot.relative(name);
+			if (temporaryPaths.length === 0) {
+				temporaryPaths = immutableStagingFileNames(name, bytes).map((candidate) => runRoot.relative(candidate));
+			}
+			authoritativeBytesMatch =
+				readRootFinalizationSealPublishedExact(runRoot, destination, temporaryPaths)?.equals(bytes) === true;
+		} catch {}
+		return finalizationSealRootResult("ambiguous", authoritativeBytesMatch, peakStorageBytes);
+	}
+}
 
 export function persistIncidentFinalizationSeal(
 	input: { path: string; value: unknown },
