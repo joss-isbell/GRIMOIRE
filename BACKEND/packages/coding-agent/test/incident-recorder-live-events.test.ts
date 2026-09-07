@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { IncidentRecorderCompactor } from "../src/modes/daemon/incident-recorder-compactor.js";
 import { acquireIncidentRecorderNamespaceCas } from "../src/modes/daemon/incident-recorder-namespace-admission.js";
+import { IncidentRecorderSegmentStore } from "../src/modes/daemon/incident-recorder-segment-store.js";
 import {
 	acquireIncidentRecorderWriterNormalLease,
 	type IncidentRecorderWriterLifecycleAdmissionContract,
@@ -30,9 +31,10 @@ interface CompactorInternals {
 		payload: Buffer;
 	}): unknown;
 	closeSegmentStore(): void;
+	segmentStore?: IncidentRecorderSegmentStore;
 }
 
-function fixture(): {
+function fixture(options: { lifecycleAvailable?: boolean } = {}): {
 	root: string;
 	compactor: IncidentRecorderCompactor;
 	internal: CompactorInternals;
@@ -63,7 +65,7 @@ function fixture(): {
 		agentDir,
 		storageScannerPath: scanner,
 		freeReserveBytes: 0,
-		writerLifecycleLease: acquireLease,
+		...(options.lifecycleAvailable === false ? {} : { writerLifecycleLease: acquireLease }),
 	});
 	compactors.push(compactor);
 	const internal = compactor as unknown as CompactorInternals;
@@ -166,10 +168,9 @@ describe("incident recorder live segment events", () => {
 		target.append(RUN_ID, 1);
 		const first = target.compactor.readLiveRunEvents({ runId: RUN_ID });
 
-		const internals = target.compactor as unknown as {
-			ensureSegmentStore(): unknown;
-		};
-		const readerFailure = vi.spyOn(internals, "ensureSegmentStore").mockImplementation(() => {
+		const internals = target.compactor as unknown as CompactorInternals;
+		if (!internals.segmentStore) throw new Error("fixture segment store was not opened");
+		const readerFailure = vi.spyOn(internals.segmentStore, "queryRunWindowPageWithinRoot").mockImplementation(() => {
 			throw new Error("transient segment reader failure");
 		});
 		const failed = target.compactor.readLiveRunEvents({ runId: RUN_ID, cursor: first.cursor });
@@ -183,6 +184,38 @@ describe("incident recorder live segment events", () => {
 		expect(recovered.state).toBe("complete");
 		expect(recovered.events).toHaveLength(1);
 		expect(recovered.events[0]?.identity.occurrenceId).toContain("000000000002");
+	});
+
+	it("fails closed when the first read opens a store before its reader fails", async () => {
+		const target = fixture();
+		await target.compactor.initializeStorageAccounting(new AbortController().signal);
+		const readerFailure = vi
+			.spyOn(IncidentRecorderSegmentStore.prototype, "queryRunWindowPageWithinRoot")
+			.mockImplementation(() => {
+				throw new Error("first-read segment reader failure");
+			});
+
+		const failed = target.compactor.readLiveRunEvents({ runId: RUN_ID });
+		readerFailure.mockRestore();
+
+		expect(failed.state).toBe("incomplete");
+		expect(failed.reason).toContain("live_run_event_query_unavailable");
+		expect(target.compactor.storageAccountingReady).toBe(false);
+		expect(target.compactor.storageMode).toBe("recovery-only");
+		expect((target.compactor as unknown as CompactorInternals).segmentStore).toBeUndefined();
+	});
+
+	it("fails closed when the writer lifecycle is unavailable", async () => {
+		const target = fixture({ lifecycleAvailable: false });
+		await target.compactor.initializeStorageAccounting(new AbortController().signal);
+
+		const failed = target.compactor.readLiveRunEvents({ runId: RUN_ID });
+
+		expect(failed.state).toBe("incomplete");
+		expect(failed.reason).toContain("writer lifecycle unavailable");
+		expect(target.compactor.storageAccountingReady).toBe(false);
+		expect(target.compactor.storageMode).toBe("recovery-only");
+		expect((target.compactor as unknown as CompactorInternals).segmentStore).toBeUndefined();
 	});
 
 	it("rejects a continuation cursor from another run", async () => {

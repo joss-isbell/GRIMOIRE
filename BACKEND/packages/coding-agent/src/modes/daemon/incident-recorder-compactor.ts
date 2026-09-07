@@ -2513,7 +2513,9 @@ export class IncidentRecorderCompactor {
 
 	private withSegmentStoreRoot<T>(
 		operation: (root: IncidentCasRootMutation, store: IncidentRecorderSegmentStore) => T,
+		discardStoreOnError = true,
 	): T {
+		const hadPreexistingStore = this.segmentStore !== undefined;
 		let store: IncidentRecorderSegmentStore | undefined;
 		let receipts: readonly IncidentRecorderSegmentRootReceipt[] = [];
 		try {
@@ -2536,7 +2538,8 @@ export class IncidentRecorderCompactor {
 			}
 			return mutation.value;
 		} catch (error) {
-			if (store?.isRootBacked) this.discardSegmentStoreAfterRootFailure("operation_failed");
+			if ((discardStoreOnError || !hadPreexistingStore) && store?.isRootBacked)
+				this.discardSegmentStoreAfterRootFailure("operation_failed");
 			throw error;
 		} finally {
 			this.releaseSegmentRootReservations();
@@ -2881,9 +2884,16 @@ export class IncidentRecorderCompactor {
 		continuation?: IncidentRecorderSegmentPruneCursor,
 	): IncidentRecorderSegmentPruneResult {
 		if (!Number.isSafeInteger(nowMs) || nowMs < 0) throw new Error("Invalid segment prune time");
-		void protection;
-		void continuation;
-		throw new Error("normal segment pruning is unavailable through root-backed storage");
+		return this.withSegmentStoreRoot((root, store) =>
+			store.pruneSealedSegmentsWithinRoot(root, {
+				sealedBeforeMs: Math.max(0, nowMs - INCIDENT_DIAGNOSTIC_RETENTION_MS),
+				protection,
+				maxSegments: SEGMENT_PRUNE_MAX_SEGMENTS,
+				maxDeletes: SEGMENT_PRUNE_MAX_SEGMENTS,
+				maxBytes: SEGMENT_PRUNE_MAX_BYTES,
+				...(continuation ? { continuation } : {}),
+			}),
+		);
 	}
 
 	pruneSegmentHistoryForRecovery(options: {
@@ -7962,7 +7972,7 @@ export class IncidentRecorderCompactor {
 			const record = store.readRecordWithinRoot(_root, locator);
 			if (!record) throw new Error("segment_occurrence_reference_missing_or_stale");
 			return record;
-		});
+		}, false);
 	}
 
 	private resolveManifestOccurrenceReference(
@@ -8578,7 +8588,7 @@ export class IncidentRecorderCompactor {
 					maxScannedIndexBytes: RUN_HISTORY_SEGMENT_PAGE_SCANNED_INDEX_BYTES,
 					...(state.segmentCursor ? { after: state.segmentCursor } : {}),
 				});
-			});
+			}, false);
 			state.segmentScannedSegments += page.scannedSegments;
 			state.segmentScannedRecords += page.scannedRecords;
 			state.segmentScannedIndexBytes += page.scannedIndexBytes;
@@ -8698,7 +8708,7 @@ export class IncidentRecorderCompactor {
 					readLease: state.segmentReadLease,
 					...(state.segmentRecoveryGapCursor ? { after: state.segmentRecoveryGapCursor } : {}),
 				});
-			});
+			}, false);
 			state.segmentScannedSegments += page.scannedSegments;
 			state.segmentScannedRecords += page.scannedGaps;
 			state.segmentScannedIndexBytes += page.scannedIndexBytes;
@@ -10356,16 +10366,18 @@ export class IncidentRecorderCompactor {
 	private advancePinTraversal(state: PinTraversal): void {
 		if (state.phase === "segment-reading") {
 			try {
-				const page = this.withSegmentStoreRoot((root, store) =>
-					store.queryRunWindowPageWithinRoot(root, {
-						runId: state.request.runId,
-						sourceId: SEGMENT_SOURCE_OCCURRENCE,
-						fromObservedAtMs: state.request.fromWallTimeMs,
-						throughObservedAtMs: state.request.throughWallTimeMs,
-						maxRecords: SEGMENT_QUERY_PAGE_RECORDS,
-						maxBytes: SEGMENT_QUERY_PAGE_BYTES,
-						...(state.segmentCursor ? { after: state.segmentCursor } : {}),
-					}),
+				const page = this.withSegmentStoreRoot(
+					(root, store) =>
+						store.queryRunWindowPageWithinRoot(root, {
+							runId: state.request.runId,
+							sourceId: SEGMENT_SOURCE_OCCURRENCE,
+							fromObservedAtMs: state.request.fromWallTimeMs,
+							throughObservedAtMs: state.request.throughWallTimeMs,
+							maxRecords: SEGMENT_QUERY_PAGE_RECORDS,
+							maxBytes: SEGMENT_QUERY_PAGE_BYTES,
+							...(state.segmentCursor ? { after: state.segmentCursor } : {}),
+						}),
+					false,
 				);
 				for (const record of page.records) {
 					let value: unknown;
@@ -10640,7 +10652,7 @@ export class IncidentRecorderCompactor {
 					...(after ? { after } : { readSnapshot: snapshot }),
 				});
 				return { kind: "page" as const, snapshot, page };
-			});
+			}, false);
 			if (segmentRead.kind === "incomplete") return segmentRead.page;
 			const { page } = segmentRead;
 			const events: IncidentRecorderRunHistoryEvent[] = [];
@@ -10790,7 +10802,7 @@ export class IncidentRecorderCompactor {
 					...(after ? { after } : { readSnapshot: snapshot }),
 				});
 				return { kind: "page" as const, snapshot, page };
-			});
+			}, false);
 			if (segmentRead.kind === "incomplete") return segmentRead.page;
 			const { page } = segmentRead;
 			const gaps: IncidentRecorderLiveRunGap[] = [];

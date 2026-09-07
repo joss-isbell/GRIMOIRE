@@ -692,6 +692,15 @@ function withCompactorCasRoot<T>(
 	}
 }
 
+function sealSegmentStoreWithinRoot(target: ReturnType<typeof fixture>, reason: string): void {
+	const lease = target.lifecycleLease ?? target.acquireLifecycleLease();
+	if (!lease) throw new Error("expected a writer lifecycle lease for segment seal");
+	const store = target.internal.segmentStore;
+	if (!store) throw new Error("expected a segment store for segment seal");
+	const mutation = lease.withRoot((root) => store.sealWithinRoot(root, reason));
+	if (mutation.state !== "committed") throw new Error("segment seal root detached");
+}
+
 function publishStagedCasForTest(
 	target: ReturnType<typeof fixture>,
 	input: { runId: string; value: Buffer; stageName: string; mtimeNs: bigint },
@@ -1892,6 +1901,7 @@ describe("incident recorder compactor segment integration", () => {
 			agentDir: target.agentDir,
 			storageScannerPath: join(target.root, "storage-scanner.cjs"),
 			freeReserveBytes: 0,
+			writerLifecycleLease: () => target.lifecycleLease,
 		});
 		await initialize(validator);
 		for (
@@ -3219,9 +3229,9 @@ describe("incident recorder compactor segment integration", () => {
 		for (let index = 1; index <= 64; index += 1) {
 			target.internal.appendSegmentRecord(occurrenceInput(index, anchor, pin.digest, pin.casPath).input);
 		}
-		target.internal.segmentStore?.seal("projection-first-generation");
+		sealSegmentStoreWithinRoot(target, "projection-first-generation");
 		target.internal.appendSegmentRecord(occurrenceInput(65, anchor, pin.digest, pin.casPath).input);
-		target.internal.segmentStore?.seal("projection-anchor");
+		sealSegmentStoreWithinRoot(target, "projection-anchor");
 		const request = { runId: RUN_ID, fromWallTimeMs: anchor, throughWallTimeMs: anchor + 1_000 };
 		const first = target.compactor.projectRunHistory(request);
 		expect(first.state).toBe("pending");
@@ -3255,7 +3265,7 @@ describe("incident recorder compactor segment integration", () => {
 		await initialize(target.compactor);
 		for (let index = 1; index <= 2; index += 1) {
 			target.internal.appendSegmentRecord(occurrenceInput(index, anchor, cas.digest, cas.casPath).input);
-			target.internal.segmentStore?.seal(`retained-publication-${index}`);
+			sealSegmentStoreWithinRoot(target, `retained-publication-${index}`);
 		}
 		const result = finishRetainedRunHistoryProjection(target.compactor, {
 			runId: RUN_ID,
@@ -3324,7 +3334,7 @@ describe("incident recorder compactor segment integration", () => {
 		await initialize(target.compactor);
 		for (let index = 1; index <= 2; index += 1) {
 			target.internal.appendSegmentRecord(occurrenceInput(index, anchor, cas.digest, cas.casPath).input);
-			target.internal.segmentStore?.seal(`retained-cancellation-${index}`);
+			sealSegmentStoreWithinRoot(target, `retained-cancellation-${index}`);
 		}
 		const result = finishRetainedRunHistoryProjection(target.compactor, {
 			runId: RUN_ID,
@@ -3347,12 +3357,12 @@ describe("incident recorder compactor segment integration", () => {
 		const target = fixture();
 		const anchor = Date.now();
 		const cas = writeCasFixture(target, Buffer.from("x"));
+		const clock = exit === "expiry" ? vi.spyOn(Date, "now").mockReturnValue(anchor) : undefined;
 		await initialize(target.compactor);
 		for (let index = 1; index <= 2; index += 1) {
 			target.internal.appendSegmentRecord(occurrenceInput(index, anchor, cas.digest, cas.casPath).input);
-			target.internal.segmentStore?.seal(`retained-${exit}-${index}`);
+			sealSegmentStoreWithinRoot(target, `retained-${exit}-${index}`);
 		}
-		const clock = exit === "expiry" ? vi.spyOn(Date, "now").mockReturnValue(anchor) : undefined;
 		try {
 			const result = finishRetainedRunHistoryProjection(target.compactor, {
 				runId: RUN_ID,
@@ -3393,7 +3403,7 @@ describe("incident recorder compactor segment integration", () => {
 		await initialize(target.compactor);
 		for (let index = 1; index <= 2; index += 1) {
 			target.internal.appendSegmentRecord(occurrenceInput(index, anchor, cas.digest, cas.casPath).input);
-			target.internal.segmentStore?.seal(`retained-error-${index}`);
+			sealSegmentStoreWithinRoot(target, `retained-error-${index}`);
 		}
 		rmSync(cas.casPath);
 		const result = finishRetainedRunHistoryProjection(target.compactor, {
@@ -3421,7 +3431,7 @@ describe("incident recorder compactor segment integration", () => {
 			await initialize(target.compactor);
 			for (let index = 1; index <= 3; index += 1) {
 				target.internal.appendSegmentRecord(occurrenceInput(index, anchor, pin.digest, pin.casPath).input);
-				if (index < 3) target.internal.segmentStore?.seal(`lease-release-${index}`);
+				if (index < 3) sealSegmentStoreWithinRoot(target, `lease-release-${index}`);
 			}
 			const request = { runId: RUN_ID, fromWallTimeMs: anchor, throughWallTimeMs: anchor + 1_000 };
 			let clock: ReturnType<typeof vi.spyOn> | undefined;
@@ -3468,12 +3478,12 @@ describe("incident recorder compactor segment integration", () => {
 			const anchor = Date.now();
 			const value = Buffer.alloc(700 * 1024, 0x61);
 			const cas = writeCasFixture(target, value);
+			vi.useFakeTimers();
+			vi.setSystemTime(anchor);
 			await initialize(target.compactor);
 			target.internal.appendSegmentRecord(
 				occurrenceInput(1, anchor, cas.digest, cas.casPath, { casBytes: value.length }).input,
 			);
-			vi.useFakeTimers();
-			vi.setSystemTime(anchor);
 			const baselineTimers = vi.getTimerCount();
 			try {
 				const request = {
@@ -3748,7 +3758,7 @@ describe("incident recorder compactor segment integration", () => {
 				metadata: {},
 				payload: Buffer.from("unrelated"),
 			});
-			if (index <= 16) target.internal.segmentStore?.seal(`gap-free-prefix-${index}`);
+			if (index <= 16) sealSegmentStoreWithinRoot(target, `gap-free-prefix-${index}`);
 		}
 		injectRecoveryGaps(target, [anchor + 2_000]);
 		const request = { runId: RUN_ID, fromWallTimeMs: anchor, throughWallTimeMs: anchor + 1_000 };
@@ -3853,11 +3863,11 @@ describe("incident recorder compactor segment integration", () => {
 			cursors.push(occurrence.cursor);
 			target.internal.appendSegmentRecord(occurrence.input);
 		}
-		target.internal.segmentStore?.seal("first-query-generation");
+		sealSegmentStoreWithinRoot(target, "first-query-generation");
 		const last = occurrenceInput(65, anchor, pin.digest, pin.casPath);
 		cursors.push(last.cursor);
 		target.internal.appendSegmentRecord(last.input);
-		target.internal.segmentStore?.seal("query-anchor");
+		sealSegmentStoreWithinRoot(target, "query-anchor");
 		writeScanProof(pin.incidentDir, anchor, cursors);
 
 		target.compactor.processPendingPins(anchor + 1);
@@ -3899,7 +3909,7 @@ describe("incident recorder compactor segment integration", () => {
 				metadata: {},
 				payload: Buffer.from([index]),
 			});
-			target.internal.segmentStore?.seal(`recovery-${index}`);
+			sealSegmentStoreWithinRoot(target, `recovery-${index}`);
 		}
 		const segmentDirectory = join(target.agentDir, "incident-recorder", "segments");
 		const result = target.compactor.pruneSegmentHistoryForRecovery({
