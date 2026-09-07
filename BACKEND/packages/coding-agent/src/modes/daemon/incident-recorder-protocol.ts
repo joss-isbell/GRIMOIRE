@@ -1,4 +1,4 @@
-import { randomBytes, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 
 export const INCIDENT_RECORDER_PROTOCOL_MAGIC = 0x4752494d;
 export const INCIDENT_RECORDER_PROTOCOL_VERSION = 3;
@@ -131,8 +131,7 @@ export function newIncidentRecorderIdentity(): string {
 }
 
 export function newIncidentRecorderToken(): string {
-	const bytes = randomBytes(16);
-	return bytesUuid(bytes, 0);
+	return randomUUID();
 }
 
 export function encodeIncidentRecorderFrame(
