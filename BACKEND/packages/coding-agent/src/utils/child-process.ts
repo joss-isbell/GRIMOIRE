@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { constants } from "node:os";
 import { basename } from "node:path";
 
-const EXIT_STDIO_GRACE_MS = 100;
+export const EXIT_STDIO_GRACE_MS = 100;
 
 const WINDOWS_SHELL_COMMANDS = new Set(["npm", "npx", "pnpm", "yarn", "yarnpkg", "corepack"]);
 

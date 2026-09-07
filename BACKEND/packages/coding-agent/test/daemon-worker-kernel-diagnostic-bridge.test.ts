@@ -4,36 +4,36 @@ import { once } from "node:events";
 import { chmodSync, linkSync, lstatSync, mkdirSync, mkdtempSync, rmSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { PassThrough, Readable, Writable } from "node:stream";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
 	encodeKernelDiagnosticBridgeEvent,
 	KERNEL_DIAGNOSTIC_BRIDGE_MAX_LINE_BYTES,
-	ReconnectableKernelDiagnosticBridgeWriter,
 	type KernelDiagnosticBridgeDropCounts,
+	ReconnectableKernelDiagnosticBridgeWriter,
 } from "../src/core/kernel/diagnostic-bridge.js";
 import type { KernelDiagnosticEvent } from "../src/core/kernel/diagnostics.js";
-import {
-	attachDaemonWorkerKernelDiagnosticCapture,
-	connectDaemonWorkerKernelDiagnostic,
-	daemonWorkerKernelDiagnosticSocketPath,
-	DAEMON_WORKER_KERNEL_DIAGNOSTIC_SOCKET_MAX_PATH_BYTES,
-	DaemonWorkerKernelDiagnosticServer,
-	type DaemonWorkerDiagnosticSupervisorClaim,
-	mayCloseInvalidDaemonWorkerKernelDiagnosticFd,
-	type DaemonWorkerKernelDiagnosticCaptureSinks,
-} from "../src/modes/daemon/daemon-worker-kernel-diagnostics.js";
 import {
 	isDaemonWorkerDescriptor,
 	sanitizeDaemonWorkerDiagnosticMetadata,
 } from "../src/modes/daemon/daemon-supervisor.js";
-import { INCIDENT_RECORDER_EXCLUDED_DIAGNOSTIC_CAPABILITY_SUFFIX } from "../src/modes/daemon/incident-recorder.js";
+import {
+	attachDaemonWorkerKernelDiagnosticCapture,
+	connectDaemonWorkerKernelDiagnostic,
+	DAEMON_WORKER_KERNEL_DIAGNOSTIC_SOCKET_MAX_PATH_BYTES,
+	type DaemonWorkerDiagnosticSupervisorClaim,
+	type DaemonWorkerKernelDiagnosticCaptureSinks,
+	DaemonWorkerKernelDiagnosticServer,
+	daemonWorkerKernelDiagnosticSocketPath,
+	mayCloseInvalidDaemonWorkerKernelDiagnosticFd,
+} from "../src/modes/daemon/daemon-worker-kernel-diagnostics.js";
 import {
 	DAEMON_WORKER_KERNEL_DIAGNOSTIC_CAPABILITY_ENV,
 	DAEMON_WORKER_KERNEL_DIAGNOSTIC_FD_ENV,
 	DAEMON_WORKER_STARTUP_GATE_FD_ENV,
 } from "../src/modes/daemon/daemon-worker-protocol.js";
+import { INCIDENT_RECORDER_EXCLUDED_DIAGNOSTIC_CAPABILITY_SUFFIX } from "../src/modes/daemon/incident-recorder.js";
 
 function capability(): string {
 	return randomBytes(32).toString("base64url");
@@ -112,9 +112,7 @@ function captureSinks(): {
 describe("daemon worker kernel diagnostic bridge", () => {
 	it("correlates a crash across a real inherited worker pipe without leaking fd6 or its capability", async () => {
 		const secret = capability();
-		const fixture = fileURLToPath(
-			new URL("./fixtures/daemon-worker-kernel-diagnostic-bridge.ts", import.meta.url),
-		);
+		const fixture = fileURLToPath(new URL("./fixtures/daemon-worker-kernel-diagnostic-bridge.ts", import.meta.url));
 		const child = spawn(process.execPath, ["--import", "tsx", fixture], {
 			cwd: process.cwd(),
 			env: {
@@ -163,9 +161,7 @@ describe("daemon worker kernel diagnostic bridge", () => {
 		});
 		expect(capture.transport.length).toBeGreaterThan(0);
 		expect(capture.kernels).toHaveLength(1);
-		expect(capture.kernelCorrelations).toEqual([
-			expect.objectContaining({ workerId: "worker-real-boundary" }),
-		]);
+		expect(capture.kernelCorrelations).toEqual([expect.objectContaining({ workerId: "worker-real-boundary" })]);
 		expect(capture.kernels[0]).toMatchObject({
 			type: "kernel_unexpected_exit",
 			sessionId: "real-worker-session",
@@ -173,6 +169,7 @@ describe("daemon worker kernel diagnostic bridge", () => {
 			requestMsgId: "worker-request-id",
 			code: 137,
 			signal: "SIGKILL",
+			stderrCaptureComplete: true,
 		});
 		if (capture.kernels[0]?.type !== "kernel_unexpected_exit") throw new Error("Expected crash event");
 		expect(Buffer.from(capture.kernels[0].stderrTail ?? [])).toEqual(
@@ -231,20 +228,23 @@ describe("daemon worker kernel diagnostic bridge", () => {
 		detach();
 
 		expect(Buffer.concat(capture.transport)).toEqual(Buffer.concat([malformed, oversize, drop, valid]));
-		expect(capture.events.filter((event) => event.type === "worker_kernel_diagnostic_transport_loss"))
-			.toHaveLength(2);
-		expect(capture.events.find((event) => event.type === "worker_kernel_diagnostic_drop")?.fields)
-			.toMatchObject(counts);
-		expect(capture.events.find((event) => event.type === "worker_kernel_diagnostic_drop")?.fields)
-			.not.toHaveProperty("counts");
+		expect(capture.events.filter((event) => event.type === "worker_kernel_diagnostic_transport_loss")).toHaveLength(
+			2,
+		);
+		expect(capture.events.find((event) => event.type === "worker_kernel_diagnostic_drop")?.fields).toMatchObject(
+			counts,
+		);
+		expect(capture.events.find((event) => event.type === "worker_kernel_diagnostic_drop")?.fields).not.toHaveProperty(
+			"counts",
+		);
 		expect(capture.kernels).toHaveLength(1);
 		expect(capture.kernels[0]).toMatchObject({
 			type: "kernel_ready",
 			kernelInstanceId: "kernel-after-corruption",
 		});
-		expect(
-			capture.events.filter((event) => event.type === "worker_kernel_diagnostic_transport_closed"),
-		).toHaveLength(1);
+		expect(capture.events.filter((event) => event.type === "worker_kernel_diagnostic_transport_closed")).toHaveLength(
+			1,
+		);
 	});
 
 	it("never treats fd3, fd4, or fd5 as closable invalid diagnostic descriptors", () => {
@@ -380,10 +380,7 @@ describe("daemon worker kernel diagnostic bridge", () => {
 		const validDiagnostic = {
 			diagnosticProtocolVersion: 1,
 			diagnosticSocketPath: join(diagnosticSocketDir, "0123456789abcdef.sock"),
-			diagnosticSecretPath: join(
-				descriptorDir,
-				`worker${INCIDENT_RECORDER_EXCLUDED_DIAGNOSTIC_CAPABILITY_SUFFIX}`,
-			),
+			diagnosticSecretPath: join(descriptorDir, `worker${INCIDENT_RECORDER_EXCLUDED_DIAGNOSTIC_CAPABILITY_SUFFIX}`),
 			diagnosticSecretDevice: "1",
 			diagnosticSecretInode: "2",
 		};
@@ -403,9 +400,7 @@ describe("daemon worker kernel diagnostic bridge", () => {
 		for (const invalidDiagnostic of invalidVariants) {
 			const descriptor = { ...base, ...invalidDiagnostic };
 			expect(isDaemonWorkerDescriptor(descriptor, supervisorSocketPath)).toBe(true);
-			expect(
-				sanitizeDaemonWorkerDiagnosticMetadata(descriptor, descriptorDir, diagnosticSocketDir),
-			).toBe(false);
+			expect(sanitizeDaemonWorkerDiagnosticMetadata(descriptor, descriptorDir, diagnosticSocketDir)).toBe(false);
 			expect(descriptor).toMatchObject({
 				workerId: base.workerId,
 				authenticationToken: base.authenticationToken,
@@ -437,9 +432,9 @@ describe("daemon worker kernel diagnostic bridge", () => {
 		await closed;
 		detach();
 
-		expect(
-			capture.events.filter((event) => event.type === "worker_kernel_diagnostic_transport_closed"),
-		).toHaveLength(1);
+		expect(capture.events.filter((event) => event.type === "worker_kernel_diagnostic_transport_closed")).toHaveLength(
+			1,
+		);
 		expect(
 			capture.events.filter(
 				(event) =>
@@ -547,9 +542,7 @@ describe("daemon worker kernel diagnostic bridge", () => {
 			first.socket.resume();
 			writer.publish(unexpectedExit(Buffer.from([0x00, 0xff, 0x72, 0x65, 0x70, 0x6c, 0x61, 0x79])));
 			await waitFor(() => firstCapture.kernels.length === 1);
-			expect(firstCapture.kernelCorrelations).toEqual([
-				expect.objectContaining({ workerId }),
-			]);
+			expect(firstCapture.kernelCorrelations).toEqual([expect.objectContaining({ workerId })]);
 			const capturedSocketBytes = Buffer.concat(firstCapture.transport).toString("ascii");
 			expect(capturedSocketBytes).toMatch(/^GKD1\./);
 			expect(capturedSocketBytes).not.toContain("GKDA1");
@@ -602,9 +595,7 @@ describe("daemon worker kernel diagnostic bridge", () => {
 				},
 			);
 			second.socket.resume();
-			await waitFor(() =>
-				secondCapture.kernels.some((event) => event.type === "kernel_channel_fault"),
-			);
+			await waitFor(() => secondCapture.kernels.some((event) => event.type === "kernel_channel_fault"));
 
 			currentGeneration = "supervisor-generation-2";
 			await waitFor(() => second.socket.destroyed);

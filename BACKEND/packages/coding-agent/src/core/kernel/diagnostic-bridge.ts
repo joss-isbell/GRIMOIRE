@@ -169,6 +169,7 @@ function serializeEvent(event: KernelDiagnosticEvent): Record<string, unknown> {
 		reason: event.reason,
 		...(stderrTail && stderrTail.byteLength > 0 ? { stderrTailBase64: stderrTail.toString("base64") } : {}),
 		stderrCaptureStatus: event.stderrCaptureStatus ?? "unknown",
+		...(event.stderrCaptureComplete !== undefined ? { stderrCaptureComplete: event.stderrCaptureComplete } : {}),
 		stderrBytes: event.stderrBytes,
 		sourceTruncated:
 			event.sourceTruncated || (event.stderrTail?.byteLength ?? 0) > KERNEL_DIAGNOSTIC_BRIDGE_MAX_STDERR_BYTES,
@@ -254,6 +255,7 @@ function decodeEvent(value: unknown): KernelDiagnosticEvent | undefined {
 		!(event.signal === null || isBoundedString(event.signal, 32)) ||
 		(event.reason !== "process_exit" && event.reason !== "forkserver_unavailable") ||
 		!isSafeNonNegativeInteger(event.stderrBytes) ||
+		!(event.stderrCaptureComplete === undefined || typeof event.stderrCaptureComplete === "boolean") ||
 		!(
 			event.stderrCaptureStatus === undefined ||
 			event.stderrCaptureStatus === "available" ||
@@ -285,6 +287,9 @@ function decodeEvent(value: unknown): KernelDiagnosticEvent | undefined {
 		reason: event.reason,
 		...(stderrTail && stderrTail.byteLength > 0 ? { stderrTail } : {}),
 		stderrCaptureStatus: event.stderrCaptureStatus ?? "unknown",
+		...(typeof event.stderrCaptureComplete === "boolean"
+			? { stderrCaptureComplete: event.stderrCaptureComplete }
+			: {}),
 		stderrBytes: event.stderrBytes,
 		sourceTruncated: event.sourceTruncated,
 	};

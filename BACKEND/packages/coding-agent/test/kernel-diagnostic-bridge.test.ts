@@ -91,11 +91,36 @@ describe("kernel diagnostic worker bridge", () => {
 		const secret = capability();
 		const legacy = { ...unexpectedExit(), stderrTail: undefined };
 		const envelope = (event: unknown) => ({ version: 1, kind: "event", sequence: 1, event });
-		expect(decode(signedPayload(envelope(legacy), secret), secret).events[0]).toMatchObject({
+		const legacyEvent = decode(signedPayload(envelope(legacy), secret), secret).events[0];
+		expect(legacyEvent).toMatchObject({
 			stderrCaptureStatus: "unknown",
 		});
+		expect(legacyEvent).not.toHaveProperty("stderrCaptureComplete");
 		const invalid = decode(
 			signedPayload(envelope({ ...legacy, stderrCaptureStatus: "definitely_empty" }), secret),
+			secret,
+		);
+		expect(invalid.events).toEqual([]);
+		expect(invalid.losses).toMatchObject([{ reason: "invalid_payload" }]);
+	});
+
+	it("round-trips optional stderr drain completion and rejects invalid completion values", () => {
+		const secret = capability();
+		for (const stderrCaptureComplete of [true, false]) {
+			const event = { ...unexpectedExit(), stderrCaptureComplete };
+			const decoded = decode(encodeKernelDiagnosticBridgeEvent(event, secret)!, secret);
+			expect(decoded.events[0]).toMatchObject({ stderrCaptureComplete });
+		}
+		const invalid = decode(
+			signedPayload(
+				{
+					version: 1,
+					kind: "event",
+					sequence: 1,
+					event: { ...unexpectedExit(), stderrCaptureComplete: "true" },
+				},
+				secret,
+			),
 			secret,
 		);
 		expect(invalid.events).toEqual([]);

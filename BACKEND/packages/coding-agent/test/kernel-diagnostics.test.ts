@@ -1,10 +1,18 @@
+import type { ChildProcess } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { type KernelDiagnosticEvent, subscribeKernelDiagnostics } from "../src/core/kernel/diagnostics.js";
 import type { ForkedKernelHandle } from "../src/core/kernel/fork-server.js";
 import { KernelManager } from "../src/core/kernel/index.js";
+import {
+	KERNEL_STDERR_TAIL_BYTES,
+	type KernelStderrCapture,
+	KernelStderrCollector,
+} from "../src/core/kernel/kernel-stderr-collector.js";
 
 const roots: string[] = [];
 const savedForkFlag = process.env.PRIME_AGENT_KERNEL_FORKSERVER;
@@ -64,6 +72,7 @@ describeIfLinux("KernelManager causal diagnostics", () => {
 				signal: "SIGABRT",
 				reason: "process_exit",
 				stderrCaptureStatus: "available",
+				stderrCaptureComplete: true,
 			});
 			if (!exited || exited.type !== "kernel_unexpected_exit") throw new Error("missing direct exit event");
 			expect(Buffer.from(exited.stderrTail ?? []).toString()).toContain("direct kernel fatal marker");
@@ -75,87 +84,270 @@ describeIfLinux("KernelManager causal diagnostics", () => {
 		}
 	});
 
-	it("bounds direct stderr bytes while retaining the exact multibyte tail and total source size", () => {
-		const capture = captureKernelDiagnostics();
-		const manager = new KernelManager({ sessionId: "session-stderr-bound" });
-		const internals = manager as unknown as {
-			kernelDiagnosticIdentity: {
-				sessionId?: string;
-				kernelInstanceId: string;
-				kernelPid: number;
-				kernelProcessStartId?: string;
-				launchMode: "direct";
-			};
-			kernelCrashPhase: "resolving_ports";
-			kernelStderr: string;
-			kernelStderrTail: Buffer;
-			kernelRawStderrTail: Buffer;
-			kernelRawStderrBytes: number;
-			appendKernelStderr(chunk: Buffer | string): void;
-			appendKernelDiagnostic(message: string): void;
-			reportUnexpectedKernelExit(code: number | null, signal: NodeJS.Signals | null, reason: "process_exit"): void;
-		};
-		internals.kernelDiagnosticIdentity = {
-			sessionId: "session-stderr-bound",
-			kernelInstanceId: "kernel-instance-stderr-bound",
-			kernelPid: 4545,
-			kernelProcessStartId: "proc:stderr-bound",
-			launchMode: "direct",
-		};
-		internals.kernelCrashPhase = "resolving_ports";
-		const maxTailBytes = 16 * 1024;
+	it("bounds one exited child's exact binary stderr tail and observed byte count", async () => {
+		const stderr = new PassThrough();
+		const child = new EventEmitter() as EventEmitter & { stderr: PassThrough };
+		child.stderr = stderr;
+		const process = child as unknown as ChildProcess;
 		const splitEmoji = Buffer.from("🙂");
-		const chunks = [
-			Buffer.alloc(maxTailBytes + 257, 0x61),
+		const source = Buffer.concat([
+			Buffer.alloc(KERNEL_STDERR_TAIL_BYTES + 257, 0x61),
 			splitEmoji.subarray(0, 2),
 			splitEmoji.subarray(2),
 			Buffer.from("tail漢"),
-		];
-		const source = Buffer.concat(chunks);
+		]);
+		const snapshot = {
+			kernelInstanceId: "kernel-instance-stderr-bound",
+			kernelPid: 4545,
+			launchMode: "direct" as const,
+			crashPhase: "resolving_ports" as const,
+			code: null,
+			signal: "SIGABRT" as const,
+			reason: "process_exit" as const,
+		};
+		let receivedSnapshot: Readonly<typeof snapshot> | undefined;
+		const capturePromise = new Promise<KernelStderrCapture>((resolve) => {
+			const collector = new KernelStderrCollector<typeof snapshot>(process);
+			collector.markExit(snapshot, (exitSnapshot, capture) => {
+				receivedSnapshot = exitSnapshot;
+				resolve(capture);
+			});
+		});
+		snapshot.kernelPid = 4546;
+		stderr.write(source.subarray(0, KERNEL_STDERR_TAIL_BYTES + 257));
+		stderr.write(source.subarray(KERNEL_STDERR_TAIL_BYTES + 257, -Buffer.byteLength("tail漢")));
+		stderr.write(Buffer.from("tail漢"));
+		const drained = new Promise<void>((resolve, reject) => {
+			stderr.once("end", resolve);
+			stderr.once("error", reject);
+		});
+		stderr.end();
+		await drained;
+		const capture = await capturePromise;
+		expect(receivedSnapshot).toMatchObject({ kernelPid: 4545, kernelInstanceId: "kernel-instance-stderr-bound" });
+		expect(capture.stderrBytes).toBe(source.byteLength);
+		expect(capture.stderrCaptureComplete).toBe(true);
+		expect(capture.sourceTruncated).toBe(true);
+		expect(capture.stderrTail).toEqual(source.subarray(-KERNEL_STDERR_TAIL_BYTES));
+		stderr.destroy();
+	});
 
+	it("reports an incomplete capture when stderr closes without end", async () => {
+		const stderr = new PassThrough();
+		const child = new EventEmitter() as EventEmitter & { stderr: PassThrough };
+		child.stderr = stderr;
+		const captures: KernelStderrCapture[] = [];
+		const collector = new KernelStderrCollector(child as unknown as ChildProcess);
+		collector.markExit({}, (_snapshot, capture) => captures.push(capture));
+		stderr.write(Buffer.from("premature stderr"));
+		stderr.destroy();
+		await vi.waitFor(() => expect(captures).toHaveLength(1));
+		expect(captures[0].stderrCaptureComplete).toBe(false);
+		expect(stderr.readableEnded).toBe(false);
+	});
+
+	it("reports an incomplete capture when the child closes before stderr end", async () => {
+		const stderr = new PassThrough();
+		const child = new EventEmitter() as EventEmitter & { stderr: PassThrough };
+		child.stderr = stderr;
+		const captures: KernelStderrCapture[] = [];
+		const collector = new KernelStderrCollector(child as unknown as ChildProcess);
+		collector.markExit({}, (_snapshot, capture) => captures.push(capture));
+		stderr.write(Buffer.from("child closed first"));
+		child.emit("close");
+		await vi.waitFor(() => expect(captures).toHaveLength(1));
+		expect(captures[0].stderrCaptureComplete).toBe(false);
+		expect(collector.isFinalized).toBe(true);
+	});
+
+	it("publishes an incomplete bounded capture after an exited child misses the drain deadline", async () => {
+		vi.useFakeTimers();
 		try {
-			for (const chunk of chunks) {
-				internals.appendKernelStderr(chunk);
-				expect(internals.kernelStderrTail.byteLength).toBeLessThanOrEqual(maxTailBytes);
-				expect(internals.kernelRawStderrTail.byteLength).toBeLessThanOrEqual(maxTailBytes);
-			}
-			expect(internals.kernelRawStderrBytes).toBe(source.byteLength);
-			expect(internals.kernelStderr).toContain("🙂tail漢");
-			internals.appendKernelDiagnostic("parent diagnostic must not enter raw stderr evidence");
-			expect(internals.kernelStderr).toContain("[kernel] parent diagnostic must not enter raw stderr evidence");
-			expect(internals.kernelRawStderrBytes).toBe(source.byteLength);
-
-			internals.reportUnexpectedKernelExit(null, "SIGABRT", "process_exit");
-			const exited = capture.events.find((event) => event.type === "kernel_unexpected_exit");
-			if (!exited || exited.type !== "kernel_unexpected_exit") throw new Error("missing bounded stderr event");
-			expect(exited.stderrBytes).toBe(source.byteLength);
-			expect(exited.sourceTruncated).toBe(true);
-			expect(Buffer.from(exited.stderrTail ?? [])).toEqual(source.subarray(-maxTailBytes));
+			const stderr = new PassThrough();
+			const child = new EventEmitter() as EventEmitter & { stderr: PassThrough };
+			child.stderr = stderr;
+			const process = child as unknown as ChildProcess;
+			const captures: KernelStderrCapture[] = [];
+			const collector = new KernelStderrCollector<Record<string, unknown>>(process);
+			collector.markExit(
+				{
+					kernelInstanceId: "kernel-instance-timeout",
+					kernelPid: 4546,
+					launchMode: "direct",
+					crashPhase: "executing",
+					requestMsgId: "request-timeout",
+					code: null,
+					signal: "SIGKILL",
+					reason: "process_exit",
+				},
+				(_snapshot, capture) => captures.push(capture),
+			);
+			stderr.write(Buffer.from([0x00, 0xff, 0x41]));
+			expect(captures).toHaveLength(0);
+			await vi.advanceTimersByTimeAsync(99);
+			expect(captures).toHaveLength(0);
+			await vi.advanceTimersByTimeAsync(1);
+			expect(captures).toHaveLength(1);
+			expect(captures[0]).toMatchObject({
+				stderrBytes: 3,
+				stderrCaptureComplete: false,
+				sourceTruncated: false,
+			});
+			expect(collector.isExitOwned).toBe(false);
+			expect(collector.isFinalized).toBe(true);
+			expect(child.listenerCount("close")).toBe(0);
+			expect(stderr.listenerCount("data")).toBe(0);
+			expect(stderr.listenerCount("end")).toBe(0);
+			expect(stderr.listenerCount("error")).toBe(0);
+			collector.dispose();
 		} finally {
-			capture.unsubscribe();
+			vi.useRealTimers();
 		}
 	});
 
-	it("resets raw stderr provenance for each direct kernel identity", () => {
-		const manager = new KernelManager({ sessionId: "session-stderr-reset" });
+	it("keeps direct stderr diagnostics tied to each child across rapid replacement", async () => {
+		const capture = captureKernelDiagnostics();
+		const manager = new KernelManager({ sessionId: "session-rapid-replacement" });
+		const aStderr = new PassThrough();
+		const aKill = vi.fn(() => false);
+		const aChild = new EventEmitter() as EventEmitter & {
+			stderr: PassThrough;
+			pid: number;
+			kill: (signal?: NodeJS.Signals) => boolean;
+		};
+		aChild.stderr = aStderr;
+		aChild.pid = 5101;
+		aChild.kill = aKill;
+		const aProcess = aChild as unknown as ChildProcess;
+		const bStderr = new PassThrough();
+		const bKill = vi.fn(() => false);
+		const bChild = new EventEmitter() as EventEmitter & {
+			stderr: PassThrough;
+			pid: number;
+			kill: (signal?: NodeJS.Signals) => boolean;
+		};
+		bChild.stderr = bStderr;
+		bChild.pid = 5102;
+		bChild.kill = bKill;
+		const bProcess = bChild as unknown as ChildProcess;
+		const aReject = vi.fn();
+		const bReject = vi.fn();
+		const aIdentity = {
+			sessionId: "session-rapid-replacement",
+			kernelInstanceId: "kernel-instance-a",
+			kernelPid: 5101,
+			kernelProcessStartId: "proc:a-start",
+			launchMode: "direct" as const,
+		};
+		const bIdentity = {
+			sessionId: "session-rapid-replacement",
+			kernelInstanceId: "kernel-instance-b",
+			kernelPid: 5102,
+			kernelProcessStartId: "proc:b-start",
+			launchMode: "direct" as const,
+		};
 		const internals = manager as unknown as {
-			kernelRawStderrTail: Buffer;
-			kernelRawStderrBytes: number;
-			appendKernelStderr(chunk: Buffer): void;
-			startKernelDiagnostics(
-				launchMode: "direct",
-				kernelPid: number,
-				kernelProcessStartId: string | undefined,
+			state: "idle" | "running" | "shutdown";
+			kernel?: ChildProcess;
+			kernelDiagnosticIdentity?: typeof aIdentity;
+			kernelCrashPhase: "resolving_ports" | "ready_probe" | "idle" | "executing";
+			activeExecution?: { requestMsgId: string; reject(error: Error): void };
+			kernelStderr: string;
+			attachKernelStderrCollector(kernel: ChildProcess): void;
+			reportUnexpectedKernelExit(
+				code: number | null,
+				signal: NodeJS.Signals | null,
+				reason: "process_exit" | "forkserver_unavailable",
+				child?: ChildProcess,
 			): void;
+			appendKernelDiagnostic(message: string): void;
+			cleanupResources(killSignal?: NodeJS.Signals): void;
 		};
 
-		internals.startKernelDiagnostics("direct", 4545, "proc:stderr-reset-old");
-		internals.appendKernelStderr(Buffer.from([0x00, 0xff]));
-		expect(internals.kernelRawStderrBytes).toBe(2);
+		try {
+			internals.state = "running";
+			internals.kernel = aProcess;
+			internals.kernelDiagnosticIdentity = aIdentity;
+			internals.kernelCrashPhase = "executing";
+			internals.activeExecution = { requestMsgId: "request-a", reject: aReject };
+			internals.attachKernelStderrCollector(aProcess);
+			aStderr.write(Buffer.from("A-before-exit\0"));
+			internals.reportUnexpectedKernelExit(null, "SIGABRT", "process_exit", aProcess);
+			internals.state = "shutdown";
+			internals.cleanupResources("SIGKILL");
+			expect(internals.kernel).toBeUndefined();
+			expect(aReject).toHaveBeenCalledWith(expect.objectContaining({ message: "Kernel has been shut down" }));
+			expect(aStderr.readableEnded).toBe(false);
 
-		internals.startKernelDiagnostics("direct", 4546, "proc:stderr-reset-new");
-		expect(internals.kernelRawStderrBytes).toBe(0);
-		expect(internals.kernelRawStderrTail).toEqual(Buffer.alloc(0));
+			// Match restart's clean human-readable view before the replacement starts.
+			internals.state = "idle";
+			internals.kernelStderr = "";
+			internals.state = "running";
+			internals.kernel = bProcess;
+			internals.kernelDiagnosticIdentity = bIdentity;
+			internals.kernelCrashPhase = "executing";
+			internals.activeExecution = { requestMsgId: "request-b", reject: bReject };
+			internals.attachKernelStderrCollector(bProcess);
+			internals.appendKernelDiagnostic("parent diagnostic must not enter raw stderr evidence");
+			const aLate = Buffer.concat([Buffer.from("A-late\0"), Buffer.from([0xff])]);
+			const bOnly = Buffer.concat([Buffer.from("B-only\0"), Buffer.from([0xfe])]);
+			aStderr.write(aLate);
+			bStderr.write(bOnly);
+			expect(internals.kernelStderr).toContain("B-only");
+			expect(internals.kernelStderr).not.toContain("A-before-exit");
+			expect(internals.kernelStderr).not.toContain("A-late");
+
+			internals.reportUnexpectedKernelExit(1, null, "process_exit", bProcess);
+			const aDrained = new Promise<void>((resolve, reject) => {
+				aStderr.once("end", resolve);
+				aStderr.once("error", reject);
+			});
+			const bDrained = new Promise<void>((resolve, reject) => {
+				bStderr.once("end", resolve);
+				bStderr.once("error", reject);
+			});
+			aStderr.end();
+			bStderr.end();
+			await Promise.all([aDrained, bDrained]);
+
+			const exits = capture.events.filter((event) => event.type === "kernel_unexpected_exit");
+			expect(exits).toHaveLength(2);
+			const aExit = exits.find((event) => event.type === "kernel_unexpected_exit" && event.kernelPid === 5101);
+			const bExit = exits.find((event) => event.type === "kernel_unexpected_exit" && event.kernelPid === 5102);
+			expect(aExit).toMatchObject({
+				type: "kernel_unexpected_exit",
+				sessionId: "session-rapid-replacement",
+				kernelInstanceId: "kernel-instance-a",
+				kernelPid: 5101,
+				kernelProcessStartId: "proc:a-start",
+				requestMsgId: "request-a",
+				crashPhase: "executing",
+				stderrCaptureComplete: true,
+			});
+			expect(bExit).toMatchObject({
+				type: "kernel_unexpected_exit",
+				sessionId: "session-rapid-replacement",
+				kernelInstanceId: "kernel-instance-b",
+				kernelPid: 5102,
+				kernelProcessStartId: "proc:b-start",
+				requestMsgId: "request-b",
+				crashPhase: "executing",
+				stderrCaptureComplete: true,
+			});
+			if (!aExit || aExit.type !== "kernel_unexpected_exit") throw new Error("missing A exit event");
+			if (!bExit || bExit.type !== "kernel_unexpected_exit") throw new Error("missing B exit event");
+			expect(Buffer.from(aExit.stderrTail ?? [])).toEqual(Buffer.concat([Buffer.from("A-before-exit\0"), aLate]));
+			expect(aExit.stderrBytes).toBe(Buffer.byteLength("A-before-exit\0") + aLate.byteLength);
+			expect(Buffer.from(bExit.stderrTail ?? [])).toEqual(bOnly);
+			expect(bExit.stderrBytes).toBe(bOnly.byteLength);
+			expect(Buffer.from(bExit.stderrTail ?? []).toString()).not.toContain("[kernel]");
+			expect(Buffer.from(bExit.stderrTail ?? []).toString()).not.toContain("A-late");
+		} finally {
+			aStderr.destroy();
+			bStderr.destroy();
+			capture.unsubscribe();
+			await manager.kill();
+		}
 	});
 
 	it("preserves fork pid/start/instance/request correlation through an unexpected exit", async () => {

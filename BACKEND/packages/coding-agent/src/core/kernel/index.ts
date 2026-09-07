@@ -19,6 +19,11 @@ import {
 	isForkServerEnabled,
 } from "./fork-server.js";
 import {
+	KERNEL_STDERR_TAIL_BYTES,
+	type KernelStderrCapture,
+	KernelStderrCollector,
+} from "./kernel-stderr-collector.js";
+import {
 	buildListNamesCode,
 	buildRestoreCode,
 	buildSnapshotCode,
@@ -57,7 +62,7 @@ const KERNEL_ABORT_GRACE_MS = 1000;
 const KERNEL_BUSY_REUSE_WAIT_MS = 5000;
 const KERNEL_BUSY_INTERRUPT_INTERVAL_MS = 500;
 const MAX_LATE_SENT_AGENT_MESSAGE_HANDLERS = 256;
-const KERNEL_DIAGNOSTIC_STDERR_TAIL_BYTES = 16 * 1024;
+const KERNEL_DIAGNOSTIC_STDERR_TAIL_BYTES = KERNEL_STDERR_TAIL_BYTES;
 const KERNEL_BUSY_AFTER_INTERRUPT_MESSAGE =
 	"IPython kernel is still running the previously interrupted cell. Wait and try again, or kill the IPython kernel to start fresh.";
 
@@ -567,6 +572,15 @@ function makeConnection(): { info: ConnectionInfo; path: string; tempDir: string
 const liveKernels = new Set<KernelManager>();
 let signalHandlersInstalled = false;
 
+type KernelUnexpectedExitSnapshot = KernelDiagnosticIdentity & {
+	type: "kernel_unexpected_exit";
+	crashPhase: KernelCrashPhase;
+	requestMsgId?: string;
+	code: number | null;
+	signal: NodeJS.Signals | null;
+	reason: "process_exit" | "forkserver_unavailable";
+};
+
 registerSessionResourceCleanup((sessionId) => {
 	for (const k of liveKernels) {
 		if (!sessionId || k.ownerSessionId === sessionId) {
@@ -626,8 +640,10 @@ export class KernelManager {
 	private connection?: ConnectionInfo;
 	private tempDir?: string;
 	private kernelStderrTail: Buffer<ArrayBufferLike> = Buffer.alloc(0);
-	private kernelRawStderrTail: Buffer<ArrayBufferLike> = Buffer.alloc(0);
-	private kernelRawStderrBytes = 0;
+	private readonly kernelStderrCollectors = new WeakMap<
+		ChildProcess,
+		KernelStderrCollector<KernelUnexpectedExitSnapshot>
+	>();
 	private kernelDiagnosticIdentity?: KernelDiagnosticIdentity;
 	private kernelCrashPhase: KernelCrashPhase = "resolving_ports";
 	private unexpectedExitReportedFor?: string;
@@ -680,18 +696,6 @@ export class KernelManager {
 		this.kernelStderrTail = appendBoundedTail(this.kernelStderrTail, bytes, KERNEL_DIAGNOSTIC_STDERR_TAIL_BYTES);
 	}
 
-	/** Captures bytes received from the direct child stderr stream for crash evidence. */
-	private appendKernelStderr(chunk: Buffer | string): void {
-		const bytes = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
-		this.appendKernelDiagnosticView(bytes);
-		this.kernelRawStderrBytes += bytes.byteLength;
-		this.kernelRawStderrTail = appendBoundedTail(
-			this.kernelRawStderrTail,
-			bytes,
-			KERNEL_DIAGNOSTIC_STDERR_TAIL_BYTES,
-		);
-	}
-
 	private appendKernelDiagnostic(message: string): void {
 		this.appendKernelDiagnosticView(`[kernel] ${message.endsWith("\n") ? message : `${message}\n`}`);
 	}
@@ -711,10 +715,6 @@ export class KernelManager {
 		this.kernelDiagnosticIdentity = identity;
 		this.kernelCrashPhase = "resolving_ports";
 		this.unexpectedExitReportedFor = undefined;
-		if (launchMode === "direct") {
-			this.kernelRawStderrTail = Buffer.alloc(0);
-			this.kernelRawStderrBytes = 0;
-		}
 		publishKernelDiagnostic({ ...identity, type: "kernel_process_started", phase: "resolving_ports" });
 	}
 
@@ -746,29 +746,59 @@ export class KernelManager {
 		});
 	}
 
+	private attachKernelStderrCollector(kernel: ChildProcess): void {
+		const stderrCollector = new KernelStderrCollector<KernelUnexpectedExitSnapshot>(kernel, (bytes) => {
+			if (this.kernel === kernel) this.appendKernelDiagnosticView(bytes);
+		});
+		this.kernelStderrCollectors.set(kernel, stderrCollector);
+	}
+
 	private reportUnexpectedKernelExit(
 		code: number | null,
 		signal: NodeJS.Signals | null,
 		reason: "process_exit" | "forkserver_unavailable",
+		child?: ChildProcess,
 	): void {
 		const identity = this.kernelDiagnosticIdentity;
 		if (!identity || this.unexpectedExitReportedFor === identity.kernelInstanceId) return;
 		this.unexpectedExitReportedFor = identity.kernelInstanceId;
 		const requestMsgId = this.activeExecution?.requestMsgId;
-		const stderrTail = identity.launchMode === "direct" ? Buffer.from(this.kernelRawStderrTail) : Buffer.alloc(0);
-		const stderrBytes = identity.launchMode === "direct" ? this.kernelRawStderrBytes : 0;
-		publishKernelDiagnostic({
+		const snapshot = Object.freeze({
 			...identity,
-			type: "kernel_unexpected_exit",
+			type: "kernel_unexpected_exit" as const,
 			crashPhase: this.kernelCrashPhase,
 			...(requestMsgId ? { requestMsgId } : {}),
 			code,
 			signal,
 			reason,
-			...(stderrTail.length > 0 ? { stderrTail } : {}),
-			stderrCaptureStatus: identity.launchMode === "direct" ? "available" : "unavailable_fork",
-			stderrBytes,
-			sourceTruncated: stderrBytes > stderrTail.length,
+		});
+		const ownedChild = child ?? this.kernel;
+		const collector =
+			identity.launchMode === "direct" && ownedChild ? this.kernelStderrCollectors.get(ownedChild) : undefined;
+		if (collector && ownedChild) {
+			collector.markExit(snapshot, (exitSnapshot, capture) => {
+				if (this.kernelStderrCollectors.get(ownedChild) === collector) {
+					this.kernelStderrCollectors.delete(ownedChild);
+				}
+				this.publishUnexpectedKernelExit(exitSnapshot, capture);
+			});
+			return;
+		}
+		this.publishUnexpectedKernelExit(snapshot);
+	}
+
+	private publishUnexpectedKernelExit(
+		snapshot: Readonly<KernelUnexpectedExitSnapshot>,
+		capture?: KernelStderrCapture,
+	): void {
+		const isDirect = snapshot.launchMode === "direct";
+		publishKernelDiagnostic({
+			...snapshot,
+			...(capture && capture.stderrTail.length > 0 ? { stderrTail: capture.stderrTail } : {}),
+			stderrCaptureStatus: isDirect ? "available" : "unavailable_fork",
+			...(capture ? { stderrCaptureComplete: capture.stderrCaptureComplete } : {}),
+			stderrBytes: capture?.stderrBytes ?? 0,
+			sourceTruncated: capture?.sourceTruncated ?? false,
 		});
 	}
 
@@ -887,10 +917,7 @@ export class KernelManager {
 				this.startKernelDiagnostics("direct", kernel.pid, getProcessStartId(kernel.pid));
 				recordOrphanProcessState(kernel.pid, true);
 			}
-
-			kernel.stderr?.on("data", (buf: Buffer) => {
-				this.appendKernelStderr(buf);
-			});
+			this.attachKernelStderrCollector(kernel);
 
 			kernel.on("error", (err) => {
 				if (this.kernel !== kernel) return;
@@ -904,7 +931,7 @@ export class KernelManager {
 				if (this.kernel !== kernel) return;
 				if (this.state !== "shutdown") {
 					this.appendKernelDiagnostic(`unexpected exit code=${code} signal=${signal}`);
-					this.reportUnexpectedKernelExit(code, signal, "process_exit");
+					this.reportUnexpectedKernelExit(code, signal, "process_exit", kernel);
 				}
 				this.state = "shutdown";
 				liveKernels.delete(this);
@@ -1700,11 +1727,17 @@ export class KernelManager {
 		this.control = undefined;
 		this.iopubPumpPromise = undefined;
 		this.controlPumpPromise = undefined;
-		if (this.kernel) {
-			const directPid = this.kernel.pid;
+		const kernel = this.kernel;
+		const stderrCollector = kernel ? this.kernelStderrCollectors.get(kernel) : undefined;
+		if (stderrCollector && !stderrCollector.isExitOwned) {
+			stderrCollector.dispose();
+			if (kernel) this.kernelStderrCollectors.delete(kernel);
+		}
+		if (kernel) {
+			const directPid = kernel.pid;
 			let signaled = false;
 			try {
-				signaled = this.kernel.kill(killSignal);
+				signaled = kernel.kill(killSignal);
 			} catch {
 				// The kernel has already exited.
 			}

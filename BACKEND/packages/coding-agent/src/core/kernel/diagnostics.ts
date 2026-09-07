@@ -42,6 +42,8 @@ export type KernelDiagnosticEvent =
 			stderrTail?: Uint8Array;
 			/** Omission denotes an older producer whose capture availability is unknown. */
 			stderrCaptureStatus?: "available" | "unavailable_fork" | "unknown";
+			/** Omission denotes an older producer or a fork where completion is unknown. */
+			stderrCaptureComplete?: boolean;
 			stderrBytes: number;
 			sourceTruncated: boolean;
 	  });

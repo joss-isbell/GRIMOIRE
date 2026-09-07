@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
-import { readlinkSync } from "node:fs";
 import { once } from "node:events";
+import { readlinkSync } from "node:fs";
 import { publishKernelDiagnostic } from "../../src/core/kernel/diagnostics.js";
 import { installDaemonWorkerKernelDiagnosticBridge } from "../../src/modes/daemon/daemon-worker-kernel-diagnostics.js";
 import {
@@ -44,6 +44,7 @@ publishKernelDiagnostic({
 	reason: "process_exit",
 	stderrTail: Buffer.from([0x00, 0xff, 0x6b, 0x65, 0x72, 0x6e, 0x65, 0x6c, 0x0a]),
 	stderrBytes: 4096,
+	stderrCaptureComplete: true,
 	sourceTruncated: true,
 });
 
