@@ -23,7 +23,7 @@ import {
 	statfsSync,
 	writeSync,
 } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import {
 	acquireIncidentCasTransaction,
 	type IncidentCasRelativePath,
@@ -1279,6 +1279,13 @@ type StorageAccountingEffect =
 	| { kind: "account"; metadata: StorageAccountingMetadata; entryCreated: boolean }
 	| { kind: "remove"; metadata: StorageAccountingMetadata; releaseOwnedInode: boolean };
 
+interface IncidentPinRootStorageReservation {
+	bytes: number;
+	entries: number;
+	inodes: number;
+	released: boolean;
+}
+
 function allocatedStorageBytes(stat: { size: number | bigint; blocks?: number | bigint }): number {
 	const size = Number(stat.size);
 	const blocks = stat.blocks === undefined ? 0 : Number(stat.blocks);
@@ -1418,6 +1425,7 @@ export class IncidentRecorderCompactor {
 	private storageReservedBytes = 0;
 	private storageReservedEntries = 0;
 	private storageReservedInodes = 0;
+	private incidentPinRootStorageReservation?: IncidentPinRootStorageReservation;
 	private storageAccountingReadyState = false;
 	/**
 	 * Monotonic invalidation generation for scans that may overlap an uncertain
@@ -1537,6 +1545,30 @@ export class IncidentRecorderCompactor {
 		let mutation: IncidentRecorderWriterLifecycleMutationResult<T>;
 		try {
 			mutation = admission.lease.withRoot((root) => operation(root, assertCurrent));
+		} finally {
+			this.segmentRootCallbackDepth -= 1;
+		}
+		if (mutation.state === "committed") return mutation;
+		switch (mutation.reason) {
+			case "released":
+				return { state: "unavailable", reason: "writer_lifecycle_lease_released" };
+			case "lease_lost":
+				return { state: "unavailable", reason: "writer_lifecycle_lease_lost" };
+			case "namespace_changed":
+			case "root_detached":
+				return { state: "unavailable", reason: "writer_lifecycle_namespace_changed" };
+			default:
+				return { state: "unavailable", reason: "writer_lifecycle_unavailable" };
+		}
+	}
+
+	private withRecorderIncidents<T>(operation: (root: IncidentCasRootMutation) => T): RecorderRootMutationResult<T> {
+		const admission = this.normalWriterLifecycleLease();
+		if (admission.state === "unavailable") return admission;
+		this.segmentRootCallbackDepth += 1;
+		let mutation: IncidentRecorderWriterLifecycleMutationResult<T>;
+		try {
+			mutation = admission.lease.withIncidents(operation);
 		} finally {
 			this.segmentRootCallbackDepth -= 1;
 		}
@@ -2300,6 +2332,30 @@ export class IncidentRecorderCompactor {
 		this.storageReservedBytes += bytes;
 		this.storageReservedEntries += entries;
 		this.storageReservedInodes += inodes;
+	}
+
+	private reserveIncidentPinRootStorage(bytes: number, entries: number, inodes: number): void {
+		this.reserveStorage(bytes, entries, inodes);
+		const reservation = this.incidentPinRootStorageReservation;
+		if (!reservation) return;
+		reservation.bytes += bytes;
+		reservation.entries += entries;
+		reservation.inodes += inodes;
+	}
+
+	private releaseIncidentPinRootStorage(bytes: number, entries: number, inodes: number): void {
+		// Provider request publication is one root transaction. Its individual
+		// helpers may finish before the accounting effects leave that transaction,
+		// so keep every reservation held until requestPin applies all effects.
+		if (this.incidentPinRootStorageReservation) return;
+		this.releaseReservedCapacity(bytes, entries, inodes);
+	}
+
+	private releaseIncidentPinRootStorageReservation(reservation: IncidentPinRootStorageReservation): void {
+		if (reservation.released) return;
+		reservation.released = true;
+		if (this.incidentPinRootStorageReservation === reservation) this.incidentPinRootStorageReservation = undefined;
+		this.releaseReservedCapacity(reservation.bytes, reservation.entries, reservation.inodes);
 	}
 
 	private consumeStorageReservation(
@@ -5537,12 +5593,9 @@ export class IncidentRecorderCompactor {
 		return bounded;
 	}
 
-	private readSysdigPinRequestPath(path: string): SysdigPinRequest | undefined {
+	private parseSysdigPinRequest(value: unknown): SysdigPinRequest | undefined {
 		try {
-			const metadata = lstatSync(path);
-			if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size > SYSDIG_PIN_REQUEST_MAX_BYTES)
-				return undefined;
-			const request = JSON.parse(readFileSync(path, "utf8")) as SysdigPinRequest;
+			const request = value as SysdigPinRequest;
 			if (
 				!hasExactOwnKeys(request, [
 					"version",
@@ -5651,13 +5704,45 @@ export class IncidentRecorderCompactor {
 		}
 	}
 
+	private readSysdigPinRequestPath(path: string): SysdigPinRequest | undefined {
+		try {
+			const metadata = lstatSync(path);
+			if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size > SYSDIG_PIN_REQUEST_MAX_BYTES)
+				return undefined;
+			return this.parseSysdigPinRequest(JSON.parse(readFileSync(path, "utf8")));
+		} catch {
+			return undefined;
+		}
+	}
+
+	private readSysdigPinRequestRoot(
+		root: IncidentCasRootMutation,
+		path: IncidentCasRelativePath,
+	): SysdigPinRequest | undefined {
+		try {
+			const metadata = root.lstat(path);
+			if (
+				!metadata ||
+				!metadata.isFile() ||
+				metadata.isSymbolicLink() ||
+				metadata.size > BigInt(SYSDIG_PIN_REQUEST_MAX_BYTES)
+			)
+				return undefined;
+			return this.parseSysdigPinRequest(
+				JSON.parse(root.readFile(path, SYSDIG_PIN_REQUEST_MAX_BYTES).toString("utf8")),
+			);
+		} catch {
+			return undefined;
+		}
+	}
+
 	private readSysdigPinRequest(incidentDir: string): SysdigPinRequest | undefined {
 		return this.readSysdigPinRequestPath(this.sysdigRequestPath(incidentDir));
 	}
 
-	private readJournalPinRequest(incidentDir: string): JournalPinRequest | undefined {
+	private parseJournalPinRequest(value: unknown): JournalPinRequest | undefined {
 		try {
-			const request = JSON.parse(readFileSync(this.journalRequestPath(incidentDir), "utf8")) as JournalPinRequest;
+			const request = value as JournalPinRequest;
 			if (
 				!hasExactOwnKeys(request, [
 					"version",
@@ -5694,40 +5779,37 @@ export class IncidentRecorderCompactor {
 		}
 	}
 
-	private readIncidentPinAuthority(incidentDir: string): IncidentPinAuthority | undefined {
-		return this.readSysdigPinRequestPath(this.pinAuthorityPath(incidentDir));
+	private readJournalPinRequest(incidentDir: string): JournalPinRequest | undefined {
+		try {
+			return this.parseJournalPinRequest(JSON.parse(readFileSync(this.journalRequestPath(incidentDir), "utf8")));
+		} catch {
+			return undefined;
+		}
 	}
 
-	private quarantineInvalidPinRequest(incidentDir: string, provider: "journal" | "sysdig", path: string): string {
-		const metadata = lstatSync(path);
-		if ((!metadata.isFile() && !metadata.isSymbolicLink()) || metadata.isDirectory()) {
-			throw new Error(`Invalid ${provider} pin request could not be quarantined safely`);
+	private readJournalPinRequestRoot(
+		root: IncidentCasRootMutation,
+		path: IncidentCasRelativePath,
+	): JournalPinRequest | undefined {
+		try {
+			const metadata = root.lstat(path);
+			if (
+				!metadata ||
+				!metadata.isFile() ||
+				metadata.isSymbolicLink() ||
+				metadata.size > BigInt(SYSDIG_PIN_REQUEST_MAX_BYTES)
+			)
+				return undefined;
+			return this.parseJournalPinRequest(
+				JSON.parse(root.readFile(path, SYSDIG_PIN_REQUEST_MAX_BYTES).toString("utf8")),
+			);
+		} catch {
+			return undefined;
 		}
-		const identity = sha256(
-			`${metadata.dev}:${metadata.ino}:${metadata.mode}:${metadata.size}:${metadata.mtimeMs}:${metadata.ctimeMs}`,
-		);
-		const quarantineDir = join(incidentDir, "provider-request-quarantine");
-		const quarantinePath = join(quarantineDir, `${provider}-${identity}.json`);
-		mkdirSync(quarantineDir, { recursive: true, mode: 0o700 });
-		const existed = existsSync(quarantinePath);
-		if (!existed) linkSync(path, quarantinePath);
-		const quarantined = lstatSync(quarantinePath);
-		if (quarantined.dev !== metadata.dev || quarantined.ino !== metadata.ino) {
-			throw new Error(`Invalid ${provider} pin request quarantine identity mismatch`);
-		}
-		if (!existed) this.accountStoragePath(quarantinePath);
-		fsyncDirectory(quarantineDir);
-		const removed = lstatSync(path);
-		rmSync(path);
-		this.accountRemovedStorageEntry(removed);
-		fsyncDirectory(incidentDir);
-		this.writeOwnedJson(join(quarantineDir, `${provider}-${identity}-recovery.json`), {
-			version: 1,
-			state: "quarantined_invalid_immutable_request",
-			provider,
-			identity,
-		});
-		return identity;
+	}
+
+	private readIncidentPinAuthority(incidentDir: string): IncidentPinAuthority | undefined {
+		return this.readSysdigPinRequestPath(this.pinAuthorityPath(incidentDir));
 	}
 
 	private quarantineInvalidProviderProof(incidentDir: string, provider: "journal" | "sysdig", path: string): void {
@@ -7095,10 +7177,364 @@ export class IncidentRecorderCompactor {
 		}
 	}
 
+	private incidentPinName(incidentDir: string): string {
+		const incidentsRoot = resolve(join(this.options.agentDir, "incidents"));
+		if (resolve(dirname(incidentDir)) !== incidentsRoot)
+			throw this.writerLifecycleAdmissionError("writer_lifecycle_namespace_changed");
+		const name = basename(incidentDir);
+		if (name.length === 0 || name === "." || name === ".." || name.includes("/") || name.includes("\\"))
+			throw new Error("Incident pin directory name is not a direct child of the incidents root");
+		return name;
+	}
+
+	private writeOwnedJsonThroughRoot(
+		root: IncidentCasRootMutation,
+		parentComponents: readonly string[],
+		name: string,
+		value: unknown,
+		effects: StorageAccountingEffect[],
+		maxBytes = SYSDIG_PIN_REQUEST_MAX_BYTES,
+	): void {
+		const encoded = Buffer.from(`${JSON.stringify(value)}\n`, "utf8");
+		if (encoded.length > maxBytes) throw new Error("Incident pin publication exceeded its immutable request bound");
+		const parent = root.relative(...parentComponents);
+		const destination = root.relative(...parentComponents, name);
+		const existing = root.lstat(destination);
+		if (existing) {
+			if (
+				!existing.isFile() ||
+				existing.isSymbolicLink() ||
+				existing.nlink !== 1n ||
+				(existing.mode & 0o077n) !== 0n ||
+				existing.size > BigInt(maxBytes) ||
+				!root.readFile(destination, maxBytes).equals(encoded)
+			)
+				throw new Error(`Immutable incident reference collision at ${root.publicPath(destination)}`);
+			root.fsyncFile(destination);
+			root.fsyncDirectory(parent);
+			return;
+		}
+
+		const scratchName = `.${name}.scratch`;
+		const scratch = root.relative(...parentComponents, scratchName);
+		const blockSize = Math.max(4096, Number(root.statfs(root.relative()).bsize));
+		const reservedBytes = Math.ceil(encoded.length / blockSize) * blockSize + blockSize * 2;
+		this.reserveIncidentPinRootStorage(reservedBytes, 2, 1);
+		try {
+			let scratchMetadata = root.lstat(scratch);
+			if (scratchMetadata) {
+				const scratchValid =
+					scratchMetadata.isFile() &&
+					!scratchMetadata.isSymbolicLink() &&
+					scratchMetadata.nlink === 1n &&
+					(scratchMetadata.mode & 0o077n) === 0n &&
+					scratchMetadata.size === BigInt(encoded.length) &&
+					root.readFile(scratch, maxBytes).equals(encoded);
+				if (!scratchValid) {
+					root.unlinkFile(scratch);
+					effects.push({
+						kind: "remove",
+						metadata: scratchMetadata,
+						releaseOwnedInode: scratchMetadata.nlink <= 1n,
+					});
+					root.fsyncDirectory(parent);
+					scratchMetadata = undefined;
+				}
+			}
+			if (!scratchMetadata) {
+				root.writeFileExclusive(scratch, encoded, 0o600);
+				effects.push({ kind: "account", metadata: root.lstat(scratch)!, entryCreated: true });
+				root.fsyncFile(scratch);
+				root.fsyncDirectory(parent);
+			} else {
+				root.fsyncFile(scratch);
+			}
+			root.hardLink(scratch, destination);
+			effects.push({ kind: "account", metadata: root.lstat(destination)!, entryCreated: true });
+			root.fsyncDirectory(parent);
+			const linkedScratch = root.lstat(scratch);
+			if (!linkedScratch) throw new Error("Incident pin publication scratch disappeared");
+			root.unlinkFile(scratch);
+			effects.push({ kind: "remove", metadata: linkedScratch, releaseOwnedInode: false });
+			effects.push({ kind: "account", metadata: root.stat(parent), entryCreated: false });
+			root.fsyncDirectory(parent);
+		} finally {
+			this.releaseIncidentPinRootStorage(reservedBytes, 2, 1);
+		}
+	}
+
+	private quarantineProviderFileThroughRoot(
+		root: IncidentCasRootMutation,
+		incidentName: string,
+		provider: "journal" | "sysdig",
+		fileName: string,
+		quarantineDirectoryName: "provider-request-quarantine" | "provider-incomplete-quarantine",
+		effects: StorageAccountingEffect[],
+	): string {
+		const source = root.relative(incidentName, fileName);
+		const metadata = root.lstat(source);
+		if (!metadata || (!metadata.isFile() && !metadata.isSymbolicLink()) || metadata.isDirectory())
+			throw new Error(`Invalid ${provider} pin request could not be quarantined safely`);
+		const identity = sha256(
+			`${metadata.dev}:${metadata.ino}:${metadata.mode}:${metadata.size}:${metadata.mtimeMs}:${metadata.ctimeMs}`,
+		);
+		const parent = root.relative(incidentName);
+		const quarantineDirectory = root.relative(incidentName, quarantineDirectoryName);
+		const blockSize = Math.max(4096, Number(root.statfs(root.relative()).bsize));
+		const existingDirectory = root.lstat(quarantineDirectory);
+		if (!existingDirectory) {
+			const reservedBytes = blockSize * 2;
+			this.reserveIncidentPinRootStorage(reservedBytes, 1, 1);
+			try {
+				root.mkdirPrivate(quarantineDirectory);
+				effects.push({ kind: "account", metadata: root.stat(quarantineDirectory), entryCreated: true });
+				effects.push({ kind: "account", metadata: root.stat(parent), entryCreated: false });
+				root.fsyncDirectory(parent);
+			} finally {
+				this.releaseIncidentPinRootStorage(reservedBytes, 1, 1);
+			}
+		} else if (!existingDirectory.isDirectory() || existingDirectory.isSymbolicLink()) {
+			throw new Error(`Invalid ${provider} pin quarantine directory`);
+		}
+		const quarantinePath = root.relative(incidentName, quarantineDirectoryName, `${provider}-${identity}.json`);
+		const existingQuarantine = root.lstat(quarantinePath);
+		if (!existingQuarantine) {
+			this.reserveIncidentPinRootStorage(blockSize, 1, 0);
+			try {
+				root.hardLink(source, quarantinePath);
+				const quarantined = root.lstat(quarantinePath)!;
+				if (quarantined.dev !== metadata.dev || quarantined.ino !== metadata.ino)
+					throw new Error(`Invalid ${provider} pin request quarantine identity mismatch`);
+				effects.push({ kind: "account", metadata: quarantined, entryCreated: true });
+				effects.push({ kind: "account", metadata: root.stat(quarantineDirectory), entryCreated: false });
+				root.fsyncDirectory(quarantineDirectory);
+			} finally {
+				this.releaseIncidentPinRootStorage(blockSize, 1, 0);
+			}
+		} else if (existingQuarantine.dev !== metadata.dev || existingQuarantine.ino !== metadata.ino) {
+			throw new Error(`Invalid ${provider} pin request quarantine identity mismatch`);
+		}
+		root.fsyncDirectory(quarantineDirectory);
+		const removed = root.lstat(source);
+		if (!removed) throw new Error(`Invalid ${provider} pin request disappeared before quarantine`);
+		root.unlinkFile(source);
+		effects.push({ kind: "remove", metadata: removed, releaseOwnedInode: false });
+		effects.push({ kind: "account", metadata: root.stat(parent), entryCreated: false });
+		root.fsyncDirectory(parent);
+		return identity;
+	}
+
+	private providerPinIncompleteMatchesRoot(
+		root: IncidentCasRootMutation,
+		path: IncidentCasRelativePath,
+		provider: "journal" | "sysdig",
+		request: { runId: string; anchorWallTimeMs: number; fromWallTimeMs: number; throughWallTimeMs: number },
+	): boolean {
+		try {
+			const owner = root.stat(root.relative());
+			const metadata = root.lstat(path);
+			if (
+				!metadata ||
+				!metadata.isFile() ||
+				metadata.isSymbolicLink() ||
+				metadata.nlink !== 1n ||
+				metadata.uid !== owner.uid ||
+				(metadata.mode & 0o077n) !== 0n ||
+				metadata.size > BigInt(64 * 1024)
+			)
+				return false;
+			const existing = JSON.parse(root.readFile(path, 64 * 1024).toString("utf8")) as Record<string, unknown>;
+			return (
+				hasExactOwnKeys(existing, [
+					"version",
+					"state",
+					"provider",
+					"reason",
+					"runId",
+					"anchorWallTimeMs",
+					"fromWallTimeMs",
+					"throughWallTimeMs",
+				]) &&
+				existing.version === 1 &&
+				existing.state === "pending_or_incomplete" &&
+				existing.provider === provider &&
+				typeof existing.reason === "string" &&
+				existing.reason.length > 0 &&
+				Buffer.byteLength(existing.reason, "utf8") <= 4 * 1024 &&
+				existing.runId === request.runId &&
+				existing.anchorWallTimeMs === request.anchorWallTimeMs &&
+				existing.fromWallTimeMs === request.fromWallTimeMs &&
+				existing.throughWallTimeMs === request.throughWallTimeMs
+			);
+		} catch {
+			return false;
+		}
+	}
+
+	private writeProviderPinIncompleteThroughRoot(
+		root: IncidentCasRootMutation,
+		incidentName: string,
+		provider: "journal" | "sysdig",
+		reason: string,
+		request: { runId: string; anchorWallTimeMs: number; fromWallTimeMs: number; throughWallTimeMs: number },
+		effects: StorageAccountingEffect[],
+	): void {
+		const fileName = `${provider}-pin-incomplete.json`;
+		const path = root.relative(incidentName, fileName);
+		if (root.lstat(path) && this.providerPinIncompleteMatchesRoot(root, path, provider, request)) {
+			root.fsyncFile(path);
+			root.fsyncDirectory(root.relative(incidentName));
+			return;
+		}
+		if (root.lstat(path))
+			this.quarantineProviderFileThroughRoot(
+				root,
+				incidentName,
+				provider,
+				fileName,
+				"provider-incomplete-quarantine",
+				effects,
+			);
+		this.writeOwnedJsonThroughRoot(
+			root,
+			[incidentName],
+			fileName,
+			{
+				version: 1,
+				state: "pending_or_incomplete",
+				provider,
+				reason: boundedNonemptyUtf8(reason, 4 * 1024, "unspecified_provider_pin_incomplete"),
+				runId: request.runId,
+				anchorWallTimeMs: request.anchorWallTimeMs,
+				fromWallTimeMs: request.fromWallTimeMs,
+				throughWallTimeMs: request.throughWallTimeMs,
+			},
+			effects,
+			64 * 1024,
+		);
+	}
+
+	private publishPinRequestsThroughIncidentsRoot(
+		root: IncidentCasRootMutation,
+		incidentName: string,
+		expectedRequest: Omit<SysdigPinRequest, "initialRingSnapshot">,
+		expectedJournalRequest: JournalPinRequest,
+	): { request: SysdigPinRequest; effects: StorageAccountingEffect[] } {
+		const effects: StorageAccountingEffect[] = [];
+		// Pre-existing malformed or stale provider files are repaired below while
+		// still inside this root scope. Lifecycle/admission failures are returned
+		// separately by requestPin and never fall through to the legacy path.
+		const authorityPath = root.relative(incidentName, "incident-pin-authority.json");
+		const existingAuthority = this.readSysdigPinRequestRoot(root, authorityPath);
+		let request: SysdigPinRequest;
+		if (existingAuthority) {
+			if (
+				this.sysdigRequestBaseFingerprint(existingAuthority) !== this.sysdigRequestBaseFingerprint(expectedRequest)
+			)
+				throw new Error("Existing immutable incident pin authority does not match the requested incident pin");
+			request = existingAuthority;
+		} else if (root.lstat(authorityPath)) {
+			throw new Error("Existing immutable incident pin authority is invalid");
+		} else {
+			const snapshot = this.boundSysdigRequestSnapshot(
+				expectedRequest,
+				this.discoverSysdigRingSnapshot(expectedRequest.ringBasePath, Date.now()),
+			);
+			request = { ...expectedRequest, initialRingSnapshot: snapshot };
+			this.writeOwnedJsonThroughRoot(root, [incidentName], "incident-pin-authority.json", request, effects);
+		}
+
+		const sysdigPath = root.relative(incidentName, "sysdig-pin-request.json");
+		const existingSysdig = this.readSysdigPinRequestRoot(root, sysdigPath);
+		if (!existingSysdig || canonicalJson(existingSysdig) !== canonicalJson(request)) {
+			if (root.lstat(sysdigPath)) {
+				const identity = this.quarantineProviderFileThroughRoot(
+					root,
+					incidentName,
+					"sysdig",
+					"sysdig-pin-request.json",
+					"provider-request-quarantine",
+					effects,
+				);
+				this.writeOwnedJsonThroughRoot(
+					root,
+					[incidentName, "provider-request-quarantine"],
+					`sysdig-${identity}-recovery.json`,
+					{ version: 1, state: "quarantined_invalid_immutable_request", provider: "sysdig", identity },
+					effects,
+					64 * 1024,
+				);
+				this.writeProviderPinIncompleteThroughRoot(
+					root,
+					incidentName,
+					"sysdig",
+					`${existingSysdig ? "sysdig_request_recreated_after_binding_mismatch" : "sysdig_request_recreated_after_corruption"}:${identity}`,
+					request,
+					effects,
+				);
+			}
+			this.writeOwnedJsonThroughRoot(root, [incidentName], "sysdig-pin-request.json", request, effects);
+		}
+		this.options.onSysdigPinStep?.("sysdig_request_durable");
+
+		const journalPath = root.relative(incidentName, "journal-pin-request.json");
+		const existingJournal = this.readJournalPinRequestRoot(root, journalPath);
+		if (existingJournal) {
+			if (canonicalJson(existingJournal) !== canonicalJson(expectedJournalRequest)) {
+				this.writeProviderPinIncompleteThroughRoot(
+					root,
+					incidentName,
+					"journal",
+					"immutable_request_binding_conflict",
+					expectedJournalRequest,
+					effects,
+				);
+				throw new Error("Existing immutable journal request does not match the requested incident pin");
+			}
+		} else {
+			if (root.lstat(journalPath)) {
+				const identity = this.quarantineProviderFileThroughRoot(
+					root,
+					incidentName,
+					"journal",
+					"journal-pin-request.json",
+					"provider-request-quarantine",
+					effects,
+				);
+				this.writeOwnedJsonThroughRoot(
+					root,
+					[incidentName, "provider-request-quarantine"],
+					`journal-${identity}-recovery.json`,
+					{ version: 1, state: "quarantined_invalid_immutable_request", provider: "journal", identity },
+					effects,
+					64 * 1024,
+				);
+				this.writeProviderPinIncompleteThroughRoot(
+					root,
+					incidentName,
+					"journal",
+					`journal_request_recreated_after_corruption:${identity}`,
+					expectedJournalRequest,
+					effects,
+				);
+			}
+			this.writeOwnedJsonThroughRoot(
+				root,
+				[incidentName],
+				"journal-pin-request.json",
+				expectedJournalRequest,
+				effects,
+			);
+		}
+		this.options.onSysdigPinStep?.("provider_requests_durable");
+		return { request, effects };
+	}
+
 	requestPin(runId: string, incidentDir: string, anchorWallTimeMs: number): void {
 		if (this.pinRetentionMaintenance) throw new Error("Incident pin request deferred during retention maintenance");
 		if (!isCanonicalUuid(runId) || !Number.isSafeInteger(anchorWallTimeMs) || anchorWallTimeMs < 0)
 			throw new Error("Incident pin authority requires a canonical run id and non-negative integer anchor");
+		const incidentName = this.incidentPinName(incidentDir);
 		const ringBasePath = this.options.sysdigRingBasePath ?? SYSDIG_RING_DEFAULT_BASE_PATH;
 		const expectedRequest: SysdigPinRequest = {
 			version: 1,
@@ -7123,71 +7559,38 @@ export class IncidentRecorderCompactor {
 			resolveAfterWallTimeMs: anchorWallTimeMs + PIN_AFTER_MS,
 			retainUntilWallTimeMs: anchorWallTimeMs + INCIDENT_DIAGNOSTIC_RETENTION_MS,
 		};
-		const requestTransaction = acquireIncidentCasTransaction(this.root);
-		if (!requestTransaction) throw new Error("Incident pin request transaction unavailable");
-		let sysdigRequest: SysdigPinRequest;
+		if (this.incidentPinRootStorageReservation) throw new TypeError("Incident pin root publication is not reentrant");
+		let publication: RecorderRootMutationResult<{ request: SysdigPinRequest; effects: StorageAccountingEffect[] }>;
+		const reservation: IncidentPinRootStorageReservation = {
+			bytes: 0,
+			entries: 0,
+			inodes: 0,
+			released: false,
+		};
+		this.incidentPinRootStorageReservation = reservation;
 		try {
-			const existingAuthority = this.readIncidentPinAuthority(incidentDir);
-			if (existingAuthority) {
-				if (
-					this.sysdigRequestBaseFingerprint(existingAuthority) !==
-					this.sysdigRequestBaseFingerprint(expectedRequest)
-				)
-					throw new Error("Existing immutable incident pin authority does not match the requested incident pin");
-				sysdigRequest = existingAuthority;
-			} else if (existsSync(this.pinAuthorityPath(incidentDir))) {
-				throw new Error("Existing immutable incident pin authority is invalid");
-			} else {
-				const snapshot = this.boundSysdigRequestSnapshot(
-					expectedRequest,
-					this.discoverSysdigRingSnapshot(ringBasePath, Date.now()),
+			try {
+				publication = this.withRecorderIncidents((root) =>
+					this.publishPinRequestsThroughIncidentsRoot(root, incidentName, expectedRequest, expectedJournalRequest),
 				);
-				sysdigRequest = { ...expectedRequest, initialRingSnapshot: snapshot };
-				this.writeOwnedJson(this.pinAuthorityPath(incidentDir), sysdigRequest, 64 * 1024);
+			} catch (error) {
+				this.invalidateStorageAccounting();
+				throw error;
 			}
-			const sysdigPath = this.sysdigRequestPath(incidentDir);
-			const existingSysdig = this.readSysdigPinRequest(incidentDir);
-			if (!existingSysdig || canonicalJson(existingSysdig) !== canonicalJson(sysdigRequest)) {
-				if (existsSync(sysdigPath)) {
-					const identity = this.quarantineInvalidPinRequest(incidentDir, "sysdig", sysdigPath);
-					this.writeProviderPinIncomplete(
-						incidentDir,
-						"sysdig",
-						`${existingSysdig ? "sysdig_request_recreated_after_binding_mismatch" : "sysdig_request_recreated_after_corruption"}:${identity}`,
-						sysdigRequest,
-					);
-				}
-				this.writeOwnedJson(sysdigPath, sysdigRequest);
+			if (publication.state === "unavailable") {
+				this.invalidateStorageAccounting();
+				throw this.writerLifecycleAdmissionError(publication.reason);
 			}
-			this.options.onSysdigPinStep?.("sysdig_request_durable");
-			const journalPath = this.journalRequestPath(incidentDir);
-			const existingJournal = this.readJournalPinRequest(incidentDir);
-			if (existingJournal) {
-				if (canonicalJson(existingJournal) !== canonicalJson(expectedJournalRequest)) {
-					this.writeProviderPinIncomplete(
-						incidentDir,
-						"journal",
-						"immutable_request_binding_conflict",
-						expectedJournalRequest,
-					);
-					throw new Error("Existing immutable journal request does not match the requested incident pin");
-				}
-			} else {
-				if (existsSync(journalPath)) {
-					const identity = this.quarantineInvalidPinRequest(incidentDir, "journal", journalPath);
-					this.writeProviderPinIncomplete(
-						incidentDir,
-						"journal",
-						`journal_request_recreated_after_corruption:${identity}`,
-						expectedJournalRequest,
-					);
-				}
-				this.writeOwnedJson(journalPath, expectedJournalRequest);
+			try {
+				this.applyStorageAccountingEffects(publication.value.effects);
+			} catch (error) {
+				this.invalidateStorageAccounting();
+				throw error;
 			}
-			this.options.onSysdigPinStep?.("provider_requests_durable");
 		} finally {
-			requestTransaction.release();
+			this.releaseIncidentPinRootStorageReservation(reservation);
 		}
+		const sysdigRequest = publication.value.request;
 		this.processSysdigPin(incidentDir, sysdigRequest, Date.now());
 	}
 

@@ -1818,17 +1818,35 @@ describe("incident recorder compactor segment integration", () => {
 		}
 		const incidentDir = join(incidentRoot, "sysdig-only-request");
 		mkdirSync(incidentDir, { recursive: true, mode: 0o700 });
+		let lifecycleLease: IncidentRecorderWriterLifecycleLease | undefined;
 		const requester = new IncidentRecorderCompactor({
 			agentDir: target.agentDir,
 			storageScannerPath: join(target.root, "storage-scanner.cjs"),
 			sysdigRingBasePath: join(ringDirectory, "ring.scap"),
 			freeReserveBytes: 0,
+			writerLifecycleLease: () => lifecycleLease,
 			onSysdigPinStep: (step) => {
 				if (step === "sysdig_request_durable") throw new Error("stranded-after-sysdig-request");
 			},
 		});
 		await initialize(requester);
-		expect(() => requester.requestPin(RUN_ID, incidentDir, anchor)).toThrow("stranded-after-sysdig-request");
+		const lifecycleAdmission = acquireIncidentRecorderWriterNormalLease(
+			{ agentDir: target.agentDir },
+			{
+				activationGenerationDigest: "a".repeat(64),
+				revalidateActivation: () => ({ state: "valid" }),
+				acquireCas: acquireIncidentRecorderNamespaceCas,
+			},
+		);
+		if (lifecycleAdmission.state !== "acquired")
+			throw new Error(`fixture lifecycle lease unavailable: ${lifecycleAdmission.reason}`);
+		try {
+			lifecycleLease = lifecycleAdmission.lease;
+			expect(() => requester.requestPin(RUN_ID, incidentDir, anchor)).toThrow("stranded-after-sysdig-request");
+		} finally {
+			lifecycleAdmission.lease.release();
+			lifecycleLease = undefined;
+		}
 		expect(existsSync(join(incidentDir, "sysdig-pin-request.json"))).toBe(true);
 		expect(existsSync(join(incidentDir, "journal-pin-request.json"))).toBe(false);
 
