@@ -430,6 +430,13 @@ function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
+function appendBoundedTail(tail: Buffer, bytes: Buffer, maxBytes: number): Buffer {
+	if (bytes.byteLength === 0) return tail;
+	if (bytes.byteLength >= maxBytes) return Buffer.from(bytes.subarray(-maxBytes));
+	const retainedBytes = Math.min(tail.byteLength, maxBytes - bytes.byteLength);
+	return Buffer.concat([tail.subarray(tail.byteLength - retainedBytes), bytes], retainedBytes + bytes.byteLength);
+}
+
 function createDeferred<T>(): Deferred<T> {
 	let resolve!: (value: T) => void;
 	let reject!: (error: Error) => void;
@@ -618,8 +625,9 @@ export class KernelManager {
 	private readonly pendingControlReplies = new Map<string, (message: JupyterMessage) => void>();
 	private connection?: ConnectionInfo;
 	private tempDir?: string;
-	private kernelStderrTail = Buffer.alloc(0);
-	private kernelStderrBytes = 0;
+	private kernelStderrTail: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+	private kernelRawStderrTail: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+	private kernelRawStderrBytes = 0;
 	private kernelDiagnosticIdentity?: KernelDiagnosticIdentity;
 	private kernelCrashPhase: KernelCrashPhase = "resolving_ports";
 	private unexpectedExitReportedFor?: string;
@@ -664,30 +672,28 @@ export class KernelManager {
 
 	private set kernelStderr(value: string) {
 		this.kernelStderrTail = Buffer.alloc(0);
-		this.kernelStderrBytes = 0;
-		this.appendKernelStderr(value);
+		this.appendKernelDiagnosticView(value);
 	}
 
+	private appendKernelDiagnosticView(chunk: Buffer | string): void {
+		const bytes = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+		this.kernelStderrTail = appendBoundedTail(this.kernelStderrTail, bytes, KERNEL_DIAGNOSTIC_STDERR_TAIL_BYTES);
+	}
+
+	/** Captures bytes received from the direct child stderr stream for crash evidence. */
 	private appendKernelStderr(chunk: Buffer | string): void {
 		const bytes = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
-		this.kernelStderrBytes += bytes.byteLength;
-		if (bytes.byteLength === 0) return;
-		if (bytes.byteLength >= KERNEL_DIAGNOSTIC_STDERR_TAIL_BYTES) {
-			this.kernelStderrTail = Buffer.from(bytes.subarray(-KERNEL_DIAGNOSTIC_STDERR_TAIL_BYTES));
-			return;
-		}
-		const retainedBytes = Math.min(
-			this.kernelStderrTail.byteLength,
-			KERNEL_DIAGNOSTIC_STDERR_TAIL_BYTES - bytes.byteLength,
-		);
-		this.kernelStderrTail = Buffer.concat(
-			[this.kernelStderrTail.subarray(this.kernelStderrTail.byteLength - retainedBytes), bytes],
-			retainedBytes + bytes.byteLength,
+		this.appendKernelDiagnosticView(bytes);
+		this.kernelRawStderrBytes += bytes.byteLength;
+		this.kernelRawStderrTail = appendBoundedTail(
+			this.kernelRawStderrTail,
+			bytes,
+			KERNEL_DIAGNOSTIC_STDERR_TAIL_BYTES,
 		);
 	}
 
 	private appendKernelDiagnostic(message: string): void {
-		this.appendKernelStderr(`[kernel] ${message.endsWith("\n") ? message : `${message}\n`}`);
+		this.appendKernelDiagnosticView(`[kernel] ${message.endsWith("\n") ? message : `${message}\n`}`);
 	}
 
 	private startKernelDiagnostics(
@@ -705,6 +711,10 @@ export class KernelManager {
 		this.kernelDiagnosticIdentity = identity;
 		this.kernelCrashPhase = "resolving_ports";
 		this.unexpectedExitReportedFor = undefined;
+		if (launchMode === "direct") {
+			this.kernelRawStderrTail = Buffer.alloc(0);
+			this.kernelRawStderrBytes = 0;
+		}
 		publishKernelDiagnostic({ ...identity, type: "kernel_process_started", phase: "resolving_ports" });
 	}
 
@@ -745,8 +755,8 @@ export class KernelManager {
 		if (!identity || this.unexpectedExitReportedFor === identity.kernelInstanceId) return;
 		this.unexpectedExitReportedFor = identity.kernelInstanceId;
 		const requestMsgId = this.activeExecution?.requestMsgId;
-		const stderrTail = identity.launchMode === "direct" ? Buffer.from(this.kernelStderrTail) : Buffer.alloc(0);
-		const stderrBytes = identity.launchMode === "direct" ? this.kernelStderrBytes : 0;
+		const stderrTail = identity.launchMode === "direct" ? Buffer.from(this.kernelRawStderrTail) : Buffer.alloc(0);
+		const stderrBytes = identity.launchMode === "direct" ? this.kernelRawStderrBytes : 0;
 		publishKernelDiagnostic({
 			...identity,
 			type: "kernel_unexpected_exit",

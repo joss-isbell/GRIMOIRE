@@ -89,8 +89,10 @@ describeIfLinux("KernelManager causal diagnostics", () => {
 			kernelCrashPhase: "resolving_ports";
 			kernelStderr: string;
 			kernelStderrTail: Buffer;
-			kernelStderrBytes: number;
+			kernelRawStderrTail: Buffer;
+			kernelRawStderrBytes: number;
 			appendKernelStderr(chunk: Buffer | string): void;
+			appendKernelDiagnostic(message: string): void;
 			reportUnexpectedKernelExit(code: number | null, signal: NodeJS.Signals | null, reason: "process_exit"): void;
 		};
 		internals.kernelDiagnosticIdentity = {
@@ -115,9 +117,13 @@ describeIfLinux("KernelManager causal diagnostics", () => {
 			for (const chunk of chunks) {
 				internals.appendKernelStderr(chunk);
 				expect(internals.kernelStderrTail.byteLength).toBeLessThanOrEqual(maxTailBytes);
+				expect(internals.kernelRawStderrTail.byteLength).toBeLessThanOrEqual(maxTailBytes);
 			}
-			expect(internals.kernelStderrBytes).toBe(source.byteLength);
+			expect(internals.kernelRawStderrBytes).toBe(source.byteLength);
 			expect(internals.kernelStderr).toContain("🙂tail漢");
+			internals.appendKernelDiagnostic("parent diagnostic must not enter raw stderr evidence");
+			expect(internals.kernelStderr).toContain("[kernel] parent diagnostic must not enter raw stderr evidence");
+			expect(internals.kernelRawStderrBytes).toBe(source.byteLength);
 
 			internals.reportUnexpectedKernelExit(null, "SIGABRT", "process_exit");
 			const exited = capture.events.find((event) => event.type === "kernel_unexpected_exit");
@@ -128,6 +134,28 @@ describeIfLinux("KernelManager causal diagnostics", () => {
 		} finally {
 			capture.unsubscribe();
 		}
+	});
+
+	it("resets raw stderr provenance for each direct kernel identity", () => {
+		const manager = new KernelManager({ sessionId: "session-stderr-reset" });
+		const internals = manager as unknown as {
+			kernelRawStderrTail: Buffer;
+			kernelRawStderrBytes: number;
+			appendKernelStderr(chunk: Buffer): void;
+			startKernelDiagnostics(
+				launchMode: "direct",
+				kernelPid: number,
+				kernelProcessStartId: string | undefined,
+			): void;
+		};
+
+		internals.startKernelDiagnostics("direct", 4545, "proc:stderr-reset-old");
+		internals.appendKernelStderr(Buffer.from([0x00, 0xff]));
+		expect(internals.kernelRawStderrBytes).toBe(2);
+
+		internals.startKernelDiagnostics("direct", 4546, "proc:stderr-reset-new");
+		expect(internals.kernelRawStderrBytes).toBe(0);
+		expect(internals.kernelRawStderrTail).toEqual(Buffer.alloc(0));
 	});
 
 	it("preserves fork pid/start/instance/request correlation through an unexpected exit", async () => {
