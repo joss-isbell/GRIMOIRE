@@ -37,7 +37,9 @@ import {
 } from "./incident-recorder-protocol.js";
 import { INCIDENT_DIAGNOSTIC_RETENTION_MS } from "./incident-recorder-retention.js";
 import {
+	estimateIncidentRecorderSegmentStoreOpenWithinRoot,
 	type IncidentRecorderSegmentAppendInput,
+	type IncidentRecorderSegmentAppendStorageEstimate,
 	type IncidentRecorderSegmentDurableWrite,
 	type IncidentRecorderSegmentLocator,
 	type IncidentRecorderSegmentOpenResult,
@@ -51,8 +53,8 @@ import {
 	type IncidentRecorderSegmentRecord,
 	type IncidentRecorderSegmentRecoveryGap,
 	type IncidentRecorderSegmentRecoveryGapQueryCursor,
+	type IncidentRecorderSegmentRootReceipt,
 	IncidentRecorderSegmentStore,
-	planIncidentRecorderSegmentStoreOpen,
 	pruneIncidentRecorderSealedHistoryForRecovery,
 } from "./incident-recorder-segment-store.js";
 import {
@@ -62,6 +64,7 @@ import {
 } from "./incident-recorder-writer.js";
 import {
 	type IncidentRecorderWriterLifecycleLease,
+	type IncidentRecorderWriterLifecycleMutationResult,
 	inspectIncidentRecorderWriterLifecycleLeaseMode,
 } from "./incident-recorder-writer-lifecycle.js";
 
@@ -1436,6 +1439,17 @@ export class IncidentRecorderCompactor {
 	private readonly segmentOpenStorageEntries = new Map<string, IncidentRecorderSegmentOpenStorageEntry>();
 	private readonly segmentAccountingSequences = new Map<string, number>();
 	private segmentOpenRequiresReconciliation = false;
+	private segmentRootCallbackDepth = 0;
+	private segmentRootOpenReservation?: {
+		bytes: number;
+		entries: number;
+		inodes: number;
+	};
+	private segmentRootAppendReservation?: {
+		bytes: number;
+		entries: number;
+		inodes: number;
+	};
 	private segmentRecoveryPruneCursor?: IncidentRecorderSegmentPruneCursor;
 	private checkpointDisposition: "valid" | "missing" | "invalid" = "missing";
 	private readonly activePinScans = new Map<string, ActivePinScan>();
@@ -1510,12 +1524,22 @@ export class IncidentRecorderCompactor {
 	}
 
 	private withRecorderRoot<T>(
-		operation: (root: IncidentCasRootMutation) => T,
+		operation: (root: IncidentCasRootMutation, assertCurrent: () => void) => T,
 		lease?: IncidentRecorderWriterLifecycleLease,
 	): RecorderRootMutationResult<T> {
 		const admission = lease ? { state: "available" as const, lease } : this.normalWriterLifecycleLease();
 		if (admission.state === "unavailable") return admission;
-		const mutation = admission.lease.withRoot(operation);
+		const assertCurrent = (): void => {
+			if (inspectIncidentRecorderWriterLifecycleLeaseMode(admission.lease) !== "normal")
+				throw this.writerLifecycleAdmissionError("writer_lifecycle_lease_lost");
+		};
+		this.segmentRootCallbackDepth += 1;
+		let mutation: IncidentRecorderWriterLifecycleMutationResult<T>;
+		try {
+			mutation = admission.lease.withRoot((root) => operation(root, assertCurrent));
+		} finally {
+			this.segmentRootCallbackDepth -= 1;
+		}
 		if (mutation.state === "committed") return mutation;
 		switch (mutation.reason) {
 			case "released":
@@ -2314,9 +2338,54 @@ export class IncidentRecorderCompactor {
 	private closeSegmentStore(): void {
 		if (this.segmentStoreCloseUncertain) throw this.segmentStoreCloseFailure;
 		this.closePendingPinDirectoryTraversal();
+		if (this.segmentRootCallbackDepth > 0) {
+			// Storage admission may discover pressure while a root callback is
+			// still active. Defer the close request rather than opening a nested
+			// lifecycle/root lease; the admission path will fail and the enclosing
+			// mutation will discard the store.
+			return;
+		}
 		const store = this.segmentStore;
 		if (!store) return;
 		this.discardRunHistoryTraversals();
+		if (store.isRootBacked) {
+			let receipts: readonly IncidentRecorderSegmentRootReceipt[] = [];
+			let mutation: RecorderRootMutationResult<boolean>;
+			try {
+				mutation = this.withRecorderRoot((root) => {
+					const result = store.closeWithinRoot(root);
+					receipts = result;
+					return true;
+				});
+			} catch (error) {
+				this.discardSegmentStoreAfterRootFailure("close_operation_failed");
+				this.releaseSegmentRootReservations();
+				this.segmentStoreCloseFailure = error;
+				this.segmentStoreCloseUncertain = true;
+				throw error;
+			}
+			if (mutation.state !== "committed") {
+				this.discardSegmentStoreAfterRootFailure(mutation.reason);
+				this.releaseSegmentRootReservations();
+				this.segmentStoreCloseFailure = this.writerLifecycleAdmissionError(mutation.reason);
+				this.segmentStoreCloseUncertain = true;
+				throw this.segmentStoreCloseFailure;
+			}
+			try {
+				this.applySegmentRootReceipts(receipts);
+				this.assertSegmentAccountingReadyAfterRootReceipt();
+			} catch (error) {
+				this.discardSegmentStoreAfterRootFailure("close_receipt_application_failed");
+				this.releaseSegmentRootReservations();
+				this.segmentOpenRequiresReconciliation = true;
+				this.segmentStoreCloseFailure = error;
+				this.segmentStoreCloseUncertain = true;
+				throw error;
+			}
+			this.releaseSegmentRootReservations();
+			this.segmentStore = undefined;
+			return;
+		}
 		try {
 			store.close();
 		} catch (error) {
@@ -2328,75 +2397,40 @@ export class IncidentRecorderCompactor {
 		this.segmentStore = undefined;
 	}
 
-	private ensureSegmentStore(): IncidentRecorderSegmentStore {
-		if (this.segmentStoreCloseUncertain) throw this.segmentStoreCloseFailure;
-		if (this.segmentStore) return this.segmentStore;
-		if (!this.storageAccountingReadyState || this.storageModeState !== "normal") {
-			const error = new Error(
-				"Incident segment store cannot open outside normal storage mode",
-			) as NodeJS.ErrnoException;
-			error.code = "ENOSPC";
-			throw error;
-		}
-		const plan = planIncidentRecorderSegmentStoreOpen(this.segmentDirectory());
-		this.reserveStorage(plan.peakAdditionalBytes, plan.peakAdditionalEntries, plan.peakAdditionalInodes);
-		this.segmentOpenRequiresReconciliation = false;
-		let store: IncidentRecorderSegmentStore | undefined;
-		try {
-			store = new IncidentRecorderSegmentStore({
-				directory: this.segmentDirectory(),
-				openPlan: plan,
-				onOpenAdmission: (admitted) => {
-					if (admitted !== plan) throw new Error("Incident segment open admission plan changed");
-				},
-				onOpenStorageResult: (result) => this.accountSegmentOpenResult(result),
-				onDurableWrite: (event) => this.accountSegmentDurableWrite(event),
-			});
-			this.segmentStore = store;
-			if (this.segmentOpenRequiresReconciliation) {
-				this.closeSegmentStore();
-				this.storageModeState = "recovery-only";
-				this.storageRecoveryReasonState = "segment_open_reconciliation_required";
-				const error = new Error(
-					"Incident segment open requires a full storage reconciliation",
-				) as NodeJS.ErrnoException;
-				error.code = "ENOSPC";
-				throw error;
-			}
-			this.segmentRecoveryPruneCursor = undefined;
-			return store;
-		} catch (error) {
-			if (this.segmentStore === store) {
-				try {
-					this.closeSegmentStore();
-				} catch {
-					this.segmentOpenRequiresReconciliation = true;
-				}
-			}
-			this.storageModeState = "recovery-only";
-			this.storageRecoveryReasonState ??= "segment_store_open_failed";
-			throw error;
-		} finally {
-			this.releaseReservedCapacity(plan.peakAdditionalBytes, plan.peakAdditionalEntries, plan.peakAdditionalInodes);
-		}
+	private existingSegmentStore(): IncidentRecorderSegmentStore {
+		if (!this.segmentStore) throw new Error("Incident segment store is not open in the current root scope");
+		return this.segmentStore;
 	}
 
 	private appendSegmentRecord(input: IncidentRecorderSegmentAppendInput): IncidentRecorderSegmentLocator {
-		const store = this.ensureSegmentStore();
-		let reservedBytes = 0;
-		let reservedEntries = 0;
-		let reservedInodes = 0;
-		let reservationHeld = false;
+		let receipts: readonly IncidentRecorderSegmentRootReceipt[] = [];
 		try {
-			const plan = store.planAppend(input, (estimate) => {
-				reservedBytes = estimate.peakAdditionalAllocatedBytes;
-				reservedEntries = estimate.peakAdditionalEntries;
-				reservedInodes = estimate.peakAdditionalInodes;
-				this.reserveStorage(reservedBytes, reservedEntries, reservedInodes);
-				reservationHeld = true;
+			const mutation = this.withRecorderRoot((root) => {
+				const locator = this.appendSegmentRecordWithinRoot(root, input, (estimate) => {
+					this.reserveStorage(
+						estimate.peakAdditionalAllocatedBytes,
+						estimate.peakAdditionalEntries,
+						estimate.peakAdditionalInodes,
+					);
+					this.segmentRootAppendReservation = {
+						bytes: estimate.peakAdditionalAllocatedBytes,
+						entries: estimate.peakAdditionalEntries,
+						inodes: estimate.peakAdditionalInodes,
+					};
+				});
+				if (this.segmentStore) receipts = this.segmentStore.drainWithinRootReceipts();
+				return locator;
 			});
-			return store.commitAppendPlan(plan).locator;
+			if (mutation.state !== "committed") {
+				this.discardSegmentStoreAfterRootFailure(mutation.reason);
+				throw this.writerLifecycleAdmissionError(mutation.reason);
+			}
+			this.applySegmentRootReceipts(receipts);
+			this.assertSegmentAccountingReadyAfterRootReceipt();
+			return mutation.value;
 		} catch (error) {
+			if (this.segmentStore?.isRootBacked && !this.isIdempotencyConflict(error))
+				this.discardSegmentStoreAfterRootFailure("operation_failed");
 			if ((error as NodeJS.ErrnoException).code === "ENOSPC") throw error;
 			const wrapped = new Error(
 				`Incident segment persistence failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -2405,14 +2439,160 @@ export class IncidentRecorderCompactor {
 			wrapped.name = "IncidentSegmentPersistenceError";
 			throw wrapped;
 		} finally {
-			if (reservationHeld) this.releaseReservedCapacity(reservedBytes, reservedEntries, reservedInodes);
+			this.releaseSegmentRootReservations();
 			const pressure = this.storagePressureReason(false);
 			if (pressure && this.storageModeState === "normal") this.enterStorageRecovery(pressure);
 		}
 	}
 
+	private ensureSegmentStoreWithinRoot(root: IncidentCasRootMutation): IncidentRecorderSegmentStore {
+		if (this.segmentStore) {
+			if (!this.segmentStore.isRootBacked) {
+				throw new Error("raw incident segment store cannot be reused for root-backed mutation");
+			}
+			return this.segmentStore;
+		}
+		if (!this.storageAccountingReadyState || this.storageModeState !== "normal") {
+			const error = new Error(
+				"Incident segment store cannot open outside normal storage mode",
+			) as NodeJS.ErrnoException;
+			error.code = "ENOSPC";
+			throw error;
+		}
+		this.segmentOpenRequiresReconciliation = false;
+		const openEstimate = estimateIncidentRecorderSegmentStoreOpenWithinRoot(root, ["segments"]);
+		let reservationHeld = false;
+		try {
+			this.reserveStorage(
+				openEstimate.peakAdditionalBytes,
+				openEstimate.peakAdditionalEntries,
+				openEstimate.peakAdditionalInodes,
+			);
+			reservationHeld = true;
+			this.segmentRootOpenReservation = {
+				bytes: openEstimate.peakAdditionalBytes,
+				entries: openEstimate.peakAdditionalEntries,
+				inodes: openEstimate.peakAdditionalInodes,
+			};
+			const store = IncidentRecorderSegmentStore.openWithinRoot(root, {
+				directory: ["segments"],
+			});
+			this.segmentStore = store;
+			return store;
+		} catch (error) {
+			if (reservationHeld)
+				this.releaseReservedCapacity(
+					openEstimate.peakAdditionalBytes,
+					openEstimate.peakAdditionalEntries,
+					openEstimate.peakAdditionalInodes,
+				);
+			this.segmentRootOpenReservation = undefined;
+			this.discardSegmentStoreAfterRootFailure("open_failed");
+			throw error;
+		}
+	}
+
+	private appendSegmentRecordWithinRoot(
+		root: IncidentCasRootMutation,
+		input: IncidentRecorderSegmentAppendInput,
+		admit?: (estimate: IncidentRecorderSegmentAppendStorageEstimate) => void,
+	): IncidentRecorderSegmentLocator {
+		const store = this.ensureSegmentStoreWithinRoot(root);
+		try {
+			return store.appendWithinRoot(root, input, admit).locator;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOSPC") throw error;
+			const wrapped = new Error(
+				`Incident segment persistence failed: ${error instanceof Error ? error.message : String(error)}`,
+				{ cause: error },
+			);
+			wrapped.name = "IncidentSegmentPersistenceError";
+			throw wrapped;
+		}
+	}
+
+	private withSegmentStoreRoot<T>(
+		operation: (root: IncidentCasRootMutation, store: IncidentRecorderSegmentStore) => T,
+	): T {
+		let store: IncidentRecorderSegmentStore | undefined;
+		let receipts: readonly IncidentRecorderSegmentRootReceipt[] = [];
+		try {
+			const mutation = this.withRecorderRoot((root) => {
+				store = this.ensureSegmentStoreWithinRoot(root);
+				const value = operation(root, store);
+				receipts = store.drainWithinRootReceipts();
+				return value;
+			});
+			if (mutation.state !== "committed") {
+				this.discardSegmentStoreAfterRootFailure(mutation.reason);
+				throw this.writerLifecycleAdmissionError(mutation.reason);
+			}
+			try {
+				this.applySegmentRootReceipts(receipts);
+				this.assertSegmentAccountingReadyAfterRootReceipt();
+			} catch (error) {
+				this.discardSegmentStoreAfterRootFailure("receipt_application_failed");
+				throw error;
+			}
+			return mutation.value;
+		} catch (error) {
+			if (store?.isRootBacked) this.discardSegmentStoreAfterRootFailure("operation_failed");
+			throw error;
+		} finally {
+			this.releaseSegmentRootReservations();
+		}
+	}
+
+	private applySegmentRootReceipts(receipts: readonly IncidentRecorderSegmentRootReceipt[]): void {
+		for (const receipt of receipts) {
+			if (receipt.kind === "open") this.accountSegmentOpenResult(receipt.result);
+			else this.accountSegmentDurableWrite(receipt.event);
+		}
+	}
+
+	private assertSegmentAccountingReadyAfterRootReceipt(): void {
+		if (!this.segmentOpenRequiresReconciliation) return;
+		this.invalidateStorageAccounting();
+		this.storageModeState = "recovery-only";
+		this.storageRecoveryReasonState = "segment_open_reconciliation_required";
+		const error = new Error("Incident segment open requires a full storage reconciliation") as NodeJS.ErrnoException;
+		error.code = "ENOSPC";
+		throw error;
+	}
+
+	private discardSegmentStoreAfterRootFailure(reason: string): void {
+		this.segmentStore = undefined;
+		this.segmentOpenRequiresReconciliation = true;
+		this.invalidateStorageAccounting();
+		this.storageModeState = "recovery-only";
+		this.storageRecoveryReasonState = `segment_root_mutation_${reason}`;
+	}
+
+	private releaseSegmentRootReservations(): void {
+		if (this.segmentRootOpenReservation) {
+			this.releaseReservedCapacity(
+				this.segmentRootOpenReservation.bytes,
+				this.segmentRootOpenReservation.entries,
+				this.segmentRootOpenReservation.inodes,
+			);
+			this.segmentRootOpenReservation = undefined;
+		}
+		if (this.segmentRootAppendReservation) {
+			this.releaseReservedCapacity(
+				this.segmentRootAppendReservation.bytes,
+				this.segmentRootAppendReservation.entries,
+				this.segmentRootAppendReservation.inodes,
+			);
+			this.segmentRootAppendReservation = undefined;
+		}
+	}
+
 	private isSegmentPersistenceError(error: unknown): boolean {
 		return error instanceof Error && error.name === "IncidentSegmentPersistenceError";
+	}
+
+	private isIdempotencyConflict(error: unknown): boolean {
+		return error instanceof Error && error.message.includes("different canonical content");
 	}
 
 	private isWriterLifecycleAdmissionError(error: unknown): boolean {
@@ -2701,14 +2881,9 @@ export class IncidentRecorderCompactor {
 		continuation?: IncidentRecorderSegmentPruneCursor,
 	): IncidentRecorderSegmentPruneResult {
 		if (!Number.isSafeInteger(nowMs) || nowMs < 0) throw new Error("Invalid segment prune time");
-		return this.ensureSegmentStore().pruneSealedSegments({
-			sealedBeforeMs: Math.max(0, nowMs - INCIDENT_DIAGNOSTIC_RETENTION_MS),
-			protection,
-			maxSegments: SEGMENT_PRUNE_MAX_SEGMENTS,
-			maxDeletes: SEGMENT_PRUNE_MAX_SEGMENTS,
-			maxBytes: SEGMENT_PRUNE_MAX_BYTES,
-			...(continuation ? { continuation } : {}),
-		});
+		void protection;
+		void continuation;
+		throw new Error("normal segment pruning is unavailable through root-backed storage");
 	}
 
 	pruneSegmentHistoryForRecovery(options: {
@@ -4516,9 +4691,10 @@ export class IncidentRecorderCompactor {
 			this.flushIncomplete(identity, "occurrence_checksum_or_length_mismatch");
 			throw new Error("Occurrence checksum or length mismatch");
 		}
+		let segmentReceipts: readonly IncidentRecorderSegmentRootReceipt[] = [];
 		let mutation: RecorderRootMutationResult<{ effects: StorageAccountingEffect[] }>;
 		try {
-			mutation = this.withRecorderRoot((root) => {
+			mutation = this.withRecorderRoot((root, assertCurrent) => {
 				const effects: StorageAccountingEffect[] = [];
 				const { casPath } = this.publishCasAndRunLease(
 					root,
@@ -4586,33 +4762,86 @@ export class IncidentRecorderCompactor {
 				// This retained-store call is the final unresolved segment lifecycle
 				// seam. It is replaced by the CAS-owned one-shot domain operation once
 				// the shared writer/read lifecycle has crossed that boundary.
-				this.appendSegmentRecord({
-					idempotencyKey: `occurrence:${occurrenceId}`,
-					runId: line.runId,
-					sourceId: SEGMENT_SOURCE_OCCURRENCE,
-					observedAtMs: segmentObservedAtMs(line.eventWallTimeMs),
-					order: isUnsigned64(firstWrapperSequence) ? firstWrapperSequence : "0",
-					metadata: {
-						version: 1,
-						state: "complete",
-						occurrenceIdentity: occurrenceId,
-						casDigest: line.occurrenceSha256,
+				// CAS publication hooks may replace/revoke the lifecycle root. Recheck
+				// before the segment mutation so a detached callback cannot leave a
+				// segment in either the old or successor namespace.
+				assertCurrent();
+				this.appendSegmentRecordWithinRoot(
+					root,
+					{
+						idempotencyKey: `occurrence:${occurrenceId}`,
+						runId: line.runId,
+						sourceId: SEGMENT_SOURCE_OCCURRENCE,
+						observedAtMs: segmentObservedAtMs(line.eventWallTimeMs),
+						order: isUnsigned64(firstWrapperSequence) ? firstWrapperSequence : "0",
+						metadata: {
+							version: 1,
+							state: "complete",
+							occurrenceIdentity: occurrenceId,
+							casDigest: line.occurrenceSha256,
+						},
+						payload: Buffer.from(`${JSON.stringify(occurrenceRecord)}\n`, "utf8"),
 					},
-					payload: Buffer.from(`${JSON.stringify(occurrenceRecord)}\n`, "utf8"),
-				});
+					(estimate) => {
+						this.reserveStorage(
+							estimate.peakAdditionalAllocatedBytes,
+							estimate.peakAdditionalEntries,
+							estimate.peakAdditionalInodes,
+						);
+						this.segmentRootAppendReservation = {
+							bytes: estimate.peakAdditionalAllocatedBytes,
+							entries: estimate.peakAdditionalEntries,
+							inodes: estimate.peakAdditionalInodes,
+						};
+					},
+				);
+				if (this.segmentStore) segmentReceipts = this.segmentStore.drainWithinRootReceipts();
 				return { effects };
 			});
 		} catch (error) {
-			if (this.isWriterLifecycleAdmissionError(error))
+			if (this.isWriterLifecycleAdmissionError(error) || this.isSegmentPersistenceError(error)) {
+				// The failure may occur before the lazy store is constructed (for
+				// example, after CAS publication but before segment admission). The
+				// absence of an instance is still a failed root mutation: invalidate
+				// accounting and force recovery-only until reconciliation.
+				this.discardSegmentStoreAfterRootFailure("operation_failed");
 				this.rollbackOccurrenceChunk(identity, assembly, reference, payload);
+			}
+			this.releaseSegmentRootReservations();
 			throw error;
 		}
 		if (mutation.state !== "committed") {
 			const error = this.writerLifecycleAdmissionError(mutation.reason);
+			this.discardSegmentStoreAfterRootFailure(mutation.reason);
+			this.releaseSegmentRootReservations();
 			this.rollbackOccurrenceChunk(identity, assembly, reference, payload);
 			throw error;
 		}
-		this.applyStorageAccountingEffects(mutation.value.effects);
+		try {
+			this.applyStorageAccountingEffects(mutation.value.effects);
+			this.applySegmentRootReceipts(segmentReceipts);
+			this.assertSegmentAccountingReadyAfterRootReceipt();
+		} catch (error) {
+			this.discardSegmentStoreAfterRootFailure("receipt_application_failed");
+			throw error;
+		} finally {
+			if (this.segmentRootOpenReservation) {
+				this.releaseReservedCapacity(
+					this.segmentRootOpenReservation.bytes,
+					this.segmentRootOpenReservation.entries,
+					this.segmentRootOpenReservation.inodes,
+				);
+				this.segmentRootOpenReservation = undefined;
+			}
+			if (this.segmentRootAppendReservation) {
+				this.releaseReservedCapacity(
+					this.segmentRootAppendReservation.bytes,
+					this.segmentRootAppendReservation.entries,
+					this.segmentRootAppendReservation.inodes,
+				);
+				this.segmentRootAppendReservation = undefined;
+			}
+		}
 		this.removeAssembly(identity);
 		for (const entry of assembly.references) entry.resolved = true;
 		this.advanceCheckpoint();
@@ -7729,16 +7958,11 @@ export class IncidentRecorderCompactor {
 	}
 
 	private readSegmentOccurrenceReference(locator: IncidentRecorderSegmentLocator): IncidentRecorderSegmentRecord {
-		const store = this.ensureSegmentStore();
-		const reader = (
-			store as unknown as {
-				readRecord?: (value: IncidentRecorderSegmentLocator) => IncidentRecorderSegmentRecord | undefined;
-			}
-		).readRecord;
-		if (typeof reader !== "function") throw new Error("segment_occurrence_reference_reader_unavailable");
-		const record = reader.call(store, locator);
-		if (!record) throw new Error("segment_occurrence_reference_missing_or_stale");
-		return record;
+		return this.withSegmentStoreRoot((_root, store) => {
+			const record = store.readRecordWithinRoot(_root, locator);
+			if (!record) throw new Error("segment_occurrence_reference_missing_or_stale");
+			return record;
+		});
 	}
 
 	private resolveManifestOccurrenceReference(
@@ -8333,26 +8557,27 @@ export class IncidentRecorderCompactor {
 		const evidencePhase = phase !== "segment-occurrences";
 		const fingerprintOccurrenceIdentityDomain = phase === "segment-occurrences";
 		try {
-			const store = this.ensureSegmentStore();
-			state.segmentReadLease ??= store.acquireReadLease(state.deadlineMs);
-			const page = store.queryRunWindowPage({
-				runId,
-				sourceId,
-				fromObservedAtMs:
-					fingerprintOccurrenceIdentityDomain || (evidencePhase && sourceId === SEGMENT_SOURCE_GAP)
-						? 0
-						: state.fromWallTimeMs,
-				throughObservedAtMs:
-					fingerprintOccurrenceIdentityDomain || (evidencePhase && sourceId === SEGMENT_SOURCE_GAP)
-						? Number.MAX_SAFE_INTEGER
-						: state.throughWallTimeMs,
-				maxRecords: SEGMENT_QUERY_PAGE_RECORDS,
-				maxBytes: SEGMENT_QUERY_PAGE_BYTES,
-				readLease: state.segmentReadLease,
-				maxScannedSegments: RUN_HISTORY_SEGMENT_PAGE_SCANNED_SEGMENTS,
-				maxScannedRecords: RUN_HISTORY_SEGMENT_PAGE_SCANNED_RECORDS,
-				maxScannedIndexBytes: RUN_HISTORY_SEGMENT_PAGE_SCANNED_INDEX_BYTES,
-				...(state.segmentCursor ? { after: state.segmentCursor } : {}),
+			const page = this.withSegmentStoreRoot((root, store) => {
+				state.segmentReadLease ??= store.acquireReadLease(state.deadlineMs);
+				return store.queryRunWindowPageWithinRoot(root, {
+					runId,
+					sourceId,
+					fromObservedAtMs:
+						fingerprintOccurrenceIdentityDomain || (evidencePhase && sourceId === SEGMENT_SOURCE_GAP)
+							? 0
+							: state.fromWallTimeMs,
+					throughObservedAtMs:
+						fingerprintOccurrenceIdentityDomain || (evidencePhase && sourceId === SEGMENT_SOURCE_GAP)
+							? Number.MAX_SAFE_INTEGER
+							: state.throughWallTimeMs,
+					maxRecords: SEGMENT_QUERY_PAGE_RECORDS,
+					maxBytes: SEGMENT_QUERY_PAGE_BYTES,
+					readLease: state.segmentReadLease,
+					maxScannedSegments: RUN_HISTORY_SEGMENT_PAGE_SCANNED_SEGMENTS,
+					maxScannedRecords: RUN_HISTORY_SEGMENT_PAGE_SCANNED_RECORDS,
+					maxScannedIndexBytes: RUN_HISTORY_SEGMENT_PAGE_SCANNED_INDEX_BYTES,
+					...(state.segmentCursor ? { after: state.segmentCursor } : {}),
+				});
 			});
 			state.segmentScannedSegments += page.scannedSegments;
 			state.segmentScannedRecords += page.scannedRecords;
@@ -8462,16 +8687,17 @@ export class IncidentRecorderCompactor {
 
 	private advanceRunHistoryRecoveryGaps(state: RunHistoryTraversal): IncidentRecorderRunHistoryProgressResult {
 		try {
-			const store = this.ensureSegmentStore();
-			if (!state.segmentReadLease) throw new Error("segment_read_lease_missing");
-			const page = store.queryRecoveryGapsPage({
-				maxGaps: SEGMENT_QUERY_PAGE_RECORDS,
-				maxBytes: SEGMENT_QUERY_PAGE_BYTES,
-				maxScannedSegments: RUN_HISTORY_SEGMENT_PAGE_SCANNED_SEGMENTS,
-				maxScannedGaps: RUN_HISTORY_SEGMENT_PAGE_SCANNED_GAPS,
-				maxScannedIndexBytes: RUN_HISTORY_SEGMENT_PAGE_SCANNED_INDEX_BYTES,
-				readLease: state.segmentReadLease,
-				...(state.segmentRecoveryGapCursor ? { after: state.segmentRecoveryGapCursor } : {}),
+			const page = this.withSegmentStoreRoot((root, store) => {
+				if (!state.segmentReadLease) throw new Error("segment_read_lease_missing");
+				return store.queryRecoveryGapsPageWithinRoot(root, {
+					maxGaps: SEGMENT_QUERY_PAGE_RECORDS,
+					maxBytes: SEGMENT_QUERY_PAGE_BYTES,
+					maxScannedSegments: RUN_HISTORY_SEGMENT_PAGE_SCANNED_SEGMENTS,
+					maxScannedGaps: RUN_HISTORY_SEGMENT_PAGE_SCANNED_GAPS,
+					maxScannedIndexBytes: RUN_HISTORY_SEGMENT_PAGE_SCANNED_INDEX_BYTES,
+					readLease: state.segmentReadLease,
+					...(state.segmentRecoveryGapCursor ? { after: state.segmentRecoveryGapCursor } : {}),
+				});
 			});
 			state.segmentScannedSegments += page.scannedSegments;
 			state.segmentScannedRecords += page.scannedGaps;
@@ -9584,7 +9810,7 @@ export class IncidentRecorderCompactor {
 		}
 		try {
 			if (!state.segmentReadLease) throw new Error("segment_read_lease_missing");
-			this.ensureSegmentStore().assertReadLeaseUsable(state.segmentReadLease);
+			this.existingSegmentStore().assertReadLeaseUsable(state.segmentReadLease);
 		} catch (error) {
 			return this.incompleteRunHistory(state, "run_history_segment_snapshot_stale_or_corrupt", {
 				kind: "corrupt",
@@ -9674,7 +9900,7 @@ export class IncidentRecorderCompactor {
 		const state = this.exactRunHistoryPublicationState(capability);
 		try {
 			if (!state.segmentReadLease) throw new Error("segment_read_lease_missing");
-			this.ensureSegmentStore().assertReadLeaseUsable(state.segmentReadLease);
+			this.existingSegmentStore().assertReadLeaseUsable(state.segmentReadLease);
 		} catch (error) {
 			this.discardRunHistoryTraversal(state);
 			throw error;
@@ -10130,15 +10356,17 @@ export class IncidentRecorderCompactor {
 	private advancePinTraversal(state: PinTraversal): void {
 		if (state.phase === "segment-reading") {
 			try {
-				const page = this.ensureSegmentStore().queryRunWindowPage({
-					runId: state.request.runId,
-					sourceId: SEGMENT_SOURCE_OCCURRENCE,
-					fromObservedAtMs: state.request.fromWallTimeMs,
-					throughObservedAtMs: state.request.throughWallTimeMs,
-					maxRecords: SEGMENT_QUERY_PAGE_RECORDS,
-					maxBytes: SEGMENT_QUERY_PAGE_BYTES,
-					...(state.segmentCursor ? { after: state.segmentCursor } : {}),
-				});
+				const page = this.withSegmentStoreRoot((root, store) =>
+					store.queryRunWindowPageWithinRoot(root, {
+						runId: state.request.runId,
+						sourceId: SEGMENT_SOURCE_OCCURRENCE,
+						fromObservedAtMs: state.request.fromWallTimeMs,
+						throughObservedAtMs: state.request.throughWallTimeMs,
+						maxRecords: SEGMENT_QUERY_PAGE_RECORDS,
+						maxBytes: SEGMENT_QUERY_PAGE_BYTES,
+						...(state.segmentCursor ? { after: state.segmentCursor } : {}),
+					}),
+				);
 				for (const record of page.records) {
 					let value: unknown;
 					try {
@@ -10375,39 +10603,46 @@ export class IncidentRecorderCompactor {
 			scannedIndexBytes: 0,
 		});
 		try {
-			const store = this.ensureSegmentStore();
-			const snapshot = store.createReadSnapshot();
-			if (
-				previous.segmentSequence > snapshot.highWaterSegmentSequence ||
-				(previous.segmentSequence === snapshot.highWaterSegmentSequence &&
-					previous.ordinal > snapshot.highWaterOrdinal)
-			) {
-				return incomplete("live_run_event_cursor_beyond_segment_frontier");
-			}
-			const after: IncidentRecorderSegmentQueryCursor | undefined = cursor
-				? {
-						version: 1,
-						snapshotId: snapshot.id,
-						generation: snapshot.generation,
-						highWaterSegmentSequence: snapshot.highWaterSegmentSequence,
-						highWaterOrdinal: snapshot.highWaterOrdinal,
-						filterSha256: cursor.filterSha256,
-						segmentSequence: cursor.segmentSequence,
-						ordinal: cursor.ordinal,
-					}
-				: undefined;
-			const page = store.queryRunWindowPage({
-				runId: input.runId,
-				sourceId: SEGMENT_SOURCE_OCCURRENCE,
-				fromObservedAtMs: 0,
-				throughObservedAtMs: Number.MAX_SAFE_INTEGER,
-				maxRecords: SEGMENT_QUERY_PAGE_RECORDS,
-				maxBytes: SEGMENT_QUERY_PAGE_BYTES,
-				maxScannedSegments: RUN_HISTORY_SEGMENT_PAGE_SCANNED_SEGMENTS,
-				maxScannedRecords: RUN_HISTORY_SEGMENT_PAGE_SCANNED_RECORDS,
-				maxScannedIndexBytes: RUN_HISTORY_SEGMENT_PAGE_SCANNED_INDEX_BYTES,
-				...(after ? { after } : { readSnapshot: snapshot }),
+			const segmentRead = this.withSegmentStoreRoot((root, store) => {
+				const snapshot = store.createReadSnapshot();
+				if (
+					previous.segmentSequence > snapshot.highWaterSegmentSequence ||
+					(previous.segmentSequence === snapshot.highWaterSegmentSequence &&
+						previous.ordinal > snapshot.highWaterOrdinal)
+				) {
+					return {
+						kind: "incomplete" as const,
+						page: incomplete("live_run_event_cursor_beyond_segment_frontier"),
+					};
+				}
+				const after: IncidentRecorderSegmentQueryCursor | undefined = cursor
+					? {
+							version: 1,
+							snapshotId: snapshot.id,
+							generation: snapshot.generation,
+							highWaterSegmentSequence: snapshot.highWaterSegmentSequence,
+							highWaterOrdinal: snapshot.highWaterOrdinal,
+							filterSha256: cursor.filterSha256,
+							segmentSequence: cursor.segmentSequence,
+							ordinal: cursor.ordinal,
+						}
+					: undefined;
+				const page = store.queryRunWindowPageWithinRoot(root, {
+					runId: input.runId,
+					sourceId: SEGMENT_SOURCE_OCCURRENCE,
+					fromObservedAtMs: 0,
+					throughObservedAtMs: Number.MAX_SAFE_INTEGER,
+					maxRecords: SEGMENT_QUERY_PAGE_RECORDS,
+					maxBytes: SEGMENT_QUERY_PAGE_BYTES,
+					maxScannedSegments: RUN_HISTORY_SEGMENT_PAGE_SCANNED_SEGMENTS,
+					maxScannedRecords: RUN_HISTORY_SEGMENT_PAGE_SCANNED_RECORDS,
+					maxScannedIndexBytes: RUN_HISTORY_SEGMENT_PAGE_SCANNED_INDEX_BYTES,
+					...(after ? { after } : { readSnapshot: snapshot }),
+				});
+				return { kind: "page" as const, snapshot, page };
 			});
+			if (segmentRead.kind === "incomplete") return segmentRead.page;
+			const { page } = segmentRead;
 			const events: IncidentRecorderRunHistoryEvent[] = [];
 			for (const record of page.records) {
 				let value: unknown;
@@ -10521,39 +10756,43 @@ export class IncidentRecorderCompactor {
 			scannedIndexBytes: 0,
 		});
 		try {
-			const store = this.ensureSegmentStore();
-			const snapshot = store.createReadSnapshot();
-			if (
-				previous.segmentSequence > snapshot.highWaterSegmentSequence ||
-				(previous.segmentSequence === snapshot.highWaterSegmentSequence &&
-					previous.ordinal > snapshot.highWaterOrdinal)
-			) {
-				return incomplete("live_run_gap_cursor_beyond_segment_frontier");
-			}
-			const after: IncidentRecorderSegmentQueryCursor | undefined = cursor
-				? {
-						version: 1,
-						snapshotId: snapshot.id,
-						generation: snapshot.generation,
-						highWaterSegmentSequence: snapshot.highWaterSegmentSequence,
-						highWaterOrdinal: snapshot.highWaterOrdinal,
-						filterSha256: cursor.filterSha256,
-						segmentSequence: cursor.segmentSequence,
-						ordinal: cursor.ordinal,
-					}
-				: undefined;
-			const page = store.queryRunWindowPage({
-				runId: input.runId,
-				sourceId: SEGMENT_SOURCE_GAP,
-				fromObservedAtMs: 0,
-				throughObservedAtMs: Number.MAX_SAFE_INTEGER,
-				maxRecords: SEGMENT_QUERY_PAGE_RECORDS,
-				maxBytes: SEGMENT_QUERY_PAGE_BYTES,
-				maxScannedSegments: RUN_HISTORY_SEGMENT_PAGE_SCANNED_SEGMENTS,
-				maxScannedRecords: RUN_HISTORY_SEGMENT_PAGE_SCANNED_RECORDS,
-				maxScannedIndexBytes: RUN_HISTORY_SEGMENT_PAGE_SCANNED_INDEX_BYTES,
-				...(after ? { after } : { readSnapshot: snapshot }),
+			const segmentRead = this.withSegmentStoreRoot((root, store) => {
+				const snapshot = store.createReadSnapshot();
+				if (
+					previous.segmentSequence > snapshot.highWaterSegmentSequence ||
+					(previous.segmentSequence === snapshot.highWaterSegmentSequence &&
+						previous.ordinal > snapshot.highWaterOrdinal)
+				) {
+					return { kind: "incomplete" as const, page: incomplete("live_run_gap_cursor_beyond_segment_frontier") };
+				}
+				const after: IncidentRecorderSegmentQueryCursor | undefined = cursor
+					? {
+							version: 1,
+							snapshotId: snapshot.id,
+							generation: snapshot.generation,
+							highWaterSegmentSequence: snapshot.highWaterSegmentSequence,
+							highWaterOrdinal: snapshot.highWaterOrdinal,
+							filterSha256: cursor.filterSha256,
+							segmentSequence: cursor.segmentSequence,
+							ordinal: cursor.ordinal,
+						}
+					: undefined;
+				const page = store.queryRunWindowPageWithinRoot(root, {
+					runId: input.runId,
+					sourceId: SEGMENT_SOURCE_GAP,
+					fromObservedAtMs: 0,
+					throughObservedAtMs: Number.MAX_SAFE_INTEGER,
+					maxRecords: SEGMENT_QUERY_PAGE_RECORDS,
+					maxBytes: SEGMENT_QUERY_PAGE_BYTES,
+					maxScannedSegments: RUN_HISTORY_SEGMENT_PAGE_SCANNED_SEGMENTS,
+					maxScannedRecords: RUN_HISTORY_SEGMENT_PAGE_SCANNED_RECORDS,
+					maxScannedIndexBytes: RUN_HISTORY_SEGMENT_PAGE_SCANNED_INDEX_BYTES,
+					...(after ? { after } : { readSnapshot: snapshot }),
+				});
+				return { kind: "page" as const, snapshot, page };
 			});
+			if (segmentRead.kind === "incomplete") return segmentRead.page;
+			const { page } = segmentRead;
 			const gaps: IncidentRecorderLiveRunGap[] = [];
 			for (const record of page.records) {
 				let value: unknown;

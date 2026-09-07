@@ -1,5 +1,6 @@
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import {
+	type BigIntStats,
 	chmodSync,
 	closeSync,
 	constants,
@@ -21,7 +22,11 @@ import {
 	writeSync,
 } from "node:fs";
 import { basename, dirname, join } from "node:path";
-import type { IncidentCasFileMutation } from "./incident-recorder-cas-transaction.js";
+import type {
+	IncidentCasFileMutation,
+	IncidentCasRelativePath,
+	IncidentCasRootMutation,
+} from "./incident-recorder-cas-transaction.js";
 
 const FORMAT_VERSION = 2;
 const FRAME_MAGIC = Buffer.from("GRM2", "ascii");
@@ -321,6 +326,13 @@ export interface IncidentRecorderSegmentOpenPlan {
 	mayRecoverActiveTail: boolean;
 }
 
+export interface IncidentRecorderSegmentRootOpenStorageEstimate {
+	peakAdditionalBytes: number;
+	peakAdditionalEntries: number;
+	peakAdditionalInodes: number;
+	mayRecoverActiveTail: boolean;
+}
+
 export interface IncidentRecorderSegmentOpenResult {
 	phase: "opened" | "failed" | "closed";
 	complete: boolean;
@@ -413,6 +425,28 @@ export interface IncidentRecorderSegmentStoreOptions {
 	onOpenAdmission?: (plan: IncidentRecorderSegmentOpenPlan) => void;
 	onOpenStorageResult?: (result: IncidentRecorderSegmentOpenResult) => void;
 }
+
+/**
+ * Options for a segment store whose filesystem authority is supplied by a
+ * recorder CAS root. `directory` is deliberately a list of relative path
+ * components; the root capability itself is never retained by the store.
+ */
+export interface IncidentRecorderSegmentStoreWithinRootOptions
+	extends Omit<IncidentRecorderSegmentStoreOptions, "directory" | "openPlan"> {
+	directory: readonly string[];
+}
+
+export type IncidentRecorderSegmentRootReceipt =
+	| {
+			readonly kind: "open";
+			readonly sequence: number;
+			readonly result: IncidentRecorderSegmentOpenResult;
+	  }
+	| {
+			readonly kind: "durable";
+			readonly sequence: number;
+			readonly event: IncidentRecorderSegmentDurableWrite;
+	  };
 
 export interface IncidentRecorderSegmentStoreStats {
 	activeSegments: 0 | 1;
@@ -576,6 +610,11 @@ interface PruneCursorCapability {
 	readonly expiresAtMs: number;
 	readonly cleanupTimer: ReturnType<typeof setTimeout>;
 	readonly expiryDiagnosticSink?: (diagnostic: IncidentRecorderPruneExpiryCleanupDiagnostic) => void;
+}
+
+interface IncidentRecorderSegmentStoreRootConstruction {
+	root: IncidentCasRootMutation;
+	directory: readonly string[];
 }
 
 const RECOVERY_PRUNE_CURSOR_CAPABILITIES = new Map<string, PruneCursorCapability>();
@@ -2650,6 +2689,54 @@ export function planIncidentRecorderSegmentStoreOpen(directory: string): Inciden
 	return plan;
 }
 
+/**
+ * Bound the first root-scoped open before its deferred receipt is applied.
+ * This is intentionally conservative: the reservation covers the directory
+ * chain, owner temporary/final entries, and a possible active-tail recovery.
+ */
+export function estimateIncidentRecorderSegmentStoreOpenWithinRoot(
+	root: IncidentCasRootMutation,
+	directory: readonly string[],
+): IncidentRecorderSegmentRootOpenStorageEstimate {
+	if (!Array.isArray(directory) || directory.length === 0) {
+		throw new TypeError("root-backed segment directory components are required");
+	}
+	const rootPath = root.relative(...directory);
+	const activePath = root.relative(...directory, "active");
+	const sealedPath = root.relative(...directory, "sealed");
+	const lstatMaybe = (path: IncidentCasRelativePath): BigIntStats | undefined => {
+		try {
+			return root.lstat(path);
+		} catch (error) {
+			if (errnoCode(error) === "ENOENT") return undefined;
+			throw error;
+		}
+	};
+	const missingDirectoryCount = [rootPath, activePath, sealedPath].filter(
+		(path) => lstatMaybe(path) === undefined,
+	).length;
+	const mayRecoverActiveTail = lstatMaybe(activePath) !== undefined;
+	const statfs = root.statfs(root.relative());
+	const blockSize = Number(statfs.bsize);
+	if (!Number.isSafeInteger(blockSize) || blockSize <= 0) throw new Error("filesystem allocation unit is invalid");
+	const directoryEntries = missingDirectoryCount + 2; // owner temporary and final link
+	const mutationCount = missingDirectoryCount + directoryEntries + (mayRecoverActiveTail ? 3 : 0);
+	return {
+		peakAdditionalBytes:
+			missingDirectoryCount * blockSize * 2 +
+			conservativeAllocatedBytes(blockSize) +
+			mutationCount * blockSize +
+			(mayRecoverActiveTail ? FORMAT_MAX_INDEX_FRAME_BYTES + FORMAT_MAX_FOOTER_FRAME_BYTES + 128 * 1024 : 0),
+		peakAdditionalEntries: directoryEntries,
+		// Every open writes a unique temporary owner claim before publishing it.
+		// The temporary claim is a new inode even when a stale owner entry is
+		// already present, so the peak reservation must not depend on ownerPath's
+		// current existence.
+		peakAdditionalInodes: missingDirectoryCount + 1,
+		mayRecoverActiveTail,
+	};
+}
+
 function captureOpenStorageEntries(
 	directory: string,
 	created: { root: boolean; active: boolean; sealed: boolean; owner: boolean },
@@ -2714,6 +2801,8 @@ export class IncidentRecorderSegmentStore {
 	readonly #ownerIdentity: IncidentRecorderSegmentOwnerIdentity;
 	readonly #isOwnerAlive: (identity: IncidentRecorderSegmentOwnerIdentity) => boolean;
 	readonly #onOpenStorageResult?: (result: IncidentRecorderSegmentOpenResult) => void;
+	readonly #rootBacked: boolean;
+	readonly #rootDirectoryComponents?: readonly string[];
 	#sealed: SegmentSummary[] = [];
 	#corrupt: CorruptSegment[] = [];
 	#readCatalog: SegmentSummary[] = [];
@@ -2736,12 +2825,19 @@ export class IncidentRecorderSegmentStore {
 	#openRemovedPreexistingEntry = false;
 	#insideCallback = false;
 	#openStorageEntries: IncidentRecorderSegmentOpenStorageEntry[] = [];
+	#rootReceiptSequence = 0;
+	#rootReceipts: IncidentRecorderSegmentRootReceipt[] = [];
 
-	constructor(options: IncidentRecorderSegmentStoreOptions) {
+	constructor(
+		options: IncidentRecorderSegmentStoreOptions,
+		rootConstruction?: IncidentRecorderSegmentStoreRootConstruction,
+	) {
 		if (!options.directory) throw new Error("directory is required");
 		this.#directory = options.directory;
 		this.#activeDirectory = join(options.directory, "active");
 		this.#sealedDirectory = join(options.directory, "sealed");
+		this.#rootBacked = rootConstruction !== undefined;
+		this.#rootDirectoryComponents = rootConstruction ? Object.freeze([...rootConstruction.directory]) : undefined;
 		this.#maxSegmentBytes = positiveInteger(
 			options.maxSegmentBytes,
 			DEFAULT_MAX_SEGMENT_BYTES,
@@ -2819,6 +2915,11 @@ export class IncidentRecorderSegmentStore {
 		assertSafeNonNegativeInteger(this.#ownerIdentity.pid, "owner pid");
 		if (!this.#ownerIdentity.startTime || !this.#ownerIdentity.bootId)
 			throw new Error("owner identity is incomplete");
+
+		if (rootConstruction) {
+			this.#openWithinRoot(rootConstruction.root);
+			return;
+		}
 
 		const openPlan = options.openPlan ?? planIncidentRecorderSegmentStoreOpen(this.#directory);
 		if (
@@ -2907,8 +3008,98 @@ export class IncidentRecorderSegmentStore {
 		}
 	}
 
+	/**
+	 * Open the store through one already-admitted recorder-root capability. The
+	 * capability is used only during this synchronous call and is not retained.
+	 */
+	static openWithinRoot(
+		root: IncidentCasRootMutation,
+		options: IncidentRecorderSegmentStoreWithinRootOptions,
+	): IncidentRecorderSegmentStore {
+		if (!options || !Array.isArray(options.directory) || options.directory.length === 0) {
+			throw new TypeError("root-backed segment directory components are required");
+		}
+		const directoryComponents = Object.freeze([...options.directory]);
+		const directory = root.publicPath(root.relative(...directoryComponents));
+		return new IncidentRecorderSegmentStore({ ...options, directory }, { root, directory: directoryComponents });
+	}
+
+	/** Return and consume root-scoped receipts after the surrounding CAS call commits. */
+	drainWithinRootReceipts(): readonly IncidentRecorderSegmentRootReceipt[] {
+		if (!this.#rootBacked) throw new Error("raw segment stores do not produce root receipts");
+		const receipts = this.#rootReceipts;
+		this.#rootReceipts = [];
+		return receipts;
+	}
+
+	/**
+	 * Append using a caller-owned root capability. Plans are single-use and may
+	 * not cross a root callback boundary.
+	 */
+	appendWithinRoot(
+		root: IncidentCasRootMutation,
+		input: IncidentRecorderSegmentAppendInput,
+		admit?: (estimate: IncidentRecorderSegmentAppendStorageEstimate) => void,
+	): IncidentRecorderSegmentAppendResult {
+		this.#assertRootBacked("appendWithinRoot");
+		this.#assertUsable();
+		const planned = this.#planAppendWithinRoot(root, input, admit);
+		return this.#commitAppendPlanWithinRoot(root, planned);
+	}
+
+	/** Plan an append while retaining no root capability or writable file view. */
+	planAppendWithinRoot(
+		root: IncidentCasRootMutation,
+		input: IncidentRecorderSegmentAppendInput,
+		admit?: (estimate: IncidentRecorderSegmentAppendStorageEstimate) => void,
+	): IncidentRecorderSegmentAppendPlan {
+		return this.#planAppendWithinRoot(root, input, admit);
+	}
+
+	commitAppendPlanWithinRoot(
+		root: IncidentCasRootMutation,
+		plan: IncidentRecorderSegmentAppendPlan,
+	): IncidentRecorderSegmentAppendResult {
+		return this.#commitAppendPlanWithinRoot(root, plan);
+	}
+
+	/** Close through the root capability and return ordered open/durable receipts. */
+	closeWithinRoot(root: IncidentCasRootMutation): readonly IncidentRecorderSegmentRootReceipt[] {
+		this.#assertRootBacked("closeWithinRoot");
+		this.#closeWithinRoot(root);
+		return this.drainWithinRootReceipts();
+	}
+
+	sealWithinRoot(root: IncidentCasRootMutation, reason: string): void {
+		this.#assertRootBacked("sealWithinRoot");
+		this.#assertUsable();
+		if (reason.length === 0 || reason.length > 256) throw new Error("seal reason must contain 1 to 256 characters");
+		this.#sealActiveWithinRoot(root, reason);
+		this.#stateRevision += 1;
+	}
+
 	getOpenStorageEntries(): readonly IncidentRecorderSegmentOpenStorageEntry[] {
 		return this.#openStorageEntries.map((entry) => ({ ...entry }));
+	}
+
+	get isRootBacked(): boolean {
+		return this.#rootBacked;
+	}
+
+	#assertRootBacked(operation: string): void {
+		if (!this.#rootBacked) throw new Error(`${operation} is available only for root-backed segment stores`);
+	}
+
+	#assertRawMutation(operation: string): void {
+		if (this.#rootBacked) {
+			throw new Error(`${operation} is unavailable for root-backed segment stores; use ${operation}WithinRoot`);
+		}
+	}
+
+	#assertRawRead(operation: string): void {
+		if (this.#rootBacked) {
+			throw new Error(`${operation} is unavailable for root-backed segment stores; use ${operation}WithinRoot`);
+		}
 	}
 
 	#assertUsable(): void {
@@ -2921,18 +3112,1153 @@ export class IncidentRecorderSegmentStore {
 		event: Omit<IncidentRecorderSegmentDurableWrite, "eventId" | "accountingSequence" | "reconciliation">,
 	): void {
 		this.#accountingSequence += 1;
+		const durable = {
+			...event,
+			eventId: `${this.#instanceId}:${String(this.#accountingSequence)}`,
+			accountingSequence: this.#accountingSequence,
+			reconciliation: "apply-by-event-id-then-reconcile-dev-inode" as const,
+		};
+		if (this.#rootBacked) {
+			this.#rootReceipts.push(
+				Object.freeze({ kind: "durable" as const, sequence: ++this.#rootReceiptSequence, event: durable }),
+			);
+			return;
+		}
 		if (!this.#onDurableWrite) return;
 		this.#insideCallback = true;
 		try {
-			this.#onDurableWrite({
-				...event,
-				eventId: this.#instanceId + ":" + String(this.#accountingSequence),
-				accountingSequence: this.#accountingSequence,
-				reconciliation: "apply-by-event-id-then-reconcile-dev-inode",
-			});
+			this.#onDurableWrite(durable);
 		} finally {
 			this.#insideCallback = false;
 		}
+	}
+
+	#emitRootOpen(result: IncidentRecorderSegmentOpenResult): void {
+		if (!this.#rootBacked) return;
+		this.#rootReceipts.push(Object.freeze({ kind: "open" as const, sequence: ++this.#rootReceiptSequence, result }));
+	}
+
+	#rootPath(root: IncidentCasRootMutation, ...components: string[]): IncidentCasRelativePath {
+		const base = this.#rootDirectoryComponents;
+		if (!base) throw new Error("root-backed segment directory is unavailable");
+		return root.relative(...base, ...components);
+	}
+
+	#rootPathString(root: IncidentCasRootMutation, ...components: string[]): string {
+		return root.publicPath(this.#rootPath(root, ...components));
+	}
+
+	#rootExists(root: IncidentCasRootMutation, path: IncidentCasRelativePath): boolean {
+		try {
+			return root.exists(path);
+		} catch (error) {
+			if (errnoCode(error) === "ENOENT") return false;
+			throw error;
+		}
+	}
+
+	#rootStorageState(root: IncidentCasRootMutation, path: IncidentCasRelativePath, directory: boolean): StorageState {
+		const status = root.stat(path);
+		if (directory ? !status.isDirectory() : !status.isFile()) throw new Error("storage accounting path type changed");
+		const logicalBytes = Number(status.size);
+		const blocks = Number(status.blocks);
+		const linkCount = Number(status.nlink);
+		const allocatedBytes = blocks * 512;
+		if (
+			!Number.isSafeInteger(logicalBytes) ||
+			logicalBytes < 0 ||
+			!Number.isSafeInteger(blocks) ||
+			blocks < 0 ||
+			!Number.isSafeInteger(allocatedBytes) ||
+			allocatedBytes < 0 ||
+			!Number.isSafeInteger(linkCount) ||
+			linkCount < 0
+		)
+			throw new Error("storage accounting metadata exceeded safe integer bounds");
+		return {
+			deviceId: status.dev.toString(),
+			inodeId: status.ino.toString(),
+			linkCount,
+			logicalBytes,
+			allocatedBytes,
+		};
+	}
+
+	#rootDirectoryEffect(
+		root: IncidentCasRootMutation,
+		path: IncidentCasRelativePath,
+		pathString: string,
+		before: StorageState,
+	): IncidentRecorderSegmentParentDirectoryEffect {
+		return parentDirectoryEffect(pathString, before, this.#rootStorageState(root, path, true));
+	}
+
+	#rootDirectoryNames(root: IncidentCasRootMutation, path: IncidentCasRelativePath): string[] {
+		const names: string[] = [];
+		let afterName: string | undefined;
+		for (;;) {
+			const page = root.directoryPage(path, {
+				...(afterName === undefined ? {} : { afterName }),
+				limit: 1024,
+				scanLimit: this.#maxStartupEntries,
+			});
+			for (const entry of page.entries) {
+				this.#accountStartupEntry(entry.name);
+				names.push(entry.name);
+			}
+			if (page.complete) return names;
+			if (page.entries.length === 0) throw new Error("root directory scan made no progress");
+			afterName = page.entries.at(-1)?.name;
+			if (!afterName) throw new Error("root directory scan cursor is missing");
+		}
+	}
+
+	#rootReadOwnerClaim(root: IncidentCasRootMutation, path: IncidentCasRelativePath): OwnerClaim {
+		const bytes = root.readFile(path, 4096);
+		if (bytes.byteLength === 0) throw new Error("writer ownership claim is malformed");
+		return parseOwnerClaim(parseJson(bytes, "writer ownership claim"));
+	}
+
+	#acquireOwnershipWithinRoot(root: IncidentCasRootMutation): void {
+		const ownerPath = this.#rootPath(root, OWNER_FILE_NAME);
+		const abandoned: IncidentCasRelativePath[] = [];
+		for (let attempt = 0; attempt < 16; attempt += 1) {
+			const claim: OwnerClaim = { version: 1, nonce: randomUUID(), ...this.#ownerIdentity };
+			const temporaryPath = this.#rootPath(root, `.writer-owner-${claim.nonce}.tmp`);
+			const bytes = Buffer.from(`${JSON.stringify(claim)}\n`, "utf8");
+			try {
+				root.writeFileExclusive(temporaryPath, bytes, 0o600);
+				try {
+					root.hardLink(temporaryPath, ownerPath);
+					this.#ownerClaim = claim;
+					root.fsyncDirectory(this.#rootPath(root));
+					root.unlinkFile(temporaryPath);
+					root.fsyncDirectory(this.#rootPath(root));
+					for (const stalePath of abandoned) {
+						if (this.#rootExists(root, stalePath)) {
+							root.unlinkFile(stalePath);
+							this.#openRemovedPreexistingEntry = true;
+						}
+					}
+					if (abandoned.length > 0) root.fsyncDirectory(this.#rootPath(root));
+					return;
+				} catch (error) {
+					if (errnoCode(error) !== "EEXIST") throw error;
+					if (this.#rootExists(root, temporaryPath)) root.unlinkFile(temporaryPath);
+					const existing = this.#rootReadOwnerClaim(root, ownerPath);
+					if (this.#isOwnerAlive(existing))
+						throw new Error("incident recorder segment store is already owned by a live writer");
+					const abandonedPath = this.#rootPath(root, `.writer-owner-stale-${claim.nonce}`);
+					try {
+						root.rename(ownerPath, abandonedPath);
+					} catch (renameError) {
+						if (errnoCode(renameError) === "ENOENT") continue;
+						throw renameError;
+					}
+					root.fsyncDirectory(this.#rootPath(root));
+					const moved = this.#rootReadOwnerClaim(root, abandonedPath);
+					if (!ownerClaimsEqual(existing, moved)) {
+						try {
+							root.hardLink(abandonedPath, ownerPath);
+							root.fsyncDirectory(this.#rootPath(root));
+						} catch {
+							// A concurrent claimant wins; retain the moved evidence and fail closed.
+						}
+						throw new Error("writer ownership claim changed during stale recovery");
+					}
+					abandoned.push(abandonedPath);
+				}
+			} finally {
+				if (this.#rootExists(root, temporaryPath)) root.unlinkFile(temporaryPath);
+			}
+		}
+		throw new Error("could not acquire unique incident recorder writer ownership");
+	}
+
+	#releaseOwnershipWithinRoot(root: IncidentCasRootMutation): void {
+		const claim = this.#ownerClaim;
+		if (!claim) return;
+		const ownerPath = this.#rootPath(root, OWNER_FILE_NAME);
+		if (!this.#rootExists(root, ownerPath)) {
+			this.#ownerClaim = undefined;
+			return;
+		}
+		const current = this.#rootReadOwnerClaim(root, ownerPath);
+		if (!ownerClaimsEqual(claim, current)) throw new Error("writer ownership claim changed while held");
+		root.unlinkFile(ownerPath);
+		root.fsyncDirectory(this.#rootPath(root));
+		this.#ownerClaim = undefined;
+	}
+
+	#withActiveSegmentFileWithinRoot<T>(
+		root: IncidentCasRootMutation,
+		access: "read" | "read_write",
+		operation: (file: IncidentRecorderSegmentFileView) => T,
+	): T {
+		const active = this.#active;
+		if (!active) throw new Error("active segment is unavailable");
+		const relative = this.#rootPath(root, "active", `${basename(active.path).replace(/\.open$/, "")}.open`);
+		return root.withFile(relative, { access }, (file) => {
+			const path = this.#rootPathString(root, "active", basename(active.path));
+			assertPrivateRegularFile(file, path);
+			if (!sameStorageState(fileAllocation(file), active.identity))
+				throw new Error("active segment identity changed before scoped operation");
+			return operation(file);
+		});
+	}
+
+	#readSealedSummaryWithinRoot(root: IncidentCasRootMutation, name: string): SegmentSummary {
+		const path = this.#rootPathString(root, "sealed", name);
+		const relative = this.#rootPath(root, "sealed", name);
+		return root.withFile(relative, { access: "read" }, (file) => {
+			assertPrivateRegularFile(file, path);
+			const fileBytes = Number(file.stat().size);
+			if (
+				!Number.isSafeInteger(fileBytes) ||
+				fileBytes < FRAME_OVERHEAD_BYTES * 3 ||
+				fileBytes > FORMAT_MAX_ACTIVE_BYTES + FORMAT_MAX_INDEX_FRAME_BYTES + FORMAT_MAX_FOOTER_FRAME_BYTES
+			)
+				throw new InvalidFrameError("sealed segment size exceeds the fixed format maximum");
+			const header = parseHeader(parseFrameAt(file, 0, fileBytes));
+			const trailer = Buffer.alloc(FRAME_TRAILER_BYTES);
+			readFully(file, trailer, fileBytes - FRAME_TRAILER_BYTES);
+			if (!trailer.subarray(4).equals(FRAME_END_MAGIC))
+				throw new InvalidFrameError("sealed footer trailer is missing");
+			const footerFrameBytes = trailer.readUInt32LE(0);
+			if (footerFrameBytes < FRAME_OVERHEAD_BYTES || footerFrameBytes > FORMAT_MAX_FOOTER_FRAME_BYTES)
+				throw new InvalidFrameError("sealed footer length exceeds the fixed format maximum");
+			const footerOffset = fileBytes - footerFrameBytes;
+			const footerFrame = parseFrameAt(file, footerOffset, fileBytes);
+			const footer = parseFooter(footerFrame);
+			if (
+				footer.segmentId !== header.segmentId ||
+				footer.segmentSequence !== header.segmentSequence ||
+				footer.createdAtMs !== header.createdAtMs ||
+				footer.indexOffset < FRAME_OVERHEAD_BYTES + parseFrameAt(file, 0, fileBytes).frameBytes ||
+				footer.contentBytes !== footer.indexOffset + footer.indexFrameBytes ||
+				footer.contentBytes + footerFrame.frameBytes !== fileBytes ||
+				footerFrame.ordinal !== footer.recordCount + footer.gapCount + 2 ||
+				name !== `${header.segmentId}.segment`
+			)
+				throw new InvalidFrameError("sealed footer identity or bounds are invalid");
+			return { header, footer, path, fileBytes };
+		});
+	}
+
+	#loadSegmentsWithinRoot(root: IncidentCasRootMutation): void {
+		const activeDirectory = this.#rootPath(root, "active");
+		const sealedDirectory = this.#rootPath(root, "sealed");
+		const activeNames = this.#rootDirectoryNames(root, activeDirectory);
+		const sealedNames = this.#rootDirectoryNames(root, sealedDirectory);
+		let cleanedTemporary = false;
+		for (const name of activeNames) {
+			if (!/^\.creating-[A-Za-z0-9_-]+\.tmp$/.test(name)) continue;
+			root.unlinkFile(this.#rootPath(root, "active", name));
+			this.#openRemovedPreexistingEntry = true;
+			cleanedTemporary = true;
+		}
+		if (cleanedTemporary) root.fsyncDirectory(activeDirectory);
+		for (const name of sealedNames) {
+			if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}\.segment$/.test(name)) continue;
+			try {
+				const summary = this.#readSealedSummaryWithinRoot(root, name);
+				if (this.#sealed.some((candidate) => candidate.header.segmentId === summary.header.segmentId))
+					throw new InvalidFrameError("duplicate sealed segment identity");
+				this.#accountSummary(summary);
+				this.#sealed.push(summary);
+			} catch (error) {
+				if (
+					error instanceof SegmentCatalogBudgetExceededError ||
+					error instanceof IncidentRecorderDescriptorCleanupError
+				)
+					throw error;
+				this.#corrupt.push({
+					segmentId: name.slice(0, -".segment".length),
+					path: this.#rootPathString(root, "sealed", name),
+					reason: errorText(error),
+				});
+			}
+		}
+		const openNames = activeNames.filter((name) => /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}\.open$/.test(name));
+		if (openNames.length > 1) throw new Error("multiple active segment files violate single-writer ownership");
+		if (openNames.length === 1) {
+			const recovered = this.#recoverActiveWithinRoot(root, openNames[0] ?? "missing");
+			if ("footer" in recovered) {
+				const existingIndex = this.#sealed.findIndex(
+					(summary) => summary.header.segmentId === recovered.header.segmentId,
+				);
+				if (existingIndex >= 0) this.#sealed[existingIndex] = recovered;
+				else {
+					this.#accountSummary(recovered);
+					this.#sealed.push(recovered);
+				}
+			} else {
+				this.#active = recovered;
+				this.#startupCatalogBytes += 512 + Buffer.byteLength(recovered.path, "utf8");
+				if (this.#startupCatalogBytes > this.#maxStartupCatalogBytes)
+					throw new Error("segment catalog exceeds maxStartupCatalogBytes");
+			}
+		}
+		this.#sealed.sort((left, right) => left.header.segmentSequence - right.header.segmentSequence);
+		for (let index = 1; index < this.#sealed.length; index += 1) {
+			if (this.#sealed[index]?.header.segmentSequence === this.#sealed[index - 1]?.header.segmentSequence)
+				throw new InvalidFrameError("duplicate sealed segment sequence");
+		}
+		const sequences = this.#sealed.map((summary) => summary.header.segmentSequence);
+		for (const corrupt of this.#corrupt) if (corrupt.summary) sequences.push(corrupt.summary.header.segmentSequence);
+		if (this.#active) sequences.push(this.#active.header.segmentSequence);
+		if (new Set(sequences).size !== sequences.length) throw new InvalidFrameError("duplicate segment sequence");
+		this.#nextSequence = sequences.length === 0 ? 0 : Math.max(...sequences) + 1;
+		this.#refreshReadCatalog();
+	}
+
+	#openWithinRoot(root: IncidentCasRootMutation): void {
+		const directory = this.#rootPath(root);
+		const active = this.#rootPath(root, "active");
+		const sealed = this.#rootPath(root, "sealed");
+		const directoryPath = this.#rootPathString(root);
+		const directoryComponents = this.#rootDirectoryComponents;
+		if (!directoryComponents) throw new Error("root-backed segment directory is unavailable");
+		const parent = root.relative(...directoryComponents.slice(0, -1));
+		const parentPath = root.publicPath(parent);
+		const parentBefore = this.#rootStorageState(root, parent, true);
+		const rootCreated = !this.#rootExists(root, directory);
+		const activeCreated = !this.#rootExists(root, active);
+		const sealedCreated = !this.#rootExists(root, sealed);
+		const ownerPath = this.#rootPath(root, OWNER_FILE_NAME);
+		const ownerCreated = !this.#rootExists(root, ownerPath);
+		try {
+			root.mkdirPrivate(directory, true);
+			root.mkdirPrivate(active, true);
+			root.mkdirPrivate(sealed, true);
+			// Persist the directory-chain entry in its retained parent before
+			// publishing the owner claim and any segment records.
+			root.fsyncDirectory(parent);
+			this.#acquireOwnershipWithinRoot(root);
+			this.#loadSegmentsWithinRoot(root);
+			const entries = [
+				{
+					path: directoryPath,
+					kind: "root-directory" as const,
+					createdByOpen: rootCreated,
+					rel: directory,
+					dir: true,
+				},
+				{
+					path: this.#rootPathString(root, "active"),
+					kind: "active-directory" as const,
+					createdByOpen: activeCreated,
+					rel: active,
+					dir: true,
+				},
+				{
+					path: this.#rootPathString(root, "sealed"),
+					kind: "sealed-directory" as const,
+					createdByOpen: sealedCreated,
+					rel: sealed,
+					dir: true,
+				},
+				{
+					path: this.#rootPathString(root, OWNER_FILE_NAME),
+					kind: "owner-file" as const,
+					createdByOpen: ownerCreated,
+					rel: ownerPath,
+					dir: false,
+				},
+			].flatMap((entry) =>
+				this.#rootExists(root, entry.rel)
+					? [
+							{
+								path: entry.path,
+								kind: entry.kind,
+								createdByOpen: entry.createdByOpen,
+								...this.#rootStorageState(root, entry.rel, entry.dir),
+							},
+						]
+					: [],
+			);
+			this.#openStorageEntries = entries;
+			this.#emitRootOpen({
+				phase: "opened",
+				complete: true,
+				reconciliation: this.#openRemovedPreexistingEntry ? "full-dev-inode-required" : "incremental-complete",
+				entries: this.getOpenStorageEntries(),
+				parentEffects: [
+					parentDirectoryEffect(parentPath, parentBefore, this.#rootStorageState(root, parent, true)),
+				],
+			});
+		} catch (error) {
+			try {
+				// A constructor failure can occur after ownership was acquired but
+				// before the store becomes reachable by its caller. Release that
+				// claim while the root capability is still scoped, preserving the
+				// original failure as authoritative.
+				this.#releaseOwnershipWithinRoot(root);
+			} catch {}
+			try {
+				this.#emitRootOpen({
+					phase: "failed",
+					complete: false,
+					reconciliation: "full-dev-inode-required",
+					entries: [],
+					parentEffects: [],
+					error: errorText(error),
+				});
+			} catch {}
+			throw error;
+		}
+	}
+
+	#selectUniqueSegmentIdWithinRoot(root: IncidentCasRootMutation): string {
+		if (this.#corrupt.some((segment) => !segment.summary))
+			throw new Error("cannot allocate a stable segment sequence while a corrupt segment identity is unknown");
+		for (let attempt = 0; attempt < 16; attempt += 1) {
+			const candidate = this.#createSegmentId();
+			assertSegmentId(candidate);
+			if (
+				!this.#rootExists(root, this.#rootPath(root, "active", `${candidate}.open`)) &&
+				!this.#rootExists(root, this.#rootPath(root, "sealed", `${candidate}.segment`))
+			)
+				return candidate;
+		}
+		throw new Error("createSegmentId did not provide a unique segment identity");
+	}
+
+	#promoteActiveFileWithinRoot(
+		root: IncidentCasRootMutation,
+		active: ActiveSegment,
+		footer: SegmentFooter,
+		fileBytes: number,
+	): SegmentSummary {
+		const name = basename(active.path);
+		const segmentName = name.endsWith(".open") ? name.slice(0, -".open".length) : name;
+		const activePath = this.#rootPath(root, "active", name);
+		const sealedPath = this.#rootPath(root, "sealed", `${segmentName}.segment`);
+		let linked = false;
+		try {
+			root.hardLink(activePath, sealedPath);
+			linked = true;
+		} catch (error) {
+			if (errnoCode(error) !== "EEXIST") throw error;
+			const activeStatus = root.lstat(activePath);
+			const sealedStatus = root.lstat(sealedPath);
+			if (
+				!activeStatus?.isFile() ||
+				activeStatus.isSymbolicLink() ||
+				!sealedStatus?.isFile() ||
+				sealedStatus.isSymbolicLink() ||
+				activeStatus.dev !== sealedStatus.dev ||
+				activeStatus.ino !== sealedStatus.ino
+			)
+				throw new Error("sealed promotion refused to clobber an existing segment identity");
+		}
+		if (linked) this.#faultInjector?.("after-sealed-link-before-directory-fsync");
+		root.fsyncFile(sealedPath);
+		root.fsyncDirectory(this.#rootPath(root, "sealed"));
+		const activeStatus = root.lstat(activePath);
+		const sealedStatus = root.lstat(sealedPath);
+		if (
+			!activeStatus?.isFile() ||
+			!sealedStatus?.isFile() ||
+			activeStatus.dev !== sealedStatus.dev ||
+			activeStatus.ino !== sealedStatus.ino
+		)
+			throw new Error("sealed promotion source changed before removal");
+		root.unlinkFile(activePath);
+		root.fsyncDirectory(this.#rootPath(root, "active"));
+		return {
+			header: active.header,
+			footer,
+			path: this.#rootPathString(root, "sealed", `${segmentName}.segment`),
+			fileBytes,
+		};
+	}
+
+	#recoverActiveWithinRoot(root: IncidentCasRootMutation, name: string): ActiveSegment | SegmentSummary {
+		const relative = this.#rootPath(root, "active", name);
+		const path = this.#rootPathString(root, "active", name);
+		return root.withFile(relative, { access: "read_write" }, (file) => {
+			assertPrivateRegularFile(file, path);
+			const fileSize = Number(file.stat().size);
+			const previousAllocation = fileAllocation(file);
+			if (
+				!Number.isSafeInteger(fileSize) ||
+				fileSize < FRAME_OVERHEAD_BYTES ||
+				fileSize > FORMAT_MAX_ACTIVE_BYTES + FORMAT_MAX_INDEX_FRAME_BYTES + FORMAT_MAX_FOOTER_FRAME_BYTES
+			)
+				throw new InvalidFrameError("active segment size exceeds the fixed format maximum");
+			const headerFrame = parseFrameAt(file, 0, fileSize);
+			const header = parseHeader(headerFrame);
+			if (name !== `${header.segmentId}.open`)
+				throw new InvalidFrameError("active segment filename does not match its header identity");
+			const active: ActiveSegment = {
+				header,
+				path,
+				identity: previousAllocation,
+				size: headerFrame.frameBytes,
+				nextOrdinal: 1,
+				records: [],
+				recoveryGaps: [],
+			};
+			let offset = headerFrame.frameBytes;
+			let invalidError: unknown;
+			while (offset < fileSize) {
+				try {
+					const frame = parseFrameAt(file, offset, fileSize);
+					if (frame.ordinal !== active.nextOrdinal)
+						throw new InvalidFrameError("active frame ordinal is not contiguous");
+					if (frame.type === FrameType.Record) {
+						if (active.records.length >= FORMAT_MAX_RECORDS)
+							throw new InvalidFrameError("active segment has too many records");
+						active.records.push(indexEntryFromFrame(header, frame, offset));
+					} else if (frame.type === FrameType.RecoveryGap) {
+						const gap = parseRecoveryGap(frame);
+						if (
+							active.recoveryGaps.length >= FORMAT_MAX_GAPS ||
+							gap.segmentId !== header.segmentId ||
+							gap.segmentSequence !== header.segmentSequence ||
+							gap.ordinal !== frame.ordinal ||
+							gap.invalidOffset !== offset
+						)
+							throw new InvalidFrameError("active recovery gap identity is invalid");
+						active.recoveryGaps.push(gap);
+					} else if (frame.type === FrameType.Index) {
+						const index = parseIndexDocument(frame);
+						const footerFrame = parseFrameAt(file, offset + frame.frameBytes, fileSize);
+						const footer = parseFooter(footerFrame);
+						if (offset + frame.frameBytes + footerFrame.frameBytes !== fileSize)
+							throw new InvalidFrameError("sealed active segment has trailing bytes");
+						this.#validateIndex(header, footer, frame, index);
+						if (
+							footer.indexOffset !== offset ||
+							footer.contentBytes !== offset + frame.frameBytes ||
+							footerFrame.ordinal !== frame.ordinal + 1 ||
+							hashFileRange(file, 0, footer.contentBytes, this.#onRecoveryRead) !== footer.contentSha256
+						)
+							throw new InvalidFrameError("sealed active segment footer or content checksum is invalid");
+						file.sync();
+						return this.#promoteActiveFileWithinRoot(root, active, footer, fileSize);
+					} else {
+						throw new InvalidFrameError("unexpected frame type in active segment");
+					}
+					offset += frame.frameBytes;
+					active.size = offset;
+					active.nextOrdinal += 1;
+				} catch (error) {
+					invalidError = error;
+					break;
+				}
+			}
+			if (invalidError !== undefined) {
+				if (active.recoveryGaps.length >= FORMAT_MAX_GAPS)
+					throw new InvalidFrameError("active recovery gap limit reached");
+				const discardedBytes = fileSize - offset;
+				const gap: IncidentRecorderSegmentRecoveryGap = {
+					version: 1,
+					segmentId: header.segmentId,
+					segmentSequence: header.segmentSequence,
+					ordinal: active.nextOrdinal,
+					reason: "invalid_or_torn_active_tail",
+					observedAtMs: this.#now(),
+					invalidOffset: offset,
+					discardedBytes,
+					discardedSha256: hashFileRange(file, offset, discardedBytes, this.#onRecoveryRead),
+				};
+				const gapFrame = encodeFrame(FrameType.RecoveryGap, gap.ordinal, encodeJson(gap));
+				writeFullyAt(file, gapFrame, offset);
+				file.sync();
+				this.#faultInjector?.("after-recovery-gap-fsync-before-truncate");
+				file.truncate(offset + gapFrame.byteLength);
+				file.sync();
+				active.recoveryGaps.push(gap);
+				active.size = offset + gapFrame.byteLength;
+				active.nextOrdinal += 1;
+				const allocation = fileAllocation(file);
+				active.identity = allocation;
+				this.#emitDurable({
+					kind: "recovery-gap",
+					segmentId: header.segmentId,
+					path,
+					entryChange: "same-inode-growth",
+					entryDelta: 0,
+					inodeDelta: 0,
+					previousLogicalBytes: previousAllocation.logicalBytes,
+					previousAllocatedBytes: previousAllocation.allocatedBytes,
+					...allocation,
+					parentEffects: [],
+				});
+			}
+			return active;
+		});
+	}
+
+	#createActiveSegmentWithinRoot(
+		root: IncidentCasRootMutation,
+		createdAtMs = this.#now(),
+		plannedSegmentId?: string,
+	): ActiveSegment {
+		const segmentId = plannedSegmentId ?? this.#selectUniqueSegmentIdWithinRoot(root);
+		assertSegmentId(segmentId);
+		const activeName = `${segmentId}.open`;
+		if (
+			this.#rootExists(root, this.#rootPath(root, "active", activeName)) ||
+			this.#rootExists(root, this.#rootPath(root, "sealed", `${segmentId}.segment`))
+		)
+			throw new Error("planned segment identity is no longer unique");
+		const header: SegmentHeader = {
+			version: 2,
+			kind: "segment-header",
+			segmentId,
+			segmentSequence: this.#nextSequence,
+			createdAtMs,
+		};
+		assertSafeNonNegativeInteger(header.createdAtMs, "segment creation time");
+		const headerFrame = encodeFrame(FrameType.Header, 0, encodeJson(header));
+		const temporaryName = `.creating-${segmentId}-${randomUUID()}.tmp`;
+		const temporaryPath = this.#rootPath(root, "active", temporaryName);
+		const activePath = this.#rootPath(root, "active", activeName);
+		const activeParentBefore = this.#rootStorageState(root, this.#rootPath(root, "active"), true);
+		try {
+			root.writeFileExclusive(temporaryPath, headerFrame, 0o600);
+			this.#faultInjector?.("after-header-fsync-before-publish");
+			root.hardLink(temporaryPath, activePath);
+			root.fsyncDirectory(this.#rootPath(root, "active"));
+			root.unlinkFile(temporaryPath);
+			root.fsyncDirectory(this.#rootPath(root, "active"));
+			const active: ActiveSegment = {
+				header,
+				path: this.#rootPathString(root, "active", activeName),
+				identity: this.#rootStorageState(root, activePath, false),
+				size: headerFrame.byteLength,
+				nextOrdinal: 1,
+				records: [],
+				recoveryGaps: [],
+			};
+			this.#active = active;
+			this.#nextSequence += 1;
+			this.#emitDurable({
+				kind: "segment-created",
+				segmentId,
+				path: active.path,
+				entryChange: "published",
+				entryDelta: 1,
+				inodeDelta: 1,
+				previousLogicalBytes: 0,
+				previousAllocatedBytes: 0,
+				...active.identity,
+				parentEffects: [
+					this.#rootDirectoryEffect(
+						root,
+						this.#rootPath(root, "active"),
+						this.#rootPathString(root, "active"),
+						activeParentBefore,
+					),
+				],
+			});
+			return active;
+		} catch (error) {
+			if (this.#rootExists(root, temporaryPath)) root.unlinkFile(temporaryPath);
+			return this.#poison(error);
+		}
+	}
+
+	#sealActiveWithinRoot(root: IncidentCasRootMutation, reason: string, sealedAtMs = this.#now()): void {
+		const active = this.#active;
+		if (!active) return;
+		const indexDocument: SegmentIndexDocument = {
+			version: 2,
+			kind: "segment-index",
+			segmentId: active.header.segmentId,
+			segmentSequence: active.header.segmentSequence,
+			records: active.records,
+			recoveryGaps: active.recoveryGaps,
+		};
+		const indexFrame = encodeFrame(FrameType.Index, active.nextOrdinal, encodeJson(indexDocument));
+		if (indexFrame.byteLength > FORMAT_MAX_INDEX_FRAME_BYTES)
+			throw new Error("segment index exceeds the fixed format maximum");
+		const indexOffset = active.size;
+		const contentBytes = indexOffset + indexFrame.byteLength;
+		if (contentBytes > FORMAT_MAX_ACTIVE_BYTES + FORMAT_MAX_INDEX_FRAME_BYTES)
+			throw new Error("sealed segment content exceeds the fixed format maximum");
+		const observations = active.records.map((record) => record.observedAtMs);
+		const previousAllocation = active.identity;
+		const activeParentBefore = this.#rootStorageState(root, this.#rootPath(root, "active"), true);
+		const sealedParentBefore = this.#rootStorageState(root, this.#rootPath(root, "sealed"), true);
+		try {
+			this.#withActiveSegmentFileWithinRoot(root, "read_write", (file) => {
+				writeFullyAt(file, indexFrame, indexOffset);
+				const footer: SegmentFooter = {
+					version: 2,
+					kind: "sealed-footer",
+					segmentId: active.header.segmentId,
+					segmentSequence: active.header.segmentSequence,
+					createdAtMs: active.header.createdAtMs,
+					sealedAtMs,
+					reason,
+					recordCount: active.records.length,
+					gapCount: active.recoveryGaps.length,
+					minObservedAtMs: observations.length === 0 ? null : Math.min(...observations),
+					maxObservedAtMs: observations.length === 0 ? null : Math.max(...observations),
+					indexOffset,
+					indexFrameBytes: indexFrame.byteLength,
+					indexSha256: sha256(indexFrame),
+					contentBytes,
+					contentSha256: hashFileRange(file, 0, contentBytes),
+					idempotencyBloomBase64: idempotencyBloom(active.records),
+				};
+				assertSafeNonNegativeInteger(footer.sealedAtMs, "segment seal time");
+				const footerFrame = encodeFrame(FrameType.Footer, active.nextOrdinal + 1, encodeJson(footer));
+				if (footerFrame.byteLength > FORMAT_MAX_FOOTER_FRAME_BYTES)
+					throw new Error("sealed footer exceeds the fixed format maximum");
+				writeFullyAt(file, footerFrame, contentBytes);
+				file.sync();
+				const summary = this.#promoteActiveFileWithinRoot(
+					root,
+					active,
+					footer,
+					contentBytes + footerFrame.byteLength,
+				);
+				this.#active = undefined;
+				const existingIndex = this.#sealed.findIndex(
+					(candidate) => candidate.header.segmentId === summary.header.segmentId,
+				);
+				if (existingIndex >= 0) this.#sealed[existingIndex] = summary;
+				else this.#sealed.push(summary);
+				this.#sealed.sort((left, right) => left.header.segmentSequence - right.header.segmentSequence);
+				this.#refreshReadCatalog();
+				const allocation = this.#rootStorageState(
+					root,
+					this.#rootPath(root, "sealed", basename(summary.path)),
+					false,
+				);
+				this.#emitDurable({
+					kind: "sealed",
+					segmentId: summary.header.segmentId,
+					path: summary.path,
+					previousPath: active.path,
+					entryChange: "same-inode-move",
+					entryDelta: 0,
+					inodeDelta: 0,
+					previousLogicalBytes: previousAllocation.logicalBytes,
+					previousAllocatedBytes: previousAllocation.allocatedBytes,
+					...allocation,
+					parentEffects: [
+						this.#rootDirectoryEffect(
+							root,
+							this.#rootPath(root, "active"),
+							this.#rootPathString(root, "active"),
+							activeParentBefore,
+						),
+						this.#rootDirectoryEffect(
+							root,
+							this.#rootPath(root, "sealed"),
+							this.#rootPathString(root, "sealed"),
+							sealedParentBefore,
+						),
+					],
+				});
+			});
+		} catch (error) {
+			this.#poison(error);
+		}
+	}
+
+	#readIndexWithinRoot(root: IncidentCasRootMutation, summary: SegmentSummary): SegmentIndexDocument {
+		const name = basename(summary.path);
+		return root.withFile(this.#rootPath(root, "sealed", name), { access: "read" }, (file) => {
+			assertPrivateRegularFile(file, summary.path);
+			const status = file.stat();
+			if (Number(status.size) !== summary.fileBytes)
+				throw new InvalidFrameError("sealed segment size changed after cataloging");
+			const indexFrame = parseFrameAt(file, summary.footer.indexOffset, summary.fileBytes);
+			const index = parseIndexDocument(indexFrame);
+			this.#validateIndex(summary.header, summary.footer, indexFrame, index);
+			return index;
+		});
+	}
+
+	#withSealedSegmentFileWithinRoot<T>(
+		root: IncidentCasRootMutation,
+		summary: SegmentSummary,
+		operation: (file: IncidentRecorderSegmentFileView, fileSize: number) => T,
+	): T {
+		const name = basename(summary.path);
+		const path = this.#rootPathString(root, "sealed", name);
+		return root.withFile(this.#rootPath(root, "sealed", name), { access: "read" }, (file) => {
+			assertPrivateRegularFile(file, path);
+			const fileSize = Number(file.stat().size);
+			if (!Number.isSafeInteger(fileSize) || fileSize !== summary.fileBytes) {
+				throw new InvalidFrameError("sealed segment size changed after cataloging");
+			}
+			return operation(file, fileSize);
+		});
+	}
+
+	#withSealedSegmentFile<T>(
+		summary: SegmentSummary,
+		operation: (file: IncidentRecorderSegmentFileView, fileSize: number) => T,
+	): T {
+		const fileDescriptor = openSync(summary.path, constants.O_RDONLY | constants.O_NOFOLLOW);
+		try {
+			assertPrivateRegularFile(fileDescriptor, summary.path);
+			const fileSize = Number(fstatSync(fileDescriptor, { bigint: true }).size);
+			if (!Number.isSafeInteger(fileSize) || fileSize !== summary.fileBytes) {
+				throw new InvalidFrameError("sealed segment size changed after cataloging");
+			}
+			return operation(scopedSegmentFileView(fileDescriptor), fileSize);
+		} finally {
+			closeSync(fileDescriptor);
+		}
+	}
+
+	#findIdempotentRecordWithinRoot(
+		root: IncidentCasRootMutation,
+		idempotencyKey: string,
+		canonicalContentSha256: string,
+	): IncidentRecorderSegmentLocator | undefined {
+		if (this.#corrupt.some((segment) => !segment.summary))
+			throw new Error("cannot prove idempotency while retained segment identity is corrupt");
+		const activeEntry = this.#active?.records.find((entry) => entry.idempotencyKey === idempotencyKey);
+		if (activeEntry) {
+			if (activeEntry.canonicalContentSha256 !== canonicalContentSha256)
+				throw new Error("idempotencyKey was already committed with different canonical content");
+			return this.#locatorFromEntry(activeEntry);
+		}
+		const summaries = [
+			...this.#sealed,
+			...this.#corrupt.flatMap((segment) => (segment.summary ? [segment.summary] : [])),
+		].sort((left, right) => right.header.segmentSequence - left.header.segmentSequence);
+		for (const summary of summaries) {
+			const bloomMayContain = idempotencyBloomMayContain(summary.footer.idempotencyBloomBase64, idempotencyKey);
+			if (!bloomMayContain) continue;
+			const index = this.#readIndexWithinRoot(root, summary);
+			const entry = index.records.find((candidate) => candidate.idempotencyKey === idempotencyKey);
+			if (!entry) continue;
+			if (entry.canonicalContentSha256 !== canonicalContentSha256)
+				throw new Error("idempotencyKey was already committed with different canonical content");
+			return this.#locatorFromEntry(entry);
+		}
+		return undefined;
+	}
+
+	#estimateAppendStorageWithinRoot(
+		root: IncidentCasRootMutation,
+		input: IncidentRecorderSegmentAppendInput,
+		sampledNow = this.#now(),
+	): IncidentRecorderSegmentAppendStorageEstimate {
+		const payload = Buffer.from(input.payload);
+		const recordIdentity = canonicalRecordIdentity(input, payload.byteLength, sha256(payload));
+		const envelope: RecordEnvelope = {
+			version: 2,
+			kind: "record",
+			...recordIdentity,
+			runId: input.runId,
+			sourceId: input.sourceId,
+			observedAtMs: input.observedAtMs,
+			order: input.order,
+			metadata: input.metadata,
+			payloadBytes: payload.byteLength,
+			payloadSha256: sha256(payload),
+		};
+		const envelopeBytes = encodeJson(envelope);
+		const length = Buffer.alloc(4);
+		length.writeUInt32LE(envelopeBytes.byteLength, 0);
+		const recordFrame = encodeFrame(FrameType.Record, 0, Buffer.concat([length, envelopeBytes, payload]));
+		if (recordFrame.byteLength > FORMAT_MAX_RECORD_FRAME_BYTES)
+			throw new Error("record frame exceeds the fixed format maximum");
+		const current = this.#active;
+		const now = sampledNow;
+		const willSealBeforeAppend =
+			current !== undefined &&
+			current.records.length + current.recoveryGaps.length > 0 &&
+			(now - current.header.createdAtMs >= this.#maxSegmentAgeMs ||
+				current.records.length >= this.#maxRecordsPerSegment ||
+				current.size + recordFrame.byteLength > this.#maxSegmentBytes);
+		const sealBeforeBytes =
+			current && willSealBeforeAppend
+				? this.#estimateSealGrowth(current, current.records, "rotation-before-append", now)
+				: 0;
+		const willCreateSegment = current === undefined || willSealBeforeAppend;
+		let headerFrameBytes = 0;
+		let target: Pick<ActiveSegment, "header" | "size" | "nextOrdinal" | "records" | "recoveryGaps">;
+		if (willCreateSegment) {
+			const header: SegmentHeader = {
+				version: 2,
+				kind: "segment-header",
+				segmentId: "s".repeat(128),
+				segmentSequence: this.#nextSequence,
+				createdAtMs: now,
+			};
+			headerFrameBytes = encodeFrame(FrameType.Header, 0, encodeJson(header)).byteLength;
+			target = { header, size: headerFrameBytes, nextOrdinal: 1, records: [], recoveryGaps: [] };
+		} else target = current;
+		const entry: SegmentIndexEntry = {
+			version: 1,
+			segmentId: target.header.segmentId,
+			segmentSequence: target.header.segmentSequence,
+			ordinal: target.nextOrdinal,
+			offset: target.size,
+			frameBytes: recordFrame.byteLength,
+			payloadBytes: payload.byteLength,
+			payloadSha256: envelope.payloadSha256,
+			idempotencyKey: envelope.idempotencyKey,
+			canonicalContentSha256: envelope.canonicalContentSha256,
+			runId: input.runId,
+			sourceId: input.sourceId,
+			observedAtMs: input.observedAtMs,
+			order: input.order,
+		};
+		const projectedRecords = [...target.records, entry];
+		const projectedSize = target.size + recordFrame.byteLength;
+		const willSealAfterAppend =
+			projectedRecords.length >= this.#maxRecordsPerSegment ||
+			projectedSize >= this.#maxSegmentBytes ||
+			now - target.header.createdAtMs >= this.#maxSegmentAgeMs;
+		const sealAfterBytes = willSealAfterAppend
+			? this.#estimateSealGrowth(target, projectedRecords, "rotation-after-append", now)
+			: 0;
+		const currentAllocated = current?.identity.allocatedBytes ?? 0;
+		const fileGrowth = willCreateSegment
+			? conservativeAllocatedBytes(headerFrameBytes + recordFrame.byteLength + sealAfterBytes)
+			: Math.max(
+					0,
+					conservativeAllocatedBytes((current?.size ?? target.size) + recordFrame.byteLength + sealAfterBytes) -
+						currentAllocated,
+				);
+		const statfs = root.statfs(this.#rootPath(root));
+		const unit = Number(statfs.bsize);
+		if (!Number.isSafeInteger(unit) || unit <= 0) throw new Error("filesystem allocation unit is invalid");
+		const parentEntries = (willCreateSegment ? 2 : 0) + Number(willSealBeforeAppend) + Number(willSealAfterAppend);
+		return {
+			recordFrameBytes: recordFrame.byteLength,
+			headerFrameBytes,
+			sealBeforeBytes,
+			sealAfterBytes,
+			peakAdditionalBytes: sealBeforeBytes + headerFrameBytes + recordFrame.byteLength + sealAfterBytes,
+			peakAdditionalAllocatedBytes: fileGrowth + parentEntries * unit,
+			peakAdditionalEntries: willCreateSegment ? 2 : willSealAfterAppend ? 1 : 0,
+			peakAdditionalInodes: willCreateSegment ? 1 : 0,
+			willSealBeforeAppend,
+			willSealAfterAppend,
+			willCreateSegment,
+		};
+	}
+
+	#appendFrozenWithinRoot(
+		root: IncidentCasRootMutation,
+		input: IncidentRecorderSegmentAppendInput,
+		sampledNow: number,
+		estimate: IncidentRecorderSegmentAppendStorageEstimate,
+		plannedSegmentId?: string,
+	): IncidentRecorderSegmentAppendResult {
+		this.#assertUsable();
+		assertIdentifier(input.runId, "runId");
+		assertIdentifier(input.sourceId, "sourceId");
+		assertSafeNonNegativeInteger(input.observedAtMs, "observedAtMs");
+		assertOrder(input.order);
+		assertMetadata(input.metadata);
+		const metadataBytes = encodeJson(input.metadata).byteLength;
+		if (metadataBytes > this.#maxMetadataBytes) throw new Error("metadata exceeds maxMetadataBytes");
+		const payload = Buffer.from(input.payload);
+		if (payload.byteLength > this.#maxRecordBytes) throw new Error("payload exceeds maxRecordBytes");
+		const recordIdentity = canonicalRecordIdentity(input, payload.byteLength, sha256(payload));
+		const existingLocator = this.#findIdempotentRecordWithinRoot(
+			root,
+			recordIdentity.idempotencyKey,
+			recordIdentity.canonicalContentSha256,
+		);
+		if (existingLocator) return { status: "existing", locator: existingLocator };
+		const envelope: RecordEnvelope = {
+			version: 2,
+			kind: "record",
+			...recordIdentity,
+			runId: input.runId,
+			sourceId: input.sourceId,
+			observedAtMs: input.observedAtMs,
+			order: input.order,
+			metadata: input.metadata,
+			payloadBytes: payload.byteLength,
+			payloadSha256: sha256(payload),
+		};
+		const envelopeBytes = encodeJson(envelope);
+		const envelopeLength = Buffer.alloc(4);
+		envelopeLength.writeUInt32LE(envelopeBytes.byteLength, 0);
+		const frame = encodeFrame(FrameType.Record, 0, Buffer.concat([envelopeLength, envelopeBytes, payload]));
+		if (frame.byteLength > FORMAT_MAX_RECORD_FRAME_BYTES)
+			throw new Error("record frame exceeds the fixed format maximum");
+		if (estimate.willSealBeforeAppend) this.#sealActiveWithinRoot(root, "rotation-before-append", sampledNow);
+		const active = this.#active ?? this.#createActiveSegmentWithinRoot(root, sampledNow, plannedSegmentId);
+		const encoded = encodeFrame(
+			FrameType.Record,
+			active.nextOrdinal,
+			Buffer.concat([envelopeLength, envelopeBytes, payload]),
+		);
+		const offset = active.size;
+		const entry: SegmentIndexEntry = {
+			version: 1,
+			segmentId: active.header.segmentId,
+			segmentSequence: active.header.segmentSequence,
+			ordinal: active.nextOrdinal,
+			offset,
+			frameBytes: encoded.byteLength,
+			payloadBytes: payload.byteLength,
+			payloadSha256: envelope.payloadSha256,
+			idempotencyKey: envelope.idempotencyKey,
+			canonicalContentSha256: envelope.canonicalContentSha256,
+			runId: input.runId,
+			sourceId: input.sourceId,
+			observedAtMs: input.observedAtMs,
+			order: input.order,
+		};
+		const previousAllocation = active.identity;
+		try {
+			this.#withActiveSegmentFileWithinRoot(root, "read_write", (file) => {
+				writeFullyAt(file, encoded, offset);
+				this.#faultInjector?.("after-record-write-before-fsync");
+				file.sync();
+				active.records.push(entry);
+				active.size += encoded.byteLength;
+				active.nextOrdinal += 1;
+				active.identity = fileAllocation(file);
+				this.#emitDurable({
+					kind: "record",
+					segmentId: active.header.segmentId,
+					path: active.path,
+					entryChange: "same-inode-growth",
+					entryDelta: 0,
+					inodeDelta: 0,
+					previousLogicalBytes: previousAllocation.logicalBytes,
+					previousAllocatedBytes: previousAllocation.allocatedBytes,
+					...active.identity,
+					parentEffects: [],
+				});
+			});
+			if (estimate.willSealAfterAppend) this.#sealActiveWithinRoot(root, "rotation-after-append", sampledNow);
+		} catch (error) {
+			return this.#poison(error);
+		}
+		this.#stateRevision += 1;
+		return { status: "appended", locator: this.#locatorFromEntry(entry) };
+	}
+
+	#planAppendWithinRoot(
+		root: IncidentCasRootMutation,
+		input: IncidentRecorderSegmentAppendInput,
+		admit?: (estimate: IncidentRecorderSegmentAppendStorageEstimate) => void,
+	): IncidentRecorderSegmentAppendPlan {
+		this.#assertRootBacked("planAppendWithinRoot");
+		this.#assertUsable();
+		assertMetadata(input.metadata);
+		const frozenMetadata = parseJson(Buffer.from(canonicalJson(input.metadata), "utf8"), "frozen append metadata");
+		assertMetadata(frozenMetadata);
+		const frozenInput: IncidentRecorderSegmentAppendInput = {
+			...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
+			runId: input.runId,
+			sourceId: input.sourceId,
+			observedAtMs: input.observedAtMs,
+			order: input.order,
+			metadata: frozenMetadata,
+			payload: Buffer.from(input.payload),
+		};
+		const sampledNow = this.#now();
+		const plannedRevision = this.#stateRevision;
+		const payload = Buffer.from(frozenInput.payload);
+		const identity = canonicalRecordIdentity(frozenInput, payload.byteLength, sha256(payload));
+		const existing = this.#findIdempotentRecordWithinRoot(
+			root,
+			identity.idempotencyKey,
+			identity.canonicalContentSha256,
+		);
+		const estimate = Object.freeze(
+			existing
+				? {
+						recordFrameBytes: 0,
+						headerFrameBytes: 0,
+						sealBeforeBytes: 0,
+						sealAfterBytes: 0,
+						peakAdditionalBytes: 0,
+						peakAdditionalAllocatedBytes: 0,
+						peakAdditionalEntries: 0,
+						peakAdditionalInodes: 0,
+						willSealBeforeAppend: false,
+						willSealAfterAppend: false,
+						willCreateSegment: false,
+					}
+				: this.#estimateAppendStorageWithinRoot(root, frozenInput, sampledNow),
+		);
+		const plannedSegmentId =
+			!existing && estimate.willCreateSegment ? this.#selectUniqueSegmentIdWithinRoot(root) : undefined;
+		admit?.(estimate);
+		this.#assertUsable();
+		if (this.#stateRevision !== plannedRevision)
+			throw new Error("store state changed during append admission; replan required");
+		const publicPlan = Object.freeze({ version: 1 as const, token: randomUUID(), estimate });
+		this.#appendPlans.set(publicPlan.token, {
+			publicPlan,
+			input: frozenInput,
+			sampledNow,
+			stateRevision: plannedRevision,
+			...(plannedSegmentId === undefined ? {} : { plannedSegmentId }),
+		});
+		return publicPlan;
+	}
+
+	#commitAppendPlanWithinRoot(
+		root: IncidentCasRootMutation,
+		plan: IncidentRecorderSegmentAppendPlan,
+	): IncidentRecorderSegmentAppendResult {
+		this.#assertRootBacked("commitAppendPlanWithinRoot");
+		this.#assertUsable();
+		const frozen = this.#appendPlans.get(plan.token);
+		this.#appendPlans.delete(plan.token);
+		if (!frozen || frozen.publicPlan !== plan || plan.version !== 1)
+			throw new Error("append plan is unknown or already consumed");
+		if (frozen.stateRevision !== this.#stateRevision)
+			throw new Error("append plan is stale because store state changed; replan required");
+		if (
+			frozen.plannedSegmentId &&
+			(this.#rootExists(root, this.#rootPath(root, "active", `${frozen.plannedSegmentId}.open`)) ||
+				this.#rootExists(root, this.#rootPath(root, "sealed", `${frozen.plannedSegmentId}.segment`)))
+		)
+			throw new Error("planned segment identity is no longer unique");
+		return this.#appendFrozenWithinRoot(
+			root,
+			frozen.input,
+			frozen.sampledNow,
+			frozen.publicPlan.estimate,
+			frozen.plannedSegmentId,
+		);
+	}
+
+	#closeWithinRoot(root: IncidentCasRootMutation): void {
+		this.#assertRootBacked("closeWithinRoot");
+		if (this.#closed) return;
+		const closeErrors: unknown[] = [];
+		if (this.#active) {
+			try {
+				this.#withActiveSegmentFileWithinRoot(root, "read_write", (file) => file.sync());
+			} catch (error) {
+				closeErrors.push(error);
+			}
+		}
+		try {
+			this.#releaseOwnershipWithinRoot(root);
+		} catch (error) {
+			closeErrors.push(error);
+		}
+		this.#closed = true;
+		this.#appendPlans.clear();
+		this.#readLeases.clear();
+		this.#pruneCursorCapabilities.clear();
+		this.#emitRootOpen({
+			phase: "closed",
+			complete: closeErrors.length === 0,
+			reconciliation: closeErrors.length === 0 ? "incremental-complete" : "full-dev-inode-required",
+			entries: [],
+			parentEffects: [],
+			...(closeErrors.length === 0 ? {} : { error: errorText(closeErrors[0]) }),
+		});
+		if (closeErrors.length > 0) throw closeErrors[0];
 	}
 
 	#poison(error: unknown): never {
@@ -4016,6 +5342,7 @@ export class IncidentRecorderSegmentStore {
 		input: IncidentRecorderSegmentAppendInput,
 		admit?: (estimate: IncidentRecorderSegmentAppendStorageEstimate) => void,
 	): IncidentRecorderSegmentAppendPlan {
+		this.#assertRawMutation("planAppend");
 		this.#assertUsable();
 		assertMetadata(input.metadata);
 		const frozenMetadata = parseJson(Buffer.from(canonicalJson(input.metadata), "utf8"), "frozen append metadata");
@@ -4069,6 +5396,7 @@ export class IncidentRecorderSegmentStore {
 	}
 
 	commitAppendPlan(plan: IncidentRecorderSegmentAppendPlan): IncidentRecorderSegmentAppendResult {
+		this.#assertRawMutation("commitAppendPlan");
 		this.#assertUsable();
 		const frozen = this.#appendPlans.get(plan.token);
 		this.#appendPlans.delete(plan.token);
@@ -4089,10 +5417,12 @@ export class IncidentRecorderSegmentStore {
 	}
 
 	append(input: IncidentRecorderSegmentAppendInput): IncidentRecorderSegmentAppendResult {
+		this.#assertRawMutation("append");
 		return this.commitAppendPlan(this.planAppend(input));
 	}
 
 	seal(reason: string): void {
+		this.#assertRawMutation("seal");
 		this.#assertUsable();
 		if (reason.length === 0 || reason.length > 256) throw new Error("seal reason must contain 1 to 256 characters");
 		this.#sealActive(reason);
@@ -4177,6 +5507,7 @@ export class IncidentRecorderSegmentStore {
 	}
 
 	readRecord(locator: IncidentRecorderSegmentLocator): IncidentRecorderSegmentRecord | undefined {
+		this.#assertRawRead("readRecord");
 		this.#assertUsable();
 		assertRecordLocator(locator);
 		const corrupt = this.#corrupt.find((segment) => segment.segmentId === locator.segmentId);
@@ -4226,6 +5557,60 @@ export class IncidentRecorderSegmentStore {
 		} finally {
 			closeSync(fileDescriptor);
 		}
+	}
+
+	readRecordWithinRoot(
+		root: IncidentCasRootMutation,
+		locator: IncidentRecorderSegmentLocator,
+	): IncidentRecorderSegmentRecord | undefined {
+		this.#assertRootBacked("readRecordWithinRoot");
+		this.#assertUsable();
+		assertRecordLocator(locator);
+		const corrupt = this.#corrupt.find((segment) => segment.segmentId === locator.segmentId);
+		if (corrupt) {
+			if (corrupt.summary && corrupt.summary.header.segmentSequence !== locator.segmentSequence) {
+				throw new InvalidFrameError("record locator conflicts with a retained corrupt segment identity");
+			}
+			throw new InvalidFrameError("record locator references a corrupt retained segment");
+		}
+		const active = this.#active;
+		if (active?.header.segmentId === locator.segmentId) {
+			if (active.header.segmentSequence !== locator.segmentSequence) {
+				throw new InvalidFrameError("record locator conflicts with the active segment identity");
+			}
+			const entry = active.records.find((candidate) => candidate.ordinal === locator.ordinal);
+			if (!entry) throw new InvalidFrameError("record locator ordinal is absent from the active segment");
+			this.#assertLocatorMatchesEntry(locator, entry);
+			return this.#withActiveSegmentFileWithinRoot(root, "read", (file) =>
+				this.#readRecordAt(file, active.size, active.header, entry),
+			);
+		}
+		const summary = this.#sealed.find((segment) => segment.header.segmentId === locator.segmentId);
+		if (!summary) return undefined;
+		if (summary.header.segmentSequence !== locator.segmentSequence) {
+			throw new InvalidFrameError("record locator conflicts with the sealed segment identity");
+		}
+		const locatorEnd = locator.offset + locator.frameBytes;
+		if (
+			!Number.isSafeInteger(locatorEnd) ||
+			locator.offset < FRAME_OVERHEAD_BYTES ||
+			locatorEnd > summary.footer.indexOffset
+		) {
+			throw new InvalidFrameError("record locator lies outside sealed record bounds");
+		}
+		const index = this.#readIndexWithinRoot(root, summary);
+		const entry = index.records.find((candidate) => candidate.ordinal === locator.ordinal);
+		if (!entry) throw new InvalidFrameError("record locator ordinal is absent from the sealed index");
+		this.#assertLocatorMatchesEntry(locator, entry);
+		const path = this.#rootPathString(root, "sealed", basename(summary.path));
+		return root.withFile(this.#rootPath(root, "sealed", basename(summary.path)), { access: "read" }, (file) => {
+			assertPrivateRegularFile(file, path);
+			const status = file.stat();
+			if (Number(status.size) !== summary.fileBytes) {
+				throw new InvalidFrameError("sealed segment size changed after locator validation");
+			}
+			return this.#readRecordAt(file, Number(status.size), summary.header, entry);
+		});
 	}
 
 	#readRecordAt(
@@ -4400,6 +5785,22 @@ export class IncidentRecorderSegmentStore {
 	}
 
 	queryRunWindowPage(query: IncidentRecorderSegmentPageQuery): IncidentRecorderSegmentQueryPage {
+		this.#assertRawRead("queryRunWindowPage");
+		return this.#queryRunWindowPage(query);
+	}
+
+	queryRunWindowPageWithinRoot(
+		root: IncidentCasRootMutation,
+		query: IncidentRecorderSegmentPageQuery,
+	): IncidentRecorderSegmentQueryPage {
+		this.#assertRootBacked("queryRunWindowPageWithinRoot");
+		return this.#queryRunWindowPage(query, root);
+	}
+
+	#queryRunWindowPage(
+		query: IncidentRecorderSegmentPageQuery,
+		root?: IncidentCasRootMutation,
+	): IncidentRecorderSegmentQueryPage {
 		this.#assertUsable();
 		assertIdentifier(query.runId, "query runId");
 		if (query.sourceId !== undefined) assertIdentifier(query.sourceId, "query sourceId");
@@ -4584,10 +5985,9 @@ export class IncidentRecorderSegmentStore {
 				complete = false;
 				break;
 			}
-			const index = this.#readIndex(summary);
+			const index = root ? this.#readIndexWithinRoot(root, summary) : this.#readIndex(summary);
 			scannedIndexBytes += summary.footer.indexFrameBytes;
-			let fileDescriptor = -1;
-			try {
+			const visit = (file: IncidentRecorderSegmentFileView, fileSize: number): void => {
 				const firstRecordIndex =
 					summary.header.segmentSequence === frontierSegmentSequence
 						? firstOrdinalAfter(index.records, frontierOrdinal)
@@ -4605,16 +6005,12 @@ export class IncidentRecorderSegmentStore {
 						continue;
 					}
 					if (!canTake(entry)) break;
-					if (fileDescriptor < 0) {
-						fileDescriptor = openSync(summary.path, constants.O_RDONLY | constants.O_NOFOLLOW);
-						assertPrivateRegularFile(fileDescriptor, summary.path);
-					}
-					records.push(this.#readRecordAt(fileDescriptor, summary.fileBytes, summary.header, entry));
+					records.push(this.#readRecordAt(file, fileSize, summary.header, entry));
 					advanceFrontier(entry.segmentSequence, entry.ordinal);
 				}
-			} finally {
-				if (fileDescriptor >= 0) closeSync(fileDescriptor);
-			}
+			};
+			if (root) this.#withSealedSegmentFileWithinRoot(root, summary, visit);
+			else this.#withSealedSegmentFile(summary, visit);
 			if (complete) advanceFrontier(summary.header.segmentSequence, frozenOrdinal);
 		}
 		const active = this.#active;
@@ -4630,7 +6026,7 @@ export class IncidentRecorderSegmentStore {
 				scannedSegments += 1;
 				const firstActiveRecordIndex =
 					activeSequence === frontierSegmentSequence ? firstOrdinalAfter(active.records, frontierOrdinal) : 0;
-				this.#withActiveSegmentFile("read", (file) => {
+				const visitActive = (file: IncidentRecorderSegmentFileView): void => {
 					for (let recordIndex = firstActiveRecordIndex; recordIndex < active.records.length; recordIndex += 1) {
 						const entry = active.records[recordIndex];
 						if (!entry || !complete || !isAfterFrontier(entry)) continue;
@@ -4647,7 +6043,9 @@ export class IncidentRecorderSegmentStore {
 						records.push(this.#readRecordAt(file, active.size, active.header, entry));
 						advanceFrontier(entry.segmentSequence, entry.ordinal);
 					}
-				});
+				};
+				if (root) this.#withActiveSegmentFileWithinRoot(root, "read", visitActive);
+				else this.#withActiveSegmentFile("read", visitActive);
 				if (complete) advanceFrontier(activeSequence, frozenOrdinal);
 			}
 		}
@@ -4684,6 +6082,22 @@ export class IncidentRecorderSegmentStore {
 
 	queryRecoveryGapsPage(
 		query: IncidentRecorderSegmentRecoveryGapPageQuery,
+	): IncidentRecorderSegmentRecoveryGapQueryPage {
+		this.#assertRawRead("queryRecoveryGapsPage");
+		return this.#queryRecoveryGapsPage(query);
+	}
+
+	queryRecoveryGapsPageWithinRoot(
+		root: IncidentCasRootMutation,
+		query: IncidentRecorderSegmentRecoveryGapPageQuery,
+	): IncidentRecorderSegmentRecoveryGapQueryPage {
+		this.#assertRootBacked("queryRecoveryGapsPageWithinRoot");
+		return this.#queryRecoveryGapsPage(query, root);
+	}
+
+	#queryRecoveryGapsPage(
+		query: IncidentRecorderSegmentRecoveryGapPageQuery,
+		root?: IncidentCasRootMutation,
 	): IncidentRecorderSegmentRecoveryGapQueryPage {
 		this.#assertUsable();
 		const filterSha256 = sha256(Buffer.from(canonicalJson({ kind: "global-recovery-gaps", version: 1 }), "utf8"));
@@ -4839,7 +6253,7 @@ export class IncidentRecorderSegmentStore {
 				complete = false;
 				break;
 			}
-			const index = this.#readIndex(summary);
+			const index = root ? this.#readIndexWithinRoot(root, summary) : this.#readIndex(summary);
 			scannedIndexBytes += summary.footer.indexFrameBytes;
 			const firstGapIndex =
 				summary.header.segmentSequence === frontierSegmentSequence
@@ -4908,6 +6322,16 @@ export class IncidentRecorderSegmentStore {
 	}
 
 	getRecoveryGaps(): IncidentRecorderSegmentRecoveryGap[] {
+		this.#assertRawRead("getRecoveryGaps");
+		return this.#getRecoveryGaps();
+	}
+
+	getRecoveryGapsWithinRoot(root: IncidentCasRootMutation): IncidentRecorderSegmentRecoveryGap[] {
+		this.#assertRootBacked("getRecoveryGapsWithinRoot");
+		return this.#getRecoveryGaps(root);
+	}
+
+	#getRecoveryGaps(root?: IncidentCasRootMutation): IncidentRecorderSegmentRecoveryGap[] {
 		this.#assertUsable();
 		if (this.#corrupt.some((segment) => !segment.summary)) {
 			throw new InvalidFrameError("an uncatalogued corrupt segment prevents exact recovery-gap replay");
@@ -4927,7 +6351,8 @@ export class IncidentRecorderSegmentStore {
 			...this.#corrupt.flatMap((segment) => (segment.summary ? [segment.summary] : [])),
 		].sort((left, right) => left.header.segmentSequence - right.header.segmentSequence);
 		for (const summary of summaries) {
-			for (const gap of this.#readIndex(summary).recoveryGaps) admit(gap);
+			for (const gap of (root ? this.#readIndexWithinRoot(root, summary) : this.#readIndex(summary)).recoveryGaps)
+				admit(gap);
 		}
 		for (const gap of this.#active?.recoveryGaps ?? []) admit(gap);
 		return gaps.sort((left, right) => left.segmentSequence - right.segmentSequence || left.ordinal - right.ordinal);
@@ -5021,6 +6446,7 @@ export class IncidentRecorderSegmentStore {
 	}
 
 	pruneSealedSegments(input: IncidentRecorderSegmentPruneInput): IncidentRecorderSegmentPruneResult {
+		this.#assertRawMutation("pruneSealedSegments");
 		this.#assertUsable();
 		const pruneNow = this.#now();
 		assertSafeNonNegativeInteger(pruneNow, "prune continuation registry time");
@@ -5324,6 +6750,7 @@ export class IncidentRecorderSegmentStore {
 	}
 
 	close(): void {
+		this.#assertRawMutation("close");
 		if (this.#closed) return;
 		const closeErrors: unknown[] = [];
 		const recordCloseFailure = (error: unknown): void => {

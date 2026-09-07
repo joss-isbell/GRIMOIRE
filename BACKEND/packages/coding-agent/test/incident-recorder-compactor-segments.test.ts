@@ -846,6 +846,58 @@ describe("incident recorder compactor segment integration", () => {
 		}
 	});
 
+	it("keeps root-backed segment mutation scoped and defers observers into ordered receipts", async () => {
+		const target = fixture();
+		await initialize(target.compactor);
+		const lease = target.acquireLifecycleLease();
+		if (!lease) throw new Error("expected a writer lifecycle lease");
+		const segmentDirectory = join(target.agentDir, "incident-recorder", "segments");
+		let observerCalls = 0;
+		let receipts: readonly ReturnType<IncidentRecorderSegmentStore["drainWithinRootReceipts"]>[number][] = [];
+		const mutation = lease.withRoot((root) => {
+			const store = IncidentRecorderSegmentStore.openWithinRoot(root, {
+				directory: ["segments"],
+				onOpenStorageResult: () => {
+					observerCalls += 1;
+				},
+				onDurableWrite: () => {
+					observerCalls += 1;
+				},
+			});
+			const input: IncidentRecorderSegmentAppendInput = {
+				idempotencyKey: "root-scoped-record",
+				runId: "root-scoped-run",
+				sourceId: "root-scoped-source",
+				observedAtMs: 1,
+				order: "1",
+				metadata: {},
+				payload: Buffer.from("root-scoped"),
+			};
+			expect(() => store.append(input)).toThrow(/unavailable for root-backed/);
+			const appended = store.appendWithinRoot(root, input);
+			expect(appended.status).toBe("appended");
+			store.sealWithinRoot(root, "test");
+			receipts = [...store.drainWithinRootReceipts(), ...store.closeWithinRoot(root)];
+			expect(observerCalls).toBe(0);
+		});
+		expect(mutation.state).toBe("committed");
+		expect(observerCalls).toBe(0);
+		expect(receipts.map((receipt) => receipt.kind)).toEqual(["open", "durable", "durable", "durable", "open"]);
+		const raw = new IncidentRecorderSegmentStore({ directory: segmentDirectory });
+		try {
+			expect(
+				raw.queryRunWindow({
+					runId: "root-scoped-run",
+					sourceId: "root-scoped-source",
+					fromObservedAtMs: 0,
+					throughObservedAtMs: 10,
+				}),
+			).toHaveLength(1);
+		} finally {
+			raw.close();
+		}
+	});
+
 	it("surfaces a real segment-store close failure after requested shutdown aborts the run loop", async () => {
 		const target = fixture();
 		await initialize(target.compactor);
@@ -860,8 +912,8 @@ describe("incident recorder compactor segment integration", () => {
 		});
 		const store = target.internal.segmentStore;
 		if (!store) throw new Error("expected a real segment store before shutdown");
-		const closeFailure: unknown = undefined;
-		const close = vi.spyOn(store, "close").mockImplementation(() => {
+		const closeFailure = new Error("injected segment-store close failure");
+		const close = vi.spyOn(store, "closeWithinRoot").mockImplementation((_root) => {
 			throw closeFailure;
 		});
 		const shutdown = new AbortController();
@@ -871,12 +923,16 @@ describe("incident recorder compactor segment integration", () => {
 					signal: shutdown.signal,
 					onStorageMode: () => shutdown.abort(),
 				}),
-			).rejects.toBeUndefined();
+			).rejects.toThrow("injected segment-store close failure");
 			expect(shutdown.signal.aborted).toBe(true);
 			expect(close).toHaveBeenCalledOnce();
 		} finally {
 			close.mockRestore();
-			store.close();
+			const lease = target.lifecycleLease;
+			if (lease) {
+				const mutation = lease.withRoot((root) => store.closeWithinRoot(root));
+				expect(mutation.state).toBe("committed");
+			}
 		}
 	});
 
@@ -893,6 +949,7 @@ describe("incident recorder compactor segment integration", () => {
 			storageScannerPath: join(target.root, "storage-scanner.cjs"),
 			journalctlPath,
 			freeReserveBytes: 0,
+			writerLifecycleLease: target.acquireLifecycleLease,
 		});
 		const internal = compactor as unknown as CompactorInternals;
 		const appendSegmentRecord = internal.appendSegmentRecord.bind(internal);
@@ -914,7 +971,7 @@ describe("incident recorder compactor segment integration", () => {
 			await expect.poll(() => internal.assemblies.size, { timeout: 2_000 }).toBe(2);
 			const store = internal.segmentStore;
 			if (!store) throw new Error("expected a real segment store before partial-assembly shutdown");
-			close = vi.spyOn(store, "close");
+			close = vi.spyOn(store, "closeWithinRoot");
 			shutdown.abort();
 			await expect(running).rejects.toBeUndefined();
 			expect(incompleteAttempts).toHaveLength(2);
@@ -1255,6 +1312,9 @@ describe("incident recorder compactor segment integration", () => {
 		expect(thrown).toMatchObject({ name: "IncidentRecorderWriterLifecycleAdmissionError" });
 		expect(target.internal.pendingEntries).toHaveLength(0);
 		expect(target.internal.assemblies.size).toBe(1);
+		expect(target.compactor.storageAccountingReady).toBe(false);
+		expect(target.compactor.storageMode).toBe("recovery-only");
+		expect(target.internal.segmentStore).toBeUndefined();
 		expect(existsSync(join(target.agentDir, "incident-recorder", "compactor-cursor.json"))).toBe(false);
 		expect(existsSync(join(target.agentDir, "incident-recorder", "segments"))).toBe(false);
 	});
