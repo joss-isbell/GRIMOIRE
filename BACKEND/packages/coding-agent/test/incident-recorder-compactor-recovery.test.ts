@@ -1,13 +1,56 @@
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { IncidentRecorderCompactor } from "../src/modes/daemon/incident-recorder-compactor.js";
+import { IncidentRecorderCompactor as ProductionCompactor } from "../src/modes/daemon/incident-recorder-compactor.js";
+import { acquireIncidentRecorderNamespaceCas } from "../src/modes/daemon/incident-recorder-namespace-admission.js";
 import { IncidentRecorderSegmentStore } from "../src/modes/daemon/incident-recorder-segment-store.js";
+import {
+	acquireIncidentRecorderWriterNormalLease,
+	type IncidentRecorderWriterLifecycleLease,
+} from "../src/modes/daemon/incident-recorder-writer-lifecycle.js";
 
 const roots: string[] = [];
+const leases: IncidentRecorderWriterLifecycleLease[] = [];
+
+class IncidentRecorderCompactor extends ProductionCompactor {
+	constructor(options: ConstructorParameters<typeof ProductionCompactor>[0]) {
+		let lease: IncidentRecorderWriterLifecycleLease | undefined;
+		super({
+			...options,
+			writerLifecycleLease:
+				options.writerLifecycleLease ??
+				(() => {
+					if (!lease) {
+						const result = acquireIncidentRecorderWriterNormalLease(
+							{ agentDir: options.agentDir },
+							{
+								activationGenerationDigest: "a".repeat(64),
+								revalidateActivation: () => ({ state: "valid" }),
+								acquireCas: acquireIncidentRecorderNamespaceCas,
+							},
+						);
+						if (result.state !== "acquired") throw new Error(`fixture writer lease: ${result.reason}`);
+						lease = result.lease;
+						leases.push(lease);
+					}
+					return lease;
+				}),
+		});
+	}
+}
 
 afterEach(() => {
+	for (const lease of leases.splice(0)) lease.release();
 	delete process.env.PRIME_TEST_STORAGE_LINES;
 	delete process.env.PRIME_TEST_STORAGE_MARKER;
 	delete process.env.PRIME_TEST_JOURNAL_LOG;
@@ -180,8 +223,7 @@ describe("incident recorder compactor recovery bounds", () => {
 		expect(compactor.storageRecoveryReason).toBeUndefined();
 		expect(compactor.admitObservation(0)).toBe(true);
 
-		process.env.PRIME_TEST_STORAGE_LINES =
-			"1\t10\t1\t8\n1\t11\t1\t8\n1\t12\t1\t8\n1\t13\t1\t8\n1\t14\t1\t8\n";
+		process.env.PRIME_TEST_STORAGE_LINES = "1\t10\t1\t8\n1\t11\t1\t8\n1\t12\t1\t8\n1\t13\t1\t8\n1\t14\t1\t8\n";
 		await compactor.initializeStorageAccounting(new AbortController().signal);
 		expect(compactor.storageAccountingReady).toBe(true);
 		expect(compactor.storageMode).toBe("recovery-only");
@@ -328,25 +370,24 @@ describe("incident recorder compactor recovery bounds", () => {
 		try {
 			await waitFor(() => {
 				try {
-					return jsonLines(target.journalLog).some((entry) =>
-						(entry.args as string[]).includes("--follow"),
-					);
+					return jsonLines(target.journalLog).some((entry) => (entry.args as string[]).includes("--follow"));
 				} catch {
 					return false;
 				}
 			});
-			process.env.PRIME_TEST_STORAGE_LINES = [
-				"1\t20\t0\t0",
-				"1\t21\t0\t0",
-				"1\t22\t0\t0",
-				"1\t23\t0\t0",
-				"1\t24\t0\t0",
-				"1\t25\t0\t0",
-				"1\t26\t0\t0",
-				"1\t27\t0\t0",
-				"1\t28\t0\t0",
-				"1\t29\t0\t0",
-			].join("\n") + "\n";
+			process.env.PRIME_TEST_STORAGE_LINES =
+				[
+					"1\t20\t0\t0",
+					"1\t21\t0\t0",
+					"1\t22\t0\t0",
+					"1\t23\t0\t0",
+					"1\t24\t0\t0",
+					"1\t25\t0\t0",
+					"1\t26\t0\t0",
+					"1\t27\t0\t0",
+					"1\t28\t0\t0",
+					"1\t29\t0\t0",
+				].join("\n") + "\n";
 			await compactor.initializeStorageAccounting(controller.signal);
 			expect(compactor.storageMode).toBe("recovery-only");
 			writeFileSync(journalGate, "release\n", { mode: 0o600 });

@@ -3,44 +3,63 @@ import {
 	appendFileSync,
 	chmodSync,
 	closeSync,
-	constants as fsConstants,
 	existsSync,
 	fchmodSync,
+	constants as fsConstants,
 	fstatSync,
+	fsyncSync,
 	linkSync,
 	lstatSync,
 	mkdirSync,
 	mkdtempSync,
 	openSync,
+	readdirSync,
 	readFileSync,
 	readlinkSync,
-	readdirSync,
 	renameSync,
 	rmSync,
 	symlinkSync,
+	utimesSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+	acquireIncidentCasTransactionDetailed,
+	type IncidentCasFileMutation,
+	type IncidentCasFileOpenOptions,
+	type IncidentCasRelativePath,
+	type IncidentCasRootMutation,
+} from "../src/modes/daemon/incident-recorder-cas-transaction.js";
+import {
 	IncidentRecorderCompactor,
+	type IncidentRecorderRetainedRunHistoryResult,
 	type IncidentRecorderRunHistoryCursor,
+	type IncidentRecorderRunHistoryCursorOnlyResult,
+	type IncidentRecorderRunHistoryPublicationCapability,
 	type IncidentRecorderRunHistoryResult,
 } from "../src/modes/daemon/incident-recorder-compactor.js";
+import { acquireIncidentRecorderNamespaceCas } from "../src/modes/daemon/incident-recorder-namespace-admission.js";
 import {
 	encodeIncidentRecorderFrame,
 	INCIDENT_RECORDER_FRAME_FLAGS,
 } from "../src/modes/daemon/incident-recorder-protocol.js";
 import {
 	createIncidentRecorderSegmentPruneProtection,
-	IncidentRecorderSegmentStore,
 	type IncidentRecorderSegmentAppendInput,
 	type IncidentRecorderSegmentLocator,
+	IncidentRecorderSegmentStore,
 } from "../src/modes/daemon/incident-recorder-segment-store.js";
 import type { IncidentJournalLine } from "../src/modes/daemon/incident-recorder-writer.js";
+import {
+	acquireIncidentRecorderWriterNormalLease,
+	type IncidentRecorderWriterLifecycleAdmissionContract,
+	type IncidentRecorderWriterLifecycleLease,
+} from "../src/modes/daemon/incident-recorder-writer-lifecycle.js";
 
 const roots: string[] = [];
+const lifecycleLeases: IncidentRecorderWriterLifecycleLease[] = [];
 const RUN_ID = "11111111-1111-4111-8111-111111111111";
 const RUN_TOKEN = "22222222-2222-4222-8222-222222222222";
 const PRODUCER_ID = "33333333-3333-4333-8333-333333333333";
@@ -54,11 +73,33 @@ interface ProcfsAuthorityInternals {
 
 interface CompactorInternals {
 	appendSegmentRecord(input: IncidentRecorderSegmentAppendInput): IncidentRecorderSegmentLocator;
+	acceptEntry(fields: Readonly<Record<string, Buffer>>): void;
 	assemblies: Map<string, unknown>;
 	closeSegmentStore(): void;
+	discardStoppedTargetStreams(): void;
+	pendingEntries: unknown[];
+	pendingPinCursor?: string;
+	pendingPinDirectoryEntriesReadLastPass: number;
+	pendingPinDirectoryTraversal?: {
+		phase: "full" | "after-cursor" | "through-cursor";
+		pendingNames: string[];
+		pendingNameBytes: number;
+	};
 	readStableLegacyOccurrence(path: string, canonicalPath?: string): { value: unknown; bytes: number };
 	openStableRunHistoryDirectory(path: string): { descriptor: number; identity: unknown };
+	publishCasAndRunLease(
+		root: IncidentCasRootMutation,
+		input: {
+			runId: string;
+			digest: string;
+			bytes: number;
+			stagedPath: IncidentCasRelativePath;
+			mtimeNs: bigint;
+		},
+		effects: unknown[],
+	): { casPath: string; leasePath: string };
 	segmentStore?: IncidentRecorderSegmentStore;
+	stoppedTargetStreams: Map<string, Record<string, unknown>>;
 	runHistoryTraversals: Map<
 		string,
 		{
@@ -74,13 +115,6 @@ interface CompactorInternals {
 			};
 		}
 	>;
-	publishCasAndRunLease(input: {
-		runId: string;
-		digest: string;
-		bytes: number;
-		value?: Buffer;
-		stagedPath?: string;
-	}): { casPath: string; leasePath: string };
 	writeJournalReference(input: {
 		fields: Readonly<Record<string, Buffer>>;
 		cursor: string;
@@ -96,6 +130,7 @@ interface CompactorInternals {
 
 afterEach(() => {
 	vi.useRealTimers();
+	for (const lease of lifecycleLeases.splice(0).reverse()) lease.release();
 	for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
@@ -106,26 +141,58 @@ function executable(root: string, name: string, source: string): string {
 	return path;
 }
 
-function fixture(
-	options: Partial<ConstructorParameters<typeof IncidentRecorderCompactor>[0]> = {},
-): {
+function fixture(options: Partial<ConstructorParameters<typeof IncidentRecorderCompactor>[0]> = {}): {
 	root: string;
 	agentDir: string;
 	compactor: IncidentRecorderCompactor;
 	internal: CompactorInternals;
+	lifecycleLease: IncidentRecorderWriterLifecycleLease | undefined;
+	acquireLifecycleLease(): IncidentRecorderWriterLifecycleLease | undefined;
+	releaseLifecycleLease(): void;
 } {
 	const root = mkdtempSync(join(tmpdir(), "prime-agent-compactor-segments-"));
 	roots.push(root);
 	const agentDir = join(root, "agent");
 	mkdirSync(agentDir, { recursive: true, mode: 0o700 });
 	const scanner = executable(root, "storage-scanner.cjs", 'process.stdout.write("1\\t1\\t0\\t0\\n");');
+	let lifecycleLease: IncidentRecorderWriterLifecycleLease | undefined;
+	const lifecycleContract: IncidentRecorderWriterLifecycleAdmissionContract = {
+		activationGenerationDigest: "a".repeat(64),
+		revalidateActivation: () => ({ state: "valid" }),
+		acquireCas: acquireIncidentRecorderNamespaceCas,
+	};
+	const defaultWriterLifecycleLease = (): IncidentRecorderWriterLifecycleLease | undefined => {
+		if (!lifecycleLease) {
+			const admission = acquireIncidentRecorderWriterNormalLease({ agentDir }, lifecycleContract);
+			if (admission.state !== "acquired")
+				throw new Error(`fixture lifecycle lease unavailable: ${admission.reason}`);
+			lifecycleLease = admission.lease;
+			lifecycleLeases.push(lifecycleLease);
+		}
+		return lifecycleLease;
+	};
 	const compactor = new IncidentRecorderCompactor({
 		agentDir,
 		storageScannerPath: scanner,
 		freeReserveBytes: 0,
+		writerLifecycleLease: defaultWriterLifecycleLease,
 		...options,
 	});
-	return { root, agentDir, compactor, internal: compactor as unknown as CompactorInternals };
+	return {
+		root,
+		agentDir,
+		compactor,
+		internal: compactor as unknown as CompactorInternals,
+		get lifecycleLease() {
+			return lifecycleLease;
+		},
+		acquireLifecycleLease() {
+			return defaultWriterLifecycleLease();
+		},
+		releaseLifecycleLease() {
+			lifecycleLease?.release();
+		},
+	};
 }
 
 async function initialize(compactor: IncidentRecorderCompactor): Promise<void> {
@@ -233,10 +300,61 @@ function partialJournalEntry(index: number, sequence: number): string {
 	].join("\n");
 }
 
-function occurrenceIdentity(
-	index: number,
-	producerId = PRODUCER_ID,
-): { occurrenceId: string; identityKey: string } {
+function terminalJournalEntry(index: number, sequence: number): string {
+	const fields = partialJournalEntry(index, sequence).split("\n");
+	const messageIndex = fields.findIndex((entry) => entry.startsWith("MESSAGE="));
+	if (messageIndex < 0) throw new Error("expected journal MESSAGE field");
+	const line = JSON.parse(fields[messageIndex]?.slice("MESSAGE=".length) ?? "null") as Record<string, unknown>;
+	const payload = Buffer.from(String(line.payloadBase64), "base64");
+	const occurrenceSha256 = createHash("sha256").update(payload).digest("hex");
+	const metadata = { occurrenceRawBytes: payload.length, occurrenceSha256 };
+	const frame = encodeIncidentRecorderFrame(
+		{
+			runId: String(line.runId),
+			runToken: String(line.runToken),
+			producerId: String(line.producerId),
+			occurrenceId: String(line.occurrenceId),
+			producerSequence: BigInt(String(line.producerSequence)),
+			wallTimeMs: BigInt(String(line.eventWallTimeMs)),
+			monotonicNs: BigInt(String(line.eventMonotonicNs)),
+			payloadKind: "exact-bytes",
+			flags:
+				INCIDENT_RECORDER_FRAME_FLAGS.critical |
+				INCIDENT_RECORDER_FRAME_FLAGS.terminal |
+				INCIDENT_RECORDER_FRAME_FLAGS.firstChunk |
+				INCIDENT_RECORDER_FRAME_FLAGS.lastChunk,
+			chunkIndex: 0,
+			chunkCount: 1,
+			source: String(line.source),
+			type: String(line.type),
+			encoding: String(line.encoding),
+			metadata,
+		},
+		payload,
+	);
+	line.chunkIndex = 0;
+	line.chunkCount = 1;
+	line.rawOccurrenceBytes = payload.length;
+	line.occurrenceSha256 = occurrenceSha256;
+	line.chunkBytes = payload.length;
+	line.chunkSha256 = createHash("sha256").update(payload).digest("hex");
+	line.flags = frame.header.flags;
+	line.frameChecksum = frame.header.checksum;
+	line.metadata = metadata;
+	fields[messageIndex] = `MESSAGE=${JSON.stringify(line)}`;
+	return fields.join("\n");
+}
+
+function exportedJournalFields(value: string): Record<string, Buffer> {
+	const fields: Record<string, Buffer> = {};
+	for (const entry of value.split("\n")) {
+		const separator = entry.indexOf("=");
+		if (separator > 0) fields[entry.slice(0, separator)] = Buffer.from(entry.slice(separator + 1), "utf8");
+	}
+	return fields;
+}
+
+function occurrenceIdentity(index: number, producerId = PRODUCER_ID): { occurrenceId: string; identityKey: string } {
 	const id = occurrenceId(index);
 	return {
 		occurrenceId: id,
@@ -264,7 +382,12 @@ function occurrenceInput(
 	digest: string,
 	casPath: string,
 	overrides: OccurrenceOverrides = {},
-): { input: IncidentRecorderSegmentAppendInput; payload: Record<string, unknown>; cursor: string; identityKey: string } {
+): {
+	input: IncidentRecorderSegmentAppendInput;
+	payload: Record<string, unknown>;
+	cursor: string;
+	identityKey: string;
+} {
 	const producerId = overrides.producerId ?? PRODUCER_ID;
 	const identity = occurrenceIdentity(index, producerId);
 	const cursor = `cursor-${index}`;
@@ -335,15 +458,15 @@ function writeLegacyOccurrence(
 		createHash("sha256").update(RUN_ID).digest("hex"),
 	);
 	mkdirSync(directory, { recursive: true, mode: 0o700 });
-	const path = join(
-		directory,
-		`seq-${String(sequence).padStart(20, "0")}-${occurrence.identityKey}.json`,
-	);
+	const path = join(directory, `seq-${String(sequence).padStart(20, "0")}-${occurrence.identityKey}.json`);
 	writeFileSync(path, `${JSON.stringify(payload)}\n`, { mode: 0o600 });
 	return { directory, path };
 }
 
-function preparePinFixture(target: ReturnType<typeof fixture>, anchor: number): {
+function preparePinFixture(
+	target: ReturnType<typeof fixture>,
+	anchor: number,
+): {
 	incidentDir: string;
 	digest: string;
 	casPath: string;
@@ -371,19 +494,33 @@ function preparePinFixture(target: ReturnType<typeof fixture>, anchor: number): 
 	return { incidentDir, digest, casPath };
 }
 
-function writeCasFixture(target: ReturnType<typeof fixture>, value: Buffer): {
+function writePendingJournalPinRequest(incidentDir: string, anchor: number, runId = RUN_ID): void {
+	mkdirSync(incidentDir, { recursive: true, mode: 0o700 });
+	writeFileSync(
+		join(incidentDir, "journal-pin-request.json"),
+		`${JSON.stringify({
+			version: 1,
+			state: "pending",
+			runId,
+			anchorWallTimeMs: anchor,
+			fromWallTimeMs: anchor,
+			throughWallTimeMs: anchor + 1_000,
+			resolveAfterWallTimeMs: anchor + 1_000,
+			retainUntilWallTimeMs: anchor + 3 * DAY,
+		})}\n`,
+		{ mode: 0o600 },
+	);
+}
+
+function writeCasFixture(
+	target: ReturnType<typeof fixture>,
+	value: Buffer,
+): {
 	digest: string;
 	casPath: string;
 } {
 	const digest = createHash("sha256").update(value).digest("hex");
-	const casPath = join(
-		target.agentDir,
-		"incident-recorder",
-		"cas",
-		"sha256",
-		digest.slice(0, 2),
-		`${digest}.blob`,
-	);
+	const casPath = join(target.agentDir, "incident-recorder", "cas", "sha256", digest.slice(0, 2), `${digest}.blob`);
 	mkdirSync(dirname(casPath), { recursive: true, mode: 0o700 });
 	writeFileSync(casPath, value, { mode: 0o600 });
 	return { digest, casPath };
@@ -403,10 +540,7 @@ function writeSyntheticFdinfoDirectory(directory: string, content: string): void
 }
 
 function currentProcfsMountId(): bigint {
-	const descriptor = openSync(
-		"/proc",
-		fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
-	);
+	const descriptor = openSync("/proc", fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
 	try {
 		const match = /^mnt_id:\s+([0-9]+)$/m.exec(
 			readFileSync(join("/proc/thread-self/fdinfo", String(descriptor)), "utf8"),
@@ -451,6 +585,138 @@ function captureThrown(run: () => unknown): { threw: false } | { threw: true; er
 	}
 }
 
+type CasCapabilityProbeFault = "before_utimes" | "after_utimes";
+
+interface CasCapabilityProbe {
+	operations: string[];
+	fault?: CasCapabilityProbeFault;
+}
+
+function observeCasCapability(
+	root: IncidentCasRootMutation,
+	probe: CasCapabilityProbe,
+	target: { digest: string; runId: string },
+): IncidentCasRootMutation {
+	const casTokens = new Set<unknown>();
+	const casDirectoryTokens = new Set<unknown>();
+	const leaseTokens = new Set<unknown>();
+	const leaseDirectoryTokens = new Set<unknown>();
+	const casDirectoryComponents = ["cas", "sha256", target.digest.slice(0, 2)];
+	const leaseDirectoryComponents = ["refs", "runs", createHash("sha256").update(target.runId).digest("hex")];
+	const rootUtimes = Reflect.get(root, "utimes") as unknown;
+	const observed: IncidentCasRootMutation & { utimes(...args: unknown[]): unknown } = {
+		...root,
+		relative(...components) {
+			const path = root.relative(...components);
+			if (
+				components.length === casDirectoryComponents.length &&
+				components.every((component, index) => component === casDirectoryComponents[index])
+			) {
+				casDirectoryTokens.add(path);
+			} else if (
+				components.length === casDirectoryComponents.length + 1 &&
+				components.slice(0, -1).every((component, index) => component === casDirectoryComponents[index]) &&
+				components.at(-1) === `${target.digest}.blob`
+			) {
+				casTokens.add(path);
+			} else if (
+				components.length === leaseDirectoryComponents.length &&
+				components.every((component, index) => component === leaseDirectoryComponents[index])
+			) {
+				leaseDirectoryTokens.add(path);
+			} else if (
+				components.length === leaseDirectoryComponents.length + 1 &&
+				components.slice(0, -1).every((component, index) => component === leaseDirectoryComponents[index]) &&
+				components.at(-1) === `cas-${target.digest}.blob`
+			) {
+				leaseTokens.add(path);
+			}
+			return path;
+		},
+		hardLink(source, destination) {
+			root.hardLink(source, destination);
+			if (casTokens.has(destination)) {
+				probe.operations.push("cas_linked");
+			} else if (casTokens.has(source) && leaseTokens.has(destination)) {
+				probe.operations.push("lease_linked");
+			}
+		},
+		withFile<T>(
+			path: IncidentCasRelativePath,
+			options: IncidentCasFileOpenOptions,
+			operation: (file: IncidentCasFileMutation) => T,
+		): T {
+			const result = root.withFile(path, options, operation);
+			if (casTokens.has(path)) probe.operations.push("cas_validated");
+			return result;
+		},
+		utimes(...args: unknown[]): unknown {
+			probe.operations.push(casTokens.has(args[0]) ? "cas_utimes" : "opaque_utimes");
+			if (probe.fault === "before_utimes") throw new Error("injected-cas-utimes");
+			if (typeof rootUtimes !== "function") throw new Error("Opaque CAS utimes capability was unavailable");
+			const result = Reflect.apply(rootUtimes, root, args);
+			if (probe.fault === "after_utimes") throw new Error("injected-after-cas-utimes");
+			return result;
+		},
+		fsyncFile(path) {
+			root.fsyncFile(path);
+			probe.operations.push(casTokens.has(path) ? "cas_fsynced" : "opaque_file_fsynced");
+		},
+		unlinkFile(path) {
+			root.unlinkFile(path);
+			if (casTokens.has(path)) probe.operations.push("cas_unlinked");
+		},
+		fsyncDirectory(path) {
+			root.fsyncDirectory(path);
+			if (casDirectoryTokens.has(path)) probe.operations.push("cas_directory_fsynced");
+			else if (leaseDirectoryTokens.has(path)) probe.operations.push("lease_directory_fsynced");
+		},
+	};
+	return observed;
+}
+
+function withCompactorCasRoot<T>(
+	target: ReturnType<typeof fixture>,
+	operation: (root: IncidentCasRootMutation) => T,
+): T {
+	const recorderRoot = join(target.agentDir, "incident-recorder");
+	mkdirSync(recorderRoot, { recursive: true, mode: 0o700 });
+	const admission = acquireIncidentCasTransactionDetailed(recorderRoot);
+	if (admission.state !== "acquired") throw new Error(`CAS test transaction unavailable: ${admission.reason}`);
+	try {
+		const mutation = admission.transaction.withRoot(operation);
+		if (mutation.state !== "committed") throw new Error("CAS test transaction root detached");
+		return mutation.value;
+	} finally {
+		admission.transaction.release();
+	}
+}
+
+function publishStagedCasForTest(
+	target: ReturnType<typeof fixture>,
+	input: { runId: string; value: Buffer; stageName: string; mtimeNs: bigint },
+	probe: CasCapabilityProbe,
+): { casPath: string; leasePath: string } {
+	const digest = createHash("sha256").update(input.value).digest("hex");
+	return withCompactorCasRoot(target, (root) => {
+		const stagingDirectory = root.relative("cas", "sha256", "staging");
+		root.mkdirPrivate(stagingDirectory, true);
+		const stagedPath = root.relative("cas", "sha256", "staging", input.stageName);
+		if (!root.exists(stagedPath)) root.writeFileExclusive(stagedPath, input.value, 0o600);
+		return target.internal.publishCasAndRunLease(
+			observeCasCapability(root, probe, { digest, runId: input.runId }),
+			{
+				runId: input.runId,
+				digest,
+				bytes: input.value.length,
+				stagedPath,
+				mtimeNs: input.mtimeNs,
+			},
+			[],
+		);
+	});
+}
+
 function injectRecoveryGaps(target: ReturnType<typeof fixture>, observedAtMs: number[]): void {
 	target.internal.closeSegmentStore();
 	const segmentDirectory = join(target.agentDir, "incident-recorder", "segments");
@@ -486,7 +752,13 @@ function writeScanProof(incidentDir: string, anchor: number, cursors: string[]):
 
 function finishRunHistoryProjection(
 	compactor: IncidentRecorderCompactor,
-	request: { runId: string; fromWallTimeMs: number; throughWallTimeMs: number; deadlineMs?: number },
+	request: {
+		runId: string;
+		fromWallTimeMs: number;
+		throughWallTimeMs: number;
+		deadlineMs?: number;
+		pendingResponse?: "full" | "cursor-only";
+	},
 	maximumPasses = 32,
 	initialCursor?: IncidentRecorderRunHistoryCursor,
 ): IncidentRecorderRunHistoryResult {
@@ -497,6 +769,31 @@ function finishRunHistoryProjection(
 		cursor = result.cursor;
 	}
 	throw new Error("run-history projection did not finish within its bounded test passes");
+}
+
+function finishRetainedRunHistoryProjection(
+	compactor: IncidentRecorderCompactor,
+	request: {
+		runId: string;
+		fromWallTimeMs: number;
+		throughWallTimeMs: number;
+		deadlineMs?: number;
+		pendingResponse?: "full" | "cursor-only";
+	},
+	maximumPasses = 32,
+	initialCursor?: IncidentRecorderRunHistoryCursor,
+): IncidentRecorderRetainedRunHistoryResult {
+	let cursor = initialCursor;
+	for (let pass = 0; pass < maximumPasses; pass += 1) {
+		const result = compactor.projectRunHistory({
+			...request,
+			retainForPublication: true,
+			...(cursor ? { cursor } : {}),
+		});
+		if (result.state !== "pending") return result;
+		cursor = result.cursor;
+	}
+	throw new Error("retained run-history projection did not finish within its bounded test passes");
 }
 
 describe("incident recorder compactor segment integration", () => {
@@ -631,24 +928,354 @@ describe("incident recorder compactor segment integration", () => {
 		}
 	});
 
-	it("publishes first-use nested CAS and run-lease paths durably and resumes after the CAS crash boundary", async () => {
-		let failAfterCas = true;
+	it("orders opaque stopped-target timestamps before CAS durability and rolls back pre-fsync failures for retry", async () => {
+		const operations: string[] = [];
+		const target = fixture({ onCasPublicationStep: (step) => operations.push(step) });
+		await initialize(target.compactor);
+		const value = Buffer.from("opaque-cas-mtime");
+		const digest = createHash("sha256").update(value).digest("hex");
+		const recorderRoot = join(target.agentDir, "incident-recorder");
+		const casPath = join(recorderRoot, "cas", "sha256", digest.slice(0, 2), `${digest}.blob`);
+		const stageName = `${digest}.mtime-red.tmp`;
+		const stagePath = join(recorderRoot, "cas", "sha256", "staging", stageName);
+		const leasePath = join(
+			recorderRoot,
+			"refs",
+			"runs",
+			createHash("sha256").update(RUN_ID).digest("hex"),
+			`cas-${digest}.blob`,
+		);
+		const mtimeNs = 1_700_000_000_123_000_000n;
+		const probe: CasCapabilityProbe = { operations };
+
+		for (const fault of ["before_utimes", "after_utimes"] as const) {
+			operations.length = 0;
+			probe.fault = fault;
+			const failed = captureThrown(() =>
+				publishStagedCasForTest(target, { runId: RUN_ID, value, stageName, mtimeNs }, probe),
+			);
+			expect(failed.threw).toBe(true);
+			if (!failed.threw) throw new Error("expected opaque CAS utimes failure");
+			expect(failed.error).toMatchObject({
+				message: fault === "before_utimes" ? "injected-cas-utimes" : "injected-after-cas-utimes",
+			});
+			expect(operations).toEqual([
+				"cas_linked",
+				"cas_directory_fsynced",
+				"cas_validated",
+				"cas_utimes",
+				"cas_unlinked",
+				"cas_directory_fsynced",
+			]);
+			expect(existsSync(casPath)).toBe(false);
+			expect(existsSync(leasePath)).toBe(false);
+			expect(existsSync(stagePath)).toBe(true);
+		}
+
+		operations.length = 0;
+		probe.fault = undefined;
+		const retried = publishStagedCasForTest(target, { runId: RUN_ID, value, stageName, mtimeNs }, probe);
+		expect(retried).toEqual({ casPath, leasePath });
+		expect(operations).toEqual([
+			"cas_linked",
+			"cas_directory_fsynced",
+			"cas_validated",
+			"cas_utimes",
+			"cas_fsynced",
+			"cas_durable",
+			"lease_linked",
+			"lease_directory_fsynced",
+			"lease_durable",
+		]);
+		const cas = lstatSync(casPath, { bigint: true });
+		const lease = lstatSync(leasePath, { bigint: true });
+		expect(cas.mtimeNs).toBe(mtimeNs);
+		expect({ dev: lease.dev, ino: lease.ino, size: lease.size }).toEqual({
+			dev: cas.dev,
+			ino: cas.ino,
+			size: BigInt(value.length),
+		});
+	});
+
+	it("repairs only a same-inode staged CAS residue and never retimestamps an unrelated existing digest", async () => {
+		const operations: string[] = [];
+		const target = fixture({ onCasPublicationStep: (step) => operations.push(step) });
+		await initialize(target.compactor);
+		const recorderRoot = join(target.agentDir, "incident-recorder");
+		const stagingDirectory = join(recorderRoot, "cas", "sha256", "staging");
+		const repairedValue = Buffer.from("same-inode-cas-residue");
+		const repairedDigest = createHash("sha256").update(repairedValue).digest("hex");
+		const repairedCasDirectory = join(recorderRoot, "cas", "sha256", repairedDigest.slice(0, 2));
+		const repairedCasPath = join(repairedCasDirectory, `${repairedDigest}.blob`);
+		const repairedStageName = `${repairedDigest}.retained.tmp`;
+		const repairedStagePath = join(stagingDirectory, repairedStageName);
+		mkdirSync(stagingDirectory, { recursive: true, mode: 0o700 });
+		mkdirSync(repairedCasDirectory, { recursive: true, mode: 0o700 });
+		writeFileSync(repairedStagePath, repairedValue, { mode: 0o600 });
+		linkSync(repairedStagePath, repairedCasPath);
+		const repairedMtimeNs = 1_600_000_000_456_000_000n;
+		const repairedProbe: CasCapabilityProbe = { operations };
+		const repaired = publishStagedCasForTest(
+			target,
+			{ runId: RUN_ID, value: repairedValue, stageName: repairedStageName, mtimeNs: repairedMtimeNs },
+			repairedProbe,
+		);
+		expect(repaired.casPath).toBe(repairedCasPath);
+		const repairedUtimes = operations.indexOf("cas_utimes");
+		expect(repairedUtimes).toBeGreaterThanOrEqual(0);
+		expect(operations.slice(0, repairedUtimes)).toContain("cas_validated");
+		expect(operations.slice(repairedUtimes, repairedUtimes + 3)).toEqual([
+			"cas_utimes",
+			"cas_fsynced",
+			"cas_durable",
+		]);
+		expect(operations).not.toContain("opaque_utimes");
+		expect(lstatSync(repairedCasPath, { bigint: true }).mtimeNs).toBe(repairedMtimeNs);
+
+		const sharedValue = Buffer.from("unrelated-existing-cas");
+		const sharedDigest = createHash("sha256").update(sharedValue).digest("hex");
+		const sharedCasDirectory = join(recorderRoot, "cas", "sha256", sharedDigest.slice(0, 2));
+		const sharedCasPath = join(sharedCasDirectory, `${sharedDigest}.blob`);
+		const sharedStageName = `${sharedDigest}.unrelated.tmp`;
+		const sharedStagePath = join(stagingDirectory, sharedStageName);
+		mkdirSync(sharedCasDirectory, { recursive: true, mode: 0o700 });
+		writeFileSync(sharedCasPath, sharedValue, { mode: 0o600 });
+		writeFileSync(sharedStagePath, sharedValue, { mode: 0o600 });
+		const sharedTime = new Date(1_500_000_000_789);
+		utimesSync(sharedCasPath, sharedTime, sharedTime);
+		const sharedMtimeNs = lstatSync(sharedCasPath, { bigint: true }).mtimeNs;
+		operations.length = 0;
+		const sharedProbe: CasCapabilityProbe = { operations, fault: "before_utimes" };
+		const shared = publishStagedCasForTest(
+			target,
+			{
+				runId: "44444444-4444-4444-8444-444444444444",
+				value: sharedValue,
+				stageName: sharedStageName,
+				mtimeNs: 1_800_000_000_321_000_000n,
+			},
+			sharedProbe,
+		);
+		expect(shared.casPath).toBe(sharedCasPath);
+		expect(operations).not.toContain("opaque_utimes");
+		expect(operations).not.toContain("cas_utimes");
+		expect(lstatSync(sharedCasPath, { bigint: true }).mtimeNs).toBe(sharedMtimeNs);
+		expect(lstatSync(shared.leasePath, { bigint: true }).ino).toBe(lstatSync(sharedCasPath, { bigint: true }).ino);
+	});
+
+	it("carries the stopped target source mtime into a newly published canonical CAS blob", async () => {
+		const target = fixture();
+		await initialize(target.compactor);
+		const value = Buffer.from("stopped-target-source-mtime");
+		const sourcePath = join(target.root, "stopped-target-source-mtime.bin");
+		writeFileSync(sourcePath, value, { mode: 0o600 });
+		const sourceTime = new Date(1_650_000_000_234);
+		utimesSync(sourcePath, sourceTime, sourceTime);
+		const sourceMtimeNs = lstatSync(sourcePath, { bigint: true }).mtimeNs;
+		const digest = createHash("sha256").update(value).digest("hex");
+		const casPath = join(target.agentDir, "incident-recorder", "cas", "sha256", digest.slice(0, 2), `${digest}.blob`);
+
+		expect(
+			target.compactor.streamStoppedTargetArtifact(RUN_ID, sourcePath, "binary", {
+				deadlineMs: Date.now() + 1_000,
+				byteBudget: value.length + 1,
+			}),
+		).toMatchObject({ state: "complete", artifact: { path: casPath } });
+		expect(lstatSync(casPath, { bigint: true }).mtimeNs).toBe(sourceMtimeNs);
+	});
+
+	it("does not stage a stopped target without a configured normal writer lease", async () => {
+		const target = fixture({ writerLifecycleLease: () => undefined });
+		await initialize(target.compactor);
+		const value = Buffer.from("missing-writer-lease");
+		const sourcePath = join(target.root, "missing-writer-lease.bin");
+		writeFileSync(sourcePath, value, { mode: 0o600 });
+		const stagingDirectory = join(target.agentDir, "incident-recorder", "cas", "sha256", "staging");
+
+		expect(
+			target.compactor.streamStoppedTargetArtifact(RUN_ID, sourcePath, "binary", {
+				deadlineMs: Date.now() + 1_000,
+				byteBudget: value.length + 1,
+			}),
+		).toEqual({
+			state: "pending",
+			reason: "writer_lifecycle_lease_required",
+			copiedBytes: 0,
+			totalBytes: 0,
+		});
+		expect(existsSync(stagingDirectory)).toBe(false);
+	});
+
+	it("does not stage a stopped target after its normal writer lease is released", async () => {
+		const target = fixture();
+		await initialize(target.compactor);
+		const lease = target.acquireLifecycleLease();
+		if (!lease) throw new Error("expected fixture writer lease");
+		expect(lease.release().state).toBe("released");
+		const value = Buffer.from("released-writer-lease");
+		const sourcePath = join(target.root, "released-writer-lease.bin");
+		writeFileSync(sourcePath, value, { mode: 0o600 });
+		const stagingDirectory = join(target.agentDir, "incident-recorder", "cas", "sha256", "staging");
+
+		expect(
+			target.compactor.streamStoppedTargetArtifact(RUN_ID, sourcePath, "binary", {
+				deadlineMs: Date.now() + 1_000,
+				byteBudget: value.length + 1,
+			}),
+		).toEqual({
+			state: "pending",
+			reason: "writer_lifecycle_lease_released",
+			copiedBytes: 0,
+			totalBytes: 0,
+		});
+		expect(existsSync(stagingDirectory)).toBe(false);
+	});
+
+	it("retains a stopped-target cleanup reservation while its writer lease is unavailable", async () => {
+		const target = fixture();
+		await initialize(target.compactor);
+		const value = Buffer.from("retained-cleanup-state");
+		const sourcePath = join(target.root, "retained-cleanup-state.bin");
+		writeFileSync(sourcePath, value, { mode: 0o600 });
+		const first = target.compactor.streamStoppedTargetArtifact(RUN_ID, sourcePath, "binary", {
+			deadlineMs: Date.now() + 1_000,
+			byteBudget: 1,
+		});
+		expect(first).toMatchObject({ state: "pending", reason: "work_budget", copiedBytes: 1 });
+		const lease = target.acquireLifecycleLease();
+		if (!lease) throw new Error("expected fixture writer lease");
+		lease.release();
+
+		target.internal.discardStoppedTargetStreams();
+		const retainedState = [...target.internal.stoppedTargetStreams.values()][0];
+		expect(retainedState).toBeDefined();
+		expect(retainedState?.reservationReleased).toBe(false);
+		expect(existsSync(join(target.agentDir, "incident-recorder", "cas", "sha256", "staging"))).toBe(true);
+	});
+
+	it("does not discard a partial stage with an unrecognized link count", async () => {
+		const target = fixture();
+		await initialize(target.compactor);
+		const value = Buffer.from("unknown-stage-link-count");
+		const sourcePath = join(target.root, "unknown-stage-link-count.bin");
+		writeFileSync(sourcePath, value, { mode: 0o600 });
+		const first = target.compactor.streamStoppedTargetArtifact(RUN_ID, sourcePath, "binary", {
+			deadlineMs: Date.now() + 1_000,
+			byteBudget: 1,
+		});
+		expect(first).toMatchObject({ state: "pending", reason: "work_budget", copiedBytes: 1 });
+		const key = createHash("sha256").update(`${RUN_ID}\0${sourcePath}\0binary`).digest("hex");
+		const stagedPath = join(target.agentDir, "incident-recorder", "cas", "sha256", "staging", `${key}.tmp`);
+		const foreignLinks = [1, 2, 3].map((index) => `${stagedPath}.foreign-${index}`);
+		for (const foreignLink of foreignLinks) linkSync(stagedPath, foreignLink);
+		expect(lstatSync(stagedPath, { bigint: true }).nlink).toBe(4n);
+
+		target.internal.discardStoppedTargetStreams();
+		const retainedState = [...target.internal.stoppedTargetStreams.values()][0];
+		expect(retainedState).toBeDefined();
+		expect(retainedState?.reservationReleased).toBe(false);
+		expect(existsSync(stagedPath)).toBe(true);
+		expect(lstatSync(stagedPath, { bigint: true }).nlink).toBe(4n);
+	});
+
+	it("does not delete a replaced stopped-target stage during cleanup", async () => {
+		const target = fixture();
+		await initialize(target.compactor);
+		const value = Buffer.from("replaced-cleanup-stage");
+		const sourcePath = join(target.root, "replaced-cleanup-stage.bin");
+		writeFileSync(sourcePath, value, { mode: 0o600 });
+		expect(
+			target.compactor.streamStoppedTargetArtifact(RUN_ID, sourcePath, "binary", {
+				deadlineMs: Date.now() + 1_000,
+				byteBudget: 1,
+			}),
+		).toMatchObject({ state: "pending", reason: "work_budget", copiedBytes: 1 });
+		const key = createHash("sha256").update(`${RUN_ID}\0${sourcePath}\0binary`).digest("hex");
+		const stagedPath = join(target.agentDir, "incident-recorder", "cas", "sha256", "staging", `${key}.tmp`);
+		const retainedPath = `${stagedPath}.retained`;
+		renameSync(stagedPath, retainedPath);
+		const foreignValue = Buffer.from("foreign-stage");
+		writeFileSync(stagedPath, foreignValue, { mode: 0o600 });
+
+		target.internal.discardStoppedTargetStreams();
+		const retainedState = [...target.internal.stoppedTargetStreams.values()][0];
+		expect(retainedState).toBeDefined();
+		expect(retainedState?.reservationReleased).toBe(false);
+		expect(readFileSync(stagedPath)).toEqual(foreignValue);
+	});
+
+	it("does not stage into a replacement recorder root after lifecycle identity replacement", async () => {
+		const target = fixture();
+		await initialize(target.compactor);
+		const lease = target.acquireLifecycleLease();
+		if (!lease) throw new Error("expected fixture writer lease");
+		const recorderRoot = join(target.agentDir, "incident-recorder");
+		const retainedRoot = `${recorderRoot}.retained`;
+		renameSync(recorderRoot, retainedRoot);
+		mkdirSync(recorderRoot, { mode: 0o700 });
+		const value = Buffer.from("replacement-recorder-root");
+		const sourcePath = join(target.root, "replacement-recorder-root.bin");
+		writeFileSync(sourcePath, value, { mode: 0o600 });
+
+		expect(
+			target.compactor.streamStoppedTargetArtifact(RUN_ID, sourcePath, "binary", {
+				deadlineMs: Date.now() + 1_000,
+				byteBudget: value.length + 1,
+			}),
+		).toMatchObject({
+			state: "pending",
+			reason: "writer_lifecycle_namespace_changed",
+			copiedBytes: 0,
+			totalBytes: value.length,
+		});
+		expect(readdirSync(recorderRoot)).toEqual([]);
+		expect(existsSync(join(retainedRoot, "cas", "sha256", "staging"))).toBe(false);
+	});
+
+	it("retries an occurrence after lifecycle loss without converting it to a durable gap", async () => {
+		let replaced = false;
 		const target = fixture({
 			onCasPublicationStep: (step) => {
-				if (step === "cas_durable" && failAfterCas) throw new Error("injected-after-cas-fsync");
+				if (step !== "cas_durable" || replaced) return;
+				replaced = true;
+				const recorderRoot = join(target.agentDir, "incident-recorder");
+				renameSync(recorderRoot, `${recorderRoot}.retained`);
+				mkdirSync(recorderRoot, { mode: 0o700 });
 			},
 		});
 		await initialize(target.compactor);
+		const fields = exportedJournalFields(terminalJournalEntry(902, 1));
+		let thrown: unknown;
+		try {
+			target.internal.acceptEntry(fields);
+		} catch (error) {
+			thrown = error;
+		}
+		expect(thrown).toBeInstanceOf(Error);
+		expect(thrown).toMatchObject({ name: "IncidentRecorderWriterLifecycleAdmissionError" });
+		expect(target.internal.pendingEntries).toHaveLength(0);
+		expect(target.internal.assemblies.size).toBe(1);
+		expect(existsSync(join(target.agentDir, "incident-recorder", "compactor-cursor.json"))).toBe(false);
+		expect(existsSync(join(target.agentDir, "incident-recorder", "segments"))).toBe(false);
+	});
+
+	it("publishes first-use nested CAS and run-lease paths durably and resumes after the CAS crash boundary", async () => {
+		let failAtStep: "cas_durable" | "lease_durable" | undefined = "cas_durable";
+		let activeLease: IncidentRecorderWriterLifecycleLease | undefined;
+		const target = fixture({
+			writerLifecycleLease: () => activeLease,
+			onCasPublicationStep: (step) => {
+				if (step === failAtStep) throw new Error(`injected-after-${step}-fsync`);
+			},
+		});
+		await initialize(target.compactor);
+		activeLease = target.acquireLifecycleLease();
+		if (!activeLease) throw new Error("expected fixture writer lease");
 		const value = Buffer.from("first-use-cas");
+		const sourcePath = join(target.root, "first-use-cas.bin");
+		writeFileSync(sourcePath, value, { mode: 0o600 });
 		const digest = createHash("sha256").update(value).digest("hex");
-		const casPath = join(
-			target.agentDir,
-			"incident-recorder",
-			"cas",
-			"sha256",
-			digest.slice(0, 2),
-			`${digest}.blob`,
-		);
+		const casPath = join(target.agentDir, "incident-recorder", "cas", "sha256", digest.slice(0, 2), `${digest}.blob`);
 		const leasePath = join(
 			target.agentDir,
 			"incident-recorder",
@@ -658,21 +1285,34 @@ describe("incident recorder compactor segment integration", () => {
 			`cas-${digest}.blob`,
 		);
 		const before = target.compactor.accountedStorageBytes;
-		expect(() =>
-			target.internal.publishCasAndRunLease({ runId: RUN_ID, digest, bytes: value.length, value }),
-		).toThrow("injected-after-cas-fsync");
+		expect(
+			target.compactor.streamStoppedTargetArtifact(RUN_ID, sourcePath, "binary", {
+				deadlineMs: Date.now() + 1_000,
+				byteBudget: value.length + 1,
+			}),
+		).toMatchObject({ state: "pending", reason: "writer_lifecycle_unavailable" });
 		expect(readFileSync(casPath)).toEqual(value);
 		expect(existsSync(leasePath)).toBe(false);
-		expect(target.compactor.accountedStorageBytes).toBeGreaterThan(before);
 
-		failAfterCas = false;
-		const published = target.internal.publishCasAndRunLease({
-			runId: RUN_ID,
-			digest,
-			bytes: value.length,
-			value,
+		const lifecycleContract: IncidentRecorderWriterLifecycleAdmissionContract = {
+			activationGenerationDigest: "a".repeat(64),
+			revalidateActivation: () => ({ state: "valid" }),
+			acquireCas: acquireIncidentRecorderNamespaceCas,
+		};
+		expect(activeLease.release().state).toBe("released");
+		const admission = acquireIncidentRecorderWriterNormalLease({ agentDir: target.agentDir }, lifecycleContract);
+		if (admission.state !== "acquired") throw new Error(`retry lease unavailable: ${admission.reason}`);
+		activeLease = admission.lease;
+		lifecycleLeases.push(activeLease);
+		failAtStep = undefined;
+		const published = target.compactor.streamStoppedTargetArtifact(RUN_ID, sourcePath, "binary", {
+			deadlineMs: Date.now() + 1_000,
+			byteBudget: value.length + 1,
 		});
-		expect(published).toEqual({ casPath, leasePath });
+		expect(published).toEqual({
+			state: "complete",
+			artifact: { algorithm: "sha256", digest, bytes: value.length, path: casPath, encoding: "binary" },
+		});
 		const cas = lstatSync(casPath);
 		const lease = lstatSync(leasePath);
 		expect({ dev: lease.dev, ino: lease.ino, size: lease.size }).toEqual({
@@ -681,10 +1321,461 @@ describe("incident recorder compactor segment integration", () => {
 			size: value.length,
 		});
 		const afterPublication = target.compactor.accountedStorageBytes;
+		expect(target.compactor.accountedStorageBytes).toBeGreaterThan(before);
 		expect(
-			target.internal.publishCasAndRunLease({ runId: RUN_ID, digest, bytes: value.length, value }),
-		).toEqual({ casPath, leasePath });
+			target.compactor.streamStoppedTargetArtifact(RUN_ID, sourcePath, "binary", {
+				deadlineMs: Date.now() + 1_000,
+				byteBudget: value.length + 1,
+			}),
+		).toEqual({
+			state: "complete",
+			artifact: { algorithm: "sha256", digest, bytes: value.length, path: casPath, encoding: "binary" },
+		});
 		expect(target.compactor.accountedStorageBytes).toBe(afterPublication);
+
+		const restartValue = Buffer.from("first-use-cas-restart");
+		const restartSourcePath = join(target.root, "first-use-cas-restart.bin");
+		writeFileSync(restartSourcePath, restartValue, { mode: 0o600 });
+		const restartDigest = createHash("sha256").update(restartValue).digest("hex");
+		const restartCasPath = join(
+			target.agentDir,
+			"incident-recorder",
+			"cas",
+			"sha256",
+			restartDigest.slice(0, 2),
+			`${restartDigest}.blob`,
+		);
+		const restartLeasePath = join(
+			target.agentDir,
+			"incident-recorder",
+			"refs",
+			"runs",
+			createHash("sha256").update(RUN_ID).digest("hex"),
+			`cas-${restartDigest}.blob`,
+		);
+		failAtStep = "cas_durable";
+		expect(
+			target.compactor.streamStoppedTargetArtifact(RUN_ID, restartSourcePath, "binary", {
+				deadlineMs: Date.now() + 1_000,
+				byteBudget: restartValue.length + 1,
+			}),
+		).toMatchObject({ state: "pending", reason: "writer_lifecycle_unavailable" });
+		expect(readFileSync(restartCasPath)).toEqual(restartValue);
+		expect(existsSync(restartLeasePath)).toBe(false);
+		expect(activeLease.release().state).toBe("released");
+		const restartAdmission = acquireIncidentRecorderWriterNormalLease(
+			{ agentDir: target.agentDir },
+			lifecycleContract,
+		);
+		if (restartAdmission.state !== "acquired")
+			throw new Error(`fresh restart lease unavailable: ${restartAdmission.reason}`);
+		lifecycleLeases.push(restartAdmission.lease);
+		const restarted = new IncidentRecorderCompactor({
+			agentDir: target.agentDir,
+			storageScannerPath: join(target.root, "storage-scanner.cjs"),
+			freeReserveBytes: 0,
+			writerLifecycleLease: () => restartAdmission.lease,
+		});
+		await initialize(restarted);
+		const resumedAfterRestart = restarted.streamStoppedTargetArtifact(RUN_ID, restartSourcePath, "binary", {
+			deadlineMs: Date.now() + 1_000,
+			byteBudget: restartValue.length + 1,
+		});
+		expect(resumedAfterRestart).toEqual({
+			state: "complete",
+			artifact: {
+				algorithm: "sha256",
+				digest: restartDigest,
+				bytes: restartValue.length,
+				path: restartCasPath,
+				encoding: "binary",
+			},
+		});
+		expect(readFileSync(restartCasPath)).toEqual(restartValue);
+		const restartCas = lstatSync(restartCasPath);
+		const restartLease = lstatSync(restartLeasePath);
+		expect({ dev: restartLease.dev, ino: restartLease.ino, size: restartLease.size }).toEqual({
+			dev: restartCas.dev,
+			ino: restartCas.ino,
+			size: restartValue.length,
+		});
+
+		activeLease = restartAdmission.lease;
+		const leaseDurableValue = Buffer.from("first-use-cas-lease-durable");
+		const leaseDurableSourcePath = join(target.root, "first-use-cas-lease-durable.bin");
+		writeFileSync(leaseDurableSourcePath, leaseDurableValue, { mode: 0o600 });
+		const leaseDurableDigest = createHash("sha256").update(leaseDurableValue).digest("hex");
+		const leaseDurableCasPath = join(
+			target.agentDir,
+			"incident-recorder",
+			"cas",
+			"sha256",
+			leaseDurableDigest.slice(0, 2),
+			`${leaseDurableDigest}.blob`,
+		);
+		const leaseDurableLeasePath = join(
+			target.agentDir,
+			"incident-recorder",
+			"refs",
+			"runs",
+			createHash("sha256").update(RUN_ID).digest("hex"),
+			`cas-${leaseDurableDigest}.blob`,
+		);
+		const leaseDurableStagePath = join(
+			target.agentDir,
+			"incident-recorder",
+			"cas",
+			"sha256",
+			"staging",
+			`${createHash("sha256").update(`${RUN_ID}\0${leaseDurableSourcePath}\0binary`).digest("hex")}.tmp`,
+		);
+		failAtStep = "lease_durable";
+		expect(
+			target.compactor.streamStoppedTargetArtifact(RUN_ID, leaseDurableSourcePath, "binary", {
+				deadlineMs: Date.now() + 1_000,
+				byteBudget: leaseDurableValue.length + 1,
+			}),
+		).toMatchObject({ state: "pending", reason: "writer_lifecycle_unavailable" });
+		expect(readFileSync(leaseDurableCasPath)).toEqual(leaseDurableValue);
+		expect(readFileSync(leaseDurableLeasePath)).toEqual(leaseDurableValue);
+		const leaseDurableCas = lstatSync(leaseDurableCasPath, { bigint: true });
+		const leaseDurableLease = lstatSync(leaseDurableLeasePath, { bigint: true });
+		const leaseDurableStage = lstatSync(leaseDurableStagePath, { bigint: true });
+		expect(leaseDurableCas.nlink).toBe(3n);
+		expect(leaseDurableStage.nlink).toBe(3n);
+		expect({ dev: leaseDurableLease.dev, ino: leaseDurableLease.ino, size: leaseDurableLease.size }).toEqual({
+			dev: leaseDurableCas.dev,
+			ino: leaseDurableCas.ino,
+			size: BigInt(leaseDurableValue.length),
+		});
+		const foreignStageLink = `${leaseDurableStagePath}.foreign`;
+		linkSync(leaseDurableStagePath, foreignStageLink);
+		expect(
+			target.compactor.streamStoppedTargetArtifact(RUN_ID, leaseDurableSourcePath, "binary", {
+				deadlineMs: Date.now() + 1_000,
+				byteBudget: leaseDurableValue.length + 1,
+			}),
+		).toMatchObject({ state: "pending", reason: "artifact_staging_reconciliation_required" });
+		expect(lstatSync(leaseDurableStagePath, { bigint: true }).nlink).toBe(4n);
+		expect(existsSync(foreignStageLink)).toBe(true);
+		rmSync(foreignStageLink);
+		expect(lstatSync(leaseDurableStagePath, { bigint: true }).nlink).toBe(3n);
+		expect(activeLease.release().state).toBe("released");
+		const leaseDurableAdmission = acquireIncidentRecorderWriterNormalLease(
+			{ agentDir: target.agentDir },
+			lifecycleContract,
+		);
+		if (leaseDurableAdmission.state !== "acquired")
+			throw new Error(`lease-durable restart lease unavailable: ${leaseDurableAdmission.reason}`);
+		lifecycleLeases.push(leaseDurableAdmission.lease);
+		const leaseDurableRestarted = new IncidentRecorderCompactor({
+			agentDir: target.agentDir,
+			storageScannerPath: join(target.root, "storage-scanner.cjs"),
+			freeReserveBytes: 0,
+			writerLifecycleLease: () => leaseDurableAdmission.lease,
+		});
+		await initialize(leaseDurableRestarted);
+		expect(
+			leaseDurableRestarted.streamStoppedTargetArtifact(RUN_ID, leaseDurableSourcePath, "binary", {
+				deadlineMs: Date.now() + 1_000,
+				byteBudget: leaseDurableValue.length + 1,
+			}),
+		).toEqual({
+			state: "complete",
+			artifact: {
+				algorithm: "sha256",
+				digest: leaseDurableDigest,
+				bytes: leaseDurableValue.length,
+				path: leaseDurableCasPath,
+				encoding: "binary",
+			},
+		});
+		expect(existsSync(join(target.agentDir, "incident-recorder", "cas", "sha256", "staging"))).toBe(true);
+		expect(existsSync(leaseDurableStagePath)).toBe(false);
+	});
+
+	it("reopens stopped-target files per capability scope and rejects a detached root without touching its successor", async () => {
+		let swapRoot = false;
+		let retainedRoot = "";
+		let recorderRootToSwap = "";
+		const target = fixture({
+			onCasPublicationStep: (step) => {
+				if (step !== "cas_durable" || !swapRoot) return;
+				swapRoot = false;
+				retainedRoot = `${recorderRootToSwap}.retained`;
+				renameSync(recorderRootToSwap, retainedRoot);
+				mkdirSync(recorderRootToSwap, { mode: 0o700 });
+			},
+		});
+		recorderRootToSwap = join(target.agentDir, "incident-recorder");
+		await initialize(target.compactor);
+		const sourcePath = join(target.root, "detached-source.bin");
+		const value = Buffer.from("detached-stopped-target");
+		writeFileSync(sourcePath, value, { mode: 0o600 });
+		const first = target.compactor.streamStoppedTargetArtifact(RUN_ID, sourcePath, "binary", {
+			deadlineMs: Date.now() + 1_000,
+			byteBudget: 1,
+		});
+		expect(first).toMatchObject({ state: "pending", reason: "work_budget", copiedBytes: 1 });
+		const stagingPath = join(
+			target.agentDir,
+			"incident-recorder",
+			"cas",
+			"sha256",
+			"staging",
+			`${createHash("sha256").update(`${RUN_ID}\0${sourcePath}\0binary`).digest("hex")}.tmp`,
+		);
+		expect(descriptorsPointingTo(sourcePath)).toEqual([]);
+		expect(descriptorsPointingTo(stagingPath)).toEqual([]);
+		const retainedState = [...target.internal.stoppedTargetStreams.values()][0];
+		expect(retainedState).toBeDefined();
+		expect(Object.keys(retainedState ?? {})).not.toEqual(
+			expect.arrayContaining(["source", "target", "temporary", "descriptor", "root"]),
+		);
+
+		swapRoot = true;
+		const detached = target.compactor.streamStoppedTargetArtifact(RUN_ID, sourcePath, "binary", {
+			deadlineMs: Date.now() + 1_000,
+			byteBudget: value.length + 1,
+		});
+		expect(detached).toMatchObject({ state: "pending", reason: "writer_lifecycle_namespace_changed" });
+		expect(target.internal.stoppedTargetStreams.size).toBe(1);
+		expect(readdirSync(join(target.agentDir, "incident-recorder"))).toEqual([]);
+		expect(retainedRoot).not.toBe("");
+		expect(
+			readFileSync(
+				join(
+					retainedRoot,
+					"cas",
+					"sha256",
+					createHash("sha256").update(value).digest("hex").slice(0, 2),
+					`${createHash("sha256").update(value).digest("hex")}.blob`,
+				),
+			),
+		).toEqual(value);
+	});
+
+	it("rehydrates an owned stopped-target stage after compactor restart", async () => {
+		const target = fixture();
+		await initialize(target.compactor);
+		const value = Buffer.from("restart-safe-stopped-target-artifact");
+		const sourcePath = join(target.root, "restart-safe-stopped-target.bin");
+		writeFileSync(sourcePath, value, { mode: 0o600 });
+		const first = target.compactor.streamStoppedTargetArtifact(RUN_ID, sourcePath, "binary", {
+			deadlineMs: Date.now() + 1_000,
+			byteBudget: 5,
+		});
+		expect(first).toMatchObject({ state: "pending", reason: "work_budget", copiedBytes: 5 });
+		const lifecycleContract: IncidentRecorderWriterLifecycleAdmissionContract = {
+			activationGenerationDigest: "a".repeat(64),
+			revalidateActivation: () => ({ state: "valid" }),
+			acquireCas: acquireIncidentRecorderNamespaceCas,
+		};
+		target.releaseLifecycleLease();
+		const admission = acquireIncidentRecorderWriterNormalLease({ agentDir: target.agentDir }, lifecycleContract);
+		if (admission.state !== "acquired") throw new Error(`restart lease unavailable: ${admission.reason}`);
+		lifecycleLeases.push(admission.lease);
+		const restarted = new IncidentRecorderCompactor({
+			agentDir: target.agentDir,
+			storageScannerPath: join(target.root, "storage-scanner.cjs"),
+			freeReserveBytes: 0,
+			writerLifecycleLease: () => admission.lease,
+		});
+		await initialize(restarted);
+		const resumed = restarted.streamStoppedTargetArtifact(RUN_ID, sourcePath, "binary", {
+			deadlineMs: Date.now() + 1_000,
+			byteBudget: value.length + 1,
+		});
+		expect(resumed).toMatchObject({ state: "complete" });
+		const digest = createHash("sha256").update(value).digest("hex");
+		expect(
+			readFileSync(
+				join(target.agentDir, "incident-recorder", "cas", "sha256", digest.slice(0, 2), `${digest}.blob`),
+			),
+		).toEqual(value);
+	});
+
+	it("leaves a mismatching restart stage untouched with explicit reconciliation evidence", async () => {
+		const target = fixture();
+		await initialize(target.compactor);
+		const value = Buffer.from("restart-stage-source-content");
+		const sourcePath = join(target.root, "restart-stage-source.bin");
+		writeFileSync(sourcePath, value, { mode: 0o600 });
+		const first = target.compactor.streamStoppedTargetArtifact(RUN_ID, sourcePath, "binary", {
+			deadlineMs: Date.now() + 1_000,
+			byteBudget: 5,
+		});
+		expect(first).toMatchObject({ state: "pending", reason: "work_budget", copiedBytes: 5 });
+		const key = createHash("sha256").update(`${RUN_ID}\0${sourcePath}\0binary`).digest("hex");
+		const stagedPath = join(target.agentDir, "incident-recorder", "cas", "sha256", "staging", `${key}.tmp`);
+		const foreignValue = Buffer.from("foreign");
+		writeFileSync(stagedPath, foreignValue, { mode: 0o600 });
+		const lifecycleContract: IncidentRecorderWriterLifecycleAdmissionContract = {
+			activationGenerationDigest: "a".repeat(64),
+			revalidateActivation: () => ({ state: "valid" }),
+			acquireCas: acquireIncidentRecorderNamespaceCas,
+		};
+		target.releaseLifecycleLease();
+		const admission = acquireIncidentRecorderWriterNormalLease({ agentDir: target.agentDir }, lifecycleContract);
+		if (admission.state !== "acquired") throw new Error(`restart lease unavailable: ${admission.reason}`);
+		lifecycleLeases.push(admission.lease);
+		const restarted = new IncidentRecorderCompactor({
+			agentDir: target.agentDir,
+			storageScannerPath: join(target.root, "storage-scanner.cjs"),
+			freeReserveBytes: 0,
+			writerLifecycleLease: () => admission.lease,
+		});
+		await initialize(restarted);
+		expect(
+			restarted.streamStoppedTargetArtifact(RUN_ID, sourcePath, "binary", {
+				deadlineMs: Date.now() + 1_000,
+				byteBudget: value.length + 1,
+			}),
+		).toMatchObject({
+			state: "pending",
+			reason: "artifact_staging_reconciliation_required",
+		});
+		expect(readFileSync(stagedPath)).toEqual(foreignValue);
+	});
+
+	it("bounds incident-root discovery while progressing past many unrelated directories without losing journal evidence", async () => {
+		const target = fixture({
+			pendingPinDirectoryDiscoveryEntriesPerPass: 5,
+			pendingPinDirectoryBatchCount: 5,
+		});
+		const anchor = Date.now();
+		const incidentRoot = join(target.agentDir, "incidents");
+		for (let index = 0; index < 301; index += 1) {
+			mkdirSync(join(incidentRoot, `empty-${index.toString().padStart(4, "0")}`), {
+				recursive: true,
+				mode: 0o700,
+			});
+		}
+		const pin = preparePinFixture(target, anchor);
+		await initialize(target.compactor);
+		const occurrence = occurrenceInput(1, anchor, pin.digest, pin.casPath);
+		target.internal.appendSegmentRecord(occurrence.input);
+		writeScanProof(pin.incidentDir, anchor, [occurrence.cursor]);
+		const manifestPath = join(pin.incidentDir, "journal-pin-manifest.json");
+
+		for (let pass = 0; pass < 256 && !existsSync(manifestPath); pass += 1) {
+			target.compactor.processPendingPins(anchor + 1);
+			expect(target.internal.pendingPinDirectoryEntriesReadLastPass).toBeLessThanOrEqual(5);
+			const traversal = target.internal.pendingPinDirectoryTraversal;
+			if (traversal) {
+				expect(traversal.pendingNames.length).toBeLessThanOrEqual(5);
+				expect(traversal.pendingNameBytes).toBeLessThanOrEqual(5 * 4096);
+			}
+		}
+
+		expect(existsSync(manifestPath)).toBe(true);
+		const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
+			version?: unknown;
+			occurrences?: Array<{
+				occurrenceReference?: { kind?: unknown; locator?: unknown };
+				cursors?: unknown;
+				cas?: { digest?: unknown };
+			}>;
+		};
+		expect(manifest.version).toBe(2);
+		expect(manifest.occurrences).toHaveLength(1);
+		expect(manifest.occurrences?.[0]).toMatchObject({
+			occurrenceReference: { kind: "segment" },
+			cursors: [occurrence.cursor],
+			cas: { digest: pin.digest },
+		});
+		target.internal.closeSegmentStore();
+	});
+
+	it("resumes a cursor sweep after restart and fairly reconsiders names inserted on both sides of the cursor", async () => {
+		const target = fixture({
+			pendingPinDirectoryDiscoveryEntriesPerPass: 1,
+			pendingPinDirectoryBatchCount: 1,
+		});
+		const anchor = Date.now();
+		const incidentRoot = join(target.agentDir, "incidents");
+		mkdirSync(join(incidentRoot, "middle-cursor"), { recursive: true, mode: 0o700 });
+		await initialize(target.compactor);
+		target.compactor.processPendingPins(anchor);
+		expect(target.internal.pendingPinCursor).toBe("middle-cursor");
+		expect(target.internal.pendingPinDirectoryEntriesReadLastPass).toBe(1);
+		target.internal.closeSegmentStore();
+
+		const later = join(incidentRoot, "zzz-existing-request");
+		const earlier = join(incidentRoot, "000-new-request");
+		writePendingJournalPinRequest(later, anchor);
+		writePendingJournalPinRequest(earlier, anchor);
+		const restarted = new IncidentRecorderCompactor({
+			agentDir: target.agentDir,
+			storageScannerPath: join(target.root, "storage-scanner.cjs"),
+			freeReserveBytes: 0,
+			writerLifecycleLease: () => target.lifecycleLease,
+			pendingPinDirectoryDiscoveryEntriesPerPass: 1,
+			pendingPinDirectoryBatchCount: 1,
+		});
+		const restartedInternal = restarted as unknown as CompactorInternals;
+		await initialize(restarted);
+		for (
+			let pass = 0;
+			pass < 32 &&
+			(!existsSync(join(later, "sysdig-pin-incomplete.json")) ||
+				!existsSync(join(earlier, "sysdig-pin-incomplete.json")));
+			pass += 1
+		) {
+			restarted.processPendingPins(anchor);
+			expect(restartedInternal.pendingPinDirectoryEntriesReadLastPass).toBeLessThanOrEqual(1);
+		}
+		expect(existsSync(join(later, "sysdig-pin-incomplete.json"))).toBe(true);
+		expect(existsSync(join(earlier, "sysdig-pin-incomplete.json"))).toBe(true);
+		restartedInternal.closeSegmentStore();
+	});
+
+	it("discovers a stranded Sysdig request through a bounded root sweep and restores its journal pair", async () => {
+		const ringDirectory = mkdtempSync(join(tmpdir(), "prime-agent-bounded-sysdig-"));
+		const target = fixture({
+			sysdigRingBasePath: join(ringDirectory, "ring.scap"),
+			pendingPinDirectoryDiscoveryEntriesPerPass: 3,
+			pendingPinDirectoryBatchCount: 3,
+		});
+		roots.push(ringDirectory);
+		mkdirSync(ringDirectory, { recursive: true, mode: 0o700 });
+		const anchor = Date.now();
+		const incidentRoot = join(target.agentDir, "incidents");
+		for (let index = 0; index < 40; index += 1) {
+			mkdirSync(join(incidentRoot, `unrelated-${index.toString().padStart(3, "0")}`), {
+				recursive: true,
+				mode: 0o700,
+			});
+		}
+		const incidentDir = join(incidentRoot, "sysdig-only-request");
+		mkdirSync(incidentDir, { recursive: true, mode: 0o700 });
+		const requester = new IncidentRecorderCompactor({
+			agentDir: target.agentDir,
+			storageScannerPath: join(target.root, "storage-scanner.cjs"),
+			sysdigRingBasePath: join(ringDirectory, "ring.scap"),
+			freeReserveBytes: 0,
+			onSysdigPinStep: (step) => {
+				if (step === "sysdig_request_durable") throw new Error("stranded-after-sysdig-request");
+			},
+		});
+		await initialize(requester);
+		expect(() => requester.requestPin(RUN_ID, incidentDir, anchor)).toThrow("stranded-after-sysdig-request");
+		expect(existsSync(join(incidentDir, "sysdig-pin-request.json"))).toBe(true);
+		expect(existsSync(join(incidentDir, "journal-pin-request.json"))).toBe(false);
+
+		await initialize(target.compactor);
+		for (let pass = 0; pass < 64 && !existsSync(join(incidentDir, "journal-pin-request.json")); pass += 1) {
+			target.compactor.processPendingPins(anchor);
+			expect(target.internal.pendingPinDirectoryEntriesReadLastPass).toBeLessThanOrEqual(3);
+		}
+		expect(existsSync(join(incidentDir, "journal-pin-request.json"))).toBe(true);
+		expect(JSON.parse(readFileSync(join(incidentDir, "journal-pin-request.json"), "utf8"))).toMatchObject({
+			version: 1,
+			state: "pending",
+			runId: RUN_ID,
+			anchorWallTimeMs: anchor,
+		});
+		target.internal.closeSegmentStore();
 	});
 
 	it("pages segment occurrences, merges a legacy duplicate, and validates v2 locator manifests", async () => {
@@ -728,10 +1819,12 @@ describe("incident recorder compactor segment integration", () => {
 		};
 		expect(manifest.version).toBe(2);
 		expect(manifest.occurrences).toHaveLength(65);
-		expect(manifest.occurrences.every((entry) => {
-			const reference = entry.occurrenceReference as { kind?: unknown; locator?: unknown };
-			return reference.kind === "segment" && typeof reference.locator === "object";
-		})).toBe(true);
+		expect(
+			manifest.occurrences.every((entry) => {
+				const reference = entry.occurrenceReference as { kind?: unknown; locator?: unknown };
+				return reference.kind === "segment" && typeof reference.locator === "object";
+			}),
+		).toBe(true);
 
 		rmSync(join(pin.incidentDir, "journal-pin-retention-proof.json"), { force: true });
 		target.internal.closeSegmentStore();
@@ -773,16 +1866,12 @@ describe("incident recorder compactor segment integration", () => {
 			{ mode: 0o600 },
 		);
 		writeScanProof(pin.incidentDir, anchor, [occurrence.cursor]);
-		for (
-			let pass = 0;
-			pass < 10 && !existsSync(join(pin.incidentDir, "journal-pin-incomplete.json"));
-			pass += 1
-		) {
+		for (let pass = 0; pass < 10 && !existsSync(join(pin.incidentDir, "journal-pin-incomplete.json")); pass += 1) {
 			target.compactor.processPendingPins(anchor + 1);
 		}
-		const incomplete = JSON.parse(
-			readFileSync(join(pin.incidentDir, "journal-pin-incomplete.json"), "utf8"),
-		) as { reason?: unknown };
+		const incomplete = JSON.parse(readFileSync(join(pin.incidentDir, "journal-pin-incomplete.json"), "utf8")) as {
+			reason?: unknown;
+		};
 		expect(incomplete.reason).toBe("duplicate_occurrence_identity_conflict");
 		expect(existsSync(join(pin.incidentDir, "journal-pin-manifest.json"))).toBe(false);
 		target.internal.closeSegmentStore();
@@ -803,10 +1892,7 @@ describe("incident recorder compactor segment integration", () => {
 			);
 			mkdirSync(legacyRunDirectory, { recursive: true, mode: 0o700 });
 			const identity = occurrenceIdentity(1);
-			const path = join(
-				legacyRunDirectory,
-				`seq-${"1".padStart(20, "0")}-${identity.identityKey}.json`,
-			);
+			const path = join(legacyRunDirectory, `seq-${"1".padStart(20, "0")}-${identity.identityKey}.json`);
 			if (kind === "symlink") {
 				const source = join(target.root, "forged-legacy.json");
 				writeFileSync(source, "{}\n", { mode: 0o600 });
@@ -816,16 +1902,12 @@ describe("incident recorder compactor segment integration", () => {
 			}
 			writeScanProof(pin.incidentDir, anchor, []);
 			await initialize(target.compactor);
-			for (
-				let pass = 0;
-				pass < 5 && !existsSync(join(pin.incidentDir, "journal-pin-incomplete.json"));
-				pass += 1
-			) {
+			for (let pass = 0; pass < 5 && !existsSync(join(pin.incidentDir, "journal-pin-incomplete.json")); pass += 1) {
 				target.compactor.processPendingPins(anchor + 1);
 			}
-			const incomplete = JSON.parse(
-				readFileSync(join(pin.incidentDir, "journal-pin-incomplete.json"), "utf8"),
-			) as { reason?: unknown };
+			const incomplete = JSON.parse(readFileSync(join(pin.incidentDir, "journal-pin-incomplete.json"), "utf8")) as {
+				reason?: unknown;
+			};
 			expect(incomplete.reason).toBe("legacy_occurrence_reference_corrupt_or_unstable");
 			target.internal.closeSegmentStore();
 		},
@@ -952,8 +2034,7 @@ describe("incident recorder compactor segment integration", () => {
 		(callerOwnedEvent.transportIdentity as Record<string, unknown>).poisonedByCaller = true;
 		callerOwnedEvent.cas.path = "poisoned-by-caller";
 		if (typeof callerOwnedEvent.occurrenceReference !== "string") {
-			(callerOwnedEvent.occurrenceReference.locator as { payloadSha256: string }).payloadSha256 =
-				"0".repeat(64);
+			(callerOwnedEvent.occurrenceReference.locator as { payloadSha256: string }).payloadSha256 = "0".repeat(64);
 		}
 		const late = occurrenceInput(66, anchor, pin.digest, pin.casPath);
 		target.internal.appendSegmentRecord(late.input);
@@ -971,6 +2052,121 @@ describe("incident recorder compactor segment integration", () => {
 		expect(result.projection.evidence).toEqual([]);
 		expect(result.snapshot).toMatchObject({ segmentRecordCount: 65, legacyOccurrenceCount: 0 });
 		target.internal.closeSegmentStore();
+	});
+
+	it("defers pending projection materialization behind an explicit cursor-only response", async () => {
+		const target = fixture();
+		const anchor = Date.now();
+		const pin = preparePinFixture(target, anchor);
+		await initialize(target.compactor);
+		for (let index = 1; index <= 65; index += 1) {
+			target.internal.appendSegmentRecord(occurrenceInput(index, anchor, pin.digest, pin.casPath).input);
+		}
+		const request = {
+			runId: RUN_ID,
+			fromWallTimeMs: anchor,
+			throughWallTimeMs: anchor + 1_000,
+			pendingResponse: "cursor-only" as const,
+		};
+		const projection = vi.spyOn(
+			target.compactor as unknown as { runHistoryProjection: (...args: unknown[]) => unknown },
+			"runHistoryProjection",
+		);
+		const first = target.compactor.projectRunHistory(request);
+		expect(first.state).toBe("pending");
+		if (first.state !== "pending") throw new Error("expected a cursor-only continuation");
+		expect(first).not.toHaveProperty("projection");
+		expect(first.progress).toEqual({
+			version: 1,
+			state: "projection_deferred",
+			phase: "segment-occurrences",
+			observedEventCount: 64,
+			observedEvidenceCount: 0,
+		});
+		expect(projection).not.toHaveBeenCalled();
+		expect(() =>
+			target.compactor.projectRunHistory({ ...request, cursor: first.cursor, pendingResponse: "full" }),
+		).toThrow(/Invalid incident run-history continuation cursor/);
+
+		let result: IncidentRecorderRunHistoryCursorOnlyResult = first;
+		let pendingCount = 1;
+		for (let pass = 0; result.state === "pending" && pass < 16; pass += 1) {
+			result = target.compactor.projectRunHistory({ ...request, cursor: result.cursor });
+			if (result.state === "pending") {
+				pendingCount += 1;
+				expect(result).not.toHaveProperty("projection");
+			}
+		}
+		expect(result.state).toBe("complete");
+		if (result.state !== "complete") throw new Error("expected a complete cursor-only projection");
+		expect(pendingCount).toBeGreaterThan(2);
+		expect(result.projection.events).toHaveLength(65);
+		expect(projection).toHaveBeenCalledTimes(1);
+		projection.mockRestore();
+		const full = finishRunHistoryProjection(target.compactor, {
+			runId: RUN_ID,
+			fromWallTimeMs: anchor,
+			throughWallTimeMs: anchor + 1_000,
+		});
+		expect(full).toMatchObject({ state: "complete" });
+		if (full.state !== "complete") throw new Error("expected the full projection baseline");
+		expect(result.projection).toEqual(full.projection);
+		expect(result.snapshot).toEqual(full.snapshot);
+		target.internal.closeSegmentStore();
+	});
+
+	it("preserves legacy full pending responses while cursor-only progress reaches the same final output", async () => {
+		const anchor = Date.now();
+		const setup = async () => {
+			const target = fixture();
+			const pin = preparePinFixture(target, anchor);
+			for (let index = 1; index <= 65; index += 1) {
+				writeLegacyOccurrence(target, occurrenceInput(index, anchor, pin.digest, pin.casPath), index);
+			}
+			await initialize(target.compactor);
+			return target;
+		};
+		const target = await setup();
+		const request = { runId: RUN_ID, fromWallTimeMs: anchor, throughWallTimeMs: anchor + 1_000 };
+		try {
+			let fullPending = target.compactor.projectRunHistory(request);
+			for (let pass = 0; fullPending.state === "pending" && fullPending.projection.events.length === 0; pass += 1) {
+				if (pass >= 16) throw new Error("legacy full projection did not reach an event-bearing pending response");
+				fullPending = target.compactor.projectRunHistory({ ...request, cursor: fullPending.cursor });
+			}
+			expect(fullPending.state).toBe("pending");
+			if (fullPending.state !== "pending") throw new Error("expected a legacy full pending response");
+			expect(fullPending.projection.events).toHaveLength(64);
+			const callerOwnedEvent = fullPending.projection.events[0];
+			if (!callerOwnedEvent) throw new Error("expected a detached legacy pending event");
+			callerOwnedEvent.metadata = { poisonedByCaller: true };
+			callerOwnedEvent.wrapperOrder[0] = "999999";
+			callerOwnedEvent.cas.path = "poisoned-by-caller";
+
+			const fullResult = finishRunHistoryProjection(target.compactor, request, 16, fullPending.cursor);
+			expect(fullResult.state).toBe("complete");
+			if (fullResult.state !== "complete") throw new Error("expected the legacy full projection to complete");
+			expect(fullResult.projection.events[0]?.metadata).toEqual({});
+			expect(fullResult.projection.events[0]?.wrapperOrder).toEqual(["2"]);
+			expect(fullResult.projection.events[0]?.cas.path).not.toBe("poisoned-by-caller");
+
+			const cursorRequest = { ...request, pendingResponse: "cursor-only" as const };
+			let cursorResult = target.compactor.projectRunHistory(cursorRequest);
+			let cursorPendingCount = 0;
+			while (cursorResult.state === "pending" && cursorPendingCount < 16) {
+				cursorPendingCount += 1;
+				expect(cursorResult).not.toHaveProperty("projection");
+				cursorResult = target.compactor.projectRunHistory({ ...cursorRequest, cursor: cursorResult.cursor });
+			}
+			expect(cursorPendingCount).toBeGreaterThan(2);
+			expect(cursorResult.state).toBe("complete");
+			if (cursorResult.state !== "complete")
+				throw new Error("expected the legacy cursor-only projection to complete");
+			expect(cursorResult.projection).toEqual(fullResult.projection);
+			expect(cursorResult.snapshot).toEqual(fullResult.snapshot);
+		} finally {
+			target.internal.closeSegmentStore();
+		}
 	});
 
 	it("merges and semantically deduplicates matching v1 and v2 run history", async () => {
@@ -1066,9 +2262,7 @@ describe("incident recorder compactor segment integration", () => {
 		const cas = writeCasFixture(target, Buffer.from("x"));
 		await initialize(target.compactor);
 		target.internal.appendSegmentRecord(occurrenceInput(1, anchor, cas.digest, cas.casPath).input);
-		target.internal.appendSegmentRecord(
-			occurrenceInput(2, anchor, cas.digest, cas.casPath, { casBytes: 2 }).input,
-		);
+		target.internal.appendSegmentRecord(occurrenceInput(2, anchor, cas.digest, cas.casPath, { casBytes: 2 }).input);
 		const result = finishRunHistoryProjection(target.compactor, {
 			runId: RUN_ID,
 			fromWallTimeMs: anchor,
@@ -1082,32 +2276,27 @@ describe("incident recorder compactor segment integration", () => {
 		target.internal.closeSegmentStore();
 	});
 
-	it.each(["missing", "corrupt"] as const)(
-		"returns explicit incomplete evidence for a %s CAS blob",
-		async (kind) => {
-			const target = fixture();
-			const anchor = Date.now();
-			const cas = writeCasFixture(target, Buffer.from("original"));
-			await initialize(target.compactor);
-			target.internal.appendSegmentRecord(
-				occurrenceInput(1, anchor, cas.digest, cas.casPath, { casBytes: 8 }).input,
-			);
-			if (kind === "missing") rmSync(cas.casPath);
-			else writeFileSync(cas.casPath, "changed!", { mode: 0o600 });
-			const result = finishRunHistoryProjection(target.compactor, {
-				runId: RUN_ID,
-				fromWallTimeMs: anchor,
-				throughWallTimeMs: anchor + 1_000,
-			});
-			expect(result.state).toBe("incomplete");
-			if (result.state !== "incomplete") throw new Error("expected CAS evidence failure");
-			expect(result.reason).toBe(
-				kind === "missing" ? "run_history_cas_blob_missing" : "run_history_cas_digest_mismatch",
-			);
-			expect(result.projection.evidence[0]?.kind).toBe(kind === "missing" ? "incomplete" : "corrupt");
-			target.internal.closeSegmentStore();
-		},
-	);
+	it.each(["missing", "corrupt"] as const)("returns explicit incomplete evidence for a %s CAS blob", async (kind) => {
+		const target = fixture();
+		const anchor = Date.now();
+		const cas = writeCasFixture(target, Buffer.from("original"));
+		await initialize(target.compactor);
+		target.internal.appendSegmentRecord(occurrenceInput(1, anchor, cas.digest, cas.casPath, { casBytes: 8 }).input);
+		if (kind === "missing") rmSync(cas.casPath);
+		else writeFileSync(cas.casPath, "changed!", { mode: 0o600 });
+		const result = finishRunHistoryProjection(target.compactor, {
+			runId: RUN_ID,
+			fromWallTimeMs: anchor,
+			throughWallTimeMs: anchor + 1_000,
+		});
+		expect(result.state).toBe("incomplete");
+		if (result.state !== "incomplete") throw new Error("expected CAS evidence failure");
+		expect(result.reason).toBe(
+			kind === "missing" ? "run_history_cas_blob_missing" : "run_history_cas_digest_mismatch",
+		);
+		expect(result.projection.evidence[0]?.kind).toBe(kind === "missing" ? "incomplete" : "corrupt");
+		target.internal.closeSegmentStore();
+	});
 
 	it("detects a canonical CAS name swap during a multi-call hash", async () => {
 		let swapped = false;
@@ -1153,9 +2342,7 @@ describe("incident recorder compactor segment integration", () => {
 		renameSync(casDirectory, redirectedDirectory);
 		symlinkSync(redirectedDirectory, casDirectory, "dir");
 		await initialize(target.compactor);
-		target.internal.appendSegmentRecord(
-			occurrenceInput(1, anchor, cas.digest, cas.casPath, { casBytes: 10 }).input,
-		);
+		target.internal.appendSegmentRecord(occurrenceInput(1, anchor, cas.digest, cas.casPath, { casBytes: 10 }).input);
 		const recorderRoot = join(target.agentDir, "incident-recorder");
 		const recorderRootDescriptorCount = (): number =>
 			readdirSync("/proc/self/fd").filter((name) => {
@@ -1332,40 +2519,43 @@ describe("incident recorder compactor segment integration", () => {
 			content: "pos:\t0\nflags:\t0100000\nmnt_id:\t0\n",
 			reason: "run_history_cas_procfs_root_fdinfo_mount_id_invalid",
 		},
-	] as const)("fails closed on a $name proc fdinfo witness without leaking descriptors", async ({ content, reason }) => {
-		const procFixtureRoot = mkdtempSync(join(tmpdir(), "prime-agent-forged-fdinfo-"));
-		roots.push(procFixtureRoot);
-		const forgedDescriptorInfoDirectory = join(procFixtureRoot, "fdinfo");
-		mkdirSync(forgedDescriptorInfoDirectory, { mode: 0o700 });
-		if (content !== undefined) writeSyntheticFdinfoDirectory(forgedDescriptorInfoDirectory, content);
-		const validationSteps: string[] = [];
-		const target = fixture({
-			onRunHistoryCasValidationStep: (event) => validationSteps.push(event.step),
-			runHistoryProcfs: {
-				descriptorDirectoryPath: "/proc/thread-self/fd",
-				descriptorInfoDirectoryPath: forgedDescriptorInfoDirectory,
-				statfsType: () => 0x9fa0,
-			},
-		});
-		const anchor = Date.now();
-		const cas = writeCasFixture(target, Buffer.from("x"));
-		await initialize(target.compactor);
-		target.internal.appendSegmentRecord(occurrenceInput(1, anchor, cas.digest, cas.casPath).input);
-		const descriptorCountBefore = readdirSync("/proc/thread-self/fd").length;
-		const result = finishRunHistoryProjection(target.compactor, {
-			runId: RUN_ID,
-			fromWallTimeMs: anchor,
-			throughWallTimeMs: anchor + 1_000,
-		});
-		expect(result.state).toBe("incomplete");
-		if (result.state !== "incomplete") throw new Error("expected malformed fdinfo containment");
-		expect(result.reason).toBe(reason);
-		expect(result.projection.evidence[0]).toMatchObject({ kind: "corrupt" });
-		expect(validationSteps).toEqual([]);
-		expect(target.internal.runHistoryTraversals.size).toBe(0);
-		expect(readdirSync("/proc/thread-self/fd").length).toBe(descriptorCountBefore);
-		target.internal.closeSegmentStore();
-	});
+	] as const)(
+		"fails closed on a $name proc fdinfo witness without leaking descriptors",
+		async ({ content, reason }) => {
+			const procFixtureRoot = mkdtempSync(join(tmpdir(), "prime-agent-forged-fdinfo-"));
+			roots.push(procFixtureRoot);
+			const forgedDescriptorInfoDirectory = join(procFixtureRoot, "fdinfo");
+			mkdirSync(forgedDescriptorInfoDirectory, { mode: 0o700 });
+			if (content !== undefined) writeSyntheticFdinfoDirectory(forgedDescriptorInfoDirectory, content);
+			const validationSteps: string[] = [];
+			const target = fixture({
+				onRunHistoryCasValidationStep: (event) => validationSteps.push(event.step),
+				runHistoryProcfs: {
+					descriptorDirectoryPath: "/proc/thread-self/fd",
+					descriptorInfoDirectoryPath: forgedDescriptorInfoDirectory,
+					statfsType: () => 0x9fa0,
+				},
+			});
+			const anchor = Date.now();
+			const cas = writeCasFixture(target, Buffer.from("x"));
+			await initialize(target.compactor);
+			target.internal.appendSegmentRecord(occurrenceInput(1, anchor, cas.digest, cas.casPath).input);
+			const descriptorCountBefore = readdirSync("/proc/thread-self/fd").length;
+			const result = finishRunHistoryProjection(target.compactor, {
+				runId: RUN_ID,
+				fromWallTimeMs: anchor,
+				throughWallTimeMs: anchor + 1_000,
+			});
+			expect(result.state).toBe("incomplete");
+			if (result.state !== "incomplete") throw new Error("expected malformed fdinfo containment");
+			expect(result.reason).toBe(reason);
+			expect(result.projection.evidence[0]).toMatchObject({ kind: "corrupt" });
+			expect(validationSteps).toEqual([]);
+			expect(target.internal.runHistoryTraversals.size).toBe(0);
+			expect(readdirSync("/proc/thread-self/fd").length).toBe(descriptorCountBefore);
+			target.internal.closeSegmentStore();
+		},
+	);
 
 	it("fails closed when a proc fdinfo mount witness drifts after admission", async () => {
 		const procFixtureRoot = mkdtempSync(join(tmpdir(), "prime-agent-drifting-fdinfo-"));
@@ -1384,10 +2574,7 @@ describe("incident recorder compactor segment integration", () => {
 				statfsType: () => 0x9fa0,
 				onAuthorityAdmitted: () => {
 					admissions += 1;
-					writeSyntheticFdinfoDirectory(
-						forgedDescriptorInfoDirectory,
-						`mnt_id:\t${mountId + 1n}\n`,
-					);
+					writeSyntheticFdinfoDirectory(forgedDescriptorInfoDirectory, `mnt_id:\t${mountId + 1n}\n`);
 				},
 			},
 		});
@@ -1795,6 +2982,70 @@ describe("incident recorder compactor segment integration", () => {
 		target.internal.closeSegmentStore();
 	});
 
+	it("rejects a legacy projection when its procfd route changes midpage", async () => {
+		const procFixtureRoot = mkdtempSync(join(tmpdir(), "prime-agent-midpage-procfd-"));
+		roots.push(procFixtureRoot);
+		const forgedDescriptorDirectory = join(procFixtureRoot, "fd");
+		const redirectedBase = join(procFixtureRoot, "redirected");
+		mkdirSync(forgedDescriptorDirectory, { mode: 0o700 });
+		mkdirSync(redirectedBase, { mode: 0o700 });
+		for (let descriptor = 0; descriptor <= highestObservedDescriptor() + 64; descriptor += 1) {
+			symlinkSync(redirectedBase, join(forgedDescriptorDirectory, String(descriptor)), "dir");
+		}
+		let substituted = false;
+		let openedOccurrences = 0;
+		let descriptorRouteLookups = 0;
+		let procfsStatfsLookups = 0;
+		const target = fixture({
+			runHistoryDescriptorIo: {
+				afterOpen: ({ role }) => {
+					if (role === "legacy_occurrence") {
+						openedOccurrences += 1;
+						substituted = true;
+					}
+				},
+			},
+			runHistoryProcfs: {
+				statfsType: () => {
+					procfsStatfsLookups += 1;
+					return 0x9fa0;
+				},
+				resolveDescriptorPath: ({ canonicalPath, descriptor, childName }) => {
+					descriptorRouteLookups += 1;
+					if (!substituted) return canonicalPath;
+					return childName === undefined
+						? join(forgedDescriptorDirectory, String(descriptor))
+						: join(forgedDescriptorDirectory, String(descriptor), childName);
+				},
+			},
+		});
+		const anchor = Date.now();
+		const pin = preparePinFixture(target, anchor);
+		for (let index = 1; index <= 64; index += 1) {
+			writeLegacyOccurrence(target, occurrenceInput(index, anchor, pin.digest, pin.casPath), index);
+		}
+		await initialize(target.compactor);
+		const result = finishRetainedRunHistoryProjection(target.compactor, {
+			runId: RUN_ID,
+			fromWallTimeMs: anchor,
+			throughWallTimeMs: anchor + 1_000,
+		});
+		expect(substituted).toBe(true);
+		expect(openedOccurrences).toBe(64);
+		expect(result.state).toBe("incomplete");
+		if (result.state !== "incomplete") throw new Error("expected a midpage procfd route failure");
+		expect(result.reason).toBe("run_history_legacy_snapshot_changed");
+		expect(result.projection.evidence[0]).toMatchObject({
+			kind: "corrupt",
+			reason: "run_history_cas_procfs_legacy_run_directory_descriptor_target_mismatch",
+		});
+		expect(result).not.toHaveProperty("publicationCapability");
+		expect(target.internal.runHistoryTraversals.size).toBe(0);
+		expect(descriptorRouteLookups).toBeLessThan(20);
+		expect(procfsStatfsLookups).toBeLessThan(1_000);
+		target.internal.closeSegmentStore();
+	});
+
 	it("sweeps abandoned projection cursors before capacity admission", async () => {
 		const target = fixture();
 		const anchor = Date.now();
@@ -1827,7 +3078,8 @@ describe("incident recorder compactor segment integration", () => {
 				deadlineMs: anchor + 30,
 			});
 			expect(admitted.state).toBe("pending");
-			if (admitted.state === "pending") expect(target.compactor.cancelRunHistoryProjection(admitted.cursor)).toBe(true);
+			if (admitted.state === "pending")
+				expect(target.compactor.cancelRunHistoryProjection(admitted.cursor)).toBe(true);
 			expect(target.internal.runHistoryTraversals.size).toBe(0);
 		} finally {
 			clock.mockRestore();
@@ -1861,7 +3113,7 @@ describe("incident recorder compactor segment integration", () => {
 		target.internal.closeSegmentStore();
 	});
 
-	it("never returns a serialized projection above its explicit byte bound", async () => {
+	it("releases an opted-in projection when its serialized result exceeds the explicit byte bound", async () => {
 		const target = fixture();
 		const anchor = Date.now();
 		const pin = preparePinFixture(target, anchor);
@@ -1875,12 +3127,13 @@ describe("incident recorder compactor segment integration", () => {
 			});
 		}
 		await initialize(target.compactor);
-		const result = finishRunHistoryProjection(
+		const result = finishRetainedRunHistoryProjection(
 			target.compactor,
 			{
 				runId: RUN_ID,
 				fromWallTimeMs: anchor,
 				throughWallTimeMs: anchor + recordCount + 1,
+				pendingResponse: "cursor-only",
 			},
 			160,
 		);
@@ -1894,6 +3147,7 @@ describe("incident recorder compactor segment integration", () => {
 			},
 		]);
 		expect(Buffer.byteLength(JSON.stringify(result) ?? "", "utf8")).toBeLessThanOrEqual(8 * 1024 * 1024);
+		expect(target.internal.runHistoryTraversals.size).toBe(0);
 		target.internal.closeSegmentStore();
 	});
 
@@ -1931,6 +3185,170 @@ describe("incident recorder compactor segment integration", () => {
 		);
 		expect(afterRelease.deletedSegmentIds).toHaveLength(2);
 		expect(afterRelease.blockedByReadSnapshot).toBe(false);
+		target.internal.closeSegmentStore();
+	});
+
+	it("retains one exact immutable publication capability until a descriptor-style caller releases it", async () => {
+		const target = fixture();
+		const anchor = Date.now();
+		const cas = writeCasFixture(target, Buffer.from("x"));
+		await initialize(target.compactor);
+		for (let index = 1; index <= 2; index += 1) {
+			target.internal.appendSegmentRecord(occurrenceInput(index, anchor, cas.digest, cas.casPath).input);
+			target.internal.segmentStore?.seal(`retained-publication-${index}`);
+		}
+		const result = finishRetainedRunHistoryProjection(target.compactor, {
+			runId: RUN_ID,
+			fromWallTimeMs: anchor,
+			throughWallTimeMs: anchor + 1_000,
+		});
+		expect(result.state).toBe("complete");
+		if (result.state !== "complete") throw new Error("expected a retained complete projection");
+		const capability = result.publicationCapability;
+		expect(Object.isFrozen(capability)).toBe(true);
+		target.compactor.assertRunHistoryPublicationReady(capability);
+
+		const blocked = target.compactor.pruneSegmentHistory(
+			anchor + 4 * DAY,
+			createIncidentRecorderSegmentPruneProtection(0, []),
+		);
+		expect(blocked.deletedSegmentIds).toEqual([]);
+		expect(blocked.blockedByReadSnapshot).toBe(true);
+
+		const descriptorPath = join(target.root, "run-history-descriptor.json");
+		const descriptor = openSync(descriptorPath, "wx", 0o600);
+		try {
+			writeFileSync(descriptor, `${JSON.stringify(result.projection)}\n`);
+			fsyncSync(descriptor);
+		} finally {
+			closeSync(descriptor);
+		}
+		target.compactor.assertRunHistoryPublicationReady(capability);
+
+		const clone = { ...capability } as IncidentRecorderRunHistoryPublicationCapability;
+		const forgery = Object.freeze({
+			...capability,
+			id: "f".repeat(64),
+		}) as IncidentRecorderRunHistoryPublicationCapability;
+		for (const rejected of [clone, forgery]) {
+			expect(() => target.compactor.assertRunHistoryPublicationReady(rejected)).toThrow(
+				/exact run-history publication capability/,
+			);
+			expect(() => target.compactor.releaseRunHistoryPublication(rejected)).toThrow(
+				/exact run-history publication capability/,
+			);
+			expect(() => target.compactor.cancelRunHistoryProjection(rejected)).toThrow(
+				/exact run-history publication capability/,
+			);
+		}
+		target.compactor.assertRunHistoryPublicationReady(capability);
+		target.compactor.releaseRunHistoryPublication(capability);
+		expect(() => target.compactor.assertRunHistoryPublicationReady(capability)).toThrow(
+			/exact run-history publication capability/,
+		);
+		expect(() => target.compactor.releaseRunHistoryPublication(capability)).not.toThrow();
+
+		const afterRelease = target.compactor.pruneSegmentHistory(
+			anchor + 4 * DAY,
+			createIncidentRecorderSegmentPruneProtection(0, []),
+		);
+		expect(afterRelease.deletedSegmentIds.length).toBeGreaterThan(0);
+		expect(afterRelease.blockedByReadSnapshot).toBe(false);
+		target.internal.closeSegmentStore();
+	});
+
+	it("accepts the exact retained capability for replay-safe cancellation", async () => {
+		const target = fixture();
+		const anchor = Date.now();
+		const cas = writeCasFixture(target, Buffer.from("x"));
+		await initialize(target.compactor);
+		for (let index = 1; index <= 2; index += 1) {
+			target.internal.appendSegmentRecord(occurrenceInput(index, anchor, cas.digest, cas.casPath).input);
+			target.internal.segmentStore?.seal(`retained-cancellation-${index}`);
+		}
+		const result = finishRetainedRunHistoryProjection(target.compactor, {
+			runId: RUN_ID,
+			fromWallTimeMs: anchor,
+			throughWallTimeMs: anchor + 1_000,
+		});
+		if (result.state !== "complete") throw new Error("expected a cancellable retained projection");
+		expect(target.compactor.cancelRunHistoryProjection(result.publicationCapability)).toBe(true);
+		expect(target.compactor.cancelRunHistoryProjection(result.publicationCapability)).toBe(true);
+		const afterCancel = target.compactor.pruneSegmentHistory(
+			anchor + 4 * DAY,
+			createIncidentRecorderSegmentPruneProtection(0, []),
+		);
+		expect(afterCancel.deletedSegmentIds.length).toBeGreaterThan(0);
+		expect(afterCancel.blockedByReadSnapshot).toBe(false);
+		target.internal.closeSegmentStore();
+	});
+
+	it.each(["expiry", "shutdown"] as const)("releases a retained publication lease on %s", async (exit) => {
+		const target = fixture();
+		const anchor = Date.now();
+		const cas = writeCasFixture(target, Buffer.from("x"));
+		await initialize(target.compactor);
+		for (let index = 1; index <= 2; index += 1) {
+			target.internal.appendSegmentRecord(occurrenceInput(index, anchor, cas.digest, cas.casPath).input);
+			target.internal.segmentStore?.seal(`retained-${exit}-${index}`);
+		}
+		const clock = exit === "expiry" ? vi.spyOn(Date, "now").mockReturnValue(anchor) : undefined;
+		try {
+			const result = finishRetainedRunHistoryProjection(target.compactor, {
+				runId: RUN_ID,
+				fromWallTimeMs: anchor,
+				throughWallTimeMs: anchor + 1_000,
+				...(exit === "expiry" ? { deadlineMs: anchor + 100 } : {}),
+			});
+			if (result.state !== "complete") throw new Error("expected a retained complete projection");
+			const blocked = target.compactor.pruneSegmentHistory(
+				anchor + 4 * DAY,
+				createIncidentRecorderSegmentPruneProtection(0, []),
+			);
+			expect(blocked.blockedByReadSnapshot).toBe(true);
+			if (exit === "expiry") {
+				clock?.mockReturnValue(anchor + 101);
+				expect(() => target.compactor.assertRunHistoryPublicationReady(result.publicationCapability)).toThrow(
+					/exact run-history publication capability/,
+				);
+			} else {
+				target.internal.closeSegmentStore();
+			}
+			const afterExit = target.compactor.pruneSegmentHistory(
+				anchor + 4 * DAY,
+				createIncidentRecorderSegmentPruneProtection(0, []),
+			);
+			expect(afterExit.deletedSegmentIds.length).toBeGreaterThan(0);
+			expect(afterExit.blockedByReadSnapshot).toBe(false);
+		} finally {
+			clock?.mockRestore();
+			target.internal.closeSegmentStore();
+		}
+	});
+
+	it("releases an opted-in traversal when projection validation returns an error result", async () => {
+		const target = fixture();
+		const anchor = Date.now();
+		const cas = writeCasFixture(target, Buffer.from("x"));
+		await initialize(target.compactor);
+		for (let index = 1; index <= 2; index += 1) {
+			target.internal.appendSegmentRecord(occurrenceInput(index, anchor, cas.digest, cas.casPath).input);
+			target.internal.segmentStore?.seal(`retained-error-${index}`);
+		}
+		rmSync(cas.casPath);
+		const result = finishRetainedRunHistoryProjection(target.compactor, {
+			runId: RUN_ID,
+			fromWallTimeMs: anchor,
+			throughWallTimeMs: anchor + 1_000,
+		});
+		expect(result.state).toBe("incomplete");
+		expect(target.internal.runHistoryTraversals.size).toBe(0);
+		const afterError = target.compactor.pruneSegmentHistory(
+			anchor + 4 * DAY,
+			createIncidentRecorderSegmentPruneProtection(0, []),
+		);
+		expect(afterError.deletedSegmentIds.length).toBeGreaterThan(0);
+		expect(afterError.blockedByReadSnapshot).toBe(false);
 		target.internal.closeSegmentStore();
 	});
 
@@ -2046,9 +3464,7 @@ describe("incident recorder compactor segment integration", () => {
 					if (incomplete.state !== "incomplete") {
 						throw new Error("expected injected CAS name replacement to fail closed");
 					}
-					expect(incomplete.reason).toMatch(
-						/^run_history_cas_blob_(?:name_swapped|changed_during_read)$/,
-					);
+					expect(incomplete.reason).toMatch(/^run_history_cas_blob_(?:name_swapped|changed_during_read)$/);
 				} else if (exit === "cancel") {
 					expect(target.compactor.cancelRunHistoryProjection(result.cursor)).toBe(true);
 				} else if (exit === "close") {
@@ -2162,49 +3578,46 @@ describe("incident recorder compactor segment integration", () => {
 		},
 	);
 
-	it.each(["gap", "corrupt-legacy"] as const)(
-		"never completes a run history containing %s evidence",
-		async (kind) => {
-			const target = fixture();
-			const anchor = Date.now();
-			await initialize(target.compactor);
-			if (kind === "gap") {
-				target.internal.appendSegmentRecord({
-					idempotencyKey: "gap:projection-gap",
-					runId: RUN_ID,
-					sourceId: "gap",
-					observedAtMs: anchor,
-					order: "1",
-					metadata: { reason: "projection-test-gap" },
-					payload: Buffer.from('{"reason":"projection-test-gap"}\n'),
-				});
-			} else {
-				const identity = occurrenceIdentity(1);
-				const legacyDirectory = join(
-					target.agentDir,
-					"incident-recorder",
-					"refs",
-					"runs",
-					createHash("sha256").update(RUN_ID).digest("hex"),
-				);
-				mkdirSync(legacyDirectory, { recursive: true, mode: 0o700 });
-				writeFileSync(
-					join(legacyDirectory, `seq-${"1".padStart(20, "0")}-${identity.identityKey}.json`),
-					"{truncated",
-					{ mode: 0o600 },
-				);
-			}
-			const result = finishRunHistoryProjection(target.compactor, {
+	it.each(["gap", "corrupt-legacy"] as const)("never completes a run history containing %s evidence", async (kind) => {
+		const target = fixture();
+		const anchor = Date.now();
+		await initialize(target.compactor);
+		if (kind === "gap") {
+			target.internal.appendSegmentRecord({
+				idempotencyKey: "gap:projection-gap",
 				runId: RUN_ID,
-				fromWallTimeMs: anchor,
-				throughWallTimeMs: anchor + 1_000,
+				sourceId: "gap",
+				observedAtMs: anchor,
+				order: "1",
+				metadata: { reason: "projection-test-gap" },
+				payload: Buffer.from('{"reason":"projection-test-gap"}\n'),
 			});
-			expect(result.state).toBe("incomplete");
-			if (result.state !== "incomplete") throw new Error("expected explicit loss evidence");
-			expect(result.projection.evidence[0]?.kind).toBe(kind === "gap" ? "gap" : "corrupt");
-			target.internal.closeSegmentStore();
-		},
-	);
+		} else {
+			const identity = occurrenceIdentity(1);
+			const legacyDirectory = join(
+				target.agentDir,
+				"incident-recorder",
+				"refs",
+				"runs",
+				createHash("sha256").update(RUN_ID).digest("hex"),
+			);
+			mkdirSync(legacyDirectory, { recursive: true, mode: 0o700 });
+			writeFileSync(
+				join(legacyDirectory, `seq-${"1".padStart(20, "0")}-${identity.identityKey}.json`),
+				"{truncated",
+				{ mode: 0o600 },
+			);
+		}
+		const result = finishRunHistoryProjection(target.compactor, {
+			runId: RUN_ID,
+			fromWallTimeMs: anchor,
+			throughWallTimeMs: anchor + 1_000,
+		});
+		expect(result.state).toBe("incomplete");
+		if (result.state !== "incomplete") throw new Error("expected explicit loss evidence");
+		expect(result.projection.evidence[0]?.kind).toBe(kind === "gap" ? "gap" : "corrupt");
+		target.internal.closeSegmentStore();
+	});
 
 	it("returns truthful incomplete evidence for a gap-only recovered segment", async () => {
 		const target = fixture();
@@ -2256,9 +3669,7 @@ describe("incident recorder compactor segment integration", () => {
 		expect(result.state).toBe("incomplete");
 		if (result.state !== "incomplete") throw new Error("expected mixed recovery-gap incompleteness");
 		expect(result.reason).toBe("run_history_segment_recovery_gap_evidence");
-		expect(result.projection.events.map((event) => event.identityKey)).toEqual([
-			occurrence.identityKey,
-		]);
+		expect(result.projection.events.map((event) => event.identityKey)).toEqual([occurrence.identityKey]);
 		expect(result.projection.evidence[0]?.kind).toBe("gap");
 		target.internal.closeSegmentStore();
 	});
@@ -2401,10 +3812,16 @@ describe("incident recorder compactor segment integration", () => {
 		expect(existsSync(join(pin.incidentDir, "journal-pin-manifest.json"))).toBe(false);
 		const incomplete = JSON.parse(
 			readFileSync(join(pin.incidentDir, "journal-pin-incomplete.json"), "utf8"),
-		) as { reason?: unknown; retainedOccurrenceCount?: unknown };
-		expect(incomplete).toMatchObject({
+		) as Record<string, unknown>;
+		expect(incomplete).toEqual({
+			version: 1,
+			state: "pending_or_incomplete",
+			provider: "journal",
 			reason: "segment_occurrence_query_failed_or_snapshot_stale",
-			retainedOccurrenceCount: 64,
+			runId: RUN_ID,
+			anchorWallTimeMs: anchor,
+			fromWallTimeMs: anchor,
+			throughWallTimeMs: anchor + 1_000,
 		});
 		target.internal.closeSegmentStore();
 	});

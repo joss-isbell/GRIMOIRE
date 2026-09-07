@@ -1,7 +1,8 @@
-import { spawn } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { createHash, type Hash } from "node:crypto";
 import {
 	type BigIntStats,
+	chmodSync,
 	closeSync,
 	type Dirent,
 	existsSync,
@@ -20,12 +21,14 @@ import {
 	renameSync,
 	rmSync,
 	statfsSync,
-	statSync,
-	utimesSync,
 	writeSync,
 } from "node:fs";
 import { basename, dirname, join } from "node:path";
-import { acquireIncidentCasTransaction } from "./incident-recorder-cas-transaction.js";
+import {
+	acquireIncidentCasTransaction,
+	type IncidentCasRelativePath,
+	type IncidentCasRootMutation,
+} from "./incident-recorder-cas-transaction.js";
 import {
 	encodeIncidentRecorderFrame,
 	INCIDENT_RECORDER_FRAME_FLAGS,
@@ -34,29 +37,33 @@ import {
 } from "./incident-recorder-protocol.js";
 import { INCIDENT_DIAGNOSTIC_RETENTION_MS } from "./incident-recorder-retention.js";
 import {
-	IncidentRecorderSegmentStore,
-	planIncidentRecorderSegmentStoreOpen,
-	pruneIncidentRecorderSealedHistoryForRecovery,
 	type IncidentRecorderSegmentAppendInput,
 	type IncidentRecorderSegmentDurableWrite,
 	type IncidentRecorderSegmentLocator,
 	type IncidentRecorderSegmentOpenResult,
 	type IncidentRecorderSegmentOpenStorageEntry,
 	type IncidentRecorderSegmentParentDirectoryEffect,
-	type IncidentRecorderSegmentPruneProtectionComplete,
 	type IncidentRecorderSegmentPruneCursor,
+	type IncidentRecorderSegmentPruneProtectionComplete,
 	type IncidentRecorderSegmentPruneResult,
 	type IncidentRecorderSegmentQueryCursor,
 	type IncidentRecorderSegmentReadLease,
 	type IncidentRecorderSegmentRecord,
 	type IncidentRecorderSegmentRecoveryGap,
 	type IncidentRecorderSegmentRecoveryGapQueryCursor,
+	IncidentRecorderSegmentStore,
+	planIncidentRecorderSegmentStoreOpen,
+	pruneIncidentRecorderSealedHistoryForRecovery,
 } from "./incident-recorder-segment-store.js";
 import {
 	INCIDENT_RECORDER_JOURNAL_IDENTIFIER,
 	INCIDENT_RECORDER_JOURNAL_NAMESPACE,
 	type IncidentJournalLine,
 } from "./incident-recorder-writer.js";
+import {
+	type IncidentRecorderWriterLifecycleLease,
+	inspectIncidentRecorderWriterLifecycleLeaseMode,
+} from "./incident-recorder-writer-lifecycle.js";
 
 const EXPORT_BUFFER_MAX_BYTES = 256 * 1024;
 const MESSAGE_MAX_BYTES = 64 * 1024;
@@ -73,6 +80,9 @@ const PIN_CURSOR_MAX_BYTES = 1024 * 1024;
 const PIN_SCAN_DEADLINE_MS = 30_000;
 const PIN_REFERENCE_BATCH_COUNT = 64;
 const PIN_LEGACY_REFERENCE_MAX_BYTES = 64 * 1024;
+const PENDING_PIN_DIRECTORY_DISCOVERY_ENTRIES = 256;
+const PENDING_PIN_DIRECTORY_BATCH_COUNT = 256;
+const PENDING_PIN_DIRECTORY_NAME_MAX_BYTES = 4096;
 const SYSDIG_RING_DEFAULT_BASE_PATH = "/var/log/grimoire/sysdig/ring.scap";
 const SYSDIG_RING_EXPECTED_SEGMENTS = 12;
 const SYSDIG_RING_ROTATION_BYTES = 320 * 1024 * 1024;
@@ -81,6 +91,8 @@ const SYSDIG_PIN_MAX_SEGMENTS = 32;
 const SYSDIG_PIN_MAX_SEGMENT_BYTES = 384 * 1024 * 1024;
 const SYSDIG_PIN_MAX_TOTAL_BYTES = 8 * 1024 * 1024 * 1024;
 const SYSDIG_PIN_COPY_BUFFER_BYTES = 1024 * 1024;
+const SYSDIG_PIN_WORK_BYTES_PER_PASS = 4 * 1024 * 1024;
+const SYSDIG_PIN_REQUEST_MAX_BYTES = 64 * 1024;
 const SYSDIG_PIN_RETENTION_MS = INCIDENT_DIAGNOSTIC_RETENTION_MS;
 const STORAGE_ACCOUNTING_MAX_INODES = 262_144;
 const STORAGE_ACCOUNTING_MAX_ENTRIES = 1_000_000;
@@ -161,7 +173,12 @@ interface Assembly {
 
 interface PinTraversal {
 	incidentDir: string;
-	request: { runId: string; fromWallTimeMs: number; throughWallTimeMs: number };
+	request: {
+		runId: string;
+		anchorWallTimeMs: number;
+		fromWallTimeMs: number;
+		throughWallTimeMs: number;
+	};
 	scannedCursors: Set<string>;
 	directory?: ReturnType<typeof opendirSync>;
 	segmentCursor?: IncidentRecorderSegmentQueryCursor;
@@ -173,8 +190,31 @@ interface PinTraversal {
 	memoryBytes: number;
 	phase: "segment-reading" | "legacy-reading" | "linking";
 	linkIndex: number;
-	linked: Map<string, string>;
+	linked: Map<string, { path: string; sealedArtifact: SealedArtifact }>;
 	pinCasDir?: string;
+}
+
+interface TrackedCompactorChild {
+	child: ChildProcess;
+	completion: Promise<void>;
+	terminate: () => void;
+}
+
+interface ActivePinScan extends TrackedCompactorChild {
+	incidentDir: string;
+	generation: number;
+	cancelled: boolean;
+}
+
+interface PendingPinDirectoryTraversal {
+	incidentRoot: string;
+	boundary?: string;
+	phase: "full" | "after-cursor" | "through-cursor";
+	directory?: ReturnType<typeof opendirSync>;
+	pendingNames: string[];
+	pendingNameBytes: number;
+	sawEntry: boolean;
+	sweepComplete: boolean;
 }
 
 export interface SegmentOccurrenceReference {
@@ -212,10 +252,7 @@ export interface IncidentRecorderRunHistoryEvent {
 export interface IncidentRecorderRunHistoryEvidence {
 	kind: "gap" | "incomplete" | "corrupt" | "truncated";
 	reason: string;
-	reference?:
-		| JournalOccurrenceReference
-		| IncidentRecorderSegmentLocator
-		| IncidentRecorderSegmentRecoveryGap;
+	reference?: JournalOccurrenceReference | IncidentRecorderSegmentLocator | IncidentRecorderSegmentRecoveryGap;
 }
 
 export interface IncidentRecorderRunHistoryProjection {
@@ -286,6 +323,107 @@ export type IncidentRecorderRunHistoryResult =
 			reason: string;
 			projection: IncidentRecorderRunHistoryProjection;
 	  };
+
+export interface IncidentRecorderRunHistoryPendingProgress {
+	readonly version: 1;
+	readonly state: "projection_deferred";
+	readonly phase:
+		| "segment-occurrences"
+		| "segment-run-gaps"
+		| "segment-run-incomplete"
+		| "segment-global-gaps"
+		| "segment-recovery-gaps"
+		| "legacy"
+		| "cas-validation"
+		| "publication-retained";
+	readonly observedEventCount: number;
+	readonly observedEvidenceCount: number;
+}
+
+export interface IncidentRecorderRunHistoryProgressPendingResult {
+	state: "pending";
+	cursor: IncidentRecorderRunHistoryCursor;
+	progress: IncidentRecorderRunHistoryPendingProgress;
+}
+
+export type IncidentRecorderRunHistoryProgressResult =
+	| Exclude<IncidentRecorderRunHistoryResult, { state: "pending" }>
+	| Extract<IncidentRecorderRunHistoryResult, { state: "pending" }>
+	| IncidentRecorderRunHistoryProgressPendingResult;
+
+export type IncidentRecorderRunHistoryCursorOnlyResult =
+	| Exclude<IncidentRecorderRunHistoryResult, { state: "pending" }>
+	| IncidentRecorderRunHistoryProgressPendingResult;
+
+export interface IncidentRecorderRunHistoryPublicationCapability {
+	readonly version: 1;
+	readonly kind: "run_history_publication";
+	readonly id: string;
+	readonly snapshotFingerprint: string;
+}
+
+export type IncidentRecorderRetainedRunHistoryResult =
+	| Exclude<IncidentRecorderRunHistoryResult, { state: "complete" }>
+	| (Extract<IncidentRecorderRunHistoryResult, { state: "complete" }> & {
+			publicationCapability: IncidentRecorderRunHistoryPublicationCapability;
+	  })
+	| IncidentRecorderRunHistoryProgressPendingResult;
+
+export type IncidentRecorderRetainedRunHistoryProgressResult =
+	| Exclude<IncidentRecorderRetainedRunHistoryResult, { state: "pending" }>
+	| Extract<IncidentRecorderRetainedRunHistoryResult, { state: "pending" }>
+	| IncidentRecorderRunHistoryProgressPendingResult;
+
+export type IncidentRecorderRetainedRunHistoryCursorOnlyResult =
+	| Exclude<IncidentRecorderRetainedRunHistoryResult, { state: "pending" }>
+	| IncidentRecorderRunHistoryProgressPendingResult;
+
+export interface IncidentRecorderRunHistoryProjectionInput {
+	runId: string;
+	fromWallTimeMs: number;
+	throughWallTimeMs: number;
+	cursor?: IncidentRecorderRunHistoryCursor;
+	deadlineMs?: number;
+	retainForPublication?: boolean;
+	pendingResponse?: "full" | "cursor-only";
+}
+
+export interface IncidentRecorderLiveRunEventsCursor {
+	readonly version: 1;
+	readonly runId: string;
+	readonly filterSha256: string;
+	readonly segmentSequence: number;
+	readonly ordinal: number;
+}
+
+export interface IncidentRecorderLiveRunEventsPage {
+	readonly version: 1;
+	readonly runId: string;
+	readonly state: "complete" | "pending" | "incomplete";
+	readonly events: IncidentRecorderRunHistoryEvent[];
+	readonly cursor: IncidentRecorderLiveRunEventsCursor;
+	readonly reason?: string;
+	readonly scannedSegments: number;
+	readonly scannedRecords: number;
+	readonly scannedIndexBytes: number;
+}
+
+export interface IncidentRecorderLiveRunGap {
+	readonly occurrenceReference: SegmentOccurrenceReference;
+	readonly evidence: Record<string, unknown>;
+}
+
+export interface IncidentRecorderLiveRunGapsPage {
+	readonly version: 1;
+	readonly runId: string;
+	readonly state: "complete" | "pending" | "incomplete";
+	readonly gaps: IncidentRecorderLiveRunGap[];
+	readonly cursor: IncidentRecorderLiveRunEventsCursor;
+	readonly reason?: string;
+	readonly scannedSegments: number;
+	readonly scannedRecords: number;
+	readonly scannedIndexBytes: number;
+}
 
 interface StableFilesystemIdentity {
 	dev: bigint;
@@ -359,7 +497,11 @@ interface RunHistoryTraversal {
 		| "segment-global-gaps"
 		| "segment-recovery-gaps"
 		| "legacy"
-		| "cas-validation";
+		| "cas-validation"
+		| "publication-retained";
+	retainForPublication: boolean;
+	pendingResponse: "full" | "cursor-only";
+	publicationCapability?: IncidentRecorderRunHistoryPublicationCapability;
 	segmentReadLease?: IncidentRecorderSegmentReadLease;
 	segmentCursor?: IncidentRecorderSegmentQueryCursor;
 	segmentRecoveryGapCursor?: IncidentRecorderSegmentRecoveryGapQueryCursor;
@@ -409,10 +551,7 @@ function stableFilesystemIdentity(stats: BigIntStats): StableFilesystemIdentity 
 	};
 }
 
-function sameStableFilesystemIdentity(
-	left: StableFilesystemIdentity,
-	right: StableFilesystemIdentity,
-): boolean {
+function sameStableFilesystemIdentity(left: StableFilesystemIdentity, right: StableFilesystemIdentity): boolean {
 	return (
 		left.dev === right.dev &&
 		left.ino === right.ino &&
@@ -424,10 +563,7 @@ function sameStableFilesystemIdentity(
 	);
 }
 
-function sameStableDirectoryIdentity(
-	left: StableFilesystemIdentity,
-	right: StableFilesystemIdentity,
-): boolean {
+function sameStableDirectoryIdentity(left: StableFilesystemIdentity, right: StableFilesystemIdentity): boolean {
 	return left.dev === right.dev && left.ino === right.ino && left.mode === right.mode;
 }
 
@@ -467,6 +603,21 @@ interface JournalManifestOccurrence {
 	cas: { digest: string; bytes: number; path: string };
 	eventWallTimeMs: string;
 	pinnedCasPath: string;
+	sealedArtifact?: SealedArtifact;
+}
+
+interface SealedArtifact {
+	version: 1;
+	state: "sealed_private_copy";
+	generationId: string;
+	dev: string;
+	ino: string;
+	bytes: number;
+	mtimeMs: number;
+	ctimeMs: number;
+	mode: 256;
+	nlink: 1;
+	sha256: string;
 }
 
 interface JournalManifestValidation {
@@ -474,6 +625,7 @@ interface JournalManifestValidation {
 	manifestPath: string;
 	descriptor: number;
 	runId: string;
+	anchorWallTimeMs: number;
 	fromWallTimeMs: number;
 	throughWallTimeMs: number;
 	retainUntilWallTimeMs: number;
@@ -486,6 +638,7 @@ interface JournalManifestValidation {
 	nlink: number;
 	phase: "header" | "occurrences" | "suffix";
 	manifestVersion?: 1 | 2;
+	artifactGenerationId?: string;
 	textBuffer: string;
 	objectText: string;
 	objectDepth: number;
@@ -506,8 +659,45 @@ interface JournalManifestValidation {
 		dev: number;
 		ino: number;
 		mtimeMs: number;
+		ctimeMs: number;
+		mode: number;
+		uid: number;
+		nlink: number;
+		sealedArtifact?: SealedArtifact;
 	};
-	verifiedPins: Map<string, { bytes: number; pinnedPath: string; dev: number; ino: number }>;
+	verifiedPins: Map<
+		string,
+		{ bytes: number; pinnedPath: string; dev: number; ino: number; sealedArtifact?: SealedArtifact }
+	>;
+}
+
+interface SysdigRingSnapshotCandidate {
+	id: string;
+	sourcePath: string;
+	sourceName: string;
+	activeAtRequest: boolean;
+	source: { dev: string; ino: string; bytes: number; mtimeMs: number; ctimeMs: number };
+}
+
+interface SysdigRingSnapshot {
+	observedAtWallTimeMs: number;
+	candidates: SysdigRingSnapshotCandidate[];
+	issues: string[];
+}
+
+interface SysdigCapturePlan {
+	version: 1;
+	state: "planned";
+	phase: "initial" | "final";
+	requestFingerprint: string;
+	snapshot: SysdigRingSnapshot;
+}
+
+interface SysdigFinalVerificationPlan {
+	version: 1;
+	state: "planned";
+	requestFingerprint: string;
+	recordIds: string[];
 }
 
 interface SysdigPinRequest {
@@ -520,7 +710,21 @@ interface SysdigPinRequest {
 	requestedAtWallTimeMs: number;
 	retainUntilWallTimeMs: number;
 	ringBasePath: string;
+	initialRingSnapshot?: SysdigRingSnapshot;
 }
+
+interface JournalPinRequest {
+	version: 1;
+	state: "pending";
+	runId: string;
+	anchorWallTimeMs: number;
+	fromWallTimeMs: number;
+	throughWallTimeMs: number;
+	resolveAfterWallTimeMs: number;
+	retainUntilWallTimeMs: number;
+}
+
+type IncidentPinAuthority = SysdigPinRequest;
 
 interface SysdigPinnedSegmentRecord {
 	version: 1;
@@ -529,13 +733,20 @@ interface SysdigPinnedSegmentRecord {
 	sourceName: string;
 	observedAtWallTimeMs: number;
 	phase: "initial" | "rotated" | "final";
-	source: { dev: string; ino: string; bytes: number; mtimeMs: number };
+	source: { dev: string; ino: string; bytes: number; mtimeMs: number; ctimeMs: number };
 	pinnedPath: string;
-	captureMethod: "hard_link" | "bounded_copy";
-	captureReason: "closed_segment_hard_link" | "active_segment_snapshot" | "hard_link_unavailable";
-	hardLinkErrorCode?: string;
+	captureMethod: "bounded_copy";
+	captureReason: "closed_segment_private_snapshot" | "active_segment_snapshot";
 	bytesAtCapture: number;
-	sha256AtCapture?: string;
+	artifactAtCapture: {
+		dev: string;
+		ino: string;
+		bytes: number;
+		mtimeMs: number;
+		ctimeMs: number;
+		mode: 384;
+		nlink: 1;
+	};
 }
 
 interface SysdigPinRecordState {
@@ -544,6 +755,47 @@ interface SysdigPinRecordState {
 	totalBytes: number;
 	saturated: boolean;
 	issues: string[];
+}
+
+interface SysdigSegmentCaptureResult {
+	complete: boolean;
+	bytesWorked: number;
+	record?: SysdigPinnedSegmentRecord;
+}
+
+interface SysdigWorkBudget {
+	remainingBytes: number;
+}
+
+interface SysdigSegmentVerification {
+	recordId: string;
+	descriptor: number;
+	offset: number;
+	hash: Hash;
+	identity: {
+		dev: number;
+		ino: number;
+		bytes: number;
+		mtimeMs: number;
+		ctimeMs: number;
+		nlink: number;
+		mode: number;
+		uid: number;
+	};
+}
+
+interface SysdigSourceCaptureState {
+	recordId: string;
+	sourcePath: string;
+	sourceDescriptor?: number;
+	partialDescriptor?: number;
+	partialDev: string;
+	partialIno: string;
+	partialUid: string;
+	partialBytes: number;
+	verifiedBytes: number;
+	phase: "verify_existing" | "copy" | "verify_final";
+	verificationSourceIdentity?: { bytes: number; mtimeMs: number; ctimeMs: number };
 }
 
 interface CursorCheckpoint {
@@ -670,51 +922,69 @@ function canonicalJson(value: unknown, depth = 0): string {
 	if (!value || typeof value !== "object") throw new Error("Incident semantic value is not canonical JSON");
 	return `{${Object.keys(value as Record<string, unknown>)
 		.sort()
-		.map(
-			(key) =>
-				`${JSON.stringify(key)}:${canonicalJson((value as Record<string, unknown>)[key], depth + 1)}`,
-		)
+		.map((key) => `${JSON.stringify(key)}:${canonicalJson((value as Record<string, unknown>)[key], depth + 1)}`)
 		.join(",")}}`;
+}
+
+function hasExactOwnKeys(value: unknown, expected: readonly string[]): value is Record<string, unknown> {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const observed = Object.keys(value as Record<string, unknown>).sort();
+	const required = [...expected].sort();
+	return observed.length === required.length && observed.every((key, index) => key === required[index]);
+}
+
+function isSealedArtifact(value: unknown): value is SealedArtifact {
+	if (
+		!hasExactOwnKeys(value, [
+			"version",
+			"state",
+			"generationId",
+			"dev",
+			"ino",
+			"bytes",
+			"mtimeMs",
+			"ctimeMs",
+			"mode",
+			"nlink",
+			"sha256",
+		])
+	)
+		return false;
+	return (
+		value.version === 1 &&
+		value.state === "sealed_private_copy" &&
+		typeof value.generationId === "string" &&
+		/^[0-9a-f]{64}$/.test(value.generationId) &&
+		typeof value.dev === "string" &&
+		/^(?:0|[1-9]\d*)$/.test(value.dev) &&
+		typeof value.ino === "string" &&
+		/^(?:0|[1-9]\d*)$/.test(value.ino) &&
+		Number.isSafeInteger(value.bytes) &&
+		Number(value.bytes) >= 0 &&
+		Number.isFinite(value.mtimeMs) &&
+		Number.isFinite(value.ctimeMs) &&
+		value.mode === 0o400 &&
+		value.nlink === 1 &&
+		typeof value.sha256 === "string" &&
+		/^[0-9a-f]{64}$/.test(value.sha256)
+	);
 }
 
 function sha256(value: Uint8Array | string): string {
 	return createHash("sha256").update(value).digest("hex");
 }
 
-function sha256FileBounded(path: string, expectedBytes: number): string {
-	if (!Number.isSafeInteger(expectedBytes) || expectedBytes < 0 || expectedBytes > SYSDIG_PIN_MAX_SEGMENT_BYTES) {
-		throw new Error("Sysdig pin hash input exceeds its byte bound");
+function boundedNonemptyUtf8(value: string, maximumBytes: number, fallback: string): string {
+	const source = value.length > 0 ? value : fallback;
+	let result = "";
+	let bytes = 0;
+	for (const character of source) {
+		const characterBytes = Buffer.byteLength(character, "utf8");
+		if (bytes + characterBytes > maximumBytes) break;
+		result += character;
+		bytes += characterBytes;
 	}
-	const descriptor = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-	const hash = createHash("sha256");
-	const buffer = Buffer.allocUnsafe(SYSDIG_PIN_COPY_BUFFER_BYTES);
-	let offset = 0;
-	try {
-		const before = fstatSync(descriptor, { bigint: true });
-		if (!before.isFile() || Number(before.size) !== expectedBytes)
-			throw new Error("Sysdig pinned segment changed before hashing");
-		while (offset < expectedBytes) {
-			const count = readSync(descriptor, buffer, 0, Math.min(buffer.length, expectedBytes - offset), offset);
-			if (count <= 0) throw new Error("Sysdig pinned segment ended before its recorded byte length");
-			hash.update(buffer.subarray(0, count));
-			offset += count;
-		}
-		if (readSync(descriptor, buffer, 0, 1, offset) !== 0)
-			throw new Error("Sysdig pinned segment grew beyond its recorded byte length");
-		const after = fstatSync(descriptor, { bigint: true });
-		if (
-			after.dev !== before.dev ||
-			after.ino !== before.ino ||
-			after.size !== before.size ||
-			after.mtimeMs !== before.mtimeMs ||
-			after.ctimeMs !== before.ctimeMs
-		) {
-			throw new Error("Sysdig pinned segment changed while hashing");
-		}
-		return hash.digest("hex");
-	} finally {
-		closeSync(descriptor);
-	}
+	return result.length > 0 ? result : fallback;
 }
 
 function fsyncDirectory(path: string): void {
@@ -757,46 +1027,11 @@ function writeImmutable(path: string, value: Buffer): void {
 			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 			const existing = readFileSync(path);
 			if (!existing.equals(value)) throw new Error(`Immutable incident reference collision at ${path}`);
+			// A previous link may have succeeded even though its directory fsync failed.
+			// Exact-byte replay must re-establish namespace durability before returning success.
+			fsyncDirectory(dirname(path));
 			rmSync(temporary, { force: true });
 		}
-	} finally {
-		if (descriptor !== undefined) closeSync(descriptor);
-		rmSync(temporary, { force: true });
-	}
-}
-
-function linkVerified(source: string, target: string): void {
-	try {
-		linkSync(source, target);
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-		const expected = lstatSync(source);
-		const observed = lstatSync(target);
-		if (
-			!expected.isFile() ||
-			expected.isSymbolicLink() ||
-			!observed.isFile() ||
-			observed.isSymbolicLink() ||
-			expected.dev !== observed.dev ||
-			expected.ino !== observed.ino
-		) {
-			throw new Error(`Existing immutable link did not match source inode at ${target}`);
-		}
-	}
-}
-
-function writeCheckpoint(path: string, value: CursorCheckpoint): void {
-	mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-	const temporary = `${path}.tmp-${process.pid}`;
-	let descriptor: number | undefined;
-	try {
-		descriptor = openSync(temporary, "w", 0o600);
-		writeAll(descriptor, Buffer.from(`${JSON.stringify(value)}\n`, "utf8"));
-		fsyncSync(descriptor);
-		closeSync(descriptor);
-		descriptor = undefined;
-		renameSync(temporary, path);
-		fsyncDirectory(dirname(path));
 	} finally {
 		if (descriptor !== undefined) closeSync(descriptor);
 		rmSync(temporary, { force: true });
@@ -819,6 +1054,10 @@ function strictBase64(value: string): Buffer {
 
 function isCanonicalUuid(value: unknown): value is string {
 	return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+}
+
+function isRecordObject(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function isUnsigned64(value: unknown): value is string {
@@ -862,7 +1101,11 @@ function isSegmentLocator(value: unknown): value is IncidentRecorderSegmentLocat
 	);
 }
 
-function isJournalOccurrenceReference(value: unknown, version: 1 | 2, legacyRoot: string): value is JournalOccurrenceReference {
+function isJournalOccurrenceReference(
+	value: unknown,
+	version: 1 | 2,
+	legacyRoot: string,
+): value is JournalOccurrenceReference {
 	if (typeof value === "string") return value.startsWith(`${legacyRoot}/`);
 	if (version !== 2 || !value || typeof value !== "object" || Array.isArray(value)) return false;
 	const reference = value as Record<string, unknown>;
@@ -983,7 +1226,17 @@ export interface StoppedTargetArtifactReference {
 export type StoppedTargetArtifactAdmission =
 	| {
 			state: "pending";
-			reason: "work_budget" | "storage_paused" | "cas_transaction_busy";
+			reason:
+				| "work_budget"
+				| "storage_paused"
+				| "cas_transaction_busy"
+				| "writer_lifecycle_lease_required"
+				| "writer_lifecycle_lease_released"
+				| "writer_lifecycle_recovery_conflict"
+				| "writer_lifecycle_lease_lost"
+				| "writer_lifecycle_namespace_changed"
+				| "writer_lifecycle_unavailable"
+				| "artifact_staging_reconciliation_required";
 			copiedBytes: number;
 			totalBytes: number;
 	  }
@@ -993,15 +1246,16 @@ export type StoppedTargetArtifactAdmission =
 interface StoppedTargetArtifactStream {
 	sourcePath: string;
 	encoding: string;
-	source: number;
-	target: number;
-	temporary: string;
 	dev: bigint;
 	ino: bigint;
-	mtimeMs: number;
-	ctimeMs: number;
+	mtimeNs: bigint;
+	ctimeNs: bigint;
+	stagedDev: bigint;
+	stagedIno: bigint;
 	totalBytes: number;
 	copiedBytes: number;
+	rehydrateBytes: number;
+	stageWasExisting: boolean;
 	hash: Hash;
 	reservedBytes: number;
 	reservedEntries: number;
@@ -1010,9 +1264,25 @@ interface StoppedTargetArtifactStream {
 	error?: string;
 }
 
-function allocatedStorageBytes(stat: { size: number; blocks?: number }): number {
-	const allocated = Number.isFinite(stat.blocks) ? Number(stat.blocks) * 512 : 0;
-	return Math.max(stat.size, allocated);
+type StorageAccountingMetadata = {
+	dev: number | bigint;
+	ino: number | bigint;
+	size: number | bigint;
+	blocks?: number | bigint;
+	nlink: number | bigint;
+};
+
+type StorageAccountingEffect =
+	| { kind: "account"; metadata: StorageAccountingMetadata; entryCreated: boolean }
+	| { kind: "remove"; metadata: StorageAccountingMetadata; releaseOwnedInode: boolean };
+
+function allocatedStorageBytes(stat: { size: number | bigint; blocks?: number | bigint }): number {
+	const size = Number(stat.size);
+	const blocks = stat.blocks === undefined ? 0 : Number(stat.blocks);
+	if (!Number.isSafeInteger(size) || size < 0 || !Number.isSafeInteger(blocks) || blocks < 0) {
+		throw new Error("Incident storage metadata exceeded safe integer bounds");
+	}
+	return Math.max(size, blocks * 512);
 }
 
 function abortError(message: string): Error {
@@ -1033,6 +1303,8 @@ function positiveBound(value: number | undefined, fallback: number): number {
 
 export interface IncidentRecorderCompactorOptions {
 	agentDir: string;
+	/** Current normal writer lease, supplied by the service lifecycle controller. */
+	writerLifecycleLease?: () => IncidentRecorderWriterLifecycleLease | undefined;
 	journalctlPath?: string;
 	/** Test/packaging override only. Production uses GNU find for bounded storage discovery. */
 	storageScannerPath?: string;
@@ -1049,29 +1321,29 @@ export interface IncidentRecorderCompactorOptions {
 	}) => void;
 	/** Test-only descriptor lifecycle seam. The close hook runs after the real descriptor is closed. */
 	runHistoryDescriptorIo?: {
-		afterOpen?: (input: {
-			role: "legacy_occurrence" | "stable_directory";
-			descriptor: number;
-		}) => void;
-		afterClose?: (input: {
-			role: "legacy_occurrence" | "stable_directory";
-			descriptor: number;
-		}) => void;
+		afterOpen?: (input: { role: "legacy_occurrence" | "stable_directory"; descriptor: number }) => void;
+		afterClose?: (input: { role: "legacy_occurrence" | "stable_directory"; descriptor: number }) => void;
 	};
 	/** Test-only seam for exercising a replaced proc descriptor subtree. */
 	runHistoryProcfs?: {
 		descriptorDirectoryPath?: string;
 		descriptorInfoDirectoryPath?: string;
 		statfsType?: (path: string) => number | bigint;
-		resolveDescriptorPath?: (input: {
-			canonicalPath: string;
-			descriptor: number;
-			childName?: string;
-		}) => string;
+		resolveDescriptorPath?: (input: { canonicalPath: string; descriptor: number; childName?: string }) => string;
 		onAuthorityAdmitted?: (input: { mountId: bigint }) => void;
 	};
 	/** Test/packaging override only. Production uses the stock root-owned Sysdig ring. */
 	sysdigRingBasePath?: string;
+	/** Test-only work bound for resumable Sysdig copies and verification. */
+	sysdigPinWorkBytesPerPass?: number;
+	/** Test-only bound for raw incident-root entries discovered per pass. */
+	pendingPinDirectoryDiscoveryEntriesPerPass?: number;
+	/** Test-only bound for pending-pin names processed per pass. */
+	pendingPinDirectoryBatchCount?: number;
+	/** Test/diagnostic crash and ordering boundary for immutable Sysdig pin requests. */
+	onSysdigPinStep?: (
+		step: "sysdig_request_durable" | "provider_requests_durable" | "initial_capture_complete",
+	) => void;
 	/** Test-only bound overrides. */
 	storageAccountingMaxInodes?: number;
 	storageAccountingMaxEntries?: number;
@@ -1091,7 +1363,9 @@ export interface IncidentRecorderCompactorRunOptions {
 	signal: AbortSignal;
 	onReaderReady?: () => void;
 	onStorageMode?: (mode: IncidentRecorderStorageMode, reason?: string) => void;
-	onRecoveryPass?: () => boolean;
+	onRecoveryPass?: () => boolean | Promise<boolean>;
+	/** Reacquire normal writer ownership after recovery, before opening journal mutation. */
+	onNormalWriterAdmission?: () => Promise<boolean>;
 	/** Test-only cadence override. */
 	storageRecoveryCadenceMs?: number;
 }
@@ -1111,9 +1385,22 @@ interface JournalReaderOutcome {
 	aborted: boolean;
 }
 
+type RecorderRootLifecycleUnavailableReason =
+	| "writer_lifecycle_lease_required"
+	| "writer_lifecycle_lease_released"
+	| "writer_lifecycle_recovery_conflict"
+	| "writer_lifecycle_lease_lost"
+	| "writer_lifecycle_namespace_changed"
+	| "writer_lifecycle_unavailable";
+
+type RecorderRootMutationResult<T> =
+	| { state: "committed"; value: T }
+	| { state: "unavailable"; reason: RecorderRootLifecycleUnavailableReason };
+
 export class IncidentRecorderCompactor {
 	private readonly root: string;
 	private readonly checkpointPath: string;
+	private readonly pendingPinCursorPath: string;
 	private readonly wrapperSequences = new Map<string, bigint>();
 	private readonly producerSequences = new Map<string, bigint>();
 	private checkpoint?: CursorCheckpoint;
@@ -1129,6 +1416,12 @@ export class IncidentRecorderCompactor {
 	private storageReservedEntries = 0;
 	private storageReservedInodes = 0;
 	private storageAccountingReadyState = false;
+	/**
+	 * Monotonic invalidation generation for scans that may overlap an uncertain
+	 * storage mutation. A scan may reconcile successful concurrent mutations,
+	 * but it must not publish a snapshot taken across an uncertain boundary.
+	 */
+	private storageAccountingInvalidationGeneration = 0;
 	private storageModeState: IncidentRecorderStorageMode = "uninitialized";
 	private storageRecoveryReasonState?: string;
 	private storageScanPromise?: Promise<void>;
@@ -1137,20 +1430,41 @@ export class IncidentRecorderCompactor {
 	private readonly storageScanConcurrentInodes = new Map<string, number>();
 	private storageScanSegmentMutation = false;
 	private segmentStore?: IncidentRecorderSegmentStore;
+	private segmentStoreCloseFailure?: unknown;
+	private segmentStoreCloseUncertain = false;
+	private transientFileCloseFailure?: Error;
 	private readonly segmentOpenStorageEntries = new Map<string, IncidentRecorderSegmentOpenStorageEntry>();
 	private readonly segmentAccountingSequences = new Map<string, number>();
 	private segmentOpenRequiresReconciliation = false;
 	private segmentRecoveryPruneCursor?: IncidentRecorderSegmentPruneCursor;
 	private checkpointDisposition: "valid" | "missing" | "invalid" = "missing";
-	private readonly activePinScans = new Set<string>();
+	private readonly activePinScans = new Map<string, ActivePinScan>();
+	private readonly activeCompactorChildren = new Set<TrackedCompactorChild>();
+	private pinReaderGeneration = 0;
+	private pinReadersQuiescing = false;
+	private readonly lifecycleClosedDescriptors = new Set<number>();
+	private readonly lifecycleClosedDirectories = new WeakSet<object>();
 	private activePinTraversal?: PinTraversal;
+	private pinRetentionMaintenance = false;
 	private readonly runHistoryTraversals = new Map<string, RunHistoryTraversal>();
+	private readonly runHistoryPublicationCapabilities = new Map<
+		IncidentRecorderRunHistoryPublicationCapability,
+		RunHistoryTraversal
+	>();
+	private readonly releasedRunHistoryPublicationCapabilities =
+		new WeakSet<IncidentRecorderRunHistoryPublicationCapability>();
 	private journalManifestValidation?: JournalManifestValidation;
 	private readonly stoppedTargetStreams = new Map<string, StoppedTargetArtifactStream>();
+	private sysdigSegmentVerification?: SysdigSegmentVerification;
+	private sysdigSourceCapture?: SysdigSourceCaptureState;
+	private pendingPinCursor?: string;
+	private pendingPinDirectoryTraversal?: PendingPinDirectoryTraversal;
+	private pendingPinDirectoryEntriesReadLastPass = 0;
 
 	constructor(private readonly options: IncidentRecorderCompactorOptions) {
 		this.root = join(options.agentDir, "incident-recorder");
 		this.checkpointPath = join(this.root, "compactor-cursor.json");
+		this.pendingPinCursorPath = join(this.root, "pending-pin-directory-cursor.json");
 		const checkpointExists = existsSync(this.checkpointPath);
 		try {
 			const parsed = JSON.parse(readFileSync(this.checkpointPath, "utf8")) as CursorCheckpoint;
@@ -1165,6 +1479,61 @@ export class IncidentRecorderCompactor {
 		} catch {
 			if (checkpointExists) this.checkpointDisposition = "invalid";
 		}
+		try {
+			const cursor = JSON.parse(readFileSync(this.pendingPinCursorPath, "utf8")) as Record<string, unknown>;
+			if (
+				cursor.version === 1 &&
+				(cursor.afterName === null ||
+					(typeof cursor.afterName === "string" && Buffer.byteLength(cursor.afterName) <= 4096))
+			) {
+				this.pendingPinCursor = typeof cursor.afterName === "string" ? cursor.afterName : undefined;
+			}
+		} catch {}
+	}
+
+	private normalWriterLifecycleLease():
+		| { state: "available"; lease: IncidentRecorderWriterLifecycleLease }
+		| { state: "unavailable"; reason: RecorderRootLifecycleUnavailableReason } {
+		const getter = this.options.writerLifecycleLease;
+		if (!getter) return { state: "unavailable", reason: "writer_lifecycle_lease_required" };
+		let lease: IncidentRecorderWriterLifecycleLease | undefined;
+		try {
+			lease = getter();
+		} catch {
+			return { state: "unavailable", reason: "writer_lifecycle_unavailable" };
+		}
+		if (!lease) return { state: "unavailable", reason: "writer_lifecycle_lease_required" };
+		const mode = inspectIncidentRecorderWriterLifecycleLeaseMode(lease);
+		if (!mode) return { state: "unavailable", reason: "writer_lifecycle_lease_released" };
+		if (mode !== "normal") return { state: "unavailable", reason: "writer_lifecycle_recovery_conflict" };
+		return { state: "available", lease };
+	}
+
+	private withRecorderRoot<T>(
+		operation: (root: IncidentCasRootMutation) => T,
+		lease?: IncidentRecorderWriterLifecycleLease,
+	): RecorderRootMutationResult<T> {
+		const admission = lease ? { state: "available" as const, lease } : this.normalWriterLifecycleLease();
+		if (admission.state === "unavailable") return admission;
+		const mutation = admission.lease.withRoot(operation);
+		if (mutation.state === "committed") return mutation;
+		switch (mutation.reason) {
+			case "released":
+				return { state: "unavailable", reason: "writer_lifecycle_lease_released" };
+			case "lease_lost":
+				return { state: "unavailable", reason: "writer_lifecycle_lease_lost" };
+			case "namespace_changed":
+			case "root_detached":
+				return { state: "unavailable", reason: "writer_lifecycle_namespace_changed" };
+			default:
+				return { state: "unavailable", reason: "writer_lifecycle_unavailable" };
+		}
+	}
+
+	private writerLifecycleAdmissionError(reason: RecorderRootLifecycleUnavailableReason): Error {
+		const error = new Error(`Incident recorder writer lifecycle unavailable: ${reason}`);
+		error.name = "IncidentRecorderWriterLifecycleAdmissionError";
+		return error;
 	}
 
 	get storageAccountingReady(): boolean {
@@ -1182,6 +1551,7 @@ export class IncidentRecorderCompactor {
 	async initializeStorageAccounting(signal: AbortSignal): Promise<void> {
 		if (this.storageScanPromise) return this.storageScanPromise;
 		const hadTrustedBaseline = this.storageAccountingReadyState;
+		const scanInvalidationGeneration = this.storageAccountingInvalidationGeneration;
 		const scan = this.scanStorageUsage(signal);
 		this.storageScanPromise = scan;
 		try {
@@ -1190,7 +1560,8 @@ export class IncidentRecorderCompactor {
 			if (signal.aborted || (error instanceof Error && error.name === "AbortError")) throw error;
 			const reason = this.storageScanRecoveryReason(error) ?? (hadTrustedBaseline ? "scan_failed" : undefined);
 			if (!reason) throw error;
-			this.storageAccountingReadyState = hadTrustedBaseline;
+			this.storageAccountingReadyState =
+				this.storageAccountingInvalidationGeneration === scanInvalidationGeneration ? hadTrustedBaseline : false;
 			this.enterStorageRecovery(reason);
 		} finally {
 			if (this.storageScanPromise === scan) this.storageScanPromise = undefined;
@@ -1202,11 +1573,18 @@ export class IncidentRecorderCompactor {
 		if (message.includes("inode bound exceeded")) return "inode_bound_exceeded";
 		if (message.includes("entry bound exceeded")) return "entry_bound_exceeded";
 		if (message.includes("storage accounting exceeded")) return "scan_timeout";
+		if (message.includes("storage accounting invalidated during discovery")) return "scan_invalidated";
 		return undefined;
+	}
+
+	private invalidateStorageAccounting(): void {
+		this.storageAccountingInvalidationGeneration += 1;
+		this.storageAccountingReadyState = false;
 	}
 
 	private async scanStorageUsage(signal: AbortSignal): Promise<void> {
 		if (signal.aborted) throw abortError("Incident storage accounting was aborted before discovery");
+		const scanInvalidationGeneration = this.storageAccountingInvalidationGeneration;
 		const incidentRoot = join(this.options.agentDir, "incidents");
 		mkdirSync(this.root, { recursive: true, mode: 0o700 });
 		mkdirSync(incidentRoot, { recursive: true, mode: 0o700 });
@@ -1231,6 +1609,15 @@ export class IncidentRecorderCompactor {
 			[this.root, incidentRoot, "-xdev", "-printf", "%D\\t%i\\t%s\\t%b\\n"],
 			{ stdio: ["ignore", "pipe", "pipe"], env: childEnvironment() },
 		);
+		let resolveChildCompletion: () => void = () => {};
+		const childCompletion = new Promise<void>((resolve) => {
+			resolveChildCompletion = resolve;
+		});
+		const trackedChild: TrackedCompactorChild = {
+			child,
+			completion: childCompletion,
+			terminate: () => {},
+		};
 		const terminate = (): void => {
 			try {
 				child.kill("SIGTERM");
@@ -1243,6 +1630,8 @@ export class IncidentRecorderCompactor {
 			}, CHILD_TERMINATION_GRACE_MS);
 			killTimer.unref();
 		};
+		trackedChild.terminate = terminate;
+		this.activeCompactorChildren.add(trackedChild);
 		const parseLine = (line: Buffer): void => {
 			entries += 1;
 			if (entries > maximumEntries) throw new Error("Incident storage accounting entry bound exceeded");
@@ -1298,7 +1687,10 @@ export class IncidentRecorderCompactor {
 		deadline.unref();
 		try {
 			const result = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
-				child.once("close", (code, childSignal) => resolve({ code, signal: childSignal }));
+				child.once("close", (code, childSignal) => {
+					resolve({ code, signal: childSignal });
+					resolveChildCompletion();
+				});
 			});
 			if (aborted || signal.aborted) throw abortError("Incident storage accounting was aborted");
 			if (!scanError && lineBuffer.length > 0)
@@ -1310,6 +1702,9 @@ export class IncidentRecorderCompactor {
 				);
 			if (this.storageScanSegmentMutation) {
 				throw new Error("Incident storage accounting changed during a segment-store mutation");
+			}
+			if (this.storageAccountingInvalidationGeneration !== scanInvalidationGeneration) {
+				throw new Error("Incident storage accounting invalidated during discovery");
 			}
 			let concurrentBytes = 0;
 			for (const [identity, added] of this.storageScanConcurrentInodes) {
@@ -1353,13 +1748,20 @@ export class IncidentRecorderCompactor {
 			this.storageScanConcurrentEntries = 0;
 			this.storageScanConcurrentInodes.clear();
 			this.storageScanSegmentMutation = false;
+			this.activeCompactorChildren.delete(trackedChild);
 		}
 	}
 
 	private accountStoragePath(path: string, entryCreated = true): number {
-		const stat = lstatSync(path);
-		const identity = `${String(stat.dev)}:${String(stat.ino)}`;
-		const added = allocatedStorageBytes(stat);
+		return this.accountStorageMetadata(lstatSync(path), entryCreated);
+	}
+
+	private accountStorageMetadata(
+		metadata: { dev: number | bigint; ino: number | bigint; size: number | bigint; blocks?: number | bigint },
+		entryCreated = true,
+	): number {
+		const identity = `${String(metadata.dev)}:${String(metadata.ino)}`;
+		const added = allocatedStorageBytes(metadata);
 		if (entryCreated) {
 			this.storageEntries += 1;
 			if (this.storageScanInProgress) this.storageScanConcurrentEntries += 1;
@@ -1383,11 +1785,14 @@ export class IncidentRecorderCompactor {
 		return added;
 	}
 
-	private accountRemovedStorageEntry(metadata: NonNullable<ReturnType<typeof lstatSync>>): void {
+	private accountRemovedStorageEntry(
+		metadata: { dev: number | bigint; ino: number | bigint; nlink: number | bigint },
+		releaseOwnedInode = false,
+	): void {
 		const identity = `${String(metadata.dev)}:${String(metadata.ino)}`;
 		this.storageEntries = Math.max(0, this.storageEntries - 1);
 		if (this.storageScanInProgress) this.storageScanConcurrentEntries -= 1;
-		if (metadata.nlink <= 1) {
+		if (releaseOwnedInode || Number(metadata.nlink) <= 1) {
 			const previous = this.storageInodes.get(identity) ?? 0;
 			this.storageInodes.delete(identity);
 			this.storageBytes = Math.max(0, this.storageBytes - previous);
@@ -1395,78 +1800,125 @@ export class IncidentRecorderCompactor {
 		}
 	}
 
-	private planOwnedDirectoryCreation(targets: string[]): string[] {
-		const missing = new Set<string>();
-		for (const target of targets) {
-			if (target !== this.root && !target.startsWith(`${this.root}/`)) {
-				throw new Error("Incident owned directory escaped the recorder root");
+	private applyStorageAccountingEffects(effects: readonly StorageAccountingEffect[]): number {
+		let addedBytes = 0;
+		for (const effect of effects) {
+			if (effect.kind === "account") {
+				addedBytes += this.accountStorageMetadata(effect.metadata, effect.entryCreated);
+			} else {
+				this.accountRemovedStorageEntry(effect.metadata, effect.releaseOwnedInode);
 			}
-			let cursor = target;
-			for (;;) {
-				try {
-					const metadata = lstatSync(cursor);
-					if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
-						throw new Error(`Incident owned path is not a stable directory: ${cursor}`);
-					}
-					break;
-				} catch (error) {
-					if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-					if (cursor === this.root) throw new Error("Incident recorder root disappeared during publication");
-					missing.add(cursor);
-					cursor = dirname(cursor);
+		}
+		return addedBytes;
+	}
+
+	private planOwnedDirectoryCreation(
+		root: IncidentCasRootMutation,
+		targets: readonly (readonly string[])[],
+	): string[][] {
+		const missing = new Map<string, string[]>();
+		for (const target of targets) {
+			for (let length = 1; length <= target.length; length += 1) {
+				const components = target.slice(0, length);
+				const parentKey = components.slice(0, -1).join("/");
+				if (parentKey.length > 0 && missing.has(parentKey)) {
+					missing.set(components.join("/"), [...components]);
+					continue;
+				}
+				const metadata = root.lstat(root.relative(...components));
+				if (!metadata) {
+					missing.set(components.join("/"), [...components]);
+					continue;
+				}
+				if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+					throw new Error(`Incident owned path is not a stable directory: ${components.join("/")}`);
 				}
 			}
 		}
-		return [...missing].sort((left, right) => left.length - right.length || left.localeCompare(right));
+		return [...missing.values()].sort(
+			(left, right) => left.length - right.length || left.join("/").localeCompare(right.join("/")),
+		);
 	}
 
-	private createPlannedOwnedDirectories(missing: readonly string[]): void {
-		for (const path of missing) {
-			const parent = dirname(path);
-			mkdirSync(path, { mode: 0o700 });
-			this.accountStoragePath(path);
-			this.accountStoragePath(parent, false);
-			fsyncDirectory(parent);
+	private createPlannedOwnedDirectories(
+		root: IncidentCasRootMutation,
+		missing: readonly (readonly string[])[],
+		effects: StorageAccountingEffect[],
+	): void {
+		for (const components of missing) {
+			const path = root.relative(...components);
+			const parent = root.relative(...components.slice(0, -1));
+			root.mkdirPrivate(path);
+			effects.push({ kind: "account", metadata: root.stat(path), entryCreated: true });
+			effects.push({ kind: "account", metadata: root.stat(parent), entryCreated: false });
+			root.fsyncDirectory(parent);
 		}
 	}
 
-	private ensureOwnedDirectories(targets: string[]): void {
-		const missing = this.planOwnedDirectoryCreation(targets);
+	private ensureOwnedDirectories(
+		root: IncidentCasRootMutation,
+		targets: readonly (readonly string[])[],
+		effects: StorageAccountingEffect[],
+	): void {
+		const missing = this.planOwnedDirectoryCreation(root, targets);
 		if (missing.length === 0) return;
-		const blockSize = Math.max(4096, Number(statfsSync(this.root).bsize));
+		const blockSize = Math.max(4096, Number(root.statfs(root.relative()).bsize));
 		const reservedBytes = missing.length * blockSize * 2;
 		this.reserveStorage(reservedBytes, missing.length, missing.length);
 		try {
-			this.createPlannedOwnedDirectories(missing);
+			this.createPlannedOwnedDirectories(root, missing, effects);
 		} finally {
 			this.releaseReservedCapacity(reservedBytes, missing.length, missing.length);
 		}
 	}
 
 	private verifyCasFile(
-		path: string,
+		root: IncidentCasRootMutation,
+		path: IncidentCasRelativePath,
 		digest: string,
 		bytes: number,
-	): NonNullable<ReturnType<typeof lstatSync>> {
-		const metadata = lstatSync(path);
-		if (
-			!metadata.isFile() ||
-			metadata.isSymbolicLink() ||
-			metadata.size !== bytes ||
-			sha256FileBounded(path, bytes) !== digest
-		) {
-			throw new Error("Existing CAS blob did not verify");
-		}
-		return metadata;
+	): BigIntStats {
+		return root.withFile(path, { access: "read" }, (file) => {
+			const before = file.stat();
+			if (!before.isFile() || before.isSymbolicLink() || before.size !== BigInt(bytes)) {
+				throw new Error("Existing CAS blob did not verify");
+			}
+			const hash = createHash("sha256");
+			const buffer = Buffer.allocUnsafe(64 * 1024);
+			let offset = 0;
+			while (offset < bytes) {
+				const count = file.read(buffer, 0, Math.min(buffer.length, bytes - offset), offset);
+				if (count <= 0) throw new Error("Existing CAS blob ended before its declared length");
+				hash.update(buffer.subarray(0, count));
+				offset += count;
+			}
+			const after = file.stat();
+			if (
+				before.dev !== after.dev ||
+				before.ino !== after.ino ||
+				before.size !== after.size ||
+				before.mtimeNs !== after.mtimeNs ||
+				before.ctimeNs !== after.ctimeNs ||
+				hash.digest("hex") !== digest
+			) {
+				throw new Error("Existing CAS blob did not verify");
+			}
+			return after;
+		});
 	}
 
-	private publishCasAndRunLease(input: {
-		runId: string;
-		digest: string;
-		bytes: number;
-		value?: Buffer;
-		stagedPath?: string;
-	}): { casPath: string; leasePath: string } {
+	private publishCasAndRunLease(
+		root: IncidentCasRootMutation,
+		input: {
+			runId: string;
+			digest: string;
+			bytes: number;
+			value?: Buffer;
+			stagedPath?: IncidentCasRelativePath;
+			mtimeNs?: bigint;
+		},
+		effects: StorageAccountingEffect[],
+	): { casPath: string; leasePath: string } {
 		if (
 			input.runId.length === 0 ||
 			Buffer.byteLength(input.runId) > 255 ||
@@ -1474,37 +1926,49 @@ export class IncidentRecorderCompactor {
 			!Number.isSafeInteger(input.bytes) ||
 			input.bytes < 0 ||
 			(input.value === undefined) === (input.stagedPath === undefined) ||
+			(input.mtimeNs !== undefined &&
+				(input.stagedPath === undefined ||
+					typeof input.mtimeNs !== "bigint" ||
+					input.mtimeNs < 0n ||
+					input.mtimeNs / 1_000n > BigInt(Number.MAX_SAFE_INTEGER))) ||
 			(input.value !== undefined && (input.value.length !== input.bytes || sha256(input.value) !== input.digest))
 		) {
 			throw new Error("CAS publication input was not canonical");
 		}
-		const casDirectory = join(this.root, "cas", "sha256", input.digest.slice(0, 2));
-		const casPath = join(casDirectory, `${input.digest}.blob`);
-		const leaseDirectory = join(this.root, "refs", "runs", sha256(input.runId));
-		const leasePath = join(leaseDirectory, `cas-${input.digest}.blob`);
+		const casDirectoryComponents = ["cas", "sha256", input.digest.slice(0, 2)] as const;
+		const leaseDirectoryComponents = ["refs", "runs", sha256(input.runId)] as const;
+		const casDirectory = root.relative(...casDirectoryComponents);
+		const cas = root.relative(...casDirectoryComponents, `${input.digest}.blob`);
+		const leaseDirectory = root.relative(...leaseDirectoryComponents);
+		const lease = root.relative(...leaseDirectoryComponents, `cas-${input.digest}.blob`);
 		const temporary = input.value
-			? join(casDirectory, `.${input.digest}.tmp-${process.pid}-${sha256(`${process.hrtime.bigint()}`)}`)
+			? root.relative(
+					...casDirectoryComponents,
+					`.${input.digest}.tmp-${process.pid}-${sha256(`${process.hrtime.bigint()}`)}`,
+				)
 			: input.stagedPath;
 		if (!temporary) throw new Error("CAS publication temporary path was unavailable");
-		if (input.stagedPath !== undefined) this.verifyCasFile(input.stagedPath, input.digest, input.bytes);
-		let casExists = false;
-		let leaseExists = false;
-		try {
-			this.verifyCasFile(casPath, input.digest, input.bytes);
-			casExists = true;
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-		}
-		try {
-			const lease = lstatSync(leasePath);
-			if (!lease.isFile() || lease.isSymbolicLink()) throw new Error("Existing CAS run lease was invalid");
-			leaseExists = true;
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		const stagedMetadata =
+			input.stagedPath === undefined
+				? undefined
+				: this.verifyCasFile(root, input.stagedPath, input.digest, input.bytes);
+		const missingDirectories = this.planOwnedDirectoryCreation(root, [
+			casDirectoryComponents,
+			leaseDirectoryComponents,
+		]);
+		const missingDirectoryKeys = new Set(missingDirectories.map((components) => components.join("/")));
+		let casExists = !missingDirectoryKeys.has(casDirectoryComponents.join("/")) && root.lstat(cas) !== undefined;
+		if (casExists) this.verifyCasFile(root, cas, input.digest, input.bytes);
+		let leaseExists =
+			!missingDirectoryKeys.has(leaseDirectoryComponents.join("/")) && root.lstat(lease) !== undefined;
+		if (leaseExists) {
+			const leaseMetadata = root.lstat(lease);
+			if (!leaseMetadata?.isFile() || leaseMetadata.isSymbolicLink()) {
+				throw new Error("Existing CAS run lease was invalid");
+			}
 		}
 		if (leaseExists && !casExists) throw new Error("CAS run lease existed without its canonical blob");
-		const missingDirectories = this.planOwnedDirectoryCreation([casDirectory, leaseDirectory]);
-		const blockSize = Math.max(4096, Number(statfsSync(this.root).bsize));
+		const blockSize = Math.max(4096, Number(root.statfs(root.relative()).bsize));
 		const createTemporary = !casExists && input.value !== undefined;
 		const createCasEntry = !casExists;
 		const createLeaseEntry = !leaseExists;
@@ -1517,76 +1981,86 @@ export class IncidentRecorderCompactor {
 		const reservedBytes = fileBytes + (mutationCount + missingDirectories.length) * blockSize;
 		this.reserveStorage(reservedBytes, reservedEntries, reservedInodes);
 		let temporaryCreated = false;
+		let casCreated = false;
 		try {
-			this.createPlannedOwnedDirectories(missingDirectories);
+			this.createPlannedOwnedDirectories(root, missingDirectories, effects);
 			if (!casExists && input.value) {
-				let descriptor: number | undefined;
-				try {
-					descriptor = openSync(temporary, "wx", 0o600);
-					writeAll(descriptor, input.value);
-					fsyncSync(descriptor);
-					closeSync(descriptor);
-					descriptor = undefined;
-					temporaryCreated = true;
-					this.accountStoragePath(temporary);
-					this.accountStoragePath(casDirectory, false);
-					fsyncDirectory(casDirectory);
-				} finally {
-					if (descriptor !== undefined) closeSync(descriptor);
-				}
+				root.writeFileExclusive(temporary, input.value, 0o600);
+				temporaryCreated = true;
+				effects.push({ kind: "account", metadata: root.stat(temporary), entryCreated: true });
+				effects.push({ kind: "account", metadata: root.stat(casDirectory), entryCreated: false });
+				root.fsyncDirectory(casDirectory);
 			}
 			if (!casExists) {
-				linkSync(temporary, casPath);
-				this.accountStoragePath(casPath);
-				this.accountStoragePath(casDirectory, false);
-				fsyncDirectory(casDirectory);
+				root.hardLink(temporary, cas);
+				casCreated = true;
+				effects.push({ kind: "account", metadata: root.stat(cas), entryCreated: true });
+				effects.push({ kind: "account", metadata: root.stat(casDirectory), entryCreated: false });
+				root.fsyncDirectory(casDirectory);
 				casExists = true;
 			}
-			const casMetadata = this.verifyCasFile(casPath, input.digest, input.bytes);
+			const casMetadata = this.verifyCasFile(root, cas, input.digest, input.bytes);
+			if (
+				input.mtimeNs !== undefined &&
+				stagedMetadata?.dev === casMetadata.dev &&
+				stagedMetadata.ino === casMetadata.ino
+			) {
+				// Center the microsecond tick so floating-point conversion cannot
+				// round a previously captured microsecond down by one on replay.
+				const timestamp = (Number(input.mtimeNs / 1_000n) + 0.5) / 1_000_000;
+				try {
+					root.utimes(cas, timestamp, timestamp);
+				} catch (error) {
+					// Only undo this attempt's new link. A pre-existing shared blob or
+					// durable crash residue belongs to its existing reference graph.
+					const current = root.lstat(cas);
+					if (casCreated && current?.dev === casMetadata.dev && current.ino === casMetadata.ino) {
+						root.unlinkFile(cas);
+						effects.push({ kind: "remove", metadata: current, releaseOwnedInode: false });
+						effects.push({ kind: "account", metadata: root.stat(casDirectory), entryCreated: false });
+						root.fsyncDirectory(casDirectory);
+					}
+					throw error;
+				}
+			}
 			if (temporaryCreated) {
-				const temporaryMetadata = lstatSync(temporary);
-				rmSync(temporary);
-				this.accountRemovedStorageEntry(temporaryMetadata);
+				const temporaryMetadata = root.stat(temporary);
+				root.unlinkFile(temporary);
+				effects.push({ kind: "remove", metadata: temporaryMetadata, releaseOwnedInode: false });
 				temporaryCreated = false;
-				this.accountStoragePath(casDirectory, false);
-				fsyncDirectory(casDirectory);
+				effects.push({ kind: "account", metadata: root.stat(casDirectory), entryCreated: false });
+				root.fsyncDirectory(casDirectory);
 			}
-			utimesSync(casPath, new Date(), new Date());
-			const casDescriptor = openSync(casPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-			try {
-				fsyncSync(casDescriptor);
-			} finally {
-				closeSync(casDescriptor);
-			}
+			root.fsyncFile(cas);
 			this.options.onCasPublicationStep?.("cas_durable");
 			if (!leaseExists) {
-				linkSync(casPath, leasePath);
-				this.accountStoragePath(leasePath);
-				this.accountStoragePath(leaseDirectory, false);
-				fsyncDirectory(leaseDirectory);
+				root.hardLink(cas, lease);
+				effects.push({ kind: "account", metadata: root.stat(lease), entryCreated: true });
+				effects.push({ kind: "account", metadata: root.stat(leaseDirectory), entryCreated: false });
+				root.fsyncDirectory(leaseDirectory);
 				leaseExists = true;
 			}
 			this.options.onCasPublicationStep?.("lease_durable");
-			const leaseMetadata = lstatSync(leasePath);
+			const leaseMetadata = root.stat(lease);
 			if (
 				!leaseMetadata.isFile() ||
 				leaseMetadata.isSymbolicLink() ||
 				leaseMetadata.dev !== casMetadata.dev ||
 				leaseMetadata.ino !== casMetadata.ino ||
-				leaseMetadata.size !== input.bytes ||
-				leaseMetadata.nlink < 2
+				leaseMetadata.size !== BigInt(input.bytes) ||
+				leaseMetadata.nlink < 2n
 			) {
 				throw new Error("CAS run lease did not resolve to the durable blob");
 			}
-			return { casPath, leasePath };
+			return { casPath: root.publicPath(cas), leasePath: root.publicPath(lease) };
 		} finally {
 			if (temporaryCreated) {
 				try {
-					const metadata = lstatSync(temporary);
-					rmSync(temporary);
-					this.accountRemovedStorageEntry(metadata);
-					this.accountStoragePath(casDirectory, false);
-					fsyncDirectory(casDirectory);
+					const metadata = root.stat(temporary);
+					root.unlinkFile(temporary);
+					effects.push({ kind: "remove", metadata, releaseOwnedInode: false });
+					effects.push({ kind: "account", metadata: root.stat(casDirectory), entryCreated: false });
+					root.fsyncDirectory(casDirectory);
 				} catch {}
 			}
 			this.releaseReservedCapacity(reservedBytes, reservedEntries, reservedInodes);
@@ -1687,13 +2161,7 @@ export class IncidentRecorderCompactor {
 			if (current.has(path)) continue;
 			this.storageEntries = Math.max(0, this.storageEntries - 1);
 			if (this.storageScanInProgress) this.storageScanConcurrentEntries -= 1;
-			this.setSegmentAccountedInode(
-				previous.deviceId,
-				previous.inodeId,
-				0,
-				0,
-				previous.linkCount <= 1,
-			);
+			this.setSegmentAccountedInode(previous.deviceId, previous.inodeId, 0, 0, previous.linkCount <= 1);
 		}
 		for (const entry of result.entries) {
 			const previous = this.segmentOpenStorageEntries.get(entry.path);
@@ -1701,18 +2169,10 @@ export class IncidentRecorderCompactor {
 				this.storageEntries += 1;
 				if (this.storageScanInProgress) this.storageScanConcurrentEntries += 1;
 			}
-			if (
-				previous &&
-				(previous.deviceId !== entry.deviceId || previous.inodeId !== entry.inodeId)
-			) {
+			if (previous && (previous.deviceId !== entry.deviceId || previous.inodeId !== entry.inodeId)) {
 				this.setSegmentAccountedInode(previous.deviceId, previous.inodeId, 0, 0, previous.linkCount <= 1);
 			}
-			this.setSegmentAccountedInode(
-				entry.deviceId,
-				entry.inodeId,
-				entry.logicalBytes,
-				entry.allocatedBytes,
-			);
+			this.setSegmentAccountedInode(entry.deviceId, entry.inodeId, entry.logicalBytes, entry.allocatedBytes);
 		}
 		for (const parentEffect of result.parentEffects) this.applySegmentParentEffect(parentEffect);
 		this.segmentOpenStorageEntries.clear();
@@ -1852,17 +2312,29 @@ export class IncidentRecorderCompactor {
 	}
 
 	private closeSegmentStore(): void {
+		if (this.segmentStoreCloseUncertain) throw this.segmentStoreCloseFailure;
+		this.closePendingPinDirectoryTraversal();
 		const store = this.segmentStore;
 		if (!store) return;
 		this.discardRunHistoryTraversals();
+		try {
+			store.close();
+		} catch (error) {
+			this.segmentOpenRequiresReconciliation = true;
+			this.segmentStoreCloseFailure = error;
+			this.segmentStoreCloseUncertain = true;
+			throw error;
+		}
 		this.segmentStore = undefined;
-		store.close();
 	}
 
 	private ensureSegmentStore(): IncidentRecorderSegmentStore {
+		if (this.segmentStoreCloseUncertain) throw this.segmentStoreCloseFailure;
 		if (this.segmentStore) return this.segmentStore;
 		if (!this.storageAccountingReadyState || this.storageModeState !== "normal") {
-			const error = new Error("Incident segment store cannot open outside normal storage mode") as NodeJS.ErrnoException;
+			const error = new Error(
+				"Incident segment store cannot open outside normal storage mode",
+			) as NodeJS.ErrnoException;
 			error.code = "ENOSPC";
 			throw error;
 		}
@@ -1885,7 +2357,9 @@ export class IncidentRecorderCompactor {
 				this.closeSegmentStore();
 				this.storageModeState = "recovery-only";
 				this.storageRecoveryReasonState = "segment_open_reconciliation_required";
-				const error = new Error("Incident segment open requires a full storage reconciliation") as NodeJS.ErrnoException;
+				const error = new Error(
+					"Incident segment open requires a full storage reconciliation",
+				) as NodeJS.ErrnoException;
 				error.code = "ENOSPC";
 				throw error;
 			}
@@ -1903,11 +2377,7 @@ export class IncidentRecorderCompactor {
 			this.storageRecoveryReasonState ??= "segment_store_open_failed";
 			throw error;
 		} finally {
-			this.releaseReservedCapacity(
-				plan.peakAdditionalBytes,
-				plan.peakAdditionalEntries,
-				plan.peakAdditionalInodes,
-			);
+			this.releaseReservedCapacity(plan.peakAdditionalBytes, plan.peakAdditionalEntries, plan.peakAdditionalInodes);
 		}
 	}
 
@@ -1945,6 +2415,39 @@ export class IncidentRecorderCompactor {
 		return error instanceof Error && error.name === "IncidentSegmentPersistenceError";
 	}
 
+	private isWriterLifecycleAdmissionError(error: unknown): boolean {
+		return error instanceof Error && error.name === "IncidentRecorderWriterLifecycleAdmissionError";
+	}
+
+	private isStoppedTargetReconciliationError(error: unknown): boolean {
+		return (
+			error instanceof Error &&
+			(error.message === "artifact_staging_identity_changed_during_capture" ||
+				error.message === "artifact_staging_changed_during_capture")
+		);
+	}
+
+	private isStoppedTargetPublicationStructuralError(error: unknown): boolean {
+		if (!(error instanceof Error)) return false;
+		if (
+			[
+				"CAS publication input was not canonical",
+				"CAS publication temporary path was unavailable",
+				"Existing CAS blob did not verify",
+				"Existing CAS blob ended before its declared length",
+				"Existing CAS run lease was invalid",
+				"CAS run lease existed without its canonical blob",
+				"CAS run lease did not resolve to the durable blob",
+				"CAS hard-link identity changed during publication",
+			].includes(error.message)
+		)
+			return true;
+		if (/^CAS capability filesystem operation failed \((?:EEXIST|EISDIR|ELOOP|ENOTDIR)\)$/.test(error.message))
+			return true;
+		const code = (error as NodeJS.ErrnoException).code;
+		return code === "EEXIST" || code === "EISDIR" || code === "ELOOP" || code === "ENOTDIR";
+	}
+
 	private segmentReference(locator: IncidentRecorderSegmentLocator): string {
 		return `segment:v1:${Buffer.from(JSON.stringify(locator), "utf8").toString("base64url")}`;
 	}
@@ -1962,30 +2465,216 @@ export class IncidentRecorderCompactor {
 	}
 
 	private writeOwnedCheckpoint(path: string, value: CursorCheckpoint): void {
-		const encodedBytes = Buffer.byteLength(`${JSON.stringify(value)}\n`);
-		this.ensureDiskAdmission(encodedBytes * 2 + 256 * 1024);
-		let previousBytes = 0;
+		if (path !== this.checkpointPath) throw new Error("Unknown recorder checkpoint path");
+		this.writeRecorderCursor("compactor-cursor.json", value);
+	}
+
+	private writeRecorderCursor(
+		name: "compactor-cursor.json" | "pending-pin-directory-cursor.json",
+		value: unknown,
+	): void {
+		const bytes = Buffer.from(`${JSON.stringify(value)}\n`, "utf8");
+		this.ensureDiskAdmission(bytes.length * 2 + 256 * 1024);
+		let changed = false;
 		try {
-			previousBytes = allocatedStorageBytes(statSync(path));
-		} catch {}
-		const existed = existsSync(path);
-		writeCheckpoint(path, value);
-		if (!existed) this.accountStoragePath(path);
-		else {
-			const nextBytes = allocatedStorageBytes(statSync(path));
-			this.storageBytes = Math.max(0, this.storageBytes - previousBytes + nextBytes);
-			if (this.storageScanInProgress) {
-				const stat = lstatSync(path);
-				this.storageScanConcurrentInodes.set(`${String(stat.dev)}:${String(stat.ino)}`, nextBytes);
-			}
+			const mutation = this.withRecorderRoot((root) => {
+				const path = root.relative(name);
+				// One fixed scratch slot makes repeated interrupted replacement bounded.
+				const next = root.relative(`.${name}.next`);
+				const previous = root.lstat(path);
+				const scratch = root.lstat(next);
+				for (const entry of [previous, scratch]) {
+					if (
+						entry &&
+						(!entry.isFile() || entry.isSymbolicLink() || entry.nlink !== 1n || (entry.mode & 0o777n) !== 0o600n)
+					)
+						throw new Error("Recorder cursor is not a private regular file");
+				}
+				changed = true;
+				root.withFile(
+					next,
+					{ access: "write", ...(scratch ? {} : { create: "exclusive" as const }), mode: 0o600 },
+					(file) => {
+						const held = file.stat();
+						if (scratch && (held.dev !== scratch.dev || held.ino !== scratch.ino))
+							throw new Error("Recorder cursor scratch changed");
+						file.truncate(0);
+						let offset = 0;
+						while (offset < bytes.length) {
+							const count = file.write(bytes, offset, bytes.length - offset, offset);
+							if (count <= 0) throw new Error("Recorder cursor write made no progress");
+							offset += count;
+						}
+						file.sync();
+					},
+				);
+				root.rename(next, path);
+				root.fsyncDirectory(root.relative());
+				const effects: StorageAccountingEffect[] = [];
+				if (previous) effects.push({ kind: "remove", metadata: previous, releaseOwnedInode: true });
+				if (scratch) effects.push({ kind: "remove", metadata: scratch, releaseOwnedInode: true });
+				effects.push({ kind: "account", metadata: root.stat(path), entryCreated: true });
+				effects.push({ kind: "account", metadata: root.stat(root.relative()), entryCreated: false });
+				return effects;
+			});
+			if (mutation.state !== "committed") throw this.writerLifecycleAdmissionError(mutation.reason);
+			this.applyStorageAccountingEffects(mutation.value);
+		} catch (error) {
+			if (changed) this.invalidateStorageAccounting();
+			throw error;
 		}
 	}
 
-	private linkOwnedVerified(source: string, target: string): void {
-		const existed = existsSync(target);
-		this.ensureDiskAdmission(64 * 1024, existed ? 0 : 1, 0);
-		linkVerified(source, target);
-		if (!existed) this.accountStoragePath(target);
+	private pendingPinDirectoryDiscoveryEntriesPerPass(): number {
+		return Math.min(
+			positiveBound(
+				this.options.pendingPinDirectoryDiscoveryEntriesPerPass,
+				PENDING_PIN_DIRECTORY_DISCOVERY_ENTRIES,
+			),
+			PENDING_PIN_DIRECTORY_DISCOVERY_ENTRIES,
+		);
+	}
+
+	private pendingPinDirectoryBatchCount(): number {
+		return Math.min(
+			positiveBound(this.options.pendingPinDirectoryBatchCount, PENDING_PIN_DIRECTORY_BATCH_COUNT),
+			PENDING_PIN_DIRECTORY_BATCH_COUNT,
+		);
+	}
+
+	private closePendingPinDirectoryTraversal(): void {
+		const state = this.pendingPinDirectoryTraversal;
+		if (!state) return;
+		const directory = state.directory;
+		if (directory) directory.closeSync();
+		state.directory = undefined;
+		state.pendingNames.length = 0;
+		state.pendingNameBytes = 0;
+		this.pendingPinDirectoryTraversal = undefined;
+	}
+
+	private discardPendingPinDirectoryTraversal(): void {
+		try {
+			this.closePendingPinDirectoryTraversal();
+		} catch {}
+	}
+
+	private completePendingPinDirectoryNames(afterName: string | undefined): void {
+		const state = this.pendingPinDirectoryTraversal;
+		if (!state || afterName === undefined) return;
+		const index = state.pendingNames.indexOf(afterName);
+		if (index < 0) return;
+		for (let offset = 0; offset <= index; offset += 1) {
+			state.pendingNameBytes -= Buffer.byteLength(state.pendingNames[offset] ?? "");
+		}
+		state.pendingNames.splice(0, index + 1);
+		state.pendingNameBytes = Math.max(0, state.pendingNameBytes);
+		if (state.sweepComplete && state.pendingNames.length === 0) {
+			this.pendingPinDirectoryTraversal = undefined;
+		}
+	}
+
+	private beginPendingPinDirectoryTraversal(incidentRoot: string): PendingPinDirectoryTraversal | undefined {
+		try {
+			const boundary = this.pendingPinCursor;
+			const state: PendingPinDirectoryTraversal = {
+				incidentRoot,
+				...(boundary === undefined ? {} : { boundary }),
+				phase: boundary === undefined ? "full" : "after-cursor",
+				directory: opendirSync(incidentRoot),
+				pendingNames: [],
+				pendingNameBytes: 0,
+				sawEntry: false,
+				sweepComplete: false,
+			};
+			this.pendingPinDirectoryTraversal = state;
+			return state;
+		} catch {
+			return undefined;
+		}
+	}
+
+	private discoverPendingPinDirectoryNames(incidentRoot: string): string[] {
+		let state = this.pendingPinDirectoryTraversal;
+		if (state && state.incidentRoot !== incidentRoot) {
+			this.discardPendingPinDirectoryTraversal();
+			state = undefined;
+		}
+		state ??= this.beginPendingPinDirectoryTraversal(incidentRoot);
+		if (!state) return [];
+		const discoveryLimit = this.pendingPinDirectoryDiscoveryEntriesPerPass();
+		const batchLimit = this.pendingPinDirectoryBatchCount();
+		if (state.pendingNames.length > 0) return state.pendingNames.slice(0, batchLimit);
+		while (
+			this.pendingPinDirectoryEntriesReadLastPass < discoveryLimit &&
+			state.pendingNames.length < discoveryLimit &&
+			!state.sweepComplete
+		) {
+			let directory = state.directory;
+			if (!directory) {
+				try {
+					directory = opendirSync(incidentRoot);
+					state.directory = directory;
+				} catch {
+					this.discardPendingPinDirectoryTraversal();
+					return [];
+				}
+			}
+			let entry: Dirent | null;
+			try {
+				entry = directory.readSync();
+			} catch {
+				this.discardPendingPinDirectoryTraversal();
+				return [];
+			}
+			if (entry === null) {
+				try {
+					directory.closeSync();
+				} catch {
+					this.discardPendingPinDirectoryTraversal();
+					return [];
+				}
+				state.directory = undefined;
+				if (state.phase === "after-cursor") {
+					state.phase = "through-cursor";
+					if (state.pendingNames.length > 0) break;
+					continue;
+				}
+				state.sweepComplete = true;
+				break;
+			}
+			this.pendingPinDirectoryEntriesReadLastPass += 1;
+			state.sawEntry = true;
+			const name = entry.name;
+			const nameBytes = Buffer.byteLength(name);
+			if (nameBytes > PENDING_PIN_DIRECTORY_NAME_MAX_BYTES) continue;
+			const eligible =
+				state.phase === "full" ||
+				(state.phase === "after-cursor" && name > (state.boundary ?? "")) ||
+				(state.phase === "through-cursor" && name <= (state.boundary ?? ""));
+			if (!eligible) continue;
+			state.pendingNames.push(name);
+			state.pendingNameBytes += nameBytes;
+		}
+		state.pendingNames.sort();
+		if (state.sweepComplete && state.pendingNames.length === 0) {
+			const rootWasEmpty = !state.sawEntry;
+			this.pendingPinDirectoryTraversal = undefined;
+			if (rootWasEmpty) this.persistPendingPinCursor(undefined);
+			return [];
+		}
+		return state.pendingNames.slice(0, batchLimit);
+	}
+
+	private persistPendingPinCursor(afterName: string | undefined): void {
+		if (this.pendingPinCursor === afterName) {
+			this.completePendingPinDirectoryNames(afterName);
+			return;
+		}
+		const value = { version: 1, afterName: afterName ?? null };
+		this.writeRecorderCursor("pending-pin-directory-cursor.json", value);
+		this.pendingPinCursor = afterName;
+		this.completePendingPinDirectoryNames(afterName);
 	}
 
 	get diskPaused(): boolean {
@@ -2062,22 +2751,42 @@ export class IncidentRecorderCompactor {
 		return result;
 	}
 
-	private discardStoppedTargetStream(key: string, state: StoppedTargetArtifactStream): void {
+	private discardStoppedTargetStream(key: string, state: StoppedTargetArtifactStream): boolean {
+		let mutation: RecorderRootMutationResult<{ cleaned: boolean; effects: StorageAccountingEffect[] }> | undefined;
 		try {
-			closeSync(state.source);
-		} catch {}
-		try {
-			closeSync(state.target);
-		} catch {}
-		try {
-			const metadata = lstatSync(state.temporary);
-			rmSync(state.temporary);
-			this.accountRemovedStorageEntry(metadata);
-			this.accountStoragePath(dirname(state.temporary), false);
-			fsyncDirectory(dirname(state.temporary));
-		} catch {}
+			mutation = this.withRecorderRoot((root) => {
+				const effects: StorageAccountingEffect[] = [];
+				const stagingDirectory = root.relative("cas", "sha256", "staging");
+				const staged = root.relative("cas", "sha256", "staging", `${key}.tmp`);
+				const metadata = root.lstat(staged);
+				if (metadata) {
+					const metadataNlink = Number(metadata.nlink);
+					if (
+						!metadata.isFile() ||
+						metadata.isSymbolicLink() ||
+						metadata.dev !== state.stagedDev ||
+						metadata.ino !== state.stagedIno ||
+						metadata.size !== BigInt(state.copiedBytes) ||
+						(metadataNlink !== 1 && metadataNlink !== 2 && metadataNlink !== 3) ||
+						(metadataNlink !== 1 && metadata.size !== BigInt(state.totalBytes))
+					)
+						return { cleaned: false, effects };
+					root.unlinkFile(staged);
+					effects.push({ kind: "remove", metadata, releaseOwnedInode: false });
+					effects.push({ kind: "account", metadata: root.stat(stagingDirectory), entryCreated: false });
+					root.fsyncDirectory(stagingDirectory);
+				}
+				return { cleaned: true, effects };
+			});
+		} catch {
+			// Keep the state and reservation for a later exact-capability retry.
+			return false;
+		}
+		if (mutation?.state !== "committed" || !mutation.value.cleaned) return false;
+		this.applyStorageAccountingEffects(mutation.value.effects);
 		this.releaseStorageReservation(state);
 		this.stoppedTargetStreams.delete(key);
+		return true;
 	}
 
 	private discardStoppedTargetStreams(): void {
@@ -2092,11 +2801,24 @@ export class IncidentRecorderCompactor {
 	): StoppedTargetArtifactAdmission {
 		const key = sha256(`${runId}\0${sourcePath}\0${encoding}`);
 		let state = this.stoppedTargetStreams.get(key);
-		if (state?.error) return { state: "error", reason: state.error };
+		if (state?.error) {
+			const reason = state.error;
+			if (!this.discardStoppedTargetStream(key, state))
+				return {
+					state: "pending",
+					reason: "writer_lifecycle_unavailable",
+					copiedBytes: state.copiedBytes,
+					totalBytes: state.totalBytes,
+				};
+			return { state: "error", reason };
+		}
 		if (!state) {
 			if (this.stoppedTargetStreams.size >= 8)
 				return { state: "pending", reason: "work_budget", copiedBytes: 0, totalBytes: 0 };
 			if (this.diskPaused) return { state: "pending", reason: "storage_paused", copiedBytes: 0, totalBytes: 0 };
+			const leaseAdmission = this.normalWriterLifecycleLease();
+			if (leaseAdmission.state === "unavailable")
+				return { state: "pending", reason: leaseAdmission.reason, copiedBytes: 0, totalBytes: 0 };
 			let metadata: BigIntStats;
 			try {
 				metadata = lstatSync(sourcePath, { bigint: true });
@@ -2108,8 +2830,6 @@ export class IncidentRecorderCompactor {
 			if (!Number.isSafeInteger(totalBytes)) {
 				return { state: "pending", reason: "storage_paused", copiedBytes: 0, totalBytes };
 			}
-			const directory = join(this.root, "cas", "sha256", "staging");
-			const temporary = join(directory, `${key}.tmp`);
 			// Hold the complete staged-file plus worst-case first-use CAS/lease
 			// publication peak for the lifetime of the resumable copy. The digest
 			// fanout is not known until hashing finishes, so this bounded structural
@@ -2119,69 +2839,157 @@ export class IncidentRecorderCompactor {
 			const reservationEntries = 8;
 			const reservationInodes = 8;
 			try {
-				this.ensureOwnedDirectories([directory]);
 				this.reserveStorage(reservationBytes, reservationEntries, reservationInodes);
 			} catch (error) {
 				if ((error as NodeJS.ErrnoException).code === "ENOSPC")
 					return { state: "pending", reason: "storage_paused", copiedBytes: 0, totalBytes };
 				throw error;
 			}
-			let source: number | undefined;
-			let target: number | undefined;
-			let reservedState: StoppedTargetArtifactStream | undefined;
+			let mutation:
+				| RecorderRootMutationResult<{
+						state?: StoppedTargetArtifactStream;
+						pendingReason?: "artifact_staging_reconciliation_required";
+						effects: StorageAccountingEffect[];
+				  }>
+				| undefined;
+			let mutationError: unknown;
 			try {
-				if (existsSync(temporary)) throw new Error("artifact_staging_path_already_exists");
-				source = openSync(sourcePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-				const openedSource = fstatSync(source, { bigint: true });
-				if (
-					openedSource.dev !== metadata.dev ||
-					openedSource.ino !== metadata.ino ||
-					openedSource.size !== metadata.size ||
-					openedSource.mtimeMs !== metadata.mtimeMs ||
-					openedSource.ctimeMs !== metadata.ctimeMs
-				)
-					throw new Error("artifact_source_identity_changed_before_capture");
-				target = openSync(temporary, "wx", 0o600);
-				reservedState = {
-					sourcePath,
-					encoding,
-					source,
-					target,
-					temporary,
-					dev: metadata.dev,
-					ino: metadata.ino,
-					mtimeMs: Number(metadata.mtimeMs),
-					ctimeMs: Number(metadata.ctimeMs),
-					totalBytes,
-					copiedBytes: 0,
-					hash: createHash("sha256"),
-					reservedBytes: reservationBytes,
-					reservedEntries: reservationEntries,
-					reservedInodes: reservationInodes,
-					reservationReleased: false,
-				};
-				const allocated = this.accountStoragePath(temporary);
-				const parentAllocated = this.accountStoragePath(directory, false);
-				fsyncDirectory(directory);
-				this.consumeStorageReservation(reservedState, allocated + parentAllocated, 1, 1);
-				state = reservedState;
-				this.stoppedTargetStreams.set(key, state);
+				mutation = this.withRecorderRoot((root) => {
+					const effects: StorageAccountingEffect[] = [];
+					const directoryComponents = ["cas", "sha256", "staging"] as const;
+					this.ensureOwnedDirectories(root, [directoryComponents], effects);
+					const directory = root.relative(...directoryComponents);
+					const staged = root.relative(...directoryComponents, `${key}.tmp`);
+					const existing = root.lstat(staged);
+					if (existing) {
+						const expectedUid = typeof process.getuid === "function" ? process.getuid() : existing.uid;
+						const existingBytes = Number(existing.size);
+						const existingNlink = Number(existing.nlink);
+						if (
+							!existing.isFile() ||
+							existing.isSymbolicLink() ||
+							(existingNlink !== 1 && existingNlink !== 2 && existingNlink !== 3) ||
+							(existingNlink !== 1 && existingBytes !== totalBytes) ||
+							Number(existing.uid) !== expectedUid ||
+							(Number(existing.mode) & 0o077) !== 0 ||
+							!Number.isSafeInteger(existingBytes) ||
+							existingBytes < 0 ||
+							existingBytes > totalBytes
+						)
+							return { pendingReason: "artifact_staging_reconciliation_required", effects };
+						return {
+							state: {
+								sourcePath,
+								encoding,
+								dev: metadata.dev,
+								ino: metadata.ino,
+								mtimeNs: metadata.mtimeNs,
+								ctimeNs: metadata.ctimeNs,
+								stagedDev: existing.dev,
+								stagedIno: existing.ino,
+								totalBytes,
+								copiedBytes: existingBytes,
+								rehydrateBytes: 0,
+								stageWasExisting: true,
+								hash: createHash("sha256"),
+								reservedBytes: reservationBytes,
+								reservedEntries: reservationEntries,
+								reservedInodes: reservationInodes,
+								reservationReleased: false,
+							},
+							effects,
+						};
+					}
+					let source: number | undefined;
+					try {
+						source = openSync(sourcePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+						const openedSource = fstatSync(source, { bigint: true });
+						if (
+							openedSource.dev !== metadata.dev ||
+							openedSource.ino !== metadata.ino ||
+							openedSource.size !== metadata.size ||
+							openedSource.mtimeNs !== metadata.mtimeNs ||
+							openedSource.ctimeNs !== metadata.ctimeNs
+						) {
+							throw new Error("artifact_source_identity_changed_before_capture");
+						}
+						root.writeFileExclusive(staged, Buffer.alloc(0), 0o600);
+					} finally {
+						if (source !== undefined) closeSync(source);
+					}
+					const stagedMetadata = root.stat(staged);
+					const directoryMetadata = root.stat(directory);
+					effects.push({ kind: "account", metadata: stagedMetadata, entryCreated: true });
+					effects.push({ kind: "account", metadata: directoryMetadata, entryCreated: false });
+					root.fsyncDirectory(directory);
+					return {
+						state: {
+							sourcePath,
+							encoding,
+							dev: metadata.dev,
+							ino: metadata.ino,
+							mtimeNs: metadata.mtimeNs,
+							ctimeNs: metadata.ctimeNs,
+							stagedDev: stagedMetadata.dev,
+							stagedIno: stagedMetadata.ino,
+							totalBytes,
+							copiedBytes: 0,
+							rehydrateBytes: 0,
+							stageWasExisting: false,
+							hash: createHash("sha256"),
+							reservedBytes: reservationBytes,
+							reservedEntries: reservationEntries,
+							reservedInodes: reservationInodes,
+							reservationReleased: false,
+						},
+						effects,
+					};
+				}, leaseAdmission.lease);
 			} catch (error) {
-				if (reservedState) this.releaseStorageReservation(reservedState);
-				else this.releaseReservedCapacity(reservationBytes, reservationEntries, reservationInodes);
-				if (source !== undefined)
-					try {
-						closeSync(source);
-					} catch {}
-				if (target !== undefined)
-					try {
-						closeSync(target);
-					} catch {}
-				try {
-					rmSync(temporary, { force: true });
-				} catch {}
-				return { state: "error", reason: error instanceof Error ? error.message : String(error) };
+				mutationError = error;
 			}
+			if (mutationError !== undefined || !mutation || mutation.state === "unavailable") {
+				this.releaseReservedCapacity(reservationBytes, reservationEntries, reservationInodes);
+				if (mutationError !== undefined) {
+					return {
+						state: "error",
+						reason: mutationError instanceof Error ? mutationError.message : String(mutationError),
+					};
+				}
+				return {
+					state: "pending",
+					reason: mutation?.state === "unavailable" ? mutation.reason : "writer_lifecycle_unavailable",
+					copiedBytes: 0,
+					totalBytes,
+				};
+			}
+			if (mutation.value.pendingReason) {
+				this.releaseReservedCapacity(reservationBytes, reservationEntries, reservationInodes);
+				return {
+					state: "pending",
+					reason: mutation.value.pendingReason,
+					copiedBytes: 0,
+					totalBytes,
+				};
+			}
+			if (!mutation.value.state) {
+				this.releaseReservedCapacity(reservationBytes, reservationEntries, reservationInodes);
+				return {
+					state: "pending",
+					reason: "artifact_staging_reconciliation_required",
+					copiedBytes: 0,
+					totalBytes,
+				};
+			}
+			state = mutation.value.state;
+			this.stoppedTargetStreams.set(key, state);
+			const addedBytes = this.applyStorageAccountingEffects(mutation.value.effects);
+			this.consumeStorageReservation(
+				state,
+				addedBytes,
+				state.stageWasExisting ? 0 : 1,
+				state.stageWasExisting ? 0 : 1,
+			);
 		}
 		if (this.diskPaused) {
 			const copiedBytes = state.copiedBytes;
@@ -2194,80 +3002,345 @@ export class IncidentRecorderCompactor {
 				totalBytes,
 			};
 		}
-		let remaining = Math.max(0, Math.min(work.byteBudget, 4 * 1024 * 1024));
-		const buffer = Buffer.allocUnsafe(64 * 1024);
-		try {
-			while (remaining > 0 && Date.now() < work.deadlineMs) {
-				const count = readSync(state.source, buffer, 0, Math.min(buffer.length, remaining), null);
-				if (count === 0) {
-					const transaction = acquireIncidentCasTransaction(this.root);
-					if (!transaction)
-						return {
-							state: "pending",
-							reason: "cas_transaction_busy",
-							copiedBytes: state.copiedBytes,
-							totalBytes: state.totalBytes,
-						};
-					try {
-						const currentPath = lstatSync(state.sourcePath, { bigint: true });
-						const currentFd = fstatSync(state.source, { bigint: true });
-						if (
-							currentFd.dev !== state.dev ||
-							currentFd.ino !== state.ino ||
-							currentPath.dev !== state.dev ||
-							currentPath.ino !== state.ino ||
-							Number(currentFd.size) !== state.totalBytes ||
-							Number(currentFd.mtimeMs) !== state.mtimeMs ||
-							Number(currentFd.ctimeMs) !== state.ctimeMs ||
-							currentPath.size !== currentFd.size ||
-							currentPath.mtimeMs !== currentFd.mtimeMs ||
-							currentPath.ctimeMs !== currentFd.ctimeMs
-						) {
-							throw new Error("artifact_source_changed_during_capture");
-						}
-						fsyncSync(state.target);
-						closeSync(state.source);
-						closeSync(state.target);
-						const digest = state.hash.digest("hex");
-						const { casPath } = this.publishCasAndRunLease({
-							runId,
-							digest,
-							bytes: state.totalBytes,
-							stagedPath: state.temporary,
-						});
-						const stagedMetadata = lstatSync(state.temporary);
-						rmSync(state.temporary);
-						this.accountRemovedStorageEntry(stagedMetadata);
-						this.accountStoragePath(dirname(state.temporary), false);
-						fsyncDirectory(dirname(state.temporary));
-						this.stoppedTargetStreams.delete(key);
-						this.releaseStorageReservation(state);
-						return {
-							state: "complete",
-							artifact: { algorithm: "sha256", digest, bytes: state.totalBytes, path: casPath, encoding },
-						};
-					} finally {
-						transaction.release();
-					}
-				}
-				state.hash.update(buffer.subarray(0, count));
-				writeAll(state.target, buffer.subarray(0, count));
-				const added = this.accountStoragePath(state.temporary, false);
-				this.consumeStorageReservation(state, added, 0, 0);
-				state.copiedBytes += count;
-				remaining -= count;
-			}
+		const remaining = Math.max(0, Math.min(work.byteBudget, 4 * 1024 * 1024));
+		if (remaining === 0 || Date.now() >= work.deadlineMs) {
 			return {
 				state: "pending",
 				reason: "work_budget",
 				copiedBytes: state.copiedBytes,
 				totalBytes: state.totalBytes,
 			};
+		}
+		const leaseAdmission = this.normalWriterLifecycleLease();
+		if (leaseAdmission.state === "unavailable") {
+			return {
+				state: "pending",
+				reason: leaseAdmission.reason,
+				copiedBytes: state.copiedBytes,
+				totalBytes: state.totalBytes,
+			};
+		}
+		let mutation:
+			| RecorderRootMutationResult<{
+					copiedBytes: number;
+					hash?: Hash;
+					rehydrateBytes?: number;
+					effects: StorageAccountingEffect[];
+					artifact?: StoppedTargetArtifactReference;
+					error?: string;
+					pendingReason?: "artifact_staging_reconciliation_required";
+			  }>
+			| undefined;
+		let mutationError: unknown;
+		try {
+			mutation = this.withRecorderRoot((root) => {
+				const effects: StorageAccountingEffect[] = [];
+				const directory = root.relative("cas", "sha256", "staging");
+				const staged = root.relative("cas", "sha256", "staging", `${key}.tmp`);
+				const stagedBefore = root.stat(staged);
+				if (
+					!stagedBefore.isFile() ||
+					stagedBefore.isSymbolicLink() ||
+					stagedBefore.dev !== state.stagedDev ||
+					stagedBefore.ino !== state.stagedIno
+				) {
+					throw new Error("artifact_staging_identity_changed_during_capture");
+				}
+				const stagedBytes = Number(stagedBefore.size);
+				const stagedNlink = Number(stagedBefore.nlink);
+				const expectedUid = typeof process.getuid === "function" ? process.getuid() : stagedBefore.uid;
+				if (
+					!Number.isSafeInteger(stagedBytes) ||
+					stagedBytes < state.copiedBytes ||
+					stagedBytes > state.totalBytes ||
+					Number(stagedBefore.uid) !== expectedUid ||
+					(Number(stagedBefore.mode) & 0o077) !== 0 ||
+					(stagedNlink !== 1 && stagedNlink !== 2 && stagedNlink !== 3) ||
+					(stagedNlink !== 1 && stagedBytes !== state.totalBytes)
+				) {
+					throw new Error("artifact_staging_identity_changed_during_capture");
+				}
+				const capturedBytes = stagedBytes;
+				let source: number | undefined;
+				const nextHash = state.hash.copy();
+				let copied = 0;
+				let rehydrated = 0;
+				let eof = false;
+				let prefixMatches = true;
+				try {
+					source = openSync(state.sourcePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+					const sourceBefore = fstatSync(source, { bigint: true });
+					if (
+						sourceBefore.dev !== state.dev ||
+						sourceBefore.ino !== state.ino ||
+						sourceBefore.size !== BigInt(state.totalBytes) ||
+						sourceBefore.mtimeNs !== state.mtimeNs ||
+						sourceBefore.ctimeNs !== state.ctimeNs
+					) {
+						throw new Error("artifact_source_changed_during_capture");
+					}
+					root.withFile(staged, { access: "read_write" }, (target) => {
+						const buffer = Buffer.allocUnsafe(64 * 1024);
+						const sourceBuffer = Buffer.allocUnsafe(64 * 1024);
+						let workUsed = 0;
+						while (
+							state.rehydrateBytes + rehydrated < capturedBytes &&
+							workUsed < remaining &&
+							Date.now() < work.deadlineMs
+						) {
+							const position = state.rehydrateBytes + rehydrated;
+							const expected = Math.min(buffer.length, capturedBytes - position, remaining - workUsed);
+							const stagedCount = target.read(buffer, 0, expected, position);
+							const sourceCount = readSync(source as number, sourceBuffer, 0, expected, position);
+							if (
+								stagedCount !== sourceCount ||
+								stagedCount <= 0 ||
+								!buffer.subarray(0, stagedCount).equals(sourceBuffer.subarray(0, sourceCount))
+							) {
+								prefixMatches = false;
+								break;
+							}
+							nextHash.update(sourceBuffer.subarray(0, sourceCount));
+							rehydrated += sourceCount;
+							workUsed += sourceCount;
+						}
+						while (prefixMatches && workUsed < remaining && Date.now() < work.deadlineMs) {
+							const count = readSync(
+								source as number,
+								buffer,
+								0,
+								Math.min(buffer.length, remaining - workUsed),
+								capturedBytes + copied,
+							);
+							if (count === 0) {
+								eof = true;
+								break;
+							}
+							let written = 0;
+							while (written < count) {
+								const amount = target.write(buffer, written, count - written, capturedBytes + copied + written);
+								if (amount <= 0) throw new Error("artifact_staging_write_made_no_progress");
+								written += amount;
+							}
+							nextHash.update(buffer.subarray(0, count));
+							copied += count;
+							workUsed += count;
+						}
+						target.sync();
+					});
+					const sourceAfter = fstatSync(source, { bigint: true });
+					const currentPath = lstatSync(state.sourcePath, { bigint: true });
+					if (
+						sourceAfter.dev !== sourceBefore.dev ||
+						sourceAfter.ino !== sourceBefore.ino ||
+						sourceAfter.size !== sourceBefore.size ||
+						sourceAfter.mtimeNs !== sourceBefore.mtimeNs ||
+						sourceAfter.ctimeNs !== sourceBefore.ctimeNs ||
+						currentPath.dev !== sourceAfter.dev ||
+						currentPath.ino !== sourceAfter.ino ||
+						currentPath.size !== sourceAfter.size ||
+						currentPath.mtimeNs !== sourceAfter.mtimeNs ||
+						currentPath.ctimeNs !== sourceAfter.ctimeNs
+					) {
+						throw new Error("artifact_source_changed_during_capture");
+					}
+				} finally {
+					if (source !== undefined) closeSync(source);
+				}
+				const stagedAfter = root.stat(staged);
+				if (
+					stagedAfter.dev !== state.stagedDev ||
+					stagedAfter.ino !== state.stagedIno ||
+					stagedAfter.nlink !== BigInt(stagedNlink) ||
+					stagedAfter.size !== BigInt(capturedBytes + copied) ||
+					Number(stagedAfter.uid) !== expectedUid ||
+					(Number(stagedAfter.mode) & 0o077) !== 0
+				) {
+					throw new Error("artifact_staging_changed_during_capture");
+				}
+				if (!prefixMatches) {
+					return {
+						copiedBytes: state.copiedBytes,
+						hash: state.hash,
+						rehydrateBytes: state.rehydrateBytes,
+						effects,
+						pendingReason: "artifact_staging_reconciliation_required",
+					};
+				}
+				effects.push({ kind: "account", metadata: stagedAfter, entryCreated: false });
+				if (state.rehydrateBytes + rehydrated < capturedBytes) {
+					return {
+						copiedBytes: capturedBytes,
+						hash: nextHash,
+						rehydrateBytes: state.rehydrateBytes + rehydrated,
+						effects,
+					};
+				}
+				if (!eof) {
+					return {
+						copiedBytes: capturedBytes + copied,
+						hash: nextHash,
+						rehydrateBytes: capturedBytes + copied,
+						effects,
+					};
+				}
+				if (capturedBytes + copied !== state.totalBytes) {
+					throw new Error("artifact_source_ended_before_declared_length");
+				}
+				const digest = nextHash.digest("hex");
+				if (stagedNlink === 2 || stagedNlink === 3) {
+					const canonical = root.relative("cas", "sha256", digest.slice(0, 2), `${digest}.blob`);
+					const canonicalMetadata = root.lstat(canonical);
+					if (
+						!canonicalMetadata ||
+						!canonicalMetadata.isFile() ||
+						canonicalMetadata.isSymbolicLink() ||
+						Number(canonicalMetadata.uid) !== expectedUid ||
+						(Number(canonicalMetadata.mode) & 0o077) !== 0 ||
+						canonicalMetadata.dev !== stagedAfter.dev ||
+						canonicalMetadata.ino !== stagedAfter.ino ||
+						canonicalMetadata.size !== BigInt(state.totalBytes) ||
+						canonicalMetadata.nlink !== BigInt(stagedNlink)
+					) {
+						return {
+							copiedBytes: state.copiedBytes,
+							effects,
+							pendingReason: "artifact_staging_reconciliation_required",
+						};
+					}
+					if (stagedNlink === 3) {
+						const lease = root.relative("refs", "runs", sha256(runId), `cas-${digest}.blob`);
+						const leaseMetadata = root.lstat(lease);
+						if (
+							!leaseMetadata ||
+							!leaseMetadata.isFile() ||
+							leaseMetadata.isSymbolicLink() ||
+							Number(leaseMetadata.uid) !== expectedUid ||
+							(Number(leaseMetadata.mode) & 0o077) !== 0 ||
+							leaseMetadata.dev !== stagedAfter.dev ||
+							leaseMetadata.ino !== stagedAfter.ino ||
+							leaseMetadata.size !== BigInt(state.totalBytes) ||
+							leaseMetadata.nlink !== 3n
+						) {
+							return {
+								copiedBytes: state.copiedBytes,
+								effects,
+								pendingReason: "artifact_staging_reconciliation_required",
+							};
+						}
+					}
+				}
+				let casPath: string;
+				try {
+					casPath = this.publishCasAndRunLease(
+						root,
+						{ runId, digest, bytes: state.totalBytes, stagedPath: staged, mtimeNs: state.mtimeNs },
+						effects,
+					).casPath;
+				} catch (error) {
+					return {
+						copiedBytes: state.copiedBytes,
+						effects,
+						error: error instanceof Error ? error.message : String(error),
+					};
+				}
+				const stagedMetadata = root.stat(staged);
+				root.unlinkFile(staged);
+				effects.push({ kind: "remove", metadata: stagedMetadata, releaseOwnedInode: false });
+				effects.push({ kind: "account", metadata: root.stat(directory), entryCreated: false });
+				root.fsyncDirectory(directory);
+				return {
+					copiedBytes: state.totalBytes,
+					effects,
+					artifact: { algorithm: "sha256", digest, bytes: state.totalBytes, path: casPath, encoding },
+				};
+			}, leaseAdmission.lease);
 		} catch (error) {
-			state.error = error instanceof Error ? error.message : String(error);
-			this.discardStoppedTargetStream(key, state);
+			mutationError = error;
+		}
+		if (mutationError !== undefined) {
+			if (this.isStoppedTargetReconciliationError(mutationError))
+				return {
+					state: "pending",
+					reason: "artifact_staging_reconciliation_required",
+					copiedBytes: state.copiedBytes,
+					totalBytes: state.totalBytes,
+				};
+			if (inspectIncidentRecorderWriterLifecycleLeaseMode(leaseAdmission.lease) === undefined)
+				return {
+					state: "pending",
+					reason: "writer_lifecycle_namespace_changed",
+					copiedBytes: state.copiedBytes,
+					totalBytes: state.totalBytes,
+				};
+			state.error = mutationError instanceof Error ? mutationError.message : String(mutationError);
+			if (!this.discardStoppedTargetStream(key, state))
+				return {
+					state: "pending",
+					reason: "writer_lifecycle_unavailable",
+					copiedBytes: state.copiedBytes,
+					totalBytes: state.totalBytes,
+				};
 			return { state: "error", reason: state.error };
 		}
+		if (!mutation || mutation.state === "unavailable") {
+			return {
+				state: "pending",
+				reason: mutation?.state === "unavailable" ? mutation.reason : "writer_lifecycle_unavailable",
+				copiedBytes: state.copiedBytes,
+				totalBytes: state.totalBytes,
+			};
+		}
+		const addedBytes = this.applyStorageAccountingEffects(mutation.value.effects);
+		if (mutation.value.pendingReason) {
+			return {
+				state: "pending",
+				reason: mutation.value.pendingReason,
+				copiedBytes: state.copiedBytes,
+				totalBytes: state.totalBytes,
+			};
+		}
+		if (mutation.value.error) {
+			if (this.isStoppedTargetPublicationStructuralError(new Error(mutation.value.error))) {
+				state.error = mutation.value.error;
+				// Publication is reached only after the complete staged source has
+				// been verified. Reflect that fact so recognized shared-link residue
+				// can be retired without treating it as a partial capture.
+				state.copiedBytes = state.totalBytes;
+				state.rehydrateBytes = state.totalBytes;
+				if (this.discardStoppedTargetStream(key, state)) return { state: "error", reason: state.error };
+				return {
+					state: "pending",
+					reason: "writer_lifecycle_unavailable",
+					copiedBytes: state.copiedBytes,
+					totalBytes: state.totalBytes,
+				};
+			}
+			// A lifecycle loss can surface as an operation error after the CAS
+			// transaction has made durable progress. Do not turn that boundary
+			// into a terminal artifact error or discard the resumable stage.
+			return {
+				state: "pending",
+				reason: "writer_lifecycle_unavailable",
+				copiedBytes: state.copiedBytes,
+				totalBytes: state.totalBytes,
+			};
+		}
+		if (mutation.value.artifact) {
+			this.stoppedTargetStreams.delete(key);
+			this.releaseStorageReservation(state);
+			return { state: "complete", artifact: mutation.value.artifact };
+		}
+		state.copiedBytes = mutation.value.copiedBytes;
+		if (mutation.value.hash) state.hash = mutation.value.hash;
+		if (mutation.value.rehydrateBytes !== undefined) state.rehydrateBytes = mutation.value.rehydrateBytes;
+		this.consumeStorageReservation(state, addedBytes, 0, 0);
+		return {
+			state: "pending",
+			reason: "work_budget",
+			copiedBytes: state.copiedBytes,
+			totalBytes: state.totalBytes,
+		};
 	}
 
 	async run(options: IncidentRecorderCompactorRunOptions): Promise<void> {
@@ -2281,7 +3354,10 @@ export class IncidentRecorderCompactor {
 		let reportedStorageMode: IncidentRecorderStorageMode | undefined;
 		let reportedRecoveryReason: string | undefined;
 		const reportStorageMode = (): void => {
-			if (reportedStorageMode === this.storageModeState && reportedRecoveryReason === this.storageRecoveryReasonState)
+			if (
+				reportedStorageMode === this.storageModeState &&
+				reportedRecoveryReason === this.storageRecoveryReasonState
+			)
 				return;
 			reportedStorageMode = this.storageModeState;
 			reportedRecoveryReason = this.storageRecoveryReasonState;
@@ -2321,7 +3397,7 @@ export class IncidentRecorderCompactor {
 		let segmentCloseError: unknown;
 		try {
 			readerLoop: for (;;) {
-				if (signal.aborted) break readerLoop;
+				if (signal.aborted) break;
 				if (!resumeCursor && !boundedStartEstablished) {
 					try {
 						this.writeGap({
@@ -2337,7 +3413,7 @@ export class IncidentRecorderCompactor {
 					} catch (error) {
 						if (!this.isStorageAdmissionError(error as Error)) throw error;
 						await this.waitUntilAdmitted(signal, options, reportStorageMode);
-						continue readerLoop;
+						continue;
 					}
 					boundedStartEstablished = true;
 				}
@@ -2388,7 +3464,7 @@ export class IncidentRecorderCompactor {
 				if (resumeCursor) followArgs.push("--no-tail", `--after-cursor=${resumeCursor}`);
 				else followArgs.push("--lines=0");
 				const outcome = await this.readJournal(followArgs, signal, notifyReaderReady);
-				if (outcome.aborted || signal.aborted) break readerLoop;
+				if (outcome.aborted || signal.aborted) break;
 				this.flushAllIncomplete("journal_stream_disconnected_before_occurrence_completion");
 				if (outcome.parserError) {
 					if (this.isStorageAdmissionError(outcome.parserError)) {
@@ -2490,6 +3566,10 @@ export class IncidentRecorderCompactor {
 		let aborted = false;
 		let killTimer: ReturnType<typeof setTimeout> | undefined;
 		let readyTimer: ReturnType<typeof setTimeout> | undefined;
+		let resolveCompletion: () => void = () => {};
+		const completion = new Promise<void>((resolve) => {
+			resolveCompletion = resolve;
+		});
 		const terminate = (): void => {
 			try {
 				child.kill("SIGTERM");
@@ -2502,6 +3582,8 @@ export class IncidentRecorderCompactor {
 			}, CHILD_TERMINATION_GRACE_MS);
 			killTimer.unref();
 		};
+		const tracked: TrackedCompactorChild = { child, completion, terminate };
+		this.activeCompactorChildren.add(tracked);
 		child.once("spawn", () => {
 			readyTimer = setTimeout(() => {
 				readyTimer = undefined;
@@ -2549,7 +3631,11 @@ export class IncidentRecorderCompactor {
 			: undefined;
 		deadline?.unref();
 		const result = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
-			child.once("close", (code, childSignal) => resolve({ code, signal: childSignal }));
+			child.once("close", (code, childSignal) => {
+				resolve({ code, signal: childSignal });
+				this.activeCompactorChildren.delete(tracked);
+				resolveCompletion();
+			});
 		});
 		if (deadline) clearTimeout(deadline);
 		if (killTimer) clearTimeout(killTimer);
@@ -2579,7 +3665,8 @@ export class IncidentRecorderCompactor {
 		const parserError = outcome.parserError;
 		if (!parserError) return undefined;
 		if (this.isStorageAdmissionError(parserError)) return undefined;
-		if (this.isSegmentPersistenceError(parserError)) throw parserError;
+		if (this.isSegmentPersistenceError(parserError) || this.isWriterLifecycleAdmissionError(parserError))
+			throw parserError;
 		const poisonCursor = optionalText(outcome.poisonFields, "__CURSOR");
 		const poisonMachine = optionalText(outcome.poisonFields, "_MACHINE_ID");
 		const poisonBoot = optionalText(outcome.poisonFields, "_BOOT_ID");
@@ -2610,6 +3697,8 @@ export class IncidentRecorderCompactor {
 	}
 
 	private resetUnseekableCursor(stderr: string): void {
+		const admission = this.withRecorderRoot(() => true);
+		if (admission.state !== "committed") throw this.writerLifecycleAdmissionError(admission.reason);
 		this.flushAllIncomplete("journal_cursor_removed_before_occurrence_completion");
 		this.writeGap({
 			reason: "journal_cursor_removed_or_unseekable",
@@ -2619,14 +3708,32 @@ export class IncidentRecorderCompactor {
 			invocationId: this.checkpoint?.invocationId,
 			journalctl: stderr,
 		});
+		let changed = false;
+		try {
+			const mutation = this.withRecorderRoot((root) => {
+				const path = root.relative("compactor-cursor.json");
+				const previous = root.lstat(path);
+				if (previous) {
+					if (!previous.isFile() || previous.isSymbolicLink() || previous.nlink !== 1n)
+						throw new Error("Recorder cursor is not a regular private entry");
+					changed = true;
+					root.unlinkFile(path);
+				}
+				root.fsyncDirectory(root.relative());
+				return previous;
+			});
+			if (mutation.state !== "committed") throw this.writerLifecycleAdmissionError(mutation.reason);
+			if (mutation.value) this.accountRemovedStorageEntry(mutation.value, true);
+		} catch (error) {
+			if (changed) this.invalidateStorageAccounting();
+			throw error;
+		}
 		this.checkpoint = undefined;
 		this.checkpointDisposition = "missing";
 		this.wrapperSequences.clear();
 		this.producerSequences.clear();
 		this.pendingEntries.length = 0;
 		this.pendingEntryBytes = 0;
-		rmSync(this.checkpointPath, { force: true });
-		fsyncDirectory(dirname(this.checkpointPath));
 	}
 
 	private journalReaderError(outcome: JournalReaderOutcome): Error {
@@ -2647,12 +3754,17 @@ export class IncidentRecorderCompactor {
 	): Promise<void> {
 		let recoveryPassesSinceScan = 0;
 		let unchangedScans = 0;
-		while (this.diskPaused) {
+		for (;;) {
+			if (!this.diskPaused) {
+				if (!recovery?.onNormalWriterAdmission || (await recovery.onNormalWriterAdmission())) return;
+				await this.abortableDelay(positiveBound(recovery.storageRecoveryCadenceMs, 250), signal);
+				continue;
+			}
 			if (signal.aborted) throw abortError("Incident journal reader admission wait was aborted");
 			if (this.storageModeState === "recovery-only") {
 				let moreRecoveryWork = false;
 				try {
-					moreRecoveryWork = recovery?.onRecoveryPass?.() ?? false;
+					moreRecoveryWork = (await recovery?.onRecoveryPass?.()) ?? false;
 				} catch {
 					// Cleanup uncertainty remains fail-closed and a later bounded pass retries it.
 				}
@@ -2701,25 +3813,301 @@ export class IncidentRecorderCompactor {
 		this.pendingEntryBytes = 0;
 	}
 
+	/**
+	 * Drop only the in-memory journal frontier after all readers have stopped.
+	 * The durable cursor remains authoritative; replay must start from the last
+	 * committed checkpoint rather than from sequence state observed in a partial
+	 * assembly.
+	 */
+	private discardVolatileJournalState(): void {
+		this.discardTransientJournalState();
+		this.wrapperSequences.clear();
+		this.producerSequences.clear();
+		const checkpoint = this.checkpoint;
+		if (!checkpoint) return;
+		for (const key of Object.getOwnPropertyNames(checkpoint.wrapperSequences ?? {})) {
+			const value = checkpoint.wrapperSequences[key];
+			if (typeof value === "string" && isUnsigned64(value)) this.wrapperSequences.set(key, BigInt(value));
+		}
+		for (const key of Object.getOwnPropertyNames(checkpoint.producerSequences ?? {})) {
+			const value = checkpoint.producerSequences[key];
+			if (typeof value === "string" && isUnsigned64(value)) this.producerSequences.set(key, BigInt(value));
+		}
+	}
+
 	private discardTransientFileState(): void {
+		this.discardPendingPinDirectoryTraversal();
 		this.discardStoppedTargetStreams();
-		try {
-			this.activePinTraversal?.directory?.closeSync();
-		} catch {}
-		this.activePinTraversal = undefined;
+		const failures: unknown[] = [];
+		const traversal = this.activePinTraversal;
+		if (traversal?.directory) {
+			try {
+				traversal.directory.closeSync();
+				traversal.directory = undefined;
+			} catch (error) {
+				failures.push(error);
+			}
+		}
+		if (traversal && !traversal.directory) this.activePinTraversal = undefined;
 		const validation = this.journalManifestValidation;
 		if (validation) {
-			if (validation.pinValidation)
+			if (validation.pinValidation) {
 				try {
 					closeSync(validation.pinValidation.descriptor);
-				} catch {}
+				} catch (error) {
+					failures.push(error);
+				}
+			}
 			try {
 				closeSync(validation.descriptor);
-			} catch {}
+			} catch (error) {
+				failures.push(error);
+			}
+			if (failures.length === 0) this.journalManifestValidation = undefined;
 		}
-		this.journalManifestValidation = undefined;
-		this.activePinScans.clear();
+		if (failures.length > 0)
+			this.transientFileCloseFailure =
+				this.transientFileCloseFailure ??
+				new Error(`Incident compactor transient file cleanup failed: ${String(failures[0])}`, {
+					cause: failures[0],
+				});
 	}
+
+	private closeLifecycleDescriptor(descriptor: number): void {
+		if (this.lifecycleClosedDescriptors.has(descriptor)) return;
+		closeSync(descriptor);
+		this.lifecycleClosedDescriptors.add(descriptor);
+	}
+
+	private closeLifecycleDirectory(directory: ReturnType<typeof opendirSync>): void {
+		if (this.lifecycleClosedDirectories.has(directory)) return;
+		directory.closeSync();
+		this.lifecycleClosedDirectories.add(directory);
+	}
+
+	private async drainCompactorChildren(deadlineAtMs: number): Promise<void> {
+		for (const scan of this.activePinScans.values()) scan.cancelled = true;
+		for (;;) {
+			const pending = new Set<TrackedCompactorChild>(this.activeCompactorChildren);
+			for (const scan of this.activePinScans.values()) pending.add(scan);
+			if (pending.size === 0) return;
+			for (const resource of pending) resource.terminate();
+			const remainingMs = deadlineAtMs - Date.now();
+			if (remainingMs <= 0) throw new Error("Incident compactor child cleanup deadline exceeded");
+			let timeout: ReturnType<typeof setTimeout> | undefined;
+			const timeoutPromise = new Promise<"timeout">((resolve) => {
+				timeout = setTimeout(() => resolve("timeout"), remainingMs);
+			});
+			const outcome = await Promise.race([
+				Promise.all([...pending].map((resource) => resource.completion)).then(() => "complete" as const),
+				timeoutPromise,
+			]);
+			if (timeout) clearTimeout(timeout);
+			if (outcome === "timeout") throw new Error("Incident compactor child cleanup deadline exceeded");
+		}
+	}
+
+	private closeRunHistoryTraversalForLifecycle(state: RunHistoryTraversal): Error[] {
+		const failures: Error[] = [];
+		const closeDescriptor = (descriptor: number, role: string): void => {
+			try {
+				this.closeLifecycleDescriptor(descriptor);
+			} catch (error) {
+				failures.push(new Error(`Incident compactor ${role} close failed`, { cause: error }));
+			}
+		};
+		const active = state.activeCasValidation;
+		if (active) {
+			const activeFailureCount = failures.length;
+			closeDescriptor(active.fileDescriptor, "run-history CAS file descriptor");
+			for (const fence of active.directoryFences) closeDescriptor(fence.descriptor, "run-history CAS fence");
+			closeDescriptor(
+				active.procfsAuthority.descriptorInfoDirectoryDescriptor,
+				"run-history procfs fdinfo descriptor",
+			);
+			closeDescriptor(active.procfsAuthority.descriptorDirectoryDescriptor, "run-history procfs fd descriptor");
+			closeDescriptor(active.procfsAuthority.rootDescriptor, "run-history procfs root descriptor");
+			if (failures.length === activeFailureCount) state.activeCasValidation = undefined;
+		}
+		if (state.directory) {
+			try {
+				this.closeLifecycleDirectory(state.directory);
+				state.directory = undefined;
+			} catch (error) {
+				failures.push(new Error("Incident compactor run-history directory close failed", { cause: error }));
+			}
+		}
+		const authority = state.procfsAuthority;
+		if (authority) {
+			const authorityFailureCount = failures.length;
+			closeDescriptor(authority.descriptorInfoDirectoryDescriptor, "run-history procfs fdinfo descriptor");
+			closeDescriptor(authority.descriptorDirectoryDescriptor, "run-history procfs fd descriptor");
+			closeDescriptor(authority.rootDescriptor, "run-history procfs root descriptor");
+			if (failures.length === authorityFailureCount) state.procfsAuthority = undefined;
+		}
+		for (const key of ["legacyDirectoryDescriptor", "legacyNamespaceDescriptor"] as const) {
+			const descriptor = state[key];
+			if (descriptor === undefined) continue;
+			const descriptorFailureCount = failures.length;
+			closeDescriptor(descriptor, `run-history ${key}`);
+			if (failures.length === descriptorFailureCount) state[key] = undefined;
+		}
+		if (state.segmentReadLease) {
+			try {
+				if (!this.segmentStore) throw new Error("segment store unavailable for read-lease release");
+				this.segmentStore.releaseReadLease(state.segmentReadLease);
+				state.segmentReadLease = undefined;
+			} catch (error) {
+				failures.push(new Error("Incident compactor segment read lease release failed", { cause: error }));
+			}
+		}
+		if (failures.length === 0) {
+			const publicationCapability = state.publicationCapability;
+			state.publicationCapability = undefined;
+			if (publicationCapability) this.releasedRunHistoryPublicationCapabilities.add(publicationCapability);
+			if (publicationCapability && this.runHistoryPublicationCapabilities.get(publicationCapability) === state) {
+				this.runHistoryPublicationCapabilities.delete(publicationCapability);
+			}
+			if (this.runHistoryTraversals.get(state.token) === state) this.runHistoryTraversals.delete(state.token);
+		}
+		return failures;
+	}
+
+	private closeLifecycleFileStates(): Error[] {
+		const failures: Error[] = [];
+		const closeDescriptor = (descriptor: number, role: string): void => {
+			try {
+				this.closeLifecycleDescriptor(descriptor);
+			} catch (error) {
+				failures.push(new Error(`Incident compactor ${role} close failed`, { cause: error }));
+			}
+		};
+		const closeDirectory = (directory: ReturnType<typeof opendirSync>, role: string): void => {
+			try {
+				this.closeLifecycleDirectory(directory);
+			} catch (error) {
+				failures.push(new Error(`Incident compactor ${role} close failed`, { cause: error }));
+			}
+		};
+		const traversal = this.activePinTraversal;
+		if (traversal?.directory) {
+			const traversalFailureCount = failures.length;
+			closeDirectory(traversal.directory, "active pin traversal directory");
+			if (failures.length === traversalFailureCount) traversal.directory = undefined;
+		}
+		const pending = this.pendingPinDirectoryTraversal;
+		if (pending?.directory) {
+			const pendingFailureCount = failures.length;
+			closeDirectory(pending.directory, "pending pin directory traversal");
+			if (failures.length === pendingFailureCount) pending.directory = undefined;
+		}
+		const manifest = this.journalManifestValidation;
+		if (manifest) {
+			const manifestFailureCount = failures.length;
+			closeDescriptor(manifest.descriptor, "journal manifest descriptor");
+			if (manifest.pinValidation)
+				closeDescriptor(manifest.pinValidation.descriptor, "journal manifest pin descriptor");
+			if (failures.length === manifestFailureCount) {
+				manifest.pinValidation = undefined;
+				this.journalManifestValidation = undefined;
+			}
+		}
+		const verification = this.sysdigSegmentVerification;
+		if (verification) {
+			const verificationFailureCount = failures.length;
+			closeDescriptor(verification.descriptor, "Sysdig verification descriptor");
+			if (failures.length === verificationFailureCount) this.sysdigSegmentVerification = undefined;
+		}
+		const sourceCapture = this.sysdigSourceCapture;
+		if (sourceCapture) {
+			const sourceFailureCount = failures.length;
+			if (sourceCapture.sourceDescriptor !== undefined)
+				closeDescriptor(sourceCapture.sourceDescriptor, "Sysdig source descriptor");
+			if (sourceCapture.partialDescriptor !== undefined)
+				closeDescriptor(sourceCapture.partialDescriptor, "Sysdig partial descriptor");
+			if (failures.length === sourceFailureCount) this.sysdigSourceCapture = undefined;
+		}
+		if (failures.length === 0) {
+			this.activePinTraversal = undefined;
+			this.pendingPinDirectoryTraversal = undefined;
+		}
+		return failures;
+	}
+
+	/** Close all compactor-owned writers/readers before the normal lifecycle lease is released. */
+	async closeWriterResourcesForLifecycle(deadlineMs: number): Promise<void> {
+		if (!Number.isSafeInteger(deadlineMs) || deadlineMs < 1)
+			throw new Error("Invalid incident compactor writer cleanup deadline");
+		this.pinReadersQuiescing = true;
+		this.pinReaderGeneration += 1;
+		const deadlineAtMs = Date.now() + deadlineMs;
+		const failures: Error[] = [];
+		let childrenDrained = false;
+		try {
+			await this.drainCompactorChildren(deadlineAtMs);
+			childrenDrained = true;
+		} catch (error) {
+			failures.push(error instanceof Error ? error : new Error(String(error)));
+		}
+		if (childrenDrained) this.discardVolatileJournalState();
+		for (const state of this.runHistoryTraversals.values())
+			failures.push(...this.closeRunHistoryTraversalForLifecycle(state));
+		const fileFailures = this.closeLifecycleFileStates();
+		failures.push(...fileFailures);
+		if (fileFailures.length === 0) this.transientFileCloseFailure = undefined;
+		if (failures.length === 0) {
+			try {
+				this.closeSegmentStore();
+			} catch (error) {
+				failures.push(error instanceof Error ? error : new Error(String(error)));
+			}
+		}
+		if (failures.length > 0) {
+			throw new AggregateError(failures, "Incident compactor writer resources did not quiesce");
+		}
+		this.lifecycleClosedDescriptors.clear();
+	}
+
+	/** Re-enable pin-reader creation only after a fresh, currently admitted normal lease is proved. */
+	resumeWriterResourcesForLifecycle(): void {
+		if (!this.pinReadersQuiescing) return;
+		if (
+			this.activeCompactorChildren.size > 0 ||
+			this.activePinScans.size > 0 ||
+			this.storageScanPromise ||
+			this.storageScanInProgress ||
+			this.segmentStore ||
+			this.segmentStoreCloseUncertain ||
+			this.segmentStoreCloseFailure !== undefined ||
+			this.transientFileCloseFailure ||
+			this.lifecycleClosedDescriptors.size > 0 ||
+			this.activePinTraversal ||
+			this.pendingPinDirectoryTraversal ||
+			this.journalManifestValidation ||
+			this.sysdigSegmentVerification ||
+			this.sysdigSourceCapture ||
+			this.runHistoryTraversals.size > 0 ||
+			this.runHistoryPublicationCapabilities.size > 0 ||
+			this.stoppedTargetStreams.size > 0 ||
+			this.assemblies.size > 0 ||
+			this.pendingEntries.length > 0
+		)
+			throw this.writerResourcesResumeError("writer_resources_not_quiescent");
+		if (!this.storageAccountingReadyState || this.storageModeState !== "normal")
+			throw this.writerResourcesResumeError("normal_storage_admission_not_ready");
+		const admission = this.normalWriterLifecycleLease();
+		if (admission.state === "unavailable") throw this.writerLifecycleAdmissionError(admission.reason);
+		const revalidated = this.withRecorderRoot(() => true, admission.lease);
+		if (revalidated.state === "unavailable") throw this.writerLifecycleAdmissionError(revalidated.reason);
+		this.pinReadersQuiescing = false;
+	}
+
+	private writerResourcesResumeError(reason: string): Error {
+		const error = new Error(`Incident compactor writer resources cannot resume: ${reason}`);
+		error.name = "IncidentRecorderCompactorWriterResourcesResumeError";
+		return error;
+	}
+
 	private acceptEntry(fields: JournalFields): void {
 		const messageBytes = fields.MESSAGE ?? Buffer.alloc(0);
 		const realCursor = optionalText(fields, "__CURSOR");
@@ -2836,7 +4224,12 @@ export class IncidentRecorderCompactor {
 			this.checkSequences(line, reference);
 			this.acceptChunk(line, payload, reference);
 		} catch (error) {
-			if (this.isSegmentPersistenceError(error) || (error as NodeJS.ErrnoException).code === "ENOSPC") throw error;
+			if (
+				this.isSegmentPersistenceError(error) ||
+				this.isWriterLifecycleAdmissionError(error) ||
+				(error as NodeJS.ErrnoException).code === "ENOSPC"
+			)
+				throw error;
 			this.writeGap({
 				cursor,
 				journalReference: reference?.path,
@@ -2912,26 +4305,19 @@ export class IncidentRecorderCompactor {
 						? "wrapper_envelope_invocation_absent_or_unknown"
 						: "both_present_and_equal",
 		};
-    const metadataBytes = Buffer.from(
-      `${JSON.stringify(persisted)}\n`,
-      "utf8",
-    );
-    // Journal retention is not a durable content reference. Keep the exact
-    // arbitrary MESSAGE bytes beside the immutable metadata in a bounded,
-    // length-delimited envelope so incident reconstruction does not depend on
-    // the source journal still containing this cursor.
-    const envelopeHeader = Buffer.allocUnsafe(16);
-    envelopeHeader.write("GRJR", 0, 4, "ascii");
-    envelopeHeader.writeUInt8(1, 4);
-    envelopeHeader.writeUInt8(0, 5);
-    envelopeHeader.writeUInt16BE(0, 6);
-    envelopeHeader.writeUInt32BE(metadataBytes.length, 8);
-    envelopeHeader.writeUInt32BE(input.messageBytes.length, 12);
-    const payload = Buffer.concat([
-      envelopeHeader,
-      metadataBytes,
-      input.messageBytes,
-    ]);
+		const metadataBytes = Buffer.from(`${JSON.stringify(persisted)}\n`, "utf8");
+		// Journal retention is not a durable content reference. Keep the exact
+		// arbitrary MESSAGE bytes beside the immutable metadata in a bounded,
+		// length-delimited envelope so incident reconstruction does not depend on
+		// the source journal still containing this cursor.
+		const envelopeHeader = Buffer.allocUnsafe(16);
+		envelopeHeader.write("GRJR", 0, 4, "ascii");
+		envelopeHeader.writeUInt8(1, 4);
+		envelopeHeader.writeUInt8(0, 5);
+		envelopeHeader.writeUInt16BE(0, 6);
+		envelopeHeader.writeUInt32BE(metadataBytes.length, 8);
+		envelopeHeader.writeUInt32BE(input.messageBytes.length, 12);
+		const payload = Buffer.concat([envelopeHeader, metadataBytes, input.messageBytes]);
 		const wrapperSequence = input.line?.wrapperSequence;
 		const locator = this.appendSegmentRecord({
 			idempotencyKey: `journal:${id}`,
@@ -3125,93 +4511,133 @@ export class IncidentRecorderCompactor {
 		assembly.memoryBytes += addedMemory;
 		this.assemblyBytes += addedMemory;
 		if (assembly.chunks.length !== line.chunkCount) return;
-		const transaction = acquireIncidentCasTransaction(this.root);
-		if (!transaction) throw new Error("Incident CAS transaction unavailable");
+		const value = Buffer.concat(assembly.chunks, assembly.bytes);
+		if (value.length !== line.rawOccurrenceBytes || sha256(value) !== line.occurrenceSha256) {
+			this.flushIncomplete(identity, "occurrence_checksum_or_length_mismatch");
+			throw new Error("Occurrence checksum or length mismatch");
+		}
+		let mutation: RecorderRootMutationResult<{ effects: StorageAccountingEffect[] }>;
 		try {
-			const value = Buffer.concat(assembly.chunks, assembly.bytes);
-			if (value.length !== line.rawOccurrenceBytes || sha256(value) !== line.occurrenceSha256) {
-				this.flushIncomplete(identity, "occurrence_checksum_or_length_mismatch");
-				throw new Error("Occurrence checksum or length mismatch");
-			}
-			const { casPath } = this.publishCasAndRunLease({
-				runId: line.runId,
-				digest: line.occurrenceSha256,
-				bytes: value.length,
-				value,
-			});
-			const occurrenceId = sha256(`${line.runId}\0${line.runToken}\0${line.producerId}\0${line.occurrenceId}`);
-			const occurrenceRecord = {
-				version: 1,
-				state: "complete",
-				identity: {
-					runId: line.runId,
-					runToken: line.runToken,
-					producerId: line.producerId,
-					occurrenceId: line.occurrenceId,
-				},
-				source: line.source,
-				type: line.type,
-				encoding: line.encoding,
-				payloadKind: line.payloadKind,
-				terminal: (line.flags & INCIDENT_RECORDER_FRAME_FLAGS.terminal) !== 0,
-				metadata: line.metadata,
-				eventWallTimeMs: line.eventWallTimeMs,
-				eventMonotonicNs: line.eventMonotonicNs,
-				transportIdentity: {
-					wrapperPid: line.wrapperPid,
-					wrapperStartId: line.wrapperStartId,
-					targetPid: line.targetPid,
-					targetStartId: line.targetStartId,
-					machineId: reference.machineId,
-					bootId: reference.bootId,
-					journalStreamId: reference.streamId,
-					journalInvocationId: reference.invocationId,
-					invocationIdentityDisposition:
-						reference.invocationId === null
-							? "trusted_journal_invocation_absent"
-							: line.systemdInvocationId === null
-								? "wrapper_envelope_invocation_absent"
-								: "both_present_and_equal",
-					systemdCatPid: line.systemdCatPid,
-					systemdCatStartId: line.systemdCatStartId,
-					journalPresence: "journal_export_observed",
-				},
-				wrapperOrder: assembly.references.map((entry) => entry.wrapperSequence),
-				producerOrder: assembly.references.map((entry) => entry.producerSequence),
-				cursors: assembly.references.map((entry) => entry.cursor),
-				journalReferences: assembly.references.map((entry) => entry.path),
-				cas: {
-					algorithm: "sha256",
-					digest: line.occurrenceSha256,
-					bytes: value.length,
-					path: casPath,
-					compression: "none",
-					resolution: "verified",
-				},
-				compactionDisposition: "compacted_and_cas_resolved",
-				journalCanonicalUntilCompactionCommit: true,
-			};
-			const firstWrapperSequence = assembly.references[0]?.wrapperSequence ?? "0";
-			this.appendSegmentRecord({
-				idempotencyKey: `occurrence:${occurrenceId}`,
-				runId: line.runId,
-				sourceId: SEGMENT_SOURCE_OCCURRENCE,
-				observedAtMs: segmentObservedAtMs(line.eventWallTimeMs),
-				order: isUnsigned64(firstWrapperSequence) ? firstWrapperSequence : "0",
-				metadata: {
+			mutation = this.withRecorderRoot((root) => {
+				const effects: StorageAccountingEffect[] = [];
+				const { casPath } = this.publishCasAndRunLease(
+					root,
+					{
+						runId: line.runId,
+						digest: line.occurrenceSha256,
+						bytes: value.length,
+						value,
+					},
+					effects,
+				);
+				const occurrenceId = sha256(`${line.runId}\0${line.runToken}\0${line.producerId}\0${line.occurrenceId}`);
+				const occurrenceRecord = {
 					version: 1,
 					state: "complete",
-					occurrenceIdentity: occurrenceId,
-					casDigest: line.occurrenceSha256,
-				},
-				payload: Buffer.from(`${JSON.stringify(occurrenceRecord)}\n`, "utf8"),
+					identity: {
+						runId: line.runId,
+						runToken: line.runToken,
+						producerId: line.producerId,
+						occurrenceId: line.occurrenceId,
+					},
+					source: line.source,
+					type: line.type,
+					encoding: line.encoding,
+					payloadKind: line.payloadKind,
+					terminal: (line.flags & INCIDENT_RECORDER_FRAME_FLAGS.terminal) !== 0,
+					metadata: line.metadata,
+					eventWallTimeMs: line.eventWallTimeMs,
+					eventMonotonicNs: line.eventMonotonicNs,
+					transportIdentity: {
+						wrapperPid: line.wrapperPid,
+						wrapperStartId: line.wrapperStartId,
+						targetPid: line.targetPid,
+						targetStartId: line.targetStartId,
+						machineId: reference.machineId,
+						bootId: reference.bootId,
+						journalStreamId: reference.streamId,
+						journalInvocationId: reference.invocationId,
+						invocationIdentityDisposition:
+							reference.invocationId === null
+								? "trusted_journal_invocation_absent"
+								: line.systemdInvocationId === null
+									? "wrapper_envelope_invocation_absent"
+									: "both_present_and_equal",
+						systemdCatPid: line.systemdCatPid,
+						systemdCatStartId: line.systemdCatStartId,
+						journalPresence: "journal_export_observed",
+					},
+					wrapperOrder: assembly.references.map((entry) => entry.wrapperSequence),
+					producerOrder: assembly.references.map((entry) => entry.producerSequence),
+					cursors: assembly.references.map((entry) => entry.cursor),
+					journalReferences: assembly.references.map((entry) => entry.path),
+					cas: {
+						algorithm: "sha256",
+						digest: line.occurrenceSha256,
+						bytes: value.length,
+						path: casPath,
+						compression: "none",
+						resolution: "verified",
+					},
+					compactionDisposition: "compacted_and_cas_resolved",
+					journalCanonicalUntilCompactionCommit: true,
+				};
+				const firstWrapperSequence = assembly.references[0]?.wrapperSequence ?? "0";
+				// This retained-store call is the final unresolved segment lifecycle
+				// seam. It is replaced by the CAS-owned one-shot domain operation once
+				// the shared writer/read lifecycle has crossed that boundary.
+				this.appendSegmentRecord({
+					idempotencyKey: `occurrence:${occurrenceId}`,
+					runId: line.runId,
+					sourceId: SEGMENT_SOURCE_OCCURRENCE,
+					observedAtMs: segmentObservedAtMs(line.eventWallTimeMs),
+					order: isUnsigned64(firstWrapperSequence) ? firstWrapperSequence : "0",
+					metadata: {
+						version: 1,
+						state: "complete",
+						occurrenceIdentity: occurrenceId,
+						casDigest: line.occurrenceSha256,
+					},
+					payload: Buffer.from(`${JSON.stringify(occurrenceRecord)}\n`, "utf8"),
+				});
+				return { effects };
 			});
-			this.removeAssembly(identity);
-			for (const entry of assembly.references) entry.resolved = true;
-			this.advanceCheckpoint();
-			this.processPendingPins();
-		} finally {
-			transaction.release();
+		} catch (error) {
+			if (this.isWriterLifecycleAdmissionError(error))
+				this.rollbackOccurrenceChunk(identity, assembly, reference, payload);
+			throw error;
+		}
+		if (mutation.state !== "committed") {
+			const error = this.writerLifecycleAdmissionError(mutation.reason);
+			this.rollbackOccurrenceChunk(identity, assembly, reference, payload);
+			throw error;
+		}
+		this.applyStorageAccountingEffects(mutation.value.effects);
+		this.removeAssembly(identity);
+		for (const entry of assembly.references) entry.resolved = true;
+		this.advanceCheckpoint();
+		this.processPendingPins();
+	}
+
+	private rollbackOccurrenceChunk(
+		identity: string,
+		assembly: Assembly,
+		reference: JournalRecordReference,
+		payload: Buffer,
+	): void {
+		const lastReference = assembly.references[assembly.references.length - 1];
+		const lastChunk = assembly.chunks[assembly.chunks.length - 1];
+		if (lastReference !== reference || lastChunk !== payload || this.assemblies.get(identity) !== assembly) return;
+		assembly.references.pop();
+		assembly.chunks.pop();
+		assembly.bytes = Math.max(0, assembly.bytes - payload.length);
+		const removedMemory = payload.length + reference.memoryBytes;
+		assembly.memoryBytes = Math.max(0, assembly.memoryBytes - removedMemory);
+		this.assemblyBytes = Math.max(0, this.assemblyBytes - removedMemory);
+		const pendingIndex = this.pendingEntries.lastIndexOf(reference);
+		if (pendingIndex >= 0) {
+			this.pendingEntries.splice(pendingIndex, 1);
+			this.pendingEntryBytes = Math.max(0, this.pendingEntryBytes - reference.memoryBytes);
 		}
 	}
 
@@ -3289,28 +4715,40 @@ export class IncidentRecorderCompactor {
 		for (;;) {
 			const entry = this.pendingEntries[0];
 			if (!entry?.resolved) return;
+			const previousWrappers = new Map(this.wrapperSequences);
+			const previousProducers = new Map(this.producerSequences);
+			try {
+				if (entry.sequenceUpdates) {
+					this.setBoundedSequence(
+						this.wrapperSequences,
+						entry.sequenceUpdates.wrapperKey,
+						BigInt(entry.sequenceUpdates.wrapper),
+					);
+					this.setBoundedSequence(
+						this.producerSequences,
+						entry.sequenceUpdates.producerKey,
+						BigInt(entry.sequenceUpdates.producer),
+					);
+				}
+				this.commitCursor(entry.cursor, entry.machineId, entry.bootId, entry.invocationId, entry.realtimeUs);
+			} catch (error) {
+				this.wrapperSequences.clear();
+				for (const [key, value] of previousWrappers) this.wrapperSequences.set(key, value);
+				this.producerSequences.clear();
+				for (const [key, value] of previousProducers) this.producerSequences.set(key, value);
+				throw error;
+			}
 			this.pendingEntries.shift();
 			this.pendingEntryBytes = Math.max(0, this.pendingEntryBytes - entry.memoryBytes);
-			if (entry.sequenceUpdates) {
-				this.setBoundedSequence(
-					this.wrapperSequences,
-					entry.sequenceUpdates.wrapperKey,
-					BigInt(entry.sequenceUpdates.wrapper),
-				);
-				this.setBoundedSequence(
-					this.producerSequences,
-					entry.sequenceUpdates.producerKey,
-					BigInt(entry.sequenceUpdates.producer),
-				);
-			}
-			this.commitCursor(entry.cursor, entry.machineId, entry.bootId, entry.invocationId, entry.realtimeUs);
 		}
 	}
 	private writeGap(value: unknown): void {
 		const serialized = JSON.stringify(value) ?? "null";
 		const id = sha256(serialized);
-		const evidence = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
-		const runId = typeof evidence.runId === "string" && isCanonicalUuid(evidence.runId) ? evidence.runId : "__recorder__";
+		const evidence =
+			value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+		const runId =
+			typeof evidence.runId === "string" && isCanonicalUuid(evidence.runId) ? evidence.runId : "__recorder__";
 		const sequence =
 			typeof evidence.expectedWrapperFrom === "string" && isUnsigned64(evidence.expectedWrapperFrom)
 				? evidence.expectedWrapperFrom
@@ -3325,7 +4763,10 @@ export class IncidentRecorderCompactor {
 			observedAtMs: 0,
 			order: sequence,
 			metadata: { version: 1, state: "gap_or_uncertainty", gapIdentity: id, reason },
-			payload: Buffer.from(`${JSON.stringify({ version: 1, state: "gap_or_uncertainty", evidence: value })}\n`, "utf8"),
+			payload: Buffer.from(
+				`${JSON.stringify({ version: 1, state: "gap_or_uncertainty", evidence: value })}\n`,
+				"utf8",
+			),
 		});
 	}
 
@@ -3340,7 +4781,7 @@ export class IncidentRecorderCompactor {
 		for (const [key, value] of this.wrapperSequences) wrapperSequences[key] = value.toString();
 		const producerSequences: Record<string, string> = {};
 		for (const [key, value] of this.producerSequences) producerSequences[key] = value.toString();
-		this.checkpoint = {
+		const checkpoint: CursorCheckpoint = {
 			version: 1,
 			cursor,
 			machineId,
@@ -3350,17 +4791,226 @@ export class IncidentRecorderCompactor {
 			wrapperSequences,
 			producerSequences,
 		};
+		this.writeOwnedCheckpoint(this.checkpointPath, checkpoint);
+		this.checkpoint = checkpoint;
 		this.checkpointDisposition = "valid";
-		this.writeOwnedCheckpoint(this.checkpointPath, this.checkpoint);
+	}
+
+	private writeProviderPinIncomplete(
+		incidentDir: string,
+		provider: "journal" | "sysdig",
+		reason: string,
+		request: {
+			runId: string;
+			anchorWallTimeMs: number;
+			fromWallTimeMs: number;
+			throughWallTimeMs: number;
+		},
+	): void {
+		const path = join(incidentDir, `${provider}-pin-incomplete.json`);
+		const value = {
+			version: 1,
+			state: "pending_or_incomplete",
+			provider,
+			reason: boundedNonemptyUtf8(reason, 4 * 1024, "unspecified_provider_pin_incomplete"),
+			runId: request.runId,
+			anchorWallTimeMs: request.anchorWallTimeMs,
+			fromWallTimeMs: request.fromWallTimeMs,
+			throughWallTimeMs: request.throughWallTimeMs,
+		};
+		if (existsSync(path)) {
+			let matchesRequest = false;
+			try {
+				const metadata = lstatSync(path);
+				const expectedUid = typeof process.getuid === "function" ? process.getuid() : metadata.uid;
+				const existing = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+				matchesRequest =
+					metadata.isFile() &&
+					!metadata.isSymbolicLink() &&
+					metadata.nlink === 1 &&
+					metadata.uid === expectedUid &&
+					(metadata.mode & 0o077) === 0 &&
+					metadata.size <= 64 * 1024 &&
+					hasExactOwnKeys(existing, [
+						"version",
+						"state",
+						"provider",
+						"reason",
+						"runId",
+						"anchorWallTimeMs",
+						"fromWallTimeMs",
+						"throughWallTimeMs",
+					]) &&
+					existing.version === 1 &&
+					existing.state === "pending_or_incomplete" &&
+					existing.provider === provider &&
+					typeof existing.reason === "string" &&
+					existing.reason.length > 0 &&
+					Buffer.byteLength(existing.reason, "utf8") <= 4 * 1024 &&
+					existing.runId === request.runId &&
+					existing.anchorWallTimeMs === request.anchorWallTimeMs &&
+					existing.fromWallTimeMs === request.fromWallTimeMs &&
+					existing.throughWallTimeMs === request.throughWallTimeMs;
+			} catch {}
+			if (matchesRequest) {
+				const descriptor = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+				try {
+					fsyncSync(descriptor);
+				} finally {
+					closeSync(descriptor);
+				}
+				fsyncDirectory(incidentDir);
+				return;
+			}
+			this.quarantineInvalidProviderIncomplete(incidentDir, provider, path);
+		}
+		this.writeOwnedJson(path, value, 64 * 1024);
+	}
+
+	private journalArtifactGenerationId(request: {
+		runId: string;
+		anchorWallTimeMs: number;
+		fromWallTimeMs: number;
+		throughWallTimeMs: number;
+	}): string {
+		return sha256(
+			canonicalJson({
+				provider: "journal",
+				runId: request.runId,
+				anchorWallTimeMs: request.anchorWallTimeMs,
+				fromWallTimeMs: request.fromWallTimeMs,
+				throughWallTimeMs: request.throughWallTimeMs,
+			}),
+		);
+	}
+
+	private sysdigArtifactGenerationId(requestFingerprint: string): string {
+		return sha256(canonicalJson({ provider: "sysdig", requestFingerprint }));
+	}
+
+	private sealPrivateArtifact(
+		path: string,
+		expectedBytes: number,
+		expectedSha256: string,
+		generationId: string,
+	): SealedArtifact {
+		let metadata = lstatSync(path);
+		const expectedUid = typeof process.getuid === "function" ? process.getuid() : metadata.uid;
+		if (
+			!metadata.isFile() ||
+			metadata.isSymbolicLink() ||
+			metadata.nlink !== 1 ||
+			metadata.uid !== expectedUid ||
+			(metadata.mode & 0o077) !== 0 ||
+			metadata.size !== expectedBytes
+		)
+			throw new Error("provider_pin_artifact_not_private_regular_copy");
+		if ((metadata.mode & 0o777) !== 0o400) {
+			chmodSync(path, 0o400);
+			const descriptor = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+			try {
+				fsyncSync(descriptor);
+			} finally {
+				closeSync(descriptor);
+			}
+			fsyncDirectory(dirname(path));
+			metadata = lstatSync(path);
+		}
+		if (
+			!metadata.isFile() ||
+			metadata.isSymbolicLink() ||
+			metadata.nlink !== 1 ||
+			metadata.uid !== expectedUid ||
+			(metadata.mode & 0o777) !== 0o400 ||
+			metadata.size !== expectedBytes
+		)
+			throw new Error("provider_pin_artifact_seal_failed");
+		return {
+			version: 1,
+			state: "sealed_private_copy",
+			generationId,
+			dev: String(metadata.dev),
+			ino: String(metadata.ino),
+			bytes: expectedBytes,
+			mtimeMs: metadata.mtimeMs,
+			ctimeMs: metadata.ctimeMs,
+			mode: 0o400,
+			nlink: 1,
+			sha256: expectedSha256,
+		};
+	}
+
+	private materializeJournalPinArtifact(
+		source: string,
+		target: string,
+		expectedBytes: number,
+		expectedSha256: string,
+		generationId: string,
+	): SealedArtifact {
+		const sourceBefore = lstatSync(source);
+		if (
+			!sourceBefore.isFile() ||
+			sourceBefore.isSymbolicLink() ||
+			sourceBefore.size !== expectedBytes ||
+			expectedBytes > 983_040
+		)
+			throw new Error("journal_pin_source_identity_or_size_invalid");
+		const bytes = readFileSync(source);
+		const sourceAfter = lstatSync(source);
+		if (
+			sourceAfter.dev !== sourceBefore.dev ||
+			sourceAfter.ino !== sourceBefore.ino ||
+			sourceAfter.size !== sourceBefore.size ||
+			sourceAfter.mtimeMs !== sourceBefore.mtimeMs ||
+			bytes.length !== expectedBytes ||
+			sha256(bytes) !== expectedSha256
+		)
+			throw new Error("journal_pin_source_changed_or_digest_mismatched");
+		let targetValid = false;
+		try {
+			const existing = lstatSync(target);
+			const expectedUid = typeof process.getuid === "function" ? process.getuid() : existing.uid;
+			targetValid =
+				existing.isFile() &&
+				!existing.isSymbolicLink() &&
+				existing.nlink === 1 &&
+				existing.uid === expectedUid &&
+				(existing.mode & 0o077) === 0 &&
+				existing.size === expectedBytes &&
+				sha256(readFileSync(target)) === expectedSha256;
+			if (!targetValid) {
+				rmSync(target);
+				this.accountRemovedStorageEntry(existing, true);
+				fsyncDirectory(dirname(target));
+			}
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
+		if (!targetValid) {
+			this.ensureDiskAdmission(expectedBytes + 64 * 1024);
+			writeImmutable(target, bytes);
+			this.accountStoragePath(target);
+		}
+		return this.sealPrivateArtifact(target, expectedBytes, expectedSha256, generationId);
 	}
 
 	private startPinRangeScan(
 		incidentDir: string,
-		request: { runId: string; fromWallTimeMs: number; throughWallTimeMs: number },
+		request: {
+			runId: string;
+			anchorWallTimeMs: number;
+			fromWallTimeMs: number;
+			throughWallTimeMs: number;
+		},
 	): void {
 		const proofPath = join(incidentDir, "journal-pin-scan-proof.json");
-		if (existsSync(proofPath) || this.activePinScans.has(incidentDir) || this.activePinScans.size >= 1) return;
-		this.activePinScans.add(incidentDir);
+		if (
+			this.pinReadersQuiescing ||
+			existsSync(proofPath) ||
+			this.activePinScans.has(incidentDir) ||
+			this.activePinScans.size >= 1
+		)
+			return;
 		const child = spawn(
 			this.options.journalctlPath ?? "journalctl",
 			[
@@ -3393,6 +5043,18 @@ export class IncidentRecorderCompactor {
 		let error: Error | undefined;
 		let bytes = 0;
 		let killTimer: ReturnType<typeof setTimeout> | undefined;
+		let resolveCompletion: () => void = () => {};
+		const completion = new Promise<void>((resolve) => {
+			resolveCompletion = resolve;
+		});
+		const tracked: ActivePinScan = {
+			incidentDir,
+			generation: this.pinReaderGeneration,
+			cancelled: false,
+			child,
+			completion,
+			terminate: () => {},
+		};
 		const terminate = (): void => {
 			try {
 				child.kill("SIGTERM");
@@ -3405,6 +5067,9 @@ export class IncidentRecorderCompactor {
 			}, 250);
 			killTimer.unref();
 		};
+		tracked.terminate = terminate;
+		this.activePinScans.set(incidentDir, tracked);
+		this.activeCompactorChildren.add(tracked);
 		const deadlineTimer = setTimeout(() => {
 			error ??= new Error("Pin range scan exceeded its process deadline");
 			terminate();
@@ -3430,20 +5095,25 @@ export class IncidentRecorderCompactor {
 		child.once("close", (code) => {
 			clearTimeout(deadlineTimer);
 			if (killTimer) clearTimeout(killTimer);
-			this.activePinScans.delete(incidentDir);
+			if (this.activePinScans.get(incidentDir) === tracked) this.activePinScans.delete(incidentDir);
+			this.activeCompactorChildren.delete(tracked);
 			try {
 				parser.finish();
 			} catch (caught) {
 				error ??= caught instanceof Error ? caught : new Error(String(caught));
 			}
+			if (tracked.cancelled || tracked.generation !== this.pinReaderGeneration) {
+				resolveCompletion();
+				return;
+			}
 			if (code !== 0 || error) {
 				try {
-					this.writeOwnedJson(join(incidentDir, "journal-pin-incomplete.json"), {
-						version: 1,
-						state: "pending_or_incomplete",
-						reason: error?.message ?? `journalctl_exit_${code ?? "unknown"}`,
-						runId: request.runId,
-					});
+					this.writeProviderPinIncomplete(
+						incidentDir,
+						"journal",
+						error?.message ?? `journalctl_exit_${code ?? "unknown"}`,
+						request,
+					);
 				} catch {}
 				return;
 			}
@@ -3458,6 +5128,7 @@ export class IncidentRecorderCompactor {
 					readBytes: bytes,
 				});
 			} catch {}
+			resolveCompletion();
 		});
 	}
 
@@ -3465,8 +5136,453 @@ export class IncidentRecorderCompactor {
 		return join(incidentDir, "sysdig-pin-request.json");
 	}
 
+	private journalRequestPath(incidentDir: string): string {
+		return join(incidentDir, "journal-pin-request.json");
+	}
+
+	private pinAuthorityPath(incidentDir: string): string {
+		return join(incidentDir, "incident-pin-authority.json");
+	}
+
+	private sysdigInitialCompletePath(incidentDir: string): string {
+		return join(incidentDir, "sysdig-pins", "initial-capture-complete.json");
+	}
+
+	private sysdigCapturePlanPath(incidentDir: string, phase: "initial" | "final"): string {
+		return join(incidentDir, "sysdig-pins", `${phase}-capture-plan.json`);
+	}
+
+	private sysdigFinalCaptureCompletePath(incidentDir: string): string {
+		return join(incidentDir, "sysdig-pins", "final-capture-complete.json");
+	}
+
+	private sysdigFinalPlanPath(incidentDir: string): string {
+		return join(incidentDir, "sysdig-pins", "final-verification-plan.json");
+	}
+
+	private sysdigFinalVerificationPath(incidentDir: string, recordId: string): string {
+		return join(incidentDir, "sysdig-pins", "final-verifications", `${recordId}.json`);
+	}
+
+	private sysdigCaptureGapPath(
+		incidentDir: string,
+		phase: "initial" | "rotated" | "final",
+		candidateId: string,
+	): string {
+		return join(incidentDir, "sysdig-pins", `${phase}-capture-gaps`, `${candidateId}.json`);
+	}
+
+	private sysdigRequestFingerprint(request: SysdigPinRequest): string {
+		return sha256(
+			canonicalJson({
+				version: request.version,
+				runId: request.runId,
+				anchorWallTimeMs: request.anchorWallTimeMs,
+				fromWallTimeMs: request.fromWallTimeMs,
+				throughWallTimeMs: request.throughWallTimeMs,
+				resolveAfterWallTimeMs: request.resolveAfterWallTimeMs,
+				retainUntilWallTimeMs: request.retainUntilWallTimeMs,
+				ringBasePath: request.ringBasePath,
+				requestedAtWallTimeMs: request.requestedAtWallTimeMs,
+				initialRingSnapshot: request.initialRingSnapshot ?? null,
+			}),
+		);
+	}
+
+	private sysdigRequestBaseFingerprint(request: SysdigPinRequest): string {
+		return sha256(
+			canonicalJson({
+				version: request.version,
+				runId: request.runId,
+				anchorWallTimeMs: request.anchorWallTimeMs,
+				fromWallTimeMs: request.fromWallTimeMs,
+				throughWallTimeMs: request.throughWallTimeMs,
+				resolveAfterWallTimeMs: request.resolveAfterWallTimeMs,
+				requestedAtWallTimeMs: request.requestedAtWallTimeMs,
+				retainUntilWallTimeMs: request.retainUntilWallTimeMs,
+				ringBasePath: request.ringBasePath,
+			}),
+		);
+	}
+
+	private discoverSysdigRingSnapshot(ringBasePath: string, observedAtWallTimeMs: number): SysdigRingSnapshot {
+		const issues: string[] = [];
+		const ringDir = dirname(ringBasePath);
+		const ringName = basename(ringBasePath);
+		let entries: Dirent[];
+		try {
+			entries = readdirSync(ringDir, { withFileTypes: true });
+		} catch {
+			return { observedAtWallTimeMs, candidates: [], issues: ["ring_directory_unavailable"] };
+		}
+		if (entries.length > SYSDIG_PIN_MAX_DISCOVERY_ENTRIES) issues.push("ring_directory_entry_bound_exceeded");
+		const discovered: SysdigRingSnapshotCandidate[] = [];
+		for (const entry of entries.slice(0, SYSDIG_PIN_MAX_DISCOVERY_ENTRIES)) {
+			if (!entry.name.startsWith(ringName)) continue;
+			const sourcePath = join(ringDir, entry.name);
+			try {
+				const metadata = lstatSync(sourcePath, { bigint: true });
+				if (!metadata.isFile()) {
+					issues.push(`non_regular_ring_entry:${entry.name}`);
+					continue;
+				}
+				const bytes = Number(metadata.size);
+				if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > SYSDIG_PIN_MAX_SEGMENT_BYTES) {
+					issues.push(`oversize_ring_entry:${entry.name}`);
+					continue;
+				}
+				const source = {
+					dev: metadata.dev.toString(),
+					ino: metadata.ino.toString(),
+					bytes,
+					mtimeMs: Number(metadata.mtimeMs),
+					ctimeMs: Number(metadata.ctimeMs),
+				};
+				discovered.push({
+					id: sha256(`${source.dev}\0${source.ino}\0${source.bytes}\0${source.mtimeMs}\0${source.ctimeMs}`),
+					sourcePath,
+					sourceName: entry.name,
+					activeAtRequest: false,
+					source,
+				});
+			} catch {
+				issues.push(`unstatable_ring_entry:${entry.name}`);
+			}
+		}
+		discovered.sort(
+			(left, right) =>
+				right.source.mtimeMs - left.source.mtimeMs ||
+				(right.sourceName === left.sourceName ? 0 : right.sourceName < left.sourceName ? -1 : 1),
+		);
+		if (discovered.length > SYSDIG_RING_EXPECTED_SEGMENTS) issues.push("ring_has_more_than_configured_12_segments");
+		if (discovered.length > SYSDIG_PIN_MAX_SEGMENTS) issues.push("ring_segment_count_bound_exceeded");
+		const candidates: SysdigRingSnapshotCandidate[] = [];
+		let totalBytes = 0;
+		for (const [index, candidate] of discovered.slice(0, SYSDIG_PIN_MAX_SEGMENTS).entries()) {
+			if (totalBytes + candidate.source.bytes > SYSDIG_PIN_MAX_TOTAL_BYTES) {
+				issues.push("incident_sysdig_pin_total_byte_bound_exceeded");
+				break;
+			}
+			totalBytes += candidate.source.bytes;
+			candidates.push({ ...candidate, activeAtRequest: index === 0 });
+		}
+		return { observedAtWallTimeMs, candidates, issues };
+	}
+
+	private boundSysdigRequestSnapshot(
+		request: Omit<SysdigPinRequest, "initialRingSnapshot">,
+		snapshot: SysdigRingSnapshot,
+	): SysdigRingSnapshot {
+		const serializedBytes = (candidateSnapshot: SysdigRingSnapshot): number =>
+			Buffer.byteLength(`${JSON.stringify({ ...request, initialRingSnapshot: candidateSnapshot })}\n`, "utf8");
+		if (serializedBytes(snapshot) <= SYSDIG_PIN_REQUEST_MAX_BYTES) return snapshot;
+		const bounded: SysdigRingSnapshot = {
+			observedAtWallTimeMs: snapshot.observedAtWallTimeMs,
+			candidates: [],
+			issues: ["request_snapshot_byte_bound_exceeded"],
+		};
+		for (const candidate of snapshot.candidates) {
+			const trial = { ...bounded, candidates: [...bounded.candidates, candidate] };
+			if (serializedBytes(trial) > SYSDIG_PIN_REQUEST_MAX_BYTES) break;
+			bounded.candidates.push(candidate);
+		}
+		for (const issue of snapshot.issues) {
+			if (bounded.issues.length >= SYSDIG_PIN_MAX_DISCOVERY_ENTRIES) break;
+			const trial = { ...bounded, issues: [...bounded.issues, issue] };
+			if (serializedBytes(trial) > SYSDIG_PIN_REQUEST_MAX_BYTES) continue;
+			bounded.issues.push(issue);
+		}
+		if (serializedBytes(bounded) > SYSDIG_PIN_REQUEST_MAX_BYTES) {
+			throw new Error("Sysdig pin request base fields exceed the 64 KiB immutable request bound");
+		}
+		return bounded;
+	}
+
+	private readSysdigPinRequestPath(path: string): SysdigPinRequest | undefined {
+		try {
+			const metadata = lstatSync(path);
+			if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size > SYSDIG_PIN_REQUEST_MAX_BYTES)
+				return undefined;
+			const request = JSON.parse(readFileSync(path, "utf8")) as SysdigPinRequest;
+			if (
+				!hasExactOwnKeys(request, [
+					"version",
+					"runId",
+					"anchorWallTimeMs",
+					"fromWallTimeMs",
+					"throughWallTimeMs",
+					"resolveAfterWallTimeMs",
+					"requestedAtWallTimeMs",
+					"retainUntilWallTimeMs",
+					"ringBasePath",
+					"initialRingSnapshot",
+				]) ||
+				request.version !== 1 ||
+				!isCanonicalUuid(request.runId) ||
+				!Number.isSafeInteger(request.anchorWallTimeMs) ||
+				request.anchorWallTimeMs < 0 ||
+				!Number.isSafeInteger(request.fromWallTimeMs) ||
+				!Number.isSafeInteger(request.throughWallTimeMs) ||
+				!Number.isSafeInteger(request.resolveAfterWallTimeMs) ||
+				!Number.isSafeInteger(request.requestedAtWallTimeMs) ||
+				!Number.isSafeInteger(request.retainUntilWallTimeMs) ||
+				typeof request.ringBasePath !== "string" ||
+				request.ringBasePath.length === 0 ||
+				Buffer.byteLength(request.ringBasePath) > 4096 ||
+				request.fromWallTimeMs !== request.anchorWallTimeMs - PIN_BEFORE_MS ||
+				request.throughWallTimeMs !== request.anchorWallTimeMs + PIN_AFTER_MS ||
+				request.resolveAfterWallTimeMs !== request.throughWallTimeMs ||
+				request.requestedAtWallTimeMs !== request.anchorWallTimeMs ||
+				request.retainUntilWallTimeMs !== request.anchorWallTimeMs + SYSDIG_PIN_RETENTION_MS
+			) {
+				return undefined;
+			}
+			const snapshot = request.initialRingSnapshot;
+			if (snapshot === undefined) return undefined;
+			{
+				if (
+					!hasExactOwnKeys(snapshot, ["observedAtWallTimeMs", "candidates", "issues"]) ||
+					!Number.isSafeInteger(snapshot.observedAtWallTimeMs) ||
+					snapshot.observedAtWallTimeMs < 0 ||
+					!Array.isArray(snapshot.candidates) ||
+					snapshot.candidates.length > SYSDIG_PIN_MAX_SEGMENTS ||
+					!Array.isArray(snapshot.issues) ||
+					snapshot.issues.length > SYSDIG_PIN_MAX_DISCOVERY_ENTRIES
+				) {
+					return undefined;
+				}
+				if (snapshot.issues.some((issue) => typeof issue !== "string" || Buffer.byteLength(issue) > 4096))
+					return undefined;
+				let totalBytes = 0;
+				const ids = new Set<string>();
+				let activeCount = 0;
+				const ringDir = dirname(request.ringBasePath);
+				const ringName = basename(request.ringBasePath);
+				for (const candidate of snapshot.candidates) {
+					if (
+						!hasExactOwnKeys(candidate, ["id", "sourcePath", "sourceName", "activeAtRequest", "source"]) ||
+						!hasExactOwnKeys(candidate.source, ["dev", "ino", "bytes", "mtimeMs", "ctimeMs"]) ||
+						!/^[0-9a-f]{64}$/.test(candidate.id) ||
+						ids.has(candidate.id) ||
+						typeof candidate.sourcePath !== "string" ||
+						Buffer.byteLength(candidate.sourcePath, "utf8") > 4096 ||
+						typeof candidate.sourceName !== "string" ||
+						candidate.sourceName.length === 0 ||
+						Buffer.byteLength(candidate.sourceName, "utf8") > 255 ||
+						basename(candidate.sourceName) !== candidate.sourceName ||
+						!candidate.sourceName.startsWith(ringName) ||
+						candidate.sourcePath !== join(ringDir, candidate.sourceName) ||
+						typeof candidate.activeAtRequest !== "boolean" ||
+						Buffer.byteLength(candidate.source.dev, "utf8") > 32 ||
+						!/^(?:0|[1-9]\d*)$/.test(candidate.source.dev) ||
+						Buffer.byteLength(candidate.source.ino, "utf8") > 32 ||
+						!/^(?:0|[1-9]\d*)$/.test(candidate.source.ino) ||
+						!Number.isSafeInteger(candidate.source.bytes) ||
+						candidate.source.bytes < 0 ||
+						candidate.source.bytes > SYSDIG_PIN_MAX_SEGMENT_BYTES ||
+						!Number.isFinite(candidate.source.mtimeMs) ||
+						candidate.source.mtimeMs < 0 ||
+						!Number.isFinite(candidate.source.ctimeMs) ||
+						candidate.source.ctimeMs < 0
+					) {
+						return undefined;
+					}
+					if (
+						candidate.id !==
+						sha256(
+							`${candidate.source.dev}\0${candidate.source.ino}\0${candidate.source.bytes}\0${candidate.source.mtimeMs}\0${candidate.source.ctimeMs}`,
+						)
+					)
+						return undefined;
+					ids.add(candidate.id);
+					if (candidate.activeAtRequest) activeCount += 1;
+					totalBytes += candidate.source.bytes;
+					if (!Number.isSafeInteger(totalBytes) || totalBytes > SYSDIG_PIN_MAX_TOTAL_BYTES) return undefined;
+				}
+				if (
+					(snapshot.candidates.length === 0 && activeCount !== 0) ||
+					(snapshot.candidates.length > 0 &&
+						(activeCount !== 1 || snapshot.candidates[0]?.activeAtRequest !== true))
+				)
+					return undefined;
+			}
+			return request;
+		} catch {
+			return undefined;
+		}
+	}
+
+	private readSysdigPinRequest(incidentDir: string): SysdigPinRequest | undefined {
+		return this.readSysdigPinRequestPath(this.sysdigRequestPath(incidentDir));
+	}
+
+	private readJournalPinRequest(incidentDir: string): JournalPinRequest | undefined {
+		try {
+			const request = JSON.parse(readFileSync(this.journalRequestPath(incidentDir), "utf8")) as JournalPinRequest;
+			if (
+				!hasExactOwnKeys(request, [
+					"version",
+					"state",
+					"runId",
+					"anchorWallTimeMs",
+					"fromWallTimeMs",
+					"throughWallTimeMs",
+					"resolveAfterWallTimeMs",
+					"retainUntilWallTimeMs",
+				]) ||
+				request.version !== 1 ||
+				request.state !== "pending" ||
+				!isCanonicalUuid(request.runId) ||
+				!Number.isSafeInteger(request.anchorWallTimeMs) ||
+				request.anchorWallTimeMs < 0 ||
+				!Number.isSafeInteger(request.fromWallTimeMs) ||
+				!Number.isSafeInteger(request.throughWallTimeMs) ||
+				!Number.isSafeInteger(request.resolveAfterWallTimeMs) ||
+				!Number.isSafeInteger(request.retainUntilWallTimeMs) ||
+				request.fromWallTimeMs < 0 ||
+				request.fromWallTimeMs > request.anchorWallTimeMs ||
+				request.throughWallTimeMs < request.anchorWallTimeMs ||
+				request.throughWallTimeMs - request.fromWallTimeMs > PIN_BEFORE_MS + PIN_AFTER_MS ||
+				request.resolveAfterWallTimeMs < request.anchorWallTimeMs ||
+				request.resolveAfterWallTimeMs > request.throughWallTimeMs ||
+				request.retainUntilWallTimeMs !== request.anchorWallTimeMs + INCIDENT_DIAGNOSTIC_RETENTION_MS
+			) {
+				return undefined;
+			}
+			return request;
+		} catch {
+			return undefined;
+		}
+	}
+
+	private readIncidentPinAuthority(incidentDir: string): IncidentPinAuthority | undefined {
+		return this.readSysdigPinRequestPath(this.pinAuthorityPath(incidentDir));
+	}
+
+	private quarantineInvalidPinRequest(incidentDir: string, provider: "journal" | "sysdig", path: string): string {
+		const metadata = lstatSync(path);
+		if ((!metadata.isFile() && !metadata.isSymbolicLink()) || metadata.isDirectory()) {
+			throw new Error(`Invalid ${provider} pin request could not be quarantined safely`);
+		}
+		const identity = sha256(
+			`${metadata.dev}:${metadata.ino}:${metadata.mode}:${metadata.size}:${metadata.mtimeMs}:${metadata.ctimeMs}`,
+		);
+		const quarantineDir = join(incidentDir, "provider-request-quarantine");
+		const quarantinePath = join(quarantineDir, `${provider}-${identity}.json`);
+		mkdirSync(quarantineDir, { recursive: true, mode: 0o700 });
+		const existed = existsSync(quarantinePath);
+		if (!existed) linkSync(path, quarantinePath);
+		const quarantined = lstatSync(quarantinePath);
+		if (quarantined.dev !== metadata.dev || quarantined.ino !== metadata.ino) {
+			throw new Error(`Invalid ${provider} pin request quarantine identity mismatch`);
+		}
+		if (!existed) this.accountStoragePath(quarantinePath);
+		fsyncDirectory(quarantineDir);
+		const removed = lstatSync(path);
+		rmSync(path);
+		this.accountRemovedStorageEntry(removed);
+		fsyncDirectory(incidentDir);
+		this.writeOwnedJson(join(quarantineDir, `${provider}-${identity}-recovery.json`), {
+			version: 1,
+			state: "quarantined_invalid_immutable_request",
+			provider,
+			identity,
+		});
+		return identity;
+	}
+
+	private quarantineInvalidProviderProof(incidentDir: string, provider: "journal" | "sysdig", path: string): void {
+		const metadata = lstatSync(path);
+		if ((!metadata.isFile() && !metadata.isSymbolicLink()) || metadata.isDirectory())
+			throw new Error(`Invalid ${provider} pin proof could not be quarantined safely`);
+		const identity = sha256(
+			`${metadata.dev}:${metadata.ino}:${metadata.mode}:${metadata.size}:${metadata.mtimeMs}:${metadata.ctimeMs}`,
+		);
+		const quarantineDir = join(incidentDir, "provider-proof-quarantine");
+		const quarantinePath = join(quarantineDir, `${provider}-${identity}.json`);
+		mkdirSync(quarantineDir, { recursive: true, mode: 0o700 });
+		const existed = existsSync(quarantinePath);
+		if (!existed) {
+			linkSync(path, quarantinePath);
+			this.accountStoragePath(quarantinePath);
+		}
+		const quarantined = lstatSync(quarantinePath);
+		if (quarantined.dev !== metadata.dev || quarantined.ino !== metadata.ino)
+			throw new Error(`Invalid ${provider} pin proof quarantine identity mismatch`);
+		fsyncDirectory(quarantineDir);
+		const removed = lstatSync(path);
+		rmSync(path);
+		this.accountRemovedStorageEntry(removed);
+		fsyncDirectory(incidentDir);
+	}
+
+	private quarantineInvalidProviderIncomplete(
+		incidentDir: string,
+		provider: "journal" | "sysdig",
+		path: string,
+	): void {
+		const metadata = lstatSync(path);
+		if ((!metadata.isFile() && !metadata.isSymbolicLink()) || metadata.isDirectory())
+			throw new Error(`Invalid ${provider} incomplete marker could not be quarantined safely`);
+		const identity = sha256(
+			`${metadata.dev}:${metadata.ino}:${metadata.mode}:${metadata.size}:${metadata.mtimeMs}:${metadata.ctimeMs}`,
+		);
+		const quarantineDir = join(incidentDir, "provider-incomplete-quarantine");
+		const quarantinePath = join(quarantineDir, `${provider}-${identity}.json`);
+		mkdirSync(quarantineDir, { recursive: true, mode: 0o700 });
+		if (!existsSync(quarantinePath)) {
+			linkSync(path, quarantinePath);
+			this.accountStoragePath(quarantinePath);
+		}
+		const quarantined = lstatSync(quarantinePath);
+		if (quarantined.dev !== metadata.dev || quarantined.ino !== metadata.ino)
+			throw new Error(`Invalid ${provider} incomplete marker quarantine identity mismatch`);
+		fsyncDirectory(quarantineDir);
+		const removed = lstatSync(path);
+		rmSync(path);
+		this.accountRemovedStorageEntry(removed);
+		fsyncDirectory(incidentDir);
+	}
+
+	private writeOrRepairProviderPinProof(
+		incidentDir: string,
+		provider: "journal" | "sysdig",
+		value: Record<string, unknown>,
+	): void {
+		const path = join(incidentDir, `${provider}-pin-retention-proof.json`);
+		if (existsSync(path)) {
+			let matches = false;
+			try {
+				const metadata = lstatSync(path);
+				const expectedUid = typeof process.getuid === "function" ? process.getuid() : metadata.uid;
+				const existing = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+				matches =
+					metadata.isFile() &&
+					!metadata.isSymbolicLink() &&
+					metadata.nlink === 1 &&
+					metadata.uid === expectedUid &&
+					(metadata.mode & 0o077) === 0 &&
+					metadata.size <= 64 * 1024 &&
+					canonicalJson(existing) === canonicalJson(value);
+			} catch {}
+			if (matches) {
+				const descriptor = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+				try {
+					fsyncSync(descriptor);
+				} finally {
+					closeSync(descriptor);
+				}
+				fsyncDirectory(incidentDir);
+				return;
+			}
+			this.quarantineInvalidProviderProof(incidentDir, provider, path);
+		}
+		this.writeOwnedJson(path, value, 64 * 1024);
+	}
+
 	private readSysdigSegmentRecordState(incidentDir: string): SysdigPinRecordState {
 		const recordsDir = join(incidentDir, "sysdig-pins", "records");
+		const segmentsDir = join(incidentDir, "sysdig-pins", "segments");
 		let entries: Dirent[];
 		try {
 			entries = readdirSync(recordsDir, { withFileTypes: true });
@@ -3494,18 +5610,78 @@ export class IncidentRecorderCompactor {
 		for (const name of names) {
 			try {
 				const path = join(recordsDir, name);
-				const stat = statSync(path);
-				if (stat.size > 64 * 1024) throw new Error("record_metadata_byte_bound_exceeded");
-				const value = JSON.parse(readFileSync(path, "utf8")) as SysdigPinnedSegmentRecord;
+				const stat = lstatSync(path);
+				const expectedUid = typeof process.getuid === "function" ? process.getuid() : stat.uid;
 				if (
+					!stat.isFile() ||
+					stat.isSymbolicLink() ||
+					stat.nlink !== 1 ||
+					stat.uid !== expectedUid ||
+					(stat.mode & 0o077) !== 0 ||
+					stat.size > 64 * 1024
+				)
+					throw new Error("record_metadata_identity_or_byte_bound_invalid");
+				const value = JSON.parse(readFileSync(path, "utf8")) as SysdigPinnedSegmentRecord;
+				const artifactAtCapture = value.artifactAtCapture;
+				if (
+					!hasExactOwnKeys(value, [
+						"version",
+						"id",
+						"sourcePath",
+						"sourceName",
+						"observedAtWallTimeMs",
+						"phase",
+						"source",
+						"pinnedPath",
+						"captureMethod",
+						"captureReason",
+						"bytesAtCapture",
+						"artifactAtCapture",
+					]) ||
 					value.version !== 1 ||
 					value.id !== name.slice(0, -5) ||
 					!/^[0-9a-f]{64}$/.test(value.id) ||
-					typeof value.pinnedPath !== "string" ||
+					!hasExactOwnKeys(value.source, ["dev", "ino", "bytes", "mtimeMs", "ctimeMs"]) ||
+					!hasExactOwnKeys(artifactAtCapture, ["dev", "ino", "bytes", "mtimeMs", "ctimeMs", "mode", "nlink"]) ||
 					typeof value.sourcePath !== "string" ||
+					Buffer.byteLength(value.sourcePath, "utf8") > 4096 ||
+					typeof value.sourceName !== "string" ||
+					value.sourceName.length === 0 ||
+					Buffer.byteLength(value.sourceName, "utf8") > 255 ||
+					basename(value.sourceName) !== value.sourceName ||
+					!Number.isSafeInteger(value.observedAtWallTimeMs) ||
+					value.observedAtWallTimeMs < 0 ||
+					(value.phase !== "initial" && value.phase !== "rotated" && value.phase !== "final") ||
+					value.pinnedPath !== join(segmentsDir, `${value.id}.scap`) ||
+					value.captureMethod !== "bounded_copy" ||
+					(value.captureReason !== "active_segment_snapshot" &&
+						value.captureReason !== "closed_segment_private_snapshot") ||
+					typeof value.source.dev !== "string" ||
+					!/^(?:0|[1-9]\d*)$/.test(value.source.dev) ||
+					typeof value.source.ino !== "string" ||
+					!/^(?:0|[1-9]\d*)$/.test(value.source.ino) ||
+					!Number.isSafeInteger(value.source.bytes) ||
+					value.source.bytes < 0 ||
+					value.source.bytes > SYSDIG_PIN_MAX_SEGMENT_BYTES ||
+					!Number.isFinite(value.source.mtimeMs) ||
+					value.source.mtimeMs < 0 ||
+					!Number.isFinite(value.source.ctimeMs) ||
+					value.source.ctimeMs < 0 ||
+					value.id !==
+						sha256(
+							`${value.source.dev}\0${value.source.ino}\0${value.source.bytes}\0${value.source.mtimeMs}\0${value.source.ctimeMs}`,
+						) ||
 					!Number.isSafeInteger(value.bytesAtCapture) ||
 					value.bytesAtCapture < 0 ||
-					value.bytesAtCapture > SYSDIG_PIN_MAX_SEGMENT_BYTES
+					value.bytesAtCapture > SYSDIG_PIN_MAX_SEGMENT_BYTES ||
+					value.source.bytes !== value.bytesAtCapture ||
+					artifactAtCapture.bytes !== value.bytesAtCapture ||
+					artifactAtCapture.mode !== 0o600 ||
+					artifactAtCapture.nlink !== 1 ||
+					!/^(?:0|[1-9]\d*)$/.test(artifactAtCapture.dev) ||
+					!/^(?:0|[1-9]\d*)$/.test(artifactAtCapture.ino) ||
+					!Number.isFinite(artifactAtCapture.mtimeMs) ||
+					!Number.isFinite(artifactAtCapture.ctimeMs)
 				)
 					throw new Error("record_metadata_invalid");
 				totalBytes += value.bytesAtCapture;
@@ -3539,6 +5715,7 @@ export class IncidentRecorderCompactor {
 		try {
 			names = readdirSync(directory)
 				.filter((name) => /^[0-9a-f]{64}\.json$/.test(name))
+				.sort()
 				.slice(0, SYSDIG_PIN_MAX_DISCOVERY_ENTRIES);
 		} catch {
 			return [];
@@ -3553,275 +5730,1056 @@ export class IncidentRecorderCompactor {
 		return issues;
 	}
 
+	private resolveSysdigSnapshotSource(
+		request: SysdigPinRequest,
+		candidate: SysdigRingSnapshotCandidate,
+		partialBytes: number,
+	): { path: string; metadata: BigIntStats } {
+		const ringDir = dirname(request.ringBasePath);
+		const ringName = basename(request.ringBasePath);
+		const paths: string[] = [];
+		if (dirname(candidate.sourcePath) === ringDir && basename(candidate.sourcePath).startsWith(ringName)) {
+			paths.push(candidate.sourcePath);
+		}
+		try {
+			for (const entry of readdirSync(ringDir, { withFileTypes: true }).slice(0, SYSDIG_PIN_MAX_DISCOVERY_ENTRIES)) {
+				if (entry.isFile() && entry.name.startsWith(ringName)) paths.push(join(ringDir, entry.name));
+			}
+		} catch {}
+		for (const path of [...new Set(paths)]) {
+			try {
+				const metadata = lstatSync(path, { bigint: true });
+				const exactRequestIdentity =
+					Number(metadata.size) === candidate.source.bytes &&
+					Number(metadata.mtimeMs) === candidate.source.mtimeMs &&
+					Number(metadata.ctimeMs) === candidate.source.ctimeMs;
+				if (
+					metadata.isFile() &&
+					metadata.dev.toString() === candidate.source.dev &&
+					metadata.ino.toString() === candidate.source.ino &&
+					(candidate.activeAtRequest && partialBytes > 0
+						? Number(metadata.size) >= candidate.source.bytes
+						: exactRequestIdentity)
+				) {
+					return { path, metadata };
+				}
+			} catch {}
+		}
+		throw new Error(`sysdig_planned_source_unavailable:${candidate.sourceName}`);
+	}
+
+	private discardSysdigSourceCapture(): void {
+		const state = this.sysdigSourceCapture;
+		if (!state) return;
+		if (state.sourceDescriptor !== undefined) {
+			try {
+				closeSync(state.sourceDescriptor);
+				state.sourceDescriptor = undefined;
+			} catch {}
+		}
+		if (state.partialDescriptor !== undefined) {
+			try {
+				closeSync(state.partialDescriptor);
+				state.partialDescriptor = undefined;
+			} catch {}
+		}
+		if (state.sourceDescriptor === undefined && state.partialDescriptor === undefined)
+			this.sysdigSourceCapture = undefined;
+	}
+
+	private beginSysdigSourceCapture(
+		request: SysdigPinRequest,
+		candidate: SysdigRingSnapshotCandidate,
+		partialPath: string,
+	): SysdigSourceCaptureState {
+		let partialBytes = 0;
+		let partialExisted = false;
+		try {
+			const partial = lstatSync(partialPath);
+			if (!partial.isFile() || partial.isSymbolicLink() || partial.nlink !== 1)
+				throw new Error("sysdig_partial_copy_invalid");
+			partialBytes = partial.size;
+			partialExisted = true;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
+		if (partialBytes > candidate.source.bytes) throw new Error("sysdig_partial_copy_exceeds_planned_bytes");
+		const resolved = this.resolveSysdigSnapshotSource(request, candidate, partialBytes);
+		let sourceDescriptor: number | undefined;
+		let partialDescriptor: number | undefined;
+		try {
+			sourceDescriptor = openSync(resolved.path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+			const openedSource = fstatSync(sourceDescriptor, { bigint: true });
+			const pathIdentity = lstatSync(resolved.path, { bigint: true });
+			const exactRequestIdentity =
+				Number(openedSource.size) === candidate.source.bytes &&
+				Number(openedSource.mtimeMs) === candidate.source.mtimeMs &&
+				Number(openedSource.ctimeMs) === candidate.source.ctimeMs;
+			if (
+				!openedSource.isFile() ||
+				!pathIdentity.isFile() ||
+				openedSource.dev !== pathIdentity.dev ||
+				openedSource.ino !== pathIdentity.ino ||
+				openedSource.dev.toString() !== candidate.source.dev ||
+				openedSource.ino.toString() !== candidate.source.ino ||
+				(candidate.activeAtRequest && partialBytes > 0
+					? Number(openedSource.size) < candidate.source.bytes
+					: !exactRequestIdentity)
+			) {
+				throw new Error("sysdig_source_identity_changed_before_open");
+			}
+			partialDescriptor = openSync(
+				partialPath,
+				fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_NOFOLLOW,
+				0o600,
+			);
+			const openedPartial = fstatSync(partialDescriptor, { bigint: true });
+			const partialPathIdentity = lstatSync(partialPath, { bigint: true });
+			const expectedUid = typeof process.getuid === "function" ? BigInt(process.getuid()) : openedPartial.uid;
+			if (
+				!openedPartial.isFile() ||
+				openedPartial.dev !== partialPathIdentity.dev ||
+				openedPartial.ino !== partialPathIdentity.ino ||
+				Number(openedPartial.nlink) !== 1 ||
+				openedPartial.uid !== expectedUid ||
+				(Number(openedPartial.mode) & 0o777) !== 0o600 ||
+				Number(openedPartial.size) !== partialBytes
+			) {
+				throw new Error("sysdig_partial_copy_changed_before_resume");
+			}
+			const state: SysdigSourceCaptureState = {
+				recordId: candidate.id,
+				sourcePath: resolved.path,
+				sourceDescriptor,
+				partialDescriptor,
+				partialDev: openedPartial.dev.toString(),
+				partialIno: openedPartial.ino.toString(),
+				partialUid: openedPartial.uid.toString(),
+				partialBytes,
+				verifiedBytes: 0,
+				phase: partialBytes > 0 ? "verify_existing" : "copy",
+				verificationSourceIdentity:
+					partialBytes > 0
+						? {
+								bytes: Number(openedSource.size),
+								mtimeMs: Number(openedSource.mtimeMs),
+								ctimeMs: Number(openedSource.ctimeMs),
+							}
+						: undefined,
+			};
+			this.sysdigSourceCapture = state;
+			if (!partialExisted) {
+				this.accountStoragePath(partialPath);
+				fsyncDirectory(dirname(partialPath));
+			}
+			return state;
+		} catch (error) {
+			if (this.sysdigSourceCapture?.recordId === candidate.id) this.sysdigSourceCapture = undefined;
+			if (sourceDescriptor !== undefined) {
+				try {
+					closeSync(sourceDescriptor);
+				} catch {}
+			}
+			if (partialDescriptor !== undefined) {
+				try {
+					closeSync(partialDescriptor);
+				} catch {}
+			}
+			throw error;
+		}
+	}
+
+	private advanceSysdigSourceCapture(
+		request: SysdigPinRequest,
+		candidate: SysdigRingSnapshotCandidate,
+		partialPath: string,
+		budget: SysdigWorkBudget,
+	): SysdigSegmentCaptureResult {
+		if (this.sysdigSourceCapture?.recordId !== candidate.id) this.discardSysdigSourceCapture();
+		if (budget.remainingBytes <= 0) return { complete: false, bytesWorked: 0 };
+		let bytesWorked = 0;
+		try {
+			const state = this.sysdigSourceCapture ?? this.beginSysdigSourceCapture(request, candidate, partialPath);
+			const sourceDescriptor = state.sourceDescriptor;
+			const partialDescriptor = state.partialDescriptor;
+			if (sourceDescriptor === undefined || partialDescriptor === undefined)
+				throw new Error("sysdig_source_capture_descriptor_unavailable");
+			const validateDescriptors = (): {
+				source: BigIntStats;
+				partial: BigIntStats;
+			} => {
+				const source = fstatSync(sourceDescriptor, { bigint: true });
+				const partial = fstatSync(partialDescriptor, { bigint: true });
+				const partialPathIdentity = lstatSync(partialPath, { bigint: true });
+				const exactClosedIdentity =
+					Number(source.size) === candidate.source.bytes &&
+					Number(source.mtimeMs) === candidate.source.mtimeMs &&
+					Number(source.ctimeMs) === candidate.source.ctimeMs;
+				if (
+					!source.isFile() ||
+					source.dev.toString() !== candidate.source.dev ||
+					source.ino.toString() !== candidate.source.ino ||
+					(candidate.activeAtRequest ? Number(source.size) < candidate.source.bytes : !exactClosedIdentity)
+				) {
+					throw new Error("sysdig_source_changed_during_bounded_capture");
+				}
+				if (
+					!partial.isFile() ||
+					partial.dev.toString() !== state.partialDev ||
+					partial.ino.toString() !== state.partialIno ||
+					partial.uid.toString() !== state.partialUid ||
+					Number(partial.nlink) !== 1 ||
+					(Number(partial.mode) & 0o777) !== 0o600 ||
+					Number(partial.size) !== state.partialBytes ||
+					partial.dev !== partialPathIdentity.dev ||
+					partial.ino !== partialPathIdentity.ino
+				) {
+					throw new Error("sysdig_partial_copy_changed_during_capture");
+				}
+				return { source, partial };
+			};
+			while (budget.remainingBytes > 0) {
+				const { source } = validateDescriptors();
+				if (state.phase === "copy" && state.partialBytes >= candidate.source.bytes) {
+					fsyncSync(partialDescriptor);
+					state.phase = "verify_final";
+					state.verifiedBytes = 0;
+					state.verificationSourceIdentity = {
+						bytes: Number(source.size),
+						mtimeMs: Number(source.mtimeMs),
+						ctimeMs: Number(source.ctimeMs),
+					};
+					continue;
+				}
+				if (state.phase === "verify_existing" || state.phase === "verify_final") {
+					const verificationBytes = state.partialBytes;
+					const allowance = Math.min(budget.remainingBytes, verificationBytes - state.verifiedBytes);
+					if (allowance > 0) {
+						const sourceBuffer = Buffer.allocUnsafe(Math.min(SYSDIG_PIN_COPY_BUFFER_BYTES, allowance));
+						const partialBuffer = Buffer.allocUnsafe(sourceBuffer.length);
+						while (state.verifiedBytes < verificationBytes && budget.remainingBytes > 0) {
+							const requested = Math.min(
+								sourceBuffer.length,
+								budget.remainingBytes,
+								verificationBytes - state.verifiedBytes,
+							);
+							const sourceCount = readSync(sourceDescriptor, sourceBuffer, 0, requested, state.verifiedBytes);
+							const partialCount = readSync(partialDescriptor, partialBuffer, 0, requested, state.verifiedBytes);
+							if (
+								sourceCount !== requested ||
+								partialCount !== requested ||
+								!sourceBuffer.subarray(0, requested).equals(partialBuffer.subarray(0, requested))
+							) {
+								throw new Error("sysdig_partial_prefix_mismatch");
+							}
+							state.verifiedBytes += requested;
+							budget.remainingBytes -= requested;
+							bytesWorked += requested;
+						}
+					}
+					if (state.verifiedBytes < verificationBytes) return { complete: false, bytesWorked };
+					const afterVerification = validateDescriptors().source;
+					const verificationIdentity = state.verificationSourceIdentity;
+					if (
+						verificationIdentity &&
+						(Number(afterVerification.size) !== verificationIdentity.bytes ||
+							Number(afterVerification.mtimeMs) !== verificationIdentity.mtimeMs ||
+							Number(afterVerification.ctimeMs) !== verificationIdentity.ctimeMs)
+					) {
+						if (!candidate.activeAtRequest)
+							throw new Error("sysdig_closed_source_changed_during_prefix_verification");
+						state.verifiedBytes = 0;
+						state.verificationSourceIdentity = {
+							bytes: Number(afterVerification.size),
+							mtimeMs: Number(afterVerification.mtimeMs),
+							ctimeMs: Number(afterVerification.ctimeMs),
+						};
+						return { complete: false, bytesWorked };
+					}
+					if (state.phase === "verify_existing") {
+						state.phase = "copy";
+						state.verifiedBytes = state.partialBytes;
+						state.verificationSourceIdentity = undefined;
+						continue;
+					}
+					fsyncSync(partialDescriptor);
+					this.discardSysdigSourceCapture();
+					return { complete: true, bytesWorked };
+				}
+				const allowance = Math.min(budget.remainingBytes, candidate.source.bytes - state.partialBytes);
+				const buffer = Buffer.allocUnsafe(Math.min(SYSDIG_PIN_COPY_BUFFER_BYTES, Math.max(1, allowance)));
+				let copied = 0;
+				while (copied < allowance) {
+					const count = readSync(
+						sourceDescriptor,
+						buffer,
+						0,
+						Math.min(buffer.length, allowance - copied),
+						state.partialBytes + copied,
+					);
+					if (count <= 0) throw new Error("sysdig_source_truncated_during_bounded_copy");
+					let written = 0;
+					while (written < count) {
+						const amount = writeSync(
+							partialDescriptor,
+							buffer,
+							written,
+							count - written,
+							state.partialBytes + copied + written,
+						);
+						if (amount <= 0) throw new Error("sysdig_bounded_copy_write_made_no_progress");
+						written += amount;
+					}
+					copied += count;
+				}
+				state.partialBytes += copied;
+				state.verifiedBytes = state.partialBytes;
+				budget.remainingBytes -= copied;
+				bytesWorked += copied;
+				fsyncSync(partialDescriptor);
+				this.accountStoragePath(partialPath, false);
+				validateDescriptors();
+			}
+			return { complete: false, bytesWorked };
+		} catch (error) {
+			this.discardSysdigSourceCapture();
+			throw error;
+		}
+	}
+
 	private captureSysdigSegment(
 		incidentDir: string,
-		sourcePath: string,
-		metadata: BigIntStats,
+		request: SysdigPinRequest,
+		candidate: SysdigRingSnapshotCandidate,
 		observedAtWallTimeMs: number,
 		phase: SysdigPinnedSegmentRecord["phase"],
 		preferCopy: boolean,
-	): SysdigPinnedSegmentRecord {
-		const source = {
-			dev: metadata.dev.toString(),
-			ino: metadata.ino.toString(),
-			bytes: Number(metadata.size),
-			mtimeMs: Number(metadata.mtimeMs),
-		};
-		if (!Number.isSafeInteger(source.bytes) || source.bytes < 0 || source.bytes > SYSDIG_PIN_MAX_SEGMENT_BYTES) {
-			throw new Error("sysdig_segment_exceeds_per_file_byte_bound");
-		}
-		const id = sha256(`${source.dev}\0${source.ino}\0${source.bytes}\0${source.mtimeMs}`);
+		budget: SysdigWorkBudget,
+	): SysdigSegmentCaptureResult {
+		const { id, source } = candidate;
 		const pinRoot = join(incidentDir, "sysdig-pins");
 		const segmentsDir = join(pinRoot, "segments");
 		const recordsDir = join(pinRoot, "records");
 		const pinnedPath = join(segmentsDir, `${id}.scap`);
 		const recordPath = join(recordsDir, `${id}.json`);
+		const partialPath = join(segmentsDir, `.${id}.partial`);
+		const captureReason: SysdigPinnedSegmentRecord["captureReason"] = preferCopy
+			? "active_segment_snapshot"
+			: "closed_segment_private_snapshot";
 		try {
 			const existing = JSON.parse(readFileSync(recordPath, "utf8")) as SysdigPinnedSegmentRecord;
-			if (existing.id === id && existing.pinnedPath === pinnedPath) return existing;
+			if (existsSync(partialPath)) {
+				const partial = lstatSync(partialPath, { bigint: true });
+				const partialAccounting = lstatSync(partialPath);
+				const published = lstatSync(pinnedPath, { bigint: true });
+				if (
+					!partial.isFile() ||
+					partial.isSymbolicLink() ||
+					partial.dev !== published.dev ||
+					partial.ino !== published.ino ||
+					BigInt(partial.nlink) !== 2n ||
+					BigInt(published.nlink) !== 2n
+				)
+					throw new Error("sysdig_published_partial_identity_mismatch");
+				rmSync(partialPath);
+				this.accountRemovedStorageEntry(partialAccounting);
+				fsyncDirectory(segmentsDir);
+			}
+			const pinned = lstatSync(pinnedPath, { bigint: true });
+			const expectedUid = typeof process.getuid === "function" ? BigInt(process.getuid()) : pinned.uid;
+			const artifactAtCapture = existing.artifactAtCapture;
+			const captureIdentityMatches =
+				hasExactOwnKeys(artifactAtCapture, ["dev", "ino", "bytes", "mtimeMs", "ctimeMs", "mode", "nlink"]) &&
+				artifactAtCapture.dev === pinned.dev.toString() &&
+				artifactAtCapture.ino === pinned.ino.toString() &&
+				artifactAtCapture.bytes === Number(pinned.size) &&
+				artifactAtCapture.mtimeMs === Number(pinned.mtimeMs) &&
+				artifactAtCapture.ctimeMs === Number(pinned.ctimeMs) &&
+				artifactAtCapture.mode === (Number(pinned.mode) & 0o777) &&
+				artifactAtCapture.nlink === Number(pinned.nlink);
+			const sealedVerification = this.readSysdigFinalVerification(
+				incidentDir,
+				existing,
+				this.sysdigArtifactGenerationId(this.sysdigRequestFingerprint(request)),
+			);
+			if (
+				existing.version === 1 &&
+				existing.id === id &&
+				existing.pinnedPath === pinnedPath &&
+				existing.source.dev === source.dev &&
+				existing.source.ino === source.ino &&
+				existing.source.bytes === source.bytes &&
+				existing.source.mtimeMs === source.mtimeMs &&
+				existing.source.ctimeMs === source.ctimeMs &&
+				existing.captureMethod === "bounded_copy" &&
+				existing.bytesAtCapture === source.bytes &&
+				pinned.isFile() &&
+				!pinned.isSymbolicLink() &&
+				BigInt(pinned.nlink) === 1n &&
+				pinned.uid === expectedUid &&
+				(Number(pinned.mode) & 0o077) === 0 &&
+				Number(pinned.size) === source.bytes &&
+				(captureIdentityMatches || sealedVerification !== undefined)
+			) {
+				this.discardSysdigSourceCapture();
+				return { complete: true, bytesWorked: 0, record: existing };
+			}
 		} catch {}
+		if (existsSync(recordPath)) throw new Error("sysdig_existing_record_invalid");
 		this.ensureDiskAdmission(source.bytes + 256 * 1024);
 		mkdirSync(segmentsDir, { recursive: true, mode: 0o700 });
 		mkdirSync(recordsDir, { recursive: true, mode: 0o700 });
-		let captureMethod: SysdigPinnedSegmentRecord["captureMethod"] = "hard_link";
-		let captureReason: SysdigPinnedSegmentRecord["captureReason"] = preferCopy
-			? "active_segment_snapshot"
-			: "closed_segment_hard_link";
-		let hardLinkErrorCode: string | undefined;
-		let digest: string | undefined;
-		let linked = false;
-		if (!preferCopy) {
-			try {
-				linkSync(sourcePath, pinnedPath);
-				const linkedStat = statSync(pinnedPath, { bigint: true });
-				if (linkedStat.dev !== metadata.dev || linkedStat.ino !== metadata.ino)
-					throw new Error("sysdig_hard_link_identity_mismatch");
-				linked = true;
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code === "EEXIST") throw error;
-				// Linux protected_hardlinks normally rejects joss linking root-owned 0640 adm files.
-				// Keep the destination behind 0700 directories and make a bounded 0600 byte copy instead.
-				hardLinkErrorCode = (error as NodeJS.ErrnoException).code ?? "UNKNOWN";
-				captureReason = "hard_link_unavailable";
-			}
-		}
-		if (!linked) {
-			captureMethod = "bounded_copy";
-			const temporary = join(segmentsDir, `.${id}.tmp-${process.pid}`);
-			let input: number | undefined;
-			let output: number | undefined;
-			try {
-				rmSync(temporary, { force: true });
-				input = openSync(sourcePath, "r");
-				const opened = fstatSync(input, { bigint: true });
+		const captureMethod: SysdigPinnedSegmentRecord["captureMethod"] = "bounded_copy";
+		if (existsSync(pinnedPath)) {
+			if (existsSync(partialPath)) {
+				const partial = lstatSync(partialPath);
+				const published = lstatSync(pinnedPath);
 				if (
-					!opened.isFile() ||
-					opened.dev !== metadata.dev ||
-					opened.ino !== metadata.ino ||
-					Number(opened.size) < source.bytes
-				) {
-					throw new Error("sysdig_source_changed_before_bounded_copy");
-				}
-				output = openSync(temporary, "wx", 0o600);
-				const hash = createHash("sha256");
-				const buffer = Buffer.allocUnsafe(SYSDIG_PIN_COPY_BUFFER_BYTES);
-				let offset = 0;
-				while (offset < source.bytes) {
-					const count = readSync(input, buffer, 0, Math.min(buffer.length, source.bytes - offset), offset);
-					if (count <= 0) throw new Error("sysdig_source_truncated_during_bounded_copy");
-					hash.update(buffer.subarray(0, count));
-					writeAll(output, buffer.subarray(0, count));
-					offset += count;
-				}
-				const after = fstatSync(input, { bigint: true });
-				if (after.dev !== metadata.dev || after.ino !== metadata.ino || Number(after.size) < source.bytes) {
-					throw new Error("sysdig_source_changed_during_bounded_copy");
-				}
-				fsyncSync(output);
-				closeSync(input);
-				input = undefined;
-				closeSync(output);
-				output = undefined;
-				renameSync(temporary, pinnedPath);
-				fsyncDirectory(segmentsDir);
-				digest = hash.digest("hex");
-			} finally {
-				if (input !== undefined)
-					try {
-						closeSync(input);
-					} catch {}
-				if (output !== undefined)
-					try {
-						closeSync(output);
-					} catch {}
-				rmSync(temporary, { force: true });
+					!partial.isFile() ||
+					partial.isSymbolicLink() ||
+					partial.dev !== published.dev ||
+					partial.ino !== published.ino ||
+					partial.nlink !== 2 ||
+					published.nlink !== 2 ||
+					partial.size !== source.bytes ||
+					published.size !== source.bytes
+				)
+					throw new Error("sysdig_interrupted_publication_identity_mismatch");
+				rmSync(pinnedPath);
+				this.accountRemovedStorageEntry(published);
+			} else {
+				const published = lstatSync(pinnedPath);
+				const expectedUid = typeof process.getuid === "function" ? process.getuid() : published.uid;
+				if (
+					!published.isFile() ||
+					published.isSymbolicLink() ||
+					published.nlink !== 1 ||
+					published.uid !== expectedUid ||
+					(published.mode & 0o777) !== 0o600 ||
+					published.size !== source.bytes
+				)
+					throw new Error("sysdig_interrupted_private_copy_invalid");
+				renameSync(pinnedPath, partialPath);
 			}
+			fsyncDirectory(segmentsDir);
 		}
+		const capture = this.advanceSysdigSourceCapture(request, candidate, partialPath, budget);
+		if (!capture.complete) return capture;
+		linkSync(partialPath, pinnedPath);
+		this.accountStoragePath(pinnedPath);
+		fsyncDirectory(segmentsDir);
+		const partial = lstatSync(partialPath);
+		rmSync(partialPath);
+		this.accountRemovedStorageEntry(partial);
+		fsyncDirectory(segmentsDir);
+		const captured = lstatSync(pinnedPath);
+		const expectedUid = typeof process.getuid === "function" ? process.getuid() : captured.uid;
+		if (
+			!captured.isFile() ||
+			captured.isSymbolicLink() ||
+			captured.nlink !== 1 ||
+			captured.uid !== expectedUid ||
+			(captured.mode & 0o777) !== 0o600 ||
+			captured.size !== source.bytes
+		)
+			throw new Error("sysdig_private_copy_cleanup_invalid");
+		const artifactAtCapture: SysdigPinnedSegmentRecord["artifactAtCapture"] = {
+			dev: String(captured.dev),
+			ino: String(captured.ino),
+			bytes: captured.size,
+			mtimeMs: captured.mtimeMs,
+			ctimeMs: captured.ctimeMs,
+			mode: 0o600,
+			nlink: 1,
+		};
 		const record: SysdigPinnedSegmentRecord = {
 			version: 1,
 			id,
-			sourcePath,
-			sourceName: basename(sourcePath),
+			sourcePath: candidate.sourcePath,
+			sourceName: candidate.sourceName,
 			observedAtWallTimeMs,
 			phase,
 			source,
 			pinnedPath,
 			captureMethod,
 			captureReason,
-			...(hardLinkErrorCode ? { hardLinkErrorCode } : {}),
 			bytesAtCapture: source.bytes,
-			...(digest ? { sha256AtCapture: digest } : {}),
+			artifactAtCapture,
 		};
-		this.accountStoragePath(pinnedPath);
 		this.writeOwnedJson(recordPath, record, 64 * 1024);
-		return record;
+		return { complete: true, bytesWorked: capture.bytesWorked, record };
 	}
 
-	private captureSysdigRing(
+	private readOrCreateSysdigCapturePlan(
 		incidentDir: string,
 		request: SysdigPinRequest,
-		phase: "initial" | "rotated" | "final",
+		phase: "initial" | "final",
 		nowMs: number,
-	): string[] {
-		const issues: string[] = [];
-		const ringDir = dirname(request.ringBasePath);
-		const ringName = basename(request.ringBasePath);
-		let entries: Dirent[];
+	): SysdigCapturePlan {
+		const path = this.sysdigCapturePlanPath(incidentDir, phase);
+		const requestFingerprint = this.sysdigRequestFingerprint(request);
 		try {
-			entries = readdirSync(ringDir, { withFileTypes: true });
-		} catch {
-			const unavailable = ["ring_directory_unavailable"];
-			this.recordSysdigPinIssues(incidentDir, unavailable);
-			return unavailable;
-		}
-		if (entries.length > SYSDIG_PIN_MAX_DISCOVERY_ENTRIES) issues.push("ring_directory_entry_bound_exceeded");
-		const candidates: Array<{ path: string; metadata: BigIntStats }> = [];
-		for (const entry of entries.slice(0, SYSDIG_PIN_MAX_DISCOVERY_ENTRIES)) {
-			if (!entry.name.startsWith(ringName)) continue;
-			const sourcePath = join(ringDir, entry.name);
-			try {
-				const metadata = lstatSync(sourcePath, { bigint: true });
-				if (!metadata.isFile()) {
-					issues.push(`non_regular_ring_entry:${entry.name}`);
-					continue;
-				}
-				const bytes = Number(metadata.size);
-				if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > SYSDIG_PIN_MAX_SEGMENT_BYTES) {
-					issues.push(`oversize_ring_entry:${entry.name}`);
-					continue;
-				}
-				candidates.push({ path: sourcePath, metadata });
-			} catch {
-				issues.push(`unstatable_ring_entry:${entry.name}`);
+			const existing = JSON.parse(readFileSync(path, "utf8")) as SysdigCapturePlan;
+			if (
+				existing.version !== 1 ||
+				existing.state !== "planned" ||
+				existing.phase !== phase ||
+				existing.requestFingerprint !== requestFingerprint ||
+				!Array.isArray(existing.snapshot?.candidates) ||
+				existing.snapshot.candidates.length > SYSDIG_PIN_MAX_SEGMENTS
+			) {
+				throw new Error(`sysdig_${phase}_capture_plan_invalid`);
 			}
+			return existing;
+		} catch (error) {
+			if (existsSync(path)) throw error;
 		}
-		candidates.sort(
-			(left, right) =>
-				Number(right.metadata.mtimeMs - left.metadata.mtimeMs) ||
-				basename(right.path).localeCompare(basename(left.path)),
-		);
-		if (candidates.length > SYSDIG_RING_EXPECTED_SEGMENTS) issues.push("ring_has_more_than_configured_12_segments");
-		if (candidates.length > SYSDIG_PIN_MAX_SEGMENTS) issues.push("ring_segment_count_bound_exceeded");
-		const existing = this.readSysdigSegmentRecordState(incidentDir);
-		issues.push(...existing.issues);
-		if (existing.saturated) {
-			this.recordSysdigPinIssues(incidentDir, issues);
-			return issues;
-		}
-		const known = new Set(existing.records.map((record) => record.id));
-		let admittedBytes = existing.totalBytes;
-		let recordFileCount = existing.recordFileCount;
-		for (let index = 0; index < Math.min(candidates.length, SYSDIG_PIN_MAX_SEGMENTS); index += 1) {
-			const candidate = candidates[index];
-			if (!candidate) continue;
-			const bytes = Number(candidate.metadata.size);
-			const id = sha256(
-				`${candidate.metadata.dev.toString()}\0${candidate.metadata.ino.toString()}\0${bytes}\0${Number(candidate.metadata.mtimeMs)}`,
-			);
-			if (known.has(id)) continue;
-			if (phase === "rotated" && index === 0) continue; // The newest file can still be receiving compressed blocks.
-			if (recordFileCount >= SYSDIG_PIN_MAX_SEGMENTS) {
-				issues.push("pin_record_count_bound_reached");
-				break;
-			}
-			if (admittedBytes + bytes > SYSDIG_PIN_MAX_TOTAL_BYTES) {
-				issues.push("incident_sysdig_pin_total_byte_bound_exceeded");
-				break;
-			}
-			try {
-				const record = this.captureSysdigSegment(
-					incidentDir,
-					candidate.path,
-					candidate.metadata,
-					nowMs,
-					phase,
-					index === 0,
-				);
-				known.add(record.id);
-				recordFileCount += 1;
-				admittedBytes += record.bytesAtCapture;
-			} catch (error) {
-				issues.push(
-					`capture_failed:${basename(candidate.path)}:${error instanceof Error ? error.message : String(error)}`,
-				);
-			}
-		}
-		this.recordSysdigPinIssues(incidentDir, issues);
-		return issues;
+		const snapshot =
+			phase === "initial" && request.initialRingSnapshot
+				? request.initialRingSnapshot
+				: this.discoverSysdigRingSnapshot(request.ringBasePath, nowMs);
+		const plan: SysdigCapturePlan = {
+			version: 1,
+			state: "planned",
+			phase,
+			requestFingerprint,
+			snapshot,
+		};
+		this.writeOwnedJson(path, plan, 128 * 1024);
+		this.recordSysdigPinIssues(incidentDir, snapshot.issues);
+		return plan;
 	}
 
-	private processSysdigPin(incidentDir: string, request: SysdigPinRequest, nowMs: number): void {
-		const manifestPath = join(incidentDir, "sysdig-pin-manifest.json");
-		if (existsSync(manifestPath)) return;
-		if (nowMs < request.resolveAfterWallTimeMs) {
-			this.captureSysdigRing(incidentDir, request, "rotated", nowMs);
-			return;
+	private sysdigCaptureMarkerMatches(path: string, plan: SysdigCapturePlan): boolean {
+		try {
+			const marker = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+			const expectedGaps = this.sysdigPlanGaps(dirname(dirname(path)), plan);
+			return (
+				hasExactOwnKeys(marker, [
+					"version",
+					"state",
+					"phase",
+					"requestFingerprint",
+					"candidateIds",
+					"outcome",
+					"gaps",
+				]) &&
+				marker.version === 1 &&
+				marker.state === "complete" &&
+				marker.phase === plan.phase &&
+				marker.requestFingerprint === plan.requestFingerprint &&
+				Array.isArray(marker.candidateIds) &&
+				canonicalJson(marker.candidateIds) ===
+					canonicalJson(plan.snapshot.candidates.map((candidate) => candidate.id)) &&
+				marker.outcome === (expectedGaps.length === 0 ? "complete" : "incomplete") &&
+				Array.isArray(marker.gaps) &&
+				canonicalJson(marker.gaps) === canonicalJson(expectedGaps)
+			);
+		} catch {
+			return false;
 		}
-		const gaps = [
-			...this.readSysdigPinIssues(incidentDir),
-			...this.captureSysdigRing(incidentDir, request, "final", nowMs),
-		];
-		const recordState = this.readSysdigSegmentRecordState(incidentDir);
-		gaps.push(...recordState.issues);
-		const segments: Array<Record<string, unknown>> = [];
-		for (const record of recordState.records) {
+	}
+
+	private readSysdigCaptureGap(
+		incidentDir: string,
+		phase: "initial" | "rotated" | "final",
+		requestFingerprint: string,
+		candidate: SysdigRingSnapshotCandidate,
+	): string | undefined {
+		try {
+			const gap = JSON.parse(
+				readFileSync(this.sysdigCaptureGapPath(incidentDir, phase, candidate.id), "utf8"),
+			) as Record<string, unknown>;
+			if (
+				gap.version !== 1 ||
+				gap.state !== "gap" ||
+				gap.phase !== phase ||
+				gap.requestFingerprint !== requestFingerprint ||
+				gap.candidateId !== candidate.id ||
+				gap.sourceIdentity !==
+					`${candidate.source.dev}:${candidate.source.ino}:${candidate.source.bytes}:${candidate.source.mtimeMs}:${candidate.source.ctimeMs}` ||
+				typeof gap.reason !== "string" ||
+				Buffer.byteLength(gap.reason) > 4096
+			) {
+				return undefined;
+			}
+			return gap.reason;
+		} catch {
+			return undefined;
+		}
+	}
+
+	private writeSysdigCaptureGap(
+		incidentDir: string,
+		phase: "initial" | "rotated" | "final",
+		requestFingerprint: string,
+		candidate: SysdigRingSnapshotCandidate,
+		reason: string,
+	): void {
+		this.writeOwnedJson(
+			this.sysdigCaptureGapPath(incidentDir, phase, candidate.id),
+			{
+				version: 1,
+				state: "gap",
+				phase,
+				requestFingerprint,
+				candidateId: candidate.id,
+				sourceIdentity: `${candidate.source.dev}:${candidate.source.ino}:${candidate.source.bytes}:${candidate.source.mtimeMs}:${candidate.source.ctimeMs}`,
+				reason,
+			},
+			64 * 1024,
+		);
+	}
+
+	private sysdigPlanGaps(incidentDir: string, plan: SysdigCapturePlan): string[] {
+		const gaps: string[] = plan.snapshot.issues.map((issue) => `snapshot:${issue}`);
+		for (const candidate of plan.snapshot.candidates) {
+			const reason = this.readSysdigCaptureGap(incidentDir, plan.phase, plan.requestFingerprint, candidate);
+			if (reason) gaps.push(`${candidate.sourceName}:${reason}`);
+		}
+		return gaps;
+	}
+
+	private captureSysdigSnapshot(
+		incidentDir: string,
+		request: SysdigPinRequest,
+		snapshot: SysdigRingSnapshot,
+		phase: "initial" | "rotated" | "final",
+		requestFingerprint: string,
+		budget: SysdigWorkBudget,
+		includeActive: boolean,
+	): boolean {
+		for (const candidate of snapshot.candidates) {
+			if (!includeActive && candidate.activeAtRequest) continue;
+			if (this.readSysdigCaptureGap(incidentDir, phase, requestFingerprint, candidate)) continue;
+			const state = this.readSysdigSegmentRecordState(incidentDir);
+			this.recordSysdigPinIssues(incidentDir, state.issues);
+			if (state.saturated) {
+				this.writeSysdigCaptureGap(incidentDir, phase, requestFingerprint, candidate, "pin_record_state_saturated");
+				this.writeProviderPinIncomplete(
+					incidentDir,
+					"sysdig",
+					`${phase}_capture_incomplete:${candidate.sourceName}:pin_record_state_saturated`,
+					request,
+				);
+				continue;
+			}
+			const existing = state.records.find((record) => record.id === candidate.id);
+			if (!existing && state.recordFileCount >= SYSDIG_PIN_MAX_SEGMENTS) {
+				this.recordSysdigPinIssues(incidentDir, ["pin_record_count_bound_reached"]);
+				this.writeSysdigCaptureGap(
+					incidentDir,
+					phase,
+					requestFingerprint,
+					candidate,
+					"pin_record_count_bound_reached",
+				);
+				this.writeProviderPinIncomplete(
+					incidentDir,
+					"sysdig",
+					`${phase}_capture_incomplete:${candidate.sourceName}:pin_record_count_bound_reached`,
+					request,
+				);
+				continue;
+			}
+			if (!existing && state.totalBytes + candidate.source.bytes > SYSDIG_PIN_MAX_TOTAL_BYTES) {
+				this.recordSysdigPinIssues(incidentDir, ["incident_sysdig_pin_total_byte_bound_exceeded"]);
+				this.writeSysdigCaptureGap(
+					incidentDir,
+					phase,
+					requestFingerprint,
+					candidate,
+					"incident_sysdig_pin_total_byte_bound_exceeded",
+				);
+				this.writeProviderPinIncomplete(
+					incidentDir,
+					"sysdig",
+					`${phase}_capture_incomplete:${candidate.sourceName}:incident_sysdig_pin_total_byte_bound_exceeded`,
+					request,
+				);
+				continue;
+			}
 			try {
-				const stat = statSync(record.pinnedPath, { bigint: true });
-				if (!stat.isFile()) throw new Error("pinned_path_not_regular_file");
-				const bytes = Number(stat.size);
-				if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > SYSDIG_PIN_MAX_SEGMENT_BYTES)
-					throw new Error("pinned_size_out_of_bounds");
-				const digest = sha256FileBounded(record.pinnedPath, bytes);
-				const changedAfterCapture =
-					bytes !== record.bytesAtCapture ||
-					(record.captureMethod === "hard_link" &&
-						(stat.dev.toString() !== record.source.dev ||
-							stat.ino.toString() !== record.source.ino ||
-							Number(stat.mtimeMs) !== record.source.mtimeMs));
-				if (record.sha256AtCapture && (bytes !== record.bytesAtCapture || digest !== record.sha256AtCapture)) {
-					throw new Error("bounded_copy_failed_exact_byte_verification");
-				}
-				if (changedAfterCapture) gaps.push(`hard_link_changed_after_capture:${record.sourceName}`);
-				segments.push({ ...record, exactBytes: { bytes, sha256: digest }, changedAfterCapture });
+				const result = this.captureSysdigSegment(
+					incidentDir,
+					request,
+					candidate,
+					snapshot.observedAtWallTimeMs,
+					phase,
+					candidate.activeAtRequest,
+					budget,
+				);
+				if (!result.complete) return false;
 			} catch (error) {
-				gaps.push(
-					`verification_failed:${record.sourceName}:${error instanceof Error ? error.message : String(error)}`,
+				if ((error as NodeJS.ErrnoException).code === "ENOSPC") throw error;
+				const reason = error instanceof Error ? error.message : "capture_failed";
+				this.recordSysdigPinIssues(incidentDir, [`capture_failed:${candidate.sourceName}:${reason}`]);
+				this.writeSysdigCaptureGap(incidentDir, phase, requestFingerprint, candidate, reason);
+				this.writeProviderPinIncomplete(
+					incidentDir,
+					"sysdig",
+					`${phase}_capture_incomplete:${candidate.sourceName}:${reason}`,
+					request,
 				);
 			}
+		}
+		return true;
+	}
+
+	private advancePlannedSysdigCapture(
+		incidentDir: string,
+		request: SysdigPinRequest,
+		plan: SysdigCapturePlan,
+		budget: SysdigWorkBudget,
+	): boolean {
+		const markerPath =
+			plan.phase === "initial"
+				? this.sysdigInitialCompletePath(incidentDir)
+				: this.sysdigFinalCaptureCompletePath(incidentDir);
+		if (this.sysdigCaptureMarkerMatches(markerPath, plan)) return true;
+		if (
+			!this.captureSysdigSnapshot(
+				incidentDir,
+				request,
+				plan.snapshot,
+				plan.phase,
+				plan.requestFingerprint,
+				budget,
+				true,
+			)
+		)
+			return false;
+		const gaps = this.sysdigPlanGaps(incidentDir, plan);
+		if (gaps.length > 0) {
+			this.writeProviderPinIncomplete(incidentDir, "sysdig", `${plan.phase}_capture_incomplete:${gaps[0]}`, request);
+		}
+		this.writeOwnedJson(markerPath, {
+			version: 1,
+			state: "complete",
+			phase: plan.phase,
+			requestFingerprint: plan.requestFingerprint,
+			candidateIds: plan.snapshot.candidates.map((candidate) => candidate.id),
+			outcome: gaps.length === 0 ? "complete" : "incomplete",
+			gaps,
+		});
+		if (plan.phase === "initial") this.options.onSysdigPinStep?.("initial_capture_complete");
+		return true;
+	}
+
+	private captureRotatedSysdigSegments(
+		incidentDir: string,
+		request: SysdigPinRequest,
+		nowMs: number,
+		budget: SysdigWorkBudget,
+	): boolean {
+		const snapshot = this.discoverSysdigRingSnapshot(request.ringBasePath, nowMs);
+		this.recordSysdigPinIssues(incidentDir, snapshot.issues);
+		return this.captureSysdigSnapshot(
+			incidentDir,
+			request,
+			snapshot,
+			"rotated",
+			this.sysdigRequestFingerprint(request),
+			budget,
+			false,
+		);
+	}
+
+	private readSysdigFinalVerification(
+		incidentDir: string,
+		record: SysdigPinnedSegmentRecord,
+		artifactGenerationId: string,
+	): Record<string, unknown> | undefined {
+		try {
+			const verification = JSON.parse(
+				readFileSync(this.sysdigFinalVerificationPath(incidentDir, record.id), "utf8"),
+			) as Record<string, unknown>;
+			const exactBytes = verification.exactBytes as Record<string, unknown> | undefined;
+			const sealedArtifact = verification.sealedArtifact;
+			if (
+				!hasExactOwnKeys(verification, [
+					"version",
+					"state",
+					"artifactGenerationId",
+					"recordId",
+					"pinnedPath",
+					"exactBytes",
+					"changedAfterCapture",
+					"sealedArtifact",
+				]) ||
+				verification.version !== 1 ||
+				verification.state !== "verified" ||
+				verification.artifactGenerationId !== artifactGenerationId ||
+				verification.recordId !== record.id ||
+				verification.pinnedPath !== record.pinnedPath ||
+				!exactBytes ||
+				!Number.isSafeInteger(exactBytes.bytes) ||
+				Number(exactBytes.bytes) < 0 ||
+				Number(exactBytes.bytes) > SYSDIG_PIN_MAX_SEGMENT_BYTES ||
+				typeof exactBytes.sha256 !== "string" ||
+				!/^[0-9a-f]{64}$/.test(exactBytes.sha256) ||
+				!isSealedArtifact(sealedArtifact) ||
+				sealedArtifact.generationId !== artifactGenerationId ||
+				sealedArtifact.bytes !== exactBytes.bytes ||
+				sealedArtifact.sha256 !== exactBytes.sha256
+			) {
+				return undefined;
+			}
+			const artifact = lstatSync(record.pinnedPath);
+			const expectedUid = typeof process.getuid === "function" ? process.getuid() : artifact.uid;
+			if (
+				!artifact.isFile() ||
+				artifact.isSymbolicLink() ||
+				artifact.uid !== expectedUid ||
+				String(artifact.dev) !== sealedArtifact.dev ||
+				String(artifact.ino) !== sealedArtifact.ino ||
+				artifact.size !== sealedArtifact.bytes ||
+				artifact.mtimeMs !== sealedArtifact.mtimeMs ||
+				artifact.ctimeMs !== sealedArtifact.ctimeMs ||
+				(artifact.mode & 0o777) !== sealedArtifact.mode ||
+				artifact.nlink !== sealedArtifact.nlink
+			)
+				return undefined;
+			return verification;
+		} catch {
+			return undefined;
+		}
+	}
+
+	private discardSysdigSegmentVerification(): void {
+		const state = this.sysdigSegmentVerification;
+		this.sysdigSegmentVerification = undefined;
+		if (!state) return;
+		try {
+			closeSync(state.descriptor);
+		} catch {}
+	}
+
+	private advanceSysdigSegmentVerification(
+		incidentDir: string,
+		record: SysdigPinnedSegmentRecord,
+		artifactGenerationId: string,
+		budget: SysdigWorkBudget,
+	): boolean {
+		if (this.readSysdigFinalVerification(incidentDir, record, artifactGenerationId)) return true;
+		if (this.sysdigSegmentVerification?.recordId !== record.id) this.discardSysdigSegmentVerification();
+		let state = this.sysdigSegmentVerification;
+		try {
+			if (!state) {
+				const descriptor = openSync(record.pinnedPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+				const opened = fstatSync(descriptor);
+				const expectedUid = typeof process.getuid === "function" ? process.getuid() : opened.uid;
+				const artifactAtCapture = record.artifactAtCapture;
+				if (
+					!hasExactOwnKeys(artifactAtCapture, ["dev", "ino", "bytes", "mtimeMs", "ctimeMs", "mode", "nlink"]) ||
+					!opened.isFile() ||
+					opened.size < 0 ||
+					opened.size > SYSDIG_PIN_MAX_SEGMENT_BYTES ||
+					opened.nlink !== 1 ||
+					opened.uid !== expectedUid ||
+					(opened.mode & 0o077) !== 0 ||
+					artifactAtCapture.dev !== String(opened.dev) ||
+					artifactAtCapture.ino !== String(opened.ino) ||
+					artifactAtCapture.bytes !== opened.size ||
+					artifactAtCapture.mtimeMs !== opened.mtimeMs ||
+					artifactAtCapture.ctimeMs !== opened.ctimeMs ||
+					artifactAtCapture.mode !== (opened.mode & 0o777) ||
+					artifactAtCapture.nlink !== opened.nlink
+				) {
+					closeSync(descriptor);
+					throw new Error("pinned_path_not_verifiable_regular_file");
+				}
+				state = {
+					recordId: record.id,
+					descriptor,
+					offset: 0,
+					hash: createHash("sha256"),
+					identity: {
+						dev: opened.dev,
+						ino: opened.ino,
+						bytes: opened.size,
+						mtimeMs: opened.mtimeMs,
+						ctimeMs: opened.ctimeMs,
+						nlink: opened.nlink,
+						mode: opened.mode,
+						uid: opened.uid,
+					},
+				};
+				this.sysdigSegmentVerification = state;
+			}
+			const buffer = Buffer.allocUnsafe(Math.min(SYSDIG_PIN_COPY_BUFFER_BYTES, Math.max(1, budget.remainingBytes)));
+			while (state.offset < state.identity.bytes && budget.remainingBytes > 0) {
+				const count = readSync(
+					state.descriptor,
+					buffer,
+					0,
+					Math.min(buffer.length, budget.remainingBytes, state.identity.bytes - state.offset),
+					state.offset,
+				);
+				if (count <= 0) throw new Error("pinned_path_truncated_during_bounded_verification");
+				state.hash.update(buffer.subarray(0, count));
+				state.offset += count;
+				budget.remainingBytes -= count;
+			}
+			if (state.offset < state.identity.bytes) return false;
+			const after = fstatSync(state.descriptor);
+			if (
+				after.dev !== state.identity.dev ||
+				after.ino !== state.identity.ino ||
+				after.size !== state.identity.bytes ||
+				after.mtimeMs !== state.identity.mtimeMs ||
+				after.ctimeMs !== state.identity.ctimeMs ||
+				after.nlink !== state.identity.nlink ||
+				after.mode !== state.identity.mode ||
+				after.uid !== state.identity.uid ||
+				readSync(state.descriptor, Buffer.allocUnsafe(1), 0, 1, state.identity.bytes) !== 0
+			) {
+				throw new Error("pinned_path_changed_during_bounded_verification");
+			}
+			const digest = state.hash.digest("hex");
+			const changedAfterCapture = state.identity.bytes !== record.bytesAtCapture;
+			closeSync(state.descriptor);
+			this.sysdigSegmentVerification = undefined;
+			const sealedArtifact = this.sealPrivateArtifact(
+				record.pinnedPath,
+				state.identity.bytes,
+				digest,
+				artifactGenerationId,
+			);
+			this.writeOwnedJson(
+				this.sysdigFinalVerificationPath(incidentDir, record.id),
+				{
+					version: 1,
+					state: "verified",
+					artifactGenerationId,
+					recordId: record.id,
+					pinnedPath: record.pinnedPath,
+					exactBytes: { bytes: state.identity.bytes, sha256: digest },
+					changedAfterCapture,
+					sealedArtifact,
+				},
+				64 * 1024,
+			);
+			return true;
+		} catch (error) {
+			this.discardSysdigSegmentVerification();
+			throw error;
+		}
+	}
+
+	private readOrCreateSysdigFinalVerificationPlan(
+		incidentDir: string,
+		request: SysdigPinRequest,
+	): SysdigFinalVerificationPlan {
+		const path = this.sysdigFinalPlanPath(incidentDir);
+		const requestFingerprint = this.sysdigRequestFingerprint(request);
+		try {
+			const plan = JSON.parse(readFileSync(path, "utf8")) as SysdigFinalVerificationPlan;
+			if (
+				plan.version !== 1 ||
+				plan.state !== "planned" ||
+				plan.requestFingerprint !== requestFingerprint ||
+				!Array.isArray(plan.recordIds) ||
+				plan.recordIds.length > SYSDIG_PIN_MAX_SEGMENTS ||
+				plan.recordIds.some((id) => typeof id !== "string" || !/^[0-9a-f]{64}$/.test(id))
+			) {
+				throw new Error("sysdig_final_verification_plan_invalid");
+			}
+			return plan;
+		} catch (error) {
+			if (existsSync(path)) throw error;
+		}
+		const recordState = this.readSysdigSegmentRecordState(incidentDir);
+		if (recordState.saturated) throw new Error("sysdig_pin_record_state_saturated_before_verification");
+		const plan: SysdigFinalVerificationPlan = {
+			version: 1,
+			state: "planned",
+			requestFingerprint,
+			recordIds: recordState.records.map((record) => record.id).sort(),
+		};
+		this.writeOwnedJson(path, plan, 64 * 1024);
+		return plan;
+	}
+
+	private advanceSysdigFinalVerifications(
+		incidentDir: string,
+		plan: SysdigFinalVerificationPlan,
+		budget: SysdigWorkBudget,
+	): boolean {
+		const records = new Map(
+			this.readSysdigSegmentRecordState(incidentDir).records.map((record) => [record.id, record]),
+		);
+		const artifactGenerationId = this.sysdigArtifactGenerationId(plan.requestFingerprint);
+		for (const id of plan.recordIds) {
+			const record = records.get(id);
+			if (!record) throw new Error(`sysdig_final_verification_record_missing:${id}`);
+			if (this.readSysdigFinalVerification(incidentDir, record, artifactGenerationId)) continue;
+			if (budget.remainingBytes <= 0) return false;
+			if (!this.advanceSysdigSegmentVerification(incidentDir, record, artifactGenerationId, budget)) return false;
+		}
+		return true;
+	}
+
+	private readSysdigCaptureOutcome(path: string): { outcome: "complete" | "incomplete"; gaps: string[] } {
+		const marker = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+		if (
+			(marker.outcome !== "complete" && marker.outcome !== "incomplete") ||
+			!Array.isArray(marker.gaps) ||
+			marker.gaps.some((gap) => typeof gap !== "string" || Buffer.byteLength(gap) > 4096)
+		) {
+			throw new Error("sysdig_capture_outcome_marker_invalid");
+		}
+		return { outcome: marker.outcome, gaps: marker.gaps as string[] };
+	}
+
+	private publishSysdigPinManifest(
+		incidentDir: string,
+		request: SysdigPinRequest,
+		plan: SysdigFinalVerificationPlan,
+	): void {
+		const manifestPath = join(incidentDir, "sysdig-pin-manifest.json");
+		const gaps = [...this.readSysdigPinIssues(incidentDir)];
+		const initialCapture = this.readSysdigCaptureOutcome(this.sysdigInitialCompletePath(incidentDir));
+		const finalCapture = this.readSysdigCaptureOutcome(this.sysdigFinalCaptureCompletePath(incidentDir));
+		gaps.push(...initialCapture.gaps.map((gap) => `initial_capture_gap:${gap}`));
+		gaps.push(...finalCapture.gaps.map((gap) => `final_capture_gap:${gap}`));
+		const captureOutcome =
+			initialCapture.outcome === "complete" && finalCapture.outcome === "complete" ? "complete" : "incomplete";
+		const recordState = this.readSysdigSegmentRecordState(incidentDir);
+		gaps.push(...recordState.issues);
+		const records = new Map(recordState.records.map((record) => [record.id, record]));
+		const artifactGenerationId = this.sysdigArtifactGenerationId(plan.requestFingerprint);
+		const segments: Array<Record<string, unknown>> = [];
+		for (const id of plan.recordIds) {
+			const record = records.get(id);
+			if (!record) throw new Error(`sysdig_final_manifest_record_missing:${id}`);
+			const verification = this.readSysdigFinalVerification(incidentDir, record, artifactGenerationId);
+			if (!verification) throw new Error(`sysdig_final_manifest_verification_missing:${id}`);
+			if (verification.changedAfterCapture === true)
+				gaps.push(`hard_link_changed_after_capture:${record.sourceName}`);
+			segments.push({
+				...record,
+				exactBytes: verification.exactBytes,
+				sealedArtifact: verification.sealedArtifact,
+				changedAfterCapture: verification.changedAfterCapture === true,
+			});
 		}
 		if (segments.length === 0) gaps.push("no_sysdig_ring_segments_were_pinned");
 		gaps.push("scap_event_time_bounds_not_inspected_coverage_is_observation_based");
 		this.writeOwnedJson(manifestPath, {
 			version: 1,
 			state: "finalized_with_observed_coverage",
+			artifactGenerationId,
 			diagnosticOnly: true,
+			captureOutcome,
+			capturePhases: { initial: initialCapture.outcome, final: finalCapture.outcome },
 			runId: request.runId,
 			requestedWindow: {
 				fromWallTimeMs: request.fromWallTimeMs,
 				anchorWallTimeMs: request.anchorWallTimeMs,
 				throughWallTimeMs: request.throughWallTimeMs,
 			},
-			captureFinalizedAtWallTimeMs: nowMs,
+			captureFinalizedAtWallTimeMs: request.resolveAfterWallTimeMs,
 			retention: { milliseconds: SYSDIG_PIN_RETENTION_MS, retainUntilWallTimeMs: request.retainUntilWallTimeMs },
 			sourceRing: {
 				basePath: request.ringBasePath,
@@ -3842,11 +6800,14 @@ export class IncidentRecorderCompactor {
 		const sysdigPinDirectory = join(incidentDir, "sysdig-pins", "segments");
 		mkdirSync(sysdigPinDirectory, { recursive: true, mode: 0o700 });
 		const sysdigPinDirectoryStat = lstatSync(sysdigPinDirectory);
-		this.writeOwnedJson(join(incidentDir, "sysdig-pin-retention-proof.json"), {
+		this.writeOrRepairProviderPinProof(incidentDir, "sysdig", {
 			version: 1,
 			state: "producer_verified_complete",
 			provider: "sysdig",
+			artifactGenerationId,
 			manifestValidated: true,
+			captureOutcome,
+			capturePhases: { initial: initialCapture.outcome, final: finalCapture.outcome },
 			runId: request.runId,
 			fromWallTimeMs: request.fromWallTimeMs,
 			throughWallTimeMs: request.throughWallTimeMs,
@@ -3872,33 +6833,48 @@ export class IncidentRecorderCompactor {
 		fsyncDirectory(incidentDir);
 	}
 
+	private processSysdigPin(incidentDir: string, request: SysdigPinRequest, nowMs: number): boolean {
+		const transaction = acquireIncidentCasTransaction(this.root);
+		if (!transaction) return false;
+		try {
+			const budget: SysdigWorkBudget = {
+				remainingBytes: positiveBound(this.options.sysdigPinWorkBytesPerPass, SYSDIG_PIN_WORK_BYTES_PER_PASS),
+			};
+			const initialPlan = this.readOrCreateSysdigCapturePlan(incidentDir, request, "initial", nowMs);
+			if (!this.advancePlannedSysdigCapture(incidentDir, request, initialPlan, budget)) return false;
+			if (nowMs < request.resolveAfterWallTimeMs) {
+				return this.captureRotatedSysdigSegments(incidentDir, request, nowMs, budget);
+			}
+			const finalPlan = this.readOrCreateSysdigCapturePlan(incidentDir, request, "final", nowMs);
+			if (!this.advancePlannedSysdigCapture(incidentDir, request, finalPlan, budget)) return false;
+			const verificationPlan = this.readOrCreateSysdigFinalVerificationPlan(incidentDir, request);
+			if (!this.advanceSysdigFinalVerifications(incidentDir, verificationPlan, budget)) return false;
+			this.publishSysdigPinManifest(incidentDir, request, verificationPlan);
+			return true;
+		} finally {
+			transaction.release();
+		}
+	}
+
 	requestPin(runId: string, incidentDir: string, anchorWallTimeMs: number): void {
-		const sysdigRequest: SysdigPinRequest = {
+		if (this.pinRetentionMaintenance) throw new Error("Incident pin request deferred during retention maintenance");
+		if (!isCanonicalUuid(runId) || !Number.isSafeInteger(anchorWallTimeMs) || anchorWallTimeMs < 0)
+			throw new Error("Incident pin authority requires a canonical run id and non-negative integer anchor");
+		const ringBasePath = this.options.sysdigRingBasePath ?? SYSDIG_RING_DEFAULT_BASE_PATH;
+		const expectedRequest: SysdigPinRequest = {
 			version: 1,
 			runId,
 			anchorWallTimeMs,
 			fromWallTimeMs: anchorWallTimeMs - PIN_BEFORE_MS,
 			throughWallTimeMs: anchorWallTimeMs + PIN_AFTER_MS,
 			resolveAfterWallTimeMs: anchorWallTimeMs + PIN_AFTER_MS,
-			requestedAtWallTimeMs: Date.now(),
+			// This request is immutable and may be replayed after a crash. Bind its bytes
+			// to the incident anchor rather than the retrying service process's clock.
+			requestedAtWallTimeMs: anchorWallTimeMs,
 			retainUntilWallTimeMs: anchorWallTimeMs + SYSDIG_PIN_RETENTION_MS,
-			ringBasePath: this.options.sysdigRingBasePath ?? SYSDIG_RING_DEFAULT_BASE_PATH,
+			ringBasePath,
 		};
-		try {
-			this.writeOwnedJson(this.sysdigRequestPath(incidentDir), sysdigRequest);
-			this.captureSysdigRing(incidentDir, sysdigRequest, "initial", sysdigRequest.requestedAtWallTimeMs);
-		} catch (error) {
-			try {
-				this.writeOwnedJson(join(incidentDir, "sysdig-pin-incomplete.json"), {
-					version: 1,
-					state: "pending_or_incomplete",
-					runId,
-					reason: error instanceof Error ? error.message : String(error),
-				});
-			} catch {}
-		}
-		const requestPath = join(incidentDir, "journal-pin-request.json");
-		this.writeOwnedJson(requestPath, {
+		const expectedJournalRequest: JournalPinRequest = {
 			version: 1,
 			state: "pending",
 			runId,
@@ -3907,38 +6883,159 @@ export class IncidentRecorderCompactor {
 			throughWallTimeMs: anchorWallTimeMs + PIN_AFTER_MS,
 			resolveAfterWallTimeMs: anchorWallTimeMs + PIN_AFTER_MS,
 			retainUntilWallTimeMs: anchorWallTimeMs + INCIDENT_DIAGNOSTIC_RETENTION_MS,
-		});
+		};
+		const requestTransaction = acquireIncidentCasTransaction(this.root);
+		if (!requestTransaction) throw new Error("Incident pin request transaction unavailable");
+		let sysdigRequest: SysdigPinRequest;
+		try {
+			const existingAuthority = this.readIncidentPinAuthority(incidentDir);
+			if (existingAuthority) {
+				if (
+					this.sysdigRequestBaseFingerprint(existingAuthority) !==
+					this.sysdigRequestBaseFingerprint(expectedRequest)
+				)
+					throw new Error("Existing immutable incident pin authority does not match the requested incident pin");
+				sysdigRequest = existingAuthority;
+			} else if (existsSync(this.pinAuthorityPath(incidentDir))) {
+				throw new Error("Existing immutable incident pin authority is invalid");
+			} else {
+				const snapshot = this.boundSysdigRequestSnapshot(
+					expectedRequest,
+					this.discoverSysdigRingSnapshot(ringBasePath, Date.now()),
+				);
+				sysdigRequest = { ...expectedRequest, initialRingSnapshot: snapshot };
+				this.writeOwnedJson(this.pinAuthorityPath(incidentDir), sysdigRequest, 64 * 1024);
+			}
+			const sysdigPath = this.sysdigRequestPath(incidentDir);
+			const existingSysdig = this.readSysdigPinRequest(incidentDir);
+			if (!existingSysdig || canonicalJson(existingSysdig) !== canonicalJson(sysdigRequest)) {
+				if (existsSync(sysdigPath)) {
+					const identity = this.quarantineInvalidPinRequest(incidentDir, "sysdig", sysdigPath);
+					this.writeProviderPinIncomplete(
+						incidentDir,
+						"sysdig",
+						`${existingSysdig ? "sysdig_request_recreated_after_binding_mismatch" : "sysdig_request_recreated_after_corruption"}:${identity}`,
+						sysdigRequest,
+					);
+				}
+				this.writeOwnedJson(sysdigPath, sysdigRequest);
+			}
+			this.options.onSysdigPinStep?.("sysdig_request_durable");
+			const journalPath = this.journalRequestPath(incidentDir);
+			const existingJournal = this.readJournalPinRequest(incidentDir);
+			if (existingJournal) {
+				if (canonicalJson(existingJournal) !== canonicalJson(expectedJournalRequest)) {
+					this.writeProviderPinIncomplete(
+						incidentDir,
+						"journal",
+						"immutable_request_binding_conflict",
+						expectedJournalRequest,
+					);
+					throw new Error("Existing immutable journal request does not match the requested incident pin");
+				}
+			} else {
+				if (existsSync(journalPath)) {
+					const identity = this.quarantineInvalidPinRequest(incidentDir, "journal", journalPath);
+					this.writeProviderPinIncomplete(
+						incidentDir,
+						"journal",
+						`journal_request_recreated_after_corruption:${identity}`,
+						expectedJournalRequest,
+					);
+				}
+				this.writeOwnedJson(journalPath, expectedJournalRequest);
+			}
+			this.options.onSysdigPinStep?.("provider_requests_durable");
+		} finally {
+			requestTransaction.release();
+		}
+		this.processSysdigPin(incidentDir, sysdigRequest, Date.now());
 	}
 
-	private retentionProofMatchesRequest(
-		path: string,
-		provider: "journal",
-		request: { runId: string; fromWallTimeMs: number; throughWallTimeMs: number },
-	): boolean {
+	private retentionProofMatchesRequest(path: string, provider: "journal", request: JournalPinRequest): boolean {
 		try {
 			const stat = lstatSync(path);
-			if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > 64 * 1024) return false;
+			const expectedUid = typeof process.getuid === "function" ? process.getuid() : stat.uid;
+			if (
+				!stat.isFile() ||
+				stat.isSymbolicLink() ||
+				stat.nlink !== 1 ||
+				stat.uid !== expectedUid ||
+				(stat.mode & 0o077) !== 0 ||
+				stat.size > 64 * 1024
+			)
+				return false;
 			const proof = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+			if (
+				!hasExactOwnKeys(proof, [
+					"version",
+					"state",
+					"provider",
+					"artifactGenerationId",
+					"manifestValidated",
+					"occurrenceReferencesResolved",
+					"runId",
+					"fromWallTimeMs",
+					"throughWallTimeMs",
+					"retainUntilWallTimeMs",
+					"retentionMilliseconds",
+					"occurrenceCount",
+					"manifestIdentity",
+					"pinDirectoryIdentity",
+				]) ||
+				!hasExactOwnKeys(proof.manifestIdentity, ["dev", "ino", "size", "mtimeMs", "ctimeMs", "nlink"]) ||
+				!hasExactOwnKeys(proof.pinDirectoryIdentity, ["path", "dev", "ino", "mtimeMs", "ctimeMs"])
+			)
+				return false;
+			const manifestIdentity = proof.manifestIdentity;
+			const pinDirectoryIdentity = proof.pinDirectoryIdentity;
+			const manifestPath = join(dirname(path), "journal-pin-manifest.json");
+			const manifest = lstatSync(manifestPath);
+			const pinDirectoryPath = join(dirname(path), "journal-pins", "cas");
+			const pinDirectory = lstatSync(pinDirectoryPath);
 			return (
 				proof.version === 1 &&
 				proof.state === "producer_verified_complete" &&
 				proof.provider === provider &&
+				proof.artifactGenerationId === this.journalArtifactGenerationId(request) &&
 				proof.manifestValidated === true &&
 				proof.occurrenceReferencesResolved === true &&
 				proof.runId === request.runId &&
 				proof.fromWallTimeMs === request.fromWallTimeMs &&
-				proof.throughWallTimeMs === request.throughWallTimeMs
+				proof.throughWallTimeMs === request.throughWallTimeMs &&
+				proof.retainUntilWallTimeMs === request.retainUntilWallTimeMs &&
+				proof.retentionMilliseconds === INCIDENT_DIAGNOSTIC_RETENTION_MS &&
+				Number.isSafeInteger(proof.occurrenceCount) &&
+				Number(proof.occurrenceCount) >= 0 &&
+				Number(proof.occurrenceCount) <= PENDING_ENTRY_MAX_COUNT &&
+				manifest.isFile() &&
+				!manifest.isSymbolicLink() &&
+				manifest.nlink === 1 &&
+				manifest.uid === expectedUid &&
+				(manifest.mode & 0o077) === 0 &&
+				manifest.size <= PENDING_ENTRY_MAX_BYTES &&
+				manifestIdentity.dev === String(manifest.dev) &&
+				manifestIdentity.ino === String(manifest.ino) &&
+				manifestIdentity.size === manifest.size &&
+				manifestIdentity.mtimeMs === manifest.mtimeMs &&
+				manifestIdentity.ctimeMs === manifest.ctimeMs &&
+				manifestIdentity.nlink === manifest.nlink &&
+				pinDirectory.isDirectory() &&
+				!pinDirectory.isSymbolicLink() &&
+				pinDirectory.uid === expectedUid &&
+				(pinDirectory.mode & 0o077) === 0 &&
+				pinDirectoryIdentity.path === "journal-pins/cas" &&
+				pinDirectoryIdentity.dev === String(pinDirectory.dev) &&
+				pinDirectoryIdentity.ino === String(pinDirectory.ino) &&
+				pinDirectoryIdentity.mtimeMs === pinDirectory.mtimeMs &&
+				pinDirectoryIdentity.ctimeMs === pinDirectory.ctimeMs
 			);
 		} catch {
 			return false;
 		}
 	}
 
-	private startJournalManifestValidation(
-		incidentDir: string,
-		manifestPath: string,
-		request: { runId: string; fromWallTimeMs: number; throughWallTimeMs: number; retainUntilWallTimeMs?: number },
-	): void {
+	private startJournalManifestValidation(incidentDir: string, manifestPath: string, request: JournalPinRequest): void {
 		let descriptor: number | undefined;
 		try {
 			const before = lstatSync(manifestPath);
@@ -3953,11 +7050,10 @@ export class IncidentRecorderCompactor {
 				manifestPath,
 				descriptor,
 				runId: request.runId,
+				anchorWallTimeMs: request.anchorWallTimeMs,
 				fromWallTimeMs: request.fromWallTimeMs,
 				throughWallTimeMs: request.throughWallTimeMs,
-				retainUntilWallTimeMs:
-					request.retainUntilWallTimeMs ??
-					request.fromWallTimeMs + PIN_BEFORE_MS + INCIDENT_DIAGNOSTIC_RETENTION_MS,
+				retainUntilWallTimeMs: request.retainUntilWallTimeMs,
 				offset: 0,
 				size: opened.size,
 				dev: opened.dev,
@@ -4028,7 +7124,36 @@ export class IncidentRecorderCompactor {
 			const header = JSON.parse(syntheticHeader) as Record<string, unknown>;
 			if (
 				(header.version !== 1 && header.version !== 2) ||
+				(header.version === 1 &&
+					!hasExactOwnKeys(header, [
+						"version",
+						"state",
+						"runId",
+						"fromWallTimeMs",
+						"throughWallTimeMs",
+						"occurrences",
+					])) ||
+				(header.version === 2 &&
+					!hasExactOwnKeys(header, [
+						"version",
+						"state",
+						"artifactGenerationId",
+						"runId",
+						"fromWallTimeMs",
+						"throughWallTimeMs",
+						"occurrences",
+					])) ||
 				header.state !== "complete_through_requested_window" ||
+				(header.version === 2 &&
+					(typeof header.artifactGenerationId !== "string" ||
+						!/^[0-9a-f]{64}$/.test(header.artifactGenerationId) ||
+						header.artifactGenerationId !==
+							this.journalArtifactGenerationId({
+								runId: state.runId,
+								anchorWallTimeMs: state.anchorWallTimeMs,
+								fromWallTimeMs: state.fromWallTimeMs,
+								throughWallTimeMs: state.throughWallTimeMs,
+							}))) ||
 				header.runId !== state.runId ||
 				header.fromWallTimeMs !== state.fromWallTimeMs ||
 				header.throughWallTimeMs !== state.throughWallTimeMs ||
@@ -4037,6 +7162,15 @@ export class IncidentRecorderCompactor {
 			)
 				throw new Error("manifest_header_schema_invalid");
 			state.manifestVersion = header.version === 1 ? 1 : 2;
+			state.artifactGenerationId =
+				typeof header.artifactGenerationId === "string"
+					? header.artifactGenerationId
+					: this.journalArtifactGenerationId({
+							runId: state.runId,
+							anchorWallTimeMs: state.anchorWallTimeMs,
+							fromWallTimeMs: state.fromWallTimeMs,
+							throughWallTimeMs: state.throughWallTimeMs,
+						});
 			state.textBuffer = state.textBuffer.slice(openBracket + 1);
 			state.phase = "occurrences";
 		}
@@ -4079,11 +7213,17 @@ export class IncidentRecorderCompactor {
 					const manifestVersion = state.manifestVersion;
 					if (
 						(manifestVersion !== 1 && manifestVersion !== 2) ||
-						!isJournalOccurrenceReference(
-							parsed.occurrenceReference,
-							manifestVersion,
-							join(this.root, "refs"),
-						) ||
+						(manifestVersion === 2 &&
+							!hasExactOwnKeys(parsed, [
+								"occurrenceReference",
+								"semanticFingerprint",
+								"cursors",
+								"cas",
+								"eventWallTimeMs",
+								"pinnedCasPath",
+								"sealedArtifact",
+							])) ||
+						!isJournalOccurrenceReference(parsed.occurrenceReference, manifestVersion, join(this.root, "refs")) ||
 						(manifestVersion === 2 &&
 							(typeof parsed.semanticFingerprint !== "string" ||
 								!/^[0-9a-f]{64}$/.test(parsed.semanticFingerprint))) ||
@@ -4110,7 +7250,12 @@ export class IncidentRecorderCompactor {
 						Number(casRecord.bytes) > 983_040 ||
 						casRecord.path !==
 							join(this.root, "cas", "sha256", casRecord.digest.slice(0, 2), `${casRecord.digest}.blob`) ||
-						parsed.pinnedCasPath !== join(state.incidentDir, "journal-pins", "cas", `${casRecord.digest}.blob`)
+						parsed.pinnedCasPath !== join(state.incidentDir, "journal-pins", "cas", `${casRecord.digest}.blob`) ||
+						(manifestVersion === 2 &&
+							(!isSealedArtifact(parsed.sealedArtifact) ||
+								parsed.sealedArtifact.generationId !== state.artifactGenerationId ||
+								parsed.sealedArtifact.bytes !== casRecord.bytes ||
+								parsed.sealedArtifact.sha256 !== casRecord.digest))
 					)
 						throw new Error("manifest_occurrence_cas_schema_invalid");
 					state.cursorBytes += (cursors as string[]).reduce(
@@ -4130,6 +7275,7 @@ export class IncidentRecorderCompactor {
 						cas: { digest: casRecord.digest, bytes: Number(casRecord.bytes), path: casRecord.path as string },
 						eventWallTimeMs: parsed.eventWallTimeMs,
 						pinnedCasPath: parsed.pinnedCasPath,
+						...(isSealedArtifact(parsed.sealedArtifact) ? { sealedArtifact: parsed.sealedArtifact } : {}),
 					};
 					return "occurrence";
 				}
@@ -4154,26 +7300,59 @@ export class IncidentRecorderCompactor {
 		this.resolveManifestOccurrenceReference(state, occurrence);
 		const previous = state.verifiedPins.get(occurrence.cas.digest);
 		if (previous) {
-			if (previous.bytes !== occurrence.cas.bytes || previous.pinnedPath !== occurrence.pinnedCasPath)
+			if (
+				previous.bytes !== occurrence.cas.bytes ||
+				previous.pinnedPath !== occurrence.pinnedCasPath ||
+				canonicalJson(previous.sealedArtifact ?? null) !== canonicalJson(occurrence.sealedArtifact ?? null)
+			)
 				throw new Error("manifest_duplicate_digest_inconsistent");
 			state.pendingOccurrence = undefined;
 			return;
 		}
 		const pinned = lstatSync(occurrence.pinnedCasPath);
 		const global = lstatSync(occurrence.cas.path);
+		const sealedArtifact = occurrence.sealedArtifact;
+		const expectedUid = typeof process.getuid === "function" ? process.getuid() : pinned.uid;
+		const sealedPrivateCopyValid =
+			state.manifestVersion === 2 &&
+			sealedArtifact !== undefined &&
+			sealedArtifact.generationId === state.artifactGenerationId &&
+			sealedArtifact.sha256 === occurrence.cas.digest &&
+			sealedArtifact.bytes === occurrence.cas.bytes &&
+			sealedArtifact.dev === String(pinned.dev) &&
+			sealedArtifact.ino === String(pinned.ino) &&
+			sealedArtifact.mtimeMs === pinned.mtimeMs &&
+			sealedArtifact.ctimeMs === pinned.ctimeMs &&
+			sealedArtifact.mode === (pinned.mode & 0o777) &&
+			sealedArtifact.nlink === pinned.nlink &&
+			pinned.nlink === 1 &&
+			pinned.uid === expectedUid &&
+			(pinned.mode & 0o777) === 0o400;
+		const legacyHardLinkValid =
+			state.manifestVersion === 1 && global.dev === pinned.dev && global.ino === pinned.ino && pinned.nlink >= 2;
 		if (
 			!pinned.isFile() ||
 			pinned.isSymbolicLink() ||
 			pinned.size !== occurrence.cas.bytes ||
-			global.dev !== pinned.dev ||
-			global.ino !== pinned.ino ||
-			pinned.nlink < 2
+			!global.isFile() ||
+			global.isSymbolicLink() ||
+			global.size !== occurrence.cas.bytes ||
+			(!sealedPrivateCopyValid && !legacyHardLinkValid)
 		) {
 			throw new Error("manifest_pin_identity_or_size_invalid");
 		}
 		const descriptor = openSync(occurrence.pinnedCasPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
 		const opened = fstatSync(descriptor);
-		if (opened.dev !== pinned.dev || opened.ino !== pinned.ino || opened.size !== pinned.size) {
+		if (
+			opened.dev !== pinned.dev ||
+			opened.ino !== pinned.ino ||
+			opened.size !== pinned.size ||
+			(sealedArtifact !== undefined &&
+				(opened.mtimeMs !== sealedArtifact.mtimeMs ||
+					opened.ctimeMs !== sealedArtifact.ctimeMs ||
+					(opened.mode & 0o777) !== sealedArtifact.mode ||
+					opened.nlink !== sealedArtifact.nlink))
+		) {
 			closeSync(descriptor);
 			throw new Error("manifest_pin_changed_before_hash");
 		}
@@ -4187,6 +7366,11 @@ export class IncidentRecorderCompactor {
 			dev: opened.dev,
 			ino: opened.ino,
 			mtimeMs: opened.mtimeMs,
+			ctimeMs: opened.ctimeMs,
+			mode: opened.mode,
+			uid: opened.uid,
+			nlink: opened.nlink,
+			...(sealedArtifact ? { sealedArtifact } : {}),
 		};
 		state.pendingOccurrence = undefined;
 	}
@@ -4210,16 +7394,27 @@ export class IncidentRecorderCompactor {
 			after.ino !== pin.ino ||
 			after.size !== pin.bytes ||
 			after.mtimeMs !== pin.mtimeMs ||
+			after.ctimeMs !== pin.ctimeMs ||
+			after.mode !== pin.mode ||
+			after.uid !== pin.uid ||
+			after.nlink !== pin.nlink ||
 			pin.hash.digest("hex") !== pin.digest
 		)
 			throw new Error("manifest_pin_content_verification_failed");
-		state.verifiedPins.set(pin.digest, { bytes: pin.bytes, pinnedPath: pin.pinnedPath, dev: pin.dev, ino: pin.ino });
+		state.verifiedPins.set(pin.digest, {
+			bytes: pin.bytes,
+			pinnedPath: pin.pinnedPath,
+			dev: pin.dev,
+			ino: pin.ino,
+			...(pin.sealedArtifact ? { sealedArtifact: pin.sealedArtifact } : {}),
+		});
 	}
 
 	private completeJournalManifestValidation(state: JournalManifestValidation): void {
 		if (state.resolvedOccurrenceCount !== state.occurrenceCount) {
 			throw new Error("manifest_occurrence_references_not_fully_resolved");
 		}
+		if (!state.artifactGenerationId) throw new Error("manifest_artifact_generation_missing");
 		const after = fstatSync(state.descriptor);
 		closeSync(state.descriptor);
 		this.journalManifestValidation = undefined;
@@ -4234,10 +7429,11 @@ export class IncidentRecorderCompactor {
 			throw new Error("manifest_identity_changed_during_validation");
 		const pinDirectory = join(state.incidentDir, "journal-pins", "cas");
 		const pinStat = lstatSync(pinDirectory);
-		this.writeOwnedJson(join(state.incidentDir, "journal-pin-retention-proof.json"), {
+		this.writeOrRepairProviderPinProof(state.incidentDir, "journal", {
 			version: 1,
 			state: "producer_verified_complete",
 			provider: "journal",
+			artifactGenerationId: state.artifactGenerationId,
 			manifestValidated: true,
 			occurrenceReferencesResolved: true,
 			runId: state.runId,
@@ -4376,7 +7572,9 @@ export class IncidentRecorderCompactor {
 		) {
 			return undefined;
 		}
-		const identityKey = sha256(`${identity.runId}\0${identity.runToken}\0${identity.producerId}\0${identity.occurrenceId}`);
+		const identityKey = sha256(
+			`${identity.runId}\0${identity.runToken}\0${identity.producerId}\0${identity.occurrenceId}`,
+		);
 		const wallTimeMs = segmentObservedAtMs(reference.eventWallTimeMs);
 		if (segmentRecord) {
 			if (
@@ -4429,10 +7627,7 @@ export class IncidentRecorderCompactor {
 		};
 	}
 
-	private closeRunHistoryDescriptor(
-		descriptor: number,
-		role: "legacy_occurrence" | "stable_directory",
-	): void {
+	private closeRunHistoryDescriptor(descriptor: number, role: "legacy_occurrence" | "stable_directory"): void {
 		closeSync(descriptor);
 		this.options.runHistoryDescriptorIo?.afterClose?.({ role, descriptor });
 	}
@@ -4474,10 +7669,7 @@ export class IncidentRecorderCompactor {
 			this.options.runHistoryDescriptorIo?.afterOpen?.({ role: "legacy_occurrence", descriptor });
 			const opened = fstatSync(descriptor, { bigint: true });
 			const openedIdentity = stableFilesystemIdentity(opened);
-			if (
-				!opened.isFile() ||
-				!sameStableFilesystemIdentity(openedIdentity, beforeIdentity)
-			) {
+			if (!opened.isFile() || !sameStableFilesystemIdentity(openedIdentity, beforeIdentity)) {
 				throw new Error("legacy_occurrence_reference_changed_before_read");
 			}
 			const byteLength = Number(opened.size);
@@ -4489,15 +7681,11 @@ export class IncidentRecorderCompactor {
 				offset += count;
 			}
 			const after = fstatSync(descriptor, { bigint: true });
-			if (
-				!after.isFile() ||
-				!sameStableFilesystemIdentity(stableFilesystemIdentity(after), openedIdentity)
-			) {
+			if (!after.isFile() || !sameStableFilesystemIdentity(stableFilesystemIdentity(after), openedIdentity)) {
 				throw new Error("legacy_occurrence_reference_changed_during_read");
 			}
 			const authorityAfter = lstatSync(path, { bigint: true });
-			const canonicalAfter =
-				canonicalPath === path ? authorityAfter : lstatSync(canonicalPath, { bigint: true });
+			const canonicalAfter = canonicalPath === path ? authorityAfter : lstatSync(canonicalPath, { bigint: true });
 			if (
 				!authorityAfter.isFile() ||
 				authorityAfter.isSymbolicLink() ||
@@ -4579,8 +7767,7 @@ export class IncidentRecorderCompactor {
 			match.cas.bytes !== occurrence.cas.bytes ||
 			match.cas.path !== occurrence.cas.path ||
 			canonicalJson(match.cursors) !== canonicalJson(occurrence.cursors) ||
-			(occurrence.semanticFingerprint !== undefined &&
-				match.semanticFingerprint !== occurrence.semanticFingerprint)
+			(occurrence.semanticFingerprint !== undefined && match.semanticFingerprint !== occurrence.semanticFingerprint)
 		) {
 			throw new Error("manifest_occurrence_reference_semantic_mismatch");
 		}
@@ -4712,9 +7899,7 @@ export class IncidentRecorderCompactor {
 				}
 			}
 		}
-		causalRelations.sort((left, right) =>
-			canonicalJson(left).localeCompare(canonicalJson(right)),
-		);
+		causalRelations.sort((left, right) => canonicalJson(left).localeCompare(canonicalJson(right)));
 		const byIdentity = new Map(events.map((event) => [event.identityKey, event]));
 		const ready = events.filter((event) => (indegree.get(event.identityKey) ?? 0) === 0);
 		ready.sort((left, right) => this.compareRunHistoryPresentation(left, right));
@@ -4750,9 +7935,7 @@ export class IncidentRecorderCompactor {
 		let ordering: RunHistoryOrdering;
 		if (state.orderingFailure) {
 			ordering = {
-				events: [...state.events.values()].sort((left, right) =>
-					this.compareRunHistoryPresentation(left, right),
-				),
+				events: [...state.events.values()].sort((left, right) => this.compareRunHistoryPresentation(left, right)),
 				causalRelations: [],
 			};
 		} else {
@@ -4883,6 +8066,12 @@ export class IncidentRecorderCompactor {
 			} catch {}
 			state.segmentReadLease = undefined;
 		}
+		const publicationCapability = state.publicationCapability;
+		state.publicationCapability = undefined;
+		if (publicationCapability) this.releasedRunHistoryPublicationCapabilities.add(publicationCapability);
+		if (publicationCapability && this.runHistoryPublicationCapabilities.get(publicationCapability) === state) {
+			this.runHistoryPublicationCapabilities.delete(publicationCapability);
+		}
 		if (this.runHistoryTraversals.get(state.token) === state) this.runHistoryTraversals.delete(state.token);
 	}
 
@@ -4905,7 +8094,7 @@ export class IncidentRecorderCompactor {
 		state: RunHistoryTraversal,
 		reason: string,
 		evidence: IncidentRecorderRunHistoryEvidence,
-	): IncidentRecorderRunHistoryResult {
+	): IncidentRecorderRunHistoryProgressResult {
 		const orderingFailure = this.validateRunHistoryOrdering(state);
 		if (orderingFailure) {
 			reason = orderingFailure;
@@ -4916,7 +8105,7 @@ export class IncidentRecorderCompactor {
 		}
 		try {
 			const projection = this.runHistoryProjection(state);
-			return this.boundedRunHistoryResult(state, { state: "incomplete", reason, projection }, false);
+			return this.boundedRunHistoryResult(state, { state: "incomplete", reason, projection }, true);
 		} catch (error) {
 			const renderFailure = error instanceof Error ? error.message : String(error);
 			return {
@@ -4952,15 +8141,26 @@ export class IncidentRecorderCompactor {
 
 	private boundedRunHistoryResult(
 		state: RunHistoryTraversal,
-		result: IncidentRecorderRunHistoryResult,
+		result: IncidentRecorderRunHistoryProgressResult,
 		discardOnSuccess: boolean,
-	): IncidentRecorderRunHistoryResult {
-		const detached = this.detachRunHistoryValue(result);
-		const serialized = JSON.stringify(detached);
+	): IncidentRecorderRunHistoryProgressResult {
+		let detached: IncidentRecorderRunHistoryProgressResult;
+		let serialized: string | undefined;
+		try {
+			detached = this.detachRunHistoryValue(result);
+			serialized = JSON.stringify(detached);
+		} catch (error) {
+			if (discardOnSuccess || state.retainForPublication) this.discardRunHistoryTraversal(state);
+			throw error;
+		}
 		if (serialized !== undefined && Buffer.byteLength(serialized, "utf8") <= RUN_HISTORY_RESULT_MAX_BYTES) {
 			if (discardOnSuccess) this.discardRunHistoryTraversal(state);
 			return detached;
 		}
+		return this.serializedRunHistoryBoundExceeded(state);
+	}
+
+	private serializedRunHistoryBoundExceeded(state: RunHistoryTraversal): IncidentRecorderRunHistoryResult {
 		const truncated: IncidentRecorderRunHistoryResult = {
 			state: "incomplete",
 			reason: "run_history_projection_serialized_bound_exceeded",
@@ -4991,6 +8191,43 @@ export class IncidentRecorderCompactor {
 		return this.detachRunHistoryValue(truncated);
 	}
 
+	private retainCompletedRunHistory(
+		state: RunHistoryTraversal,
+		result: Extract<IncidentRecorderRunHistoryResult, { state: "complete" }>,
+	): IncidentRecorderRunHistoryResult {
+		let detached: Extract<IncidentRecorderRunHistoryResult, { state: "complete" }>;
+		try {
+			detached = this.detachRunHistoryValue(result);
+		} catch (error) {
+			this.discardRunHistoryTraversal(state);
+			throw error;
+		}
+		const publicationCapability = Object.freeze({
+			version: 1 as const,
+			kind: "run_history_publication" as const,
+			id: sha256(`${state.token}\0${detached.snapshot.fingerprint}\0publication\0${process.hrtime.bigint()}`),
+			snapshotFingerprint: detached.snapshot.fingerprint,
+		});
+		const retained: IncidentRecorderRetainedRunHistoryResult = {
+			...detached,
+			publicationCapability,
+		};
+		let serialized: string | undefined;
+		try {
+			serialized = JSON.stringify(retained);
+		} catch (error) {
+			this.discardRunHistoryTraversal(state);
+			throw error;
+		}
+		if (serialized === undefined || Buffer.byteLength(serialized, "utf8") > RUN_HISTORY_RESULT_MAX_BYTES) {
+			return this.serializedRunHistoryBoundExceeded(state);
+		}
+		state.phase = "publication-retained";
+		state.publicationCapability = publicationCapability;
+		this.runHistoryPublicationCapabilities.set(publicationCapability, state);
+		return retained;
+	}
+
 	private observeRunHistorySemanticFingerprint(
 		state: RunHistoryTraversal,
 		event: IncidentRecorderRunHistoryEvent,
@@ -5016,10 +8253,7 @@ export class IncidentRecorderCompactor {
 		return undefined;
 	}
 
-	private addRunHistoryEvent(
-		state: RunHistoryTraversal,
-		event: IncidentRecorderRunHistoryEvent,
-	): string | undefined {
+	private addRunHistoryEvent(state: RunHistoryTraversal, event: IncidentRecorderRunHistoryEvent): string | undefined {
 		const semanticConflict = this.observeRunHistorySemanticFingerprint(state, event);
 		if (semanticConflict) return semanticConflict;
 		const existing = state.events.get(event.identityKey);
@@ -5049,7 +8283,24 @@ export class IncidentRecorderCompactor {
 		return { version: 1, token: state.token, requestFingerprint: state.requestFingerprint };
 	}
 
-	private pendingRunHistory(state: RunHistoryTraversal): IncidentRecorderRunHistoryResult {
+	private pendingRunHistory(state: RunHistoryTraversal): IncidentRecorderRunHistoryProgressResult {
+		if (state.pendingResponse === "cursor-only") {
+			return this.boundedRunHistoryResult(
+				state,
+				{
+					state: "pending",
+					cursor: this.runHistoryCursor(state),
+					progress: {
+						version: 1,
+						state: "projection_deferred",
+						phase: state.phase,
+						observedEventCount: state.events.size,
+						observedEvidenceCount: state.evidence.length,
+					},
+				},
+				false,
+			);
+		}
 		const orderingFailure = this.validateRunHistoryOrdering(state);
 		if (orderingFailure) {
 			return this.incompleteRunHistory(state, orderingFailure, {
@@ -5064,9 +8315,13 @@ export class IncidentRecorderCompactor {
 		);
 	}
 
-	private advanceRunHistorySegmentPhase(state: RunHistoryTraversal): IncidentRecorderRunHistoryResult | undefined {
+	private advanceRunHistorySegmentPhase(
+		state: RunHistoryTraversal,
+	): IncidentRecorderRunHistoryProgressResult | undefined {
 		const phase = state.phase;
-		if (phase === "legacy" || phase === "cas-validation") return undefined;
+		if (phase === "legacy" || phase === "cas-validation" || phase === "publication-retained") {
+			return undefined;
+		}
 		if (phase === "segment-recovery-gaps") return this.advanceRunHistoryRecoveryGaps(state);
 		const sourceId =
 			phase === "segment-occurrences"
@@ -5205,7 +8460,7 @@ export class IncidentRecorderCompactor {
 		}
 	}
 
-	private advanceRunHistoryRecoveryGaps(state: RunHistoryTraversal): IncidentRecorderRunHistoryResult {
+	private advanceRunHistoryRecoveryGaps(state: RunHistoryTraversal): IncidentRecorderRunHistoryProgressResult {
 		try {
 			const store = this.ensureSegmentStore();
 			if (!state.segmentReadLease) throw new Error("segment_read_lease_missing");
@@ -5283,20 +8538,14 @@ export class IncidentRecorderCompactor {
 			throw new Error("legacy_run_reference_directory_invalid");
 		}
 		const identity = stableFilesystemIdentity(before);
-		const descriptor = openSync(
-			path,
-			fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
-		);
+		const descriptor = openSync(path, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
 		let result: { descriptor: number; identity: StableFilesystemIdentity } | undefined;
 		let hasValidationError = false;
 		let validationError: unknown;
 		try {
 			this.options.runHistoryDescriptorIo?.afterOpen?.({ role: "stable_directory", descriptor });
 			const opened = fstatSync(descriptor, { bigint: true });
-			if (
-				!opened.isDirectory() ||
-				!sameStableFilesystemIdentity(identity, stableFilesystemIdentity(opened))
-			) {
+			if (!opened.isDirectory() || !sameStableFilesystemIdentity(identity, stableFilesystemIdentity(opened))) {
 				throw new Error("legacy_run_reference_directory_changed_before_open");
 			}
 			result = { descriptor, identity };
@@ -5358,7 +8607,7 @@ export class IncidentRecorderCompactor {
 		}
 	}
 
-	private beginRunHistoryCasValidation(state: RunHistoryTraversal): IncidentRecorderRunHistoryResult {
+	private beginRunHistoryCasValidation(state: RunHistoryTraversal): IncidentRecorderRunHistoryProgressResult {
 		const orderingFailure = this.validateRunHistoryOrdering(state);
 		if (orderingFailure) {
 			return this.incompleteRunHistory(state, orderingFailure, {
@@ -5372,7 +8621,39 @@ export class IncidentRecorderCompactor {
 		return this.pendingRunHistory(state);
 	}
 
-	private advanceRunHistoryLegacy(state: RunHistoryTraversal): IncidentRecorderRunHistoryResult {
+	private advanceRunHistoryLegacy(state: RunHistoryTraversal): IncidentRecorderRunHistoryProgressResult {
+		const assertLegacyPageBoundary = (): IncidentRecorderRunHistoryProgressResult | undefined => {
+			try {
+				if (
+					!state.procfsAuthority ||
+					state.legacyDirectoryDescriptor === undefined ||
+					state.legacyDirectoryResolvedPath === undefined
+				) {
+					throw new Error("legacy_procfs_stability_fence_missing");
+				}
+				this.assertRunHistoryProcfsDescriptorEntry(
+					state.procfsAuthority,
+					state.legacyDirectoryDescriptor,
+					state.legacyDirectoryResolvedPath,
+					"legacy_run_directory",
+					"directory",
+				);
+			} catch (error) {
+				return this.incompleteRunHistory(state, "run_history_legacy_snapshot_changed", {
+					kind: "corrupt",
+					reason: error instanceof Error ? error.message : String(error),
+				});
+			}
+			return undefined;
+		};
+		const incompleteLegacyPage = (
+			reason: string,
+			evidence: IncidentRecorderRunHistoryEvidence,
+		): IncidentRecorderRunHistoryProgressResult => {
+			const pageBoundaryFailure = assertLegacyPageBoundary();
+			return pageBoundaryFailure ?? this.incompleteRunHistory(state, reason, evidence);
+		};
+		const continuingPage = Boolean(state.directory);
 		if (!state.directory) {
 			const path = join(this.root, "refs", "runs", sha256(state.runId));
 			try {
@@ -5442,9 +8723,13 @@ export class IncidentRecorderCompactor {
 		}
 		const directory = state.directory;
 		if (!directory) return this.beginRunHistoryCasValidation(state);
+		if (continuingPage) {
+			const pageStartFailure = assertLegacyPageBoundary();
+			if (pageStartFailure) return pageStartFailure;
+		}
 		for (let count = 0; count < PIN_REFERENCE_BATCH_COUNT; count += 1) {
 			if (Date.now() > state.deadlineMs) {
-				return this.incompleteRunHistory(state, "run_history_deadline_exceeded", {
+				return incompleteLegacyPage("run_history_deadline_exceeded", {
 					kind: "truncated",
 					reason: "legacy_snapshot_deadline_exceeded",
 				});
@@ -5453,7 +8738,7 @@ export class IncidentRecorderCompactor {
 			try {
 				entry = directory.readSync();
 			} catch (error) {
-				return this.incompleteRunHistory(state, "run_history_legacy_directory_corrupt", {
+				return incompleteLegacyPage("run_history_legacy_directory_corrupt", {
 					kind: "corrupt",
 					reason: error instanceof Error ? error.message : String(error),
 				});
@@ -5501,14 +8786,12 @@ export class IncidentRecorderCompactor {
 						reason: "legacy_directory_identity_missing_during_projection",
 					});
 				}
-				state.snapshotFacts.push(
-					canonicalJson({ legacyDirectory: serializableFilesystemIdentity(before) }),
-				);
+				state.snapshotFacts.push(canonicalJson({ legacyDirectory: serializableFilesystemIdentity(before) }));
 				return this.beginRunHistoryCasValidation(state);
 			}
 			state.legacyEntriesScanned += 1;
 			if (state.legacyEntriesScanned > PENDING_ENTRY_MAX_COUNT) {
-				return this.incompleteRunHistory(state, "run_history_legacy_entry_bound_exceeded", {
+				return incompleteLegacyPage("run_history_legacy_entry_bound_exceeded", {
 					kind: "truncated",
 					reason: "legacy_directory_entry_bound_exceeded",
 				});
@@ -5524,24 +8807,10 @@ export class IncidentRecorderCompactor {
 				) {
 					throw new Error("legacy_procfs_stability_fence_missing");
 				}
-				this.assertRunHistoryProcfsDescriptorEntry(
-					state.procfsAuthority,
-					state.legacyDirectoryDescriptor,
-					state.legacyDirectoryResolvedPath,
-					"legacy_run_directory",
-					"directory",
-				);
 				const { value, bytes } = this.readStableLegacyOccurrence(authorityPath, canonicalPath);
-				this.assertRunHistoryProcfsDescriptorEntry(
-					state.procfsAuthority,
-					state.legacyDirectoryDescriptor,
-					state.legacyDirectoryResolvedPath,
-					"legacy_run_directory",
-					"directory",
-				);
 				state.legacyBytesRead += bytes;
 				if (state.legacyBytesRead > PENDING_ENTRY_MAX_BYTES) {
-					return this.incompleteRunHistory(state, "run_history_legacy_byte_bound_exceeded", {
+					return incompleteLegacyPage("run_history_legacy_byte_bound_exceeded", {
 						kind: "truncated",
 						reason: "legacy_reference_byte_bound_exceeded",
 					});
@@ -5550,7 +8819,7 @@ export class IncidentRecorderCompactor {
 				if (!event) throw new Error("legacy_occurrence_semantic_validation_failed");
 				const semanticConflict = this.observeRunHistorySemanticFingerprint(state, event);
 				if (semanticConflict) {
-					return this.incompleteRunHistory(state, semanticConflict, {
+					return incompleteLegacyPage(semanticConflict, {
 						kind: semanticConflict.includes("truncated") ? "truncated" : "corrupt",
 						reason: semanticConflict,
 						reference: canonicalPath,
@@ -5561,20 +8830,22 @@ export class IncidentRecorderCompactor {
 				state.legacyOccurrenceCount += 1;
 				const conflict = this.addRunHistoryEvent(state, event);
 				if (conflict) {
-					return this.incompleteRunHistory(state, conflict, {
+					return incompleteLegacyPage(conflict, {
 						kind: conflict.includes("truncated") ? "truncated" : "corrupt",
 						reason: conflict,
 						reference: canonicalPath,
 					});
 				}
 			} catch (error) {
-				return this.incompleteRunHistory(state, "run_history_legacy_reference_corrupt", {
+				return incompleteLegacyPage("run_history_legacy_reference_corrupt", {
 					kind: error instanceof Error && error.message.includes("truncated") ? "truncated" : "corrupt",
 					reason: error instanceof Error ? error.message : String(error),
 					reference: canonicalPath,
 				});
 			}
 		}
+		const pageEndFailure = assertLegacyPageBoundary();
+		if (pageEndFailure) return pageEndFailure;
 		return this.pendingRunHistory(state);
 	}
 
@@ -5623,10 +8894,7 @@ export class IncidentRecorderCompactor {
 		}
 		let namedDescriptor: number | undefined;
 		try {
-			namedDescriptor = openSync(
-				path,
-				fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
-			);
+			namedDescriptor = openSync(path, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
 			const namedOpened = fstatSync(namedDescriptor, { bigint: true });
 			if (
 				!namedOpened.isDirectory() ||
@@ -5643,11 +8911,7 @@ export class IncidentRecorderCompactor {
 		}
 	}
 
-	private readRunHistoryProcfsMountId(
-		authority: RunHistoryProcfsAuthority,
-		descriptor: number,
-		role: string,
-	): bigint {
+	private readRunHistoryProcfsMountId(authority: RunHistoryProcfsAuthority, descriptor: number, role: string): bigint {
 		this.assertRunHistoryProcfsDirectoryStable(
 			authority.descriptorInfoDirectoryPath,
 			authority.descriptorInfoDirectoryDescriptor,
@@ -5659,10 +8923,7 @@ export class IncidentRecorderCompactor {
 		const chunks: Buffer[] = [];
 		let bytes = 0;
 		try {
-			infoDescriptor = openSync(
-				path,
-				fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
-			);
+			infoDescriptor = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
 			const before = fstatSync(infoDescriptor, { bigint: true });
 			if (!before.isFile()) throw new Error(`run_history_cas_procfs_${role}_fdinfo_invalid`);
 			for (;;) {
@@ -5678,12 +8939,7 @@ export class IncidentRecorderCompactor {
 				}
 			}
 			const after = fstatSync(infoDescriptor, { bigint: true });
-			if (
-				!after.isFile() ||
-				before.dev !== after.dev ||
-				before.ino !== after.ino ||
-				before.mode !== after.mode
-			) {
+			if (!after.isFile() || before.dev !== after.dev || before.ino !== after.ino || before.mode !== after.mode) {
 				throw new Error(`run_history_cas_procfs_${role}_fdinfo_changed`);
 			}
 		} finally {
@@ -5737,11 +8993,7 @@ export class IncidentRecorderCompactor {
 		if (authority.rootIdentity.ino !== 1n) {
 			throw new Error("run_history_cas_procfs_root_inode_mismatch");
 		}
-		const rootMountId = this.readRunHistoryProcfsMountId(
-			authority,
-			authority.rootDescriptor,
-			"root",
-		);
+		const rootMountId = this.readRunHistoryProcfsMountId(authority, authority.rootDescriptor, "root");
 		const descriptorMountId = this.readRunHistoryProcfsMountId(
 			authority,
 			authority.descriptorDirectoryDescriptor,
@@ -5771,8 +9023,7 @@ export class IncidentRecorderCompactor {
 	private openRunHistoryProcfsAuthority(): RunHistoryProcfsAuthority {
 		if (process.platform !== "linux") throw new Error("run_history_cas_descriptor_anchoring_unavailable");
 		const rootPath = "/proc" as const;
-		const descriptorDirectoryPath =
-			this.options.runHistoryProcfs?.descriptorDirectoryPath ?? "/proc/thread-self/fd";
+		const descriptorDirectoryPath = this.options.runHistoryProcfs?.descriptorDirectoryPath ?? "/proc/thread-self/fd";
 		const descriptorInfoDirectoryPath =
 			this.options.runHistoryProcfs?.descriptorInfoDirectoryPath ?? "/proc/thread-self/fdinfo";
 		let rootDescriptor: number | undefined;
@@ -5784,10 +9035,7 @@ export class IncidentRecorderCompactor {
 					throw new Error("run_history_cas_procfs_filesystem_mismatch");
 				}
 			}
-			rootDescriptor = openSync(
-				rootPath,
-				fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
-			);
+			rootDescriptor = openSync(rootPath, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
 			descriptorDirectoryDescriptor = openSync(
 				descriptorDirectoryPath,
 				fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
@@ -5840,11 +9088,7 @@ export class IncidentRecorderCompactor {
 			this.options.runHistoryProcfs?.onAuthorityAdmitted?.({ mountId: authority.mountId });
 			return authority;
 		} catch (error) {
-			for (const descriptor of [
-				descriptorInfoDirectoryDescriptor,
-				descriptorDirectoryDescriptor,
-				rootDescriptor,
-			]) {
+			for (const descriptor of [descriptorInfoDirectoryDescriptor, descriptorDirectoryDescriptor, rootDescriptor]) {
 				if (descriptor === undefined) continue;
 				try {
 					closeSync(descriptor);
@@ -5873,8 +9117,7 @@ export class IncidentRecorderCompactor {
 			}
 			reopenedDescriptor = openSync(
 				entryPath,
-				fsConstants.O_RDONLY |
-					(kind === "directory" ? fsConstants.O_DIRECTORY : fsConstants.O_NONBLOCK),
+				fsConstants.O_RDONLY | (kind === "directory" ? fsConstants.O_DIRECTORY : fsConstants.O_NONBLOCK),
 			);
 			const held = fstatSync(descriptor, { bigint: true });
 			const reopened = fstatSync(reopenedDescriptor, { bigint: true });
@@ -5882,16 +9125,10 @@ export class IncidentRecorderCompactor {
 				kind === "directory"
 					? held.isDirectory() &&
 						reopened.isDirectory() &&
-						sameStableDirectoryIdentity(
-							stableFilesystemIdentity(held),
-							stableFilesystemIdentity(reopened),
-						)
+						sameStableDirectoryIdentity(stableFilesystemIdentity(held), stableFilesystemIdentity(reopened))
 					: held.isFile() &&
 						reopened.isFile() &&
-						sameStableFilesystemIdentity(
-							stableFilesystemIdentity(held),
-							stableFilesystemIdentity(reopened),
-						);
+						sameStableFilesystemIdentity(stableFilesystemIdentity(held), stableFilesystemIdentity(reopened));
 			if (!matches || readlinkSync(entryPath, "utf8") !== expectedPath) {
 				throw new Error(`run_history_cas_procfs_${role}_descriptor_identity_mismatch`);
 			}
@@ -5951,18 +9188,11 @@ export class IncidentRecorderCompactor {
 			);
 		}
 		const target = input.parent
-			? this.runHistoryProcfsDescriptorPath(
-					authority,
-					input.parent.descriptor,
-					input.name ?? "",
-				)
+			? this.runHistoryProcfsDescriptorPath(authority, input.parent.descriptor, input.name ?? "")
 			: input.path;
 		let descriptor: number | undefined;
 		try {
-			descriptor = openSync(
-				target,
-				fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
-			);
+			descriptor = openSync(target, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
 			if (input.parent) {
 				this.assertRunHistoryProcfsDescriptorEntry(
 					authority,
@@ -6071,11 +9301,7 @@ export class IncidentRecorderCompactor {
 			);
 			try {
 				fileDescriptor = openSync(
-					this.runHistoryProcfsDescriptorPath(
-						procfsAuthority,
-						shardDirectory.descriptor,
-						`${claim.digest}.blob`,
-					),
+					this.runHistoryProcfsDescriptorPath(procfsAuthority, shardDirectory.descriptor, `${claim.digest}.blob`),
 					fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
 				);
 			} catch (error) {
@@ -6162,10 +9388,7 @@ export class IncidentRecorderCompactor {
 		}
 		for (const fence of active.directoryFences) {
 			const opened = fstatSync(fence.descriptor, { bigint: true });
-			if (
-				!opened.isDirectory() ||
-				!sameStableDirectoryIdentity(fence.identity, stableFilesystemIdentity(opened))
-			) {
+			if (!opened.isDirectory() || !sameStableDirectoryIdentity(fence.identity, stableFilesystemIdentity(opened))) {
 				throw new Error(`run_history_cas_${fence.role}_changed_during_read`);
 			}
 			this.assertRunHistoryProcfsDescriptorEntry(
@@ -6178,22 +9401,12 @@ export class IncidentRecorderCompactor {
 			const target =
 				fence.parentDescriptor === undefined
 					? fence.path
-					: this.runHistoryProcfsDescriptorPath(
-							active.procfsAuthority,
-							fence.parentDescriptor,
-							fence.name ?? "",
-						);
+					: this.runHistoryProcfsDescriptorPath(active.procfsAuthority, fence.parentDescriptor, fence.name ?? "");
 			let namedDescriptor: number | undefined;
 			try {
-				namedDescriptor = openSync(
-					target,
-					fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
-				);
+				namedDescriptor = openSync(target, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
 				const named = fstatSync(namedDescriptor, { bigint: true });
-				if (
-					!named.isDirectory() ||
-					!sameStableDirectoryIdentity(fence.identity, stableFilesystemIdentity(named))
-				) {
+				if (!named.isDirectory() || !sameStableDirectoryIdentity(fence.identity, stableFilesystemIdentity(named))) {
 					throw new Error(`run_history_cas_${fence.role}_name_swapped`);
 				}
 			} catch (error) {
@@ -6236,10 +9449,7 @@ export class IncidentRecorderCompactor {
 				"directory",
 			);
 			const named = fstatSync(namedFileDescriptor, { bigint: true });
-			if (
-				!named.isFile() ||
-				!sameStableFilesystemIdentity(active.fileIdentity, stableFilesystemIdentity(named))
-			) {
+			if (!named.isFile() || !sameStableFilesystemIdentity(active.fileIdentity, stableFilesystemIdentity(named))) {
 				throw new Error("run_history_cas_blob_name_swapped");
 			}
 		} catch (error) {
@@ -6261,10 +9471,7 @@ export class IncidentRecorderCompactor {
 				"file",
 			);
 		} catch (error) {
-			if (
-				error instanceof Error &&
-				error.message.startsWith("run_history_cas_procfs_blob_descriptor_")
-			) {
+			if (error instanceof Error && error.message.startsWith("run_history_cas_procfs_blob_descriptor_")) {
 				throw new Error("run_history_cas_blob_changed_during_read");
 			}
 			throw error;
@@ -6272,7 +9479,7 @@ export class IncidentRecorderCompactor {
 		this.assertRunHistoryProcfsAuthorityStable(active.procfsAuthority);
 	}
 
-	private advanceRunHistoryCasValidation(state: RunHistoryTraversal): IncidentRecorderRunHistoryResult {
+	private advanceRunHistoryCasValidation(state: RunHistoryTraversal): IncidentRecorderRunHistoryProgressResult {
 		state.casDigests ??= [...state.casClaims.keys()].sort();
 		let reads = 0;
 		let completedDigests = 0;
@@ -6350,7 +9557,7 @@ export class IncidentRecorderCompactor {
 		} catch (error) {
 			const reason =
 				error instanceof Error && error.message.startsWith("run_history_cas_")
-					? error.message.split(":", 1)[0] ?? "run_history_cas_validation_failed"
+					? (error.message.split(":", 1)[0] ?? "run_history_cas_validation_failed")
 					: "run_history_cas_validation_failed";
 			const reference = state.activeCasValidation?.claim.path;
 			return this.incompleteRunHistory(state, reason, {
@@ -6361,7 +9568,7 @@ export class IncidentRecorderCompactor {
 		}
 	}
 
-	private completeRunHistory(state: RunHistoryTraversal): IncidentRecorderRunHistoryResult {
+	private completeRunHistory(state: RunHistoryTraversal): IncidentRecorderRunHistoryProgressResult {
 		const orderingFailure = this.validateRunHistoryOrdering(state);
 		if (orderingFailure) {
 			return this.incompleteRunHistory(state, orderingFailure, {
@@ -6389,7 +9596,14 @@ export class IncidentRecorderCompactor {
 			version: 1,
 			fingerprint: sha256(
 				canonicalJson({
-					requestFingerprint: state.requestFingerprint,
+					requestFingerprint: sha256(
+						canonicalJson({
+							runId: state.runId,
+							fromWallTimeMs: state.fromWallTimeMs,
+							throughWallTimeMs: state.throughWallTimeMs,
+							...(state.retainForPublication ? { retainForPublication: true } : {}),
+						}),
+					),
 					segmentReadFrontier: {
 						storeInstanceId: state.segmentReadLease.storeInstanceId,
 						highWaterSegmentSequence: state.segmentReadLease.highWaterSegmentSequence,
@@ -6411,7 +9625,10 @@ export class IncidentRecorderCompactor {
 			legacyOccurrenceCount: state.legacyOccurrenceCount,
 			validatedCasDigestCount: state.validatedCasFacts.length,
 		};
-		return this.boundedRunHistoryResult(state, { state: "complete", projection, snapshot }, true);
+		const result = { state: "complete" as const, projection, snapshot };
+		return state.retainForPublication
+			? this.retainCompletedRunHistory(state, result)
+			: this.boundedRunHistoryResult(state, result, true);
 	}
 
 	private sweepExpiredRunHistoryTraversals(nowMs: number): void {
@@ -6436,7 +9653,51 @@ export class IncidentRecorderCompactor {
 		state.deadlineTimer = timer;
 	}
 
-	cancelRunHistoryProjection(cursor: IncidentRecorderRunHistoryCursor): boolean {
+	private isRunHistoryPublicationCapability(
+		value: IncidentRecorderRunHistoryCursor | IncidentRecorderRunHistoryPublicationCapability,
+	): value is IncidentRecorderRunHistoryPublicationCapability {
+		return "kind" in value && value.kind === "run_history_publication";
+	}
+
+	private exactRunHistoryPublicationState(
+		capability: IncidentRecorderRunHistoryPublicationCapability,
+	): RunHistoryTraversal {
+		const state = this.runHistoryPublicationCapabilities.get(capability);
+		if (!state || state.publicationCapability !== capability || state.phase !== "publication-retained") {
+			throw new Error("Expected the exact run-history publication capability from this process");
+		}
+		return state;
+	}
+
+	assertRunHistoryPublicationReady(capability: IncidentRecorderRunHistoryPublicationCapability): void {
+		this.sweepExpiredRunHistoryTraversals(Date.now());
+		const state = this.exactRunHistoryPublicationState(capability);
+		try {
+			if (!state.segmentReadLease) throw new Error("segment_read_lease_missing");
+			this.ensureSegmentStore().assertReadLeaseUsable(state.segmentReadLease);
+		} catch (error) {
+			this.discardRunHistoryTraversal(state);
+			throw error;
+		}
+	}
+
+	releaseRunHistoryPublication(capability: IncidentRecorderRunHistoryPublicationCapability): void {
+		this.sweepExpiredRunHistoryTraversals(Date.now());
+		if (this.releasedRunHistoryPublicationCapabilities.has(capability)) return;
+		this.discardRunHistoryTraversal(this.exactRunHistoryPublicationState(capability));
+	}
+
+	cancelRunHistoryProjection(cursor: IncidentRecorderRunHistoryCursor): boolean;
+	cancelRunHistoryProjection(capability: IncidentRecorderRunHistoryPublicationCapability): true;
+	cancelRunHistoryProjection(
+		cursor: IncidentRecorderRunHistoryCursor | IncidentRecorderRunHistoryPublicationCapability,
+	): boolean {
+		this.sweepExpiredRunHistoryTraversals(Date.now());
+		if (this.isRunHistoryPublicationCapability(cursor)) {
+			if (this.releasedRunHistoryPublicationCapabilities.has(cursor)) return true;
+			this.discardRunHistoryTraversal(this.exactRunHistoryPublicationState(cursor));
+			return true;
+		}
 		if (
 			cursor.version !== 1 ||
 			!/^[0-9a-f]{64}$/.test(cursor.token) ||
@@ -6444,20 +9705,53 @@ export class IncidentRecorderCompactor {
 		) {
 			throw new Error("Invalid incident run-history continuation cursor");
 		}
-		this.sweepExpiredRunHistoryTraversals(Date.now());
 		const state = this.runHistoryTraversals.get(cursor.token);
 		if (!state || state.requestFingerprint !== cursor.requestFingerprint) return false;
+		if (state.publicationCapability) {
+			throw new Error("Retained run-history completion requires its exact run-history publication capability");
+		}
 		this.discardRunHistoryTraversal(state);
 		return true;
 	}
 
-	projectRunHistory(input: {
-		runId: string;
-		fromWallTimeMs: number;
-		throughWallTimeMs: number;
-		cursor?: IncidentRecorderRunHistoryCursor;
-		deadlineMs?: number;
-	}): IncidentRecorderRunHistoryResult {
+	projectRunHistory(
+		input: IncidentRecorderRunHistoryProjectionInput & {
+			retainForPublication: true;
+			pendingResponse: "cursor-only";
+		},
+	): IncidentRecorderRetainedRunHistoryCursorOnlyResult;
+	projectRunHistory(
+		input: IncidentRecorderRunHistoryProjectionInput & {
+			retainForPublication: true;
+			pendingResponse?: "full" | "cursor-only" | undefined;
+		},
+	): IncidentRecorderRetainedRunHistoryProgressResult;
+	projectRunHistory(
+		input: IncidentRecorderRunHistoryProjectionInput & {
+			retainForPublication?: false | undefined;
+			pendingResponse: "cursor-only";
+		},
+	): IncidentRecorderRunHistoryCursorOnlyResult;
+	projectRunHistory(
+		input: IncidentRecorderRunHistoryProjectionInput & {
+			retainForPublication?: false | undefined;
+			pendingResponse?: "full" | undefined;
+		},
+	): IncidentRecorderRunHistoryResult;
+	projectRunHistory(
+		input: IncidentRecorderRunHistoryProjectionInput,
+	):
+		| IncidentRecorderRunHistoryResult
+		| IncidentRecorderRetainedRunHistoryResult
+		| IncidentRecorderRunHistoryProgressResult
+		| IncidentRecorderRetainedRunHistoryProgressResult;
+	projectRunHistory(
+		input: IncidentRecorderRunHistoryProjectionInput,
+	):
+		| IncidentRecorderRunHistoryResult
+		| IncidentRecorderRetainedRunHistoryResult
+		| IncidentRecorderRunHistoryProgressResult
+		| IncidentRecorderRetainedRunHistoryProgressResult {
 		if (
 			!isCanonicalUuid(input.runId) ||
 			!Number.isSafeInteger(input.fromWallTimeMs) ||
@@ -6465,19 +9759,25 @@ export class IncidentRecorderCompactor {
 			!Number.isSafeInteger(input.throughWallTimeMs) ||
 			input.throughWallTimeMs < input.fromWallTimeMs ||
 			(input.deadlineMs !== undefined &&
-				(!Number.isFinite(input.deadlineMs) ||
-					!Number.isSafeInteger(input.deadlineMs) ||
-					input.deadlineMs < 0))
+				(!Number.isFinite(input.deadlineMs) || !Number.isSafeInteger(input.deadlineMs) || input.deadlineMs < 0)) ||
+			(input.retainForPublication !== undefined && typeof input.retainForPublication !== "boolean") ||
+			(input.pendingResponse !== undefined &&
+				input.pendingResponse !== "full" &&
+				input.pendingResponse !== "cursor-only")
 		) {
 			throw new Error("Invalid incident run-history projection request");
 		}
 		const nowMs = Date.now();
 		this.sweepExpiredRunHistoryTraversals(nowMs);
+		const retainForPublication = input.retainForPublication === true;
+		const pendingResponse = input.pendingResponse ?? "full";
 		const requestFingerprint = sha256(
 			canonicalJson({
 				runId: input.runId,
 				fromWallTimeMs: input.fromWallTimeMs,
 				throughWallTimeMs: input.throughWallTimeMs,
+				...(retainForPublication ? { retainForPublication: true } : {}),
+				pendingResponse,
 			}),
 		);
 		let state: RunHistoryTraversal | undefined;
@@ -6490,7 +9790,12 @@ export class IncidentRecorderCompactor {
 				throw new Error("Invalid incident run-history continuation cursor");
 			}
 			state = this.runHistoryTraversals.get(input.cursor.token);
-			if (!state || state.requestFingerprint !== requestFingerprint) {
+			if (
+				!state ||
+				state.requestFingerprint !== requestFingerprint ||
+				state.retainForPublication !== retainForPublication ||
+				state.pendingResponse !== pendingResponse
+			) {
 				const empty: RunHistoryTraversal = {
 					token: input.cursor.token,
 					requestFingerprint,
@@ -6499,6 +9804,8 @@ export class IncidentRecorderCompactor {
 					throughWallTimeMs: input.throughWallTimeMs,
 					deadlineMs: Date.now(),
 					phase: "segment-occurrences",
+					retainForPublication,
+					pendingResponse,
 					segmentRecordCount: 0,
 					segmentRecoveryGapCount: 0,
 					segmentScannedSegments: 0,
@@ -6538,11 +9845,10 @@ export class IncidentRecorderCompactor {
 				runId: input.runId,
 				fromWallTimeMs: input.fromWallTimeMs,
 				throughWallTimeMs: input.throughWallTimeMs,
-				deadlineMs: Math.min(
-					input.deadlineMs ?? nowMs + PIN_SCAN_DEADLINE_MS,
-					nowMs + PIN_SCAN_DEADLINE_MS,
-				),
+				deadlineMs: Math.min(input.deadlineMs ?? nowMs + PIN_SCAN_DEADLINE_MS, nowMs + PIN_SCAN_DEADLINE_MS),
 				phase: "segment-occurrences",
+				retainForPublication,
+				pendingResponse,
 				segmentRecordCount: 0,
 				segmentRecoveryGapCount: 0,
 				segmentScannedSegments: 0,
@@ -6564,33 +9870,32 @@ export class IncidentRecorderCompactor {
 			this.armRunHistoryDeadline(state);
 		}
 		if (!state) throw new Error("Incident run-history traversal state was not initialized");
+		if (state.phase === "publication-retained") {
+			throw new Error("Retained run-history completion requires its exact run-history publication capability");
+		}
 		if (Date.now() > state.deadlineMs) {
 			return this.incompleteRunHistory(state, "run_history_deadline_exceeded", {
 				kind: "truncated",
 				reason: "projection_deadline_exceeded",
 			});
 		}
-		if (state.phase === "cas-validation") return this.advanceRunHistoryCasValidation(state);
-		if (state.phase === "legacy") return this.advanceRunHistoryLegacy(state);
-		return this.advanceRunHistorySegmentPhase(state) ?? this.pendingRunHistory(state);
+		try {
+			if (state.phase === "cas-validation") return this.advanceRunHistoryCasValidation(state);
+			if (state.phase === "legacy") return this.advanceRunHistoryLegacy(state);
+			return this.advanceRunHistorySegmentPhase(state) ?? this.pendingRunHistory(state);
+		} catch (error) {
+			if (state.retainForPublication) this.discardRunHistoryTraversal(state);
+			throw error;
+		}
 	}
 
-	private failPinTraversal(state: PinTraversal, reason: string, evidence: Record<string, unknown> = {}): void {
+	private failPinTraversal(state: PinTraversal, reason: string, _evidence: Record<string, unknown> = {}): void {
 		try {
 			state.directory?.closeSync();
 		} catch {}
 		state.directory = undefined;
 		this.activePinTraversal = undefined;
-		const path = join(state.incidentDir, "journal-pin-incomplete.json");
-		if (existsSync(path)) return;
-		this.writeOwnedJson(path, {
-			version: 1,
-			state: "pending_or_incomplete",
-			reason,
-			runId: state.request.runId,
-			retainedOccurrenceCount: state.matches.length,
-			...evidence,
-		});
+		this.writeProviderPinIncomplete(state.incidentDir, "journal", reason, state.request);
 	}
 
 	private addPinMatch(state: PinTraversal, match: PinOccurrenceMatch): boolean {
@@ -6620,8 +9925,32 @@ export class IncidentRecorderCompactor {
 		return true;
 	}
 
+	/** Retention must not remove directories still used by incremental pin writers. */
+	get hasActivePinWriters(): boolean {
+		return (
+			this.activePinScans.size > 0 ||
+			Boolean(
+				this.activePinTraversal ||
+					this.journalManifestValidation ||
+					this.sysdigSourceCapture ||
+					this.sysdigSegmentVerification,
+			)
+		);
+	}
+
+	beginPinRetentionMaintenance(): boolean {
+		if (this.hasActivePinWriters) return false;
+		this.pinRetentionMaintenance = true;
+		return true;
+	}
+
+	endPinRetentionMaintenance(): void {
+		this.pinRetentionMaintenance = false;
+	}
+
 	processPendingPins(nowMs = Date.now()): void {
-		if (this.diskPaused) return;
+		this.pendingPinDirectoryEntriesReadLastPass = 0;
+		if (this.diskPaused || this.pinReadersQuiescing || this.pinRetentionMaintenance) return;
 		if (this.journalManifestValidation) {
 			this.advanceJournalManifestValidation();
 			return;
@@ -6632,52 +9961,100 @@ export class IncidentRecorderCompactor {
 		}
 		if (this.activePinScans.size > 0) return;
 		const incidentRoot = join(this.options.agentDir, "incidents");
-		let incidentNames: string[];
-		try {
-			incidentNames = readdirSync(incidentRoot).sort().slice(0, PENDING_ENTRY_MAX_COUNT);
-		} catch {
-			return;
-		}
+		const incidentNames = this.discoverPendingPinDirectoryNames(incidentRoot);
+		if (incidentNames.length === 0) return;
+		let completedCursor = this.pendingPinCursor;
 		for (const name of incidentNames) {
 			const incidentDir = join(incidentRoot, name);
-			const requestPath = join(incidentDir, "journal-pin-request.json");
 			const manifestPath = join(incidentDir, "journal-pin-manifest.json");
-			let request: {
-				runId: string;
-				fromWallTimeMs: number;
-				throughWallTimeMs: number;
-				resolveAfterWallTimeMs: number;
-				retainUntilWallTimeMs?: number;
-			};
-			try {
-				request = JSON.parse(readFileSync(requestPath, "utf8")) as typeof request;
-			} catch {
-				continue;
+			const request = this.readJournalPinRequest(incidentDir);
+			const sysdigRequest = this.readSysdigPinRequest(incidentDir);
+			if (!request && !sysdigRequest) {
+				const authority = this.readIncidentPinAuthority(incidentDir);
+				if (authority) {
+					this.persistPendingPinCursor(completedCursor);
+					this.requestPin(authority.runId, incidentDir, authority.anchorWallTimeMs);
+					return;
+				}
 			}
-			try {
-				const sysdigRequest = JSON.parse(
-					readFileSync(this.sysdigRequestPath(incidentDir), "utf8"),
-				) as SysdigPinRequest;
-				if (
-					sysdigRequest.version === 1 &&
-					sysdigRequest.runId === request.runId &&
-					sysdigRequest.fromWallTimeMs === request.fromWallTimeMs &&
-					sysdigRequest.throughWallTimeMs === request.throughWallTimeMs &&
-					typeof sysdigRequest.ringBasePath === "string"
-				)
-					this.processSysdigPin(incidentDir, sysdigRequest, nowMs);
-			} catch {}
-			if (existsSync(manifestPath)) {
-				const retentionProofPath = join(incidentDir, "journal-pin-retention-proof.json");
-				if (this.retentionProofMatchesRequest(retentionProofPath, "journal", request)) continue;
-				this.startJournalManifestValidation(incidentDir, manifestPath, request);
-				if (this.journalManifestValidation) this.advanceJournalManifestValidation();
+			if (!request && sysdigRequest) {
+				this.persistPendingPinCursor(completedCursor);
+				this.requestPin(sysdigRequest.runId, incidentDir, sysdigRequest.anchorWallTimeMs);
 				return;
 			}
-			if (nowMs < request.resolveAfterWallTimeMs) continue;
+			if (!request) {
+				completedCursor = name;
+				continue;
+			}
+			if (!sysdigRequest) {
+				const authority = this.readIncidentPinAuthority(incidentDir);
+				if (authority) {
+					this.persistPendingPinCursor(completedCursor);
+					this.requestPin(authority.runId, incidentDir, authority.anchorWallTimeMs);
+					return;
+				}
+				this.writeProviderPinIncomplete(
+					incidentDir,
+					"sysdig",
+					"legacy_journal_only_request_has_no_sysdig_capture_authority",
+					request,
+				);
+			} else {
+				try {
+					if (
+						sysdigRequest.runId === request.runId &&
+						sysdigRequest.fromWallTimeMs === request.fromWallTimeMs &&
+						sysdigRequest.throughWallTimeMs === request.throughWallTimeMs &&
+						typeof sysdigRequest.ringBasePath === "string"
+					) {
+						if (!this.processSysdigPin(incidentDir, sysdigRequest, nowMs)) {
+							this.persistPendingPinCursor(completedCursor);
+							return;
+						}
+					} else {
+						this.writeProviderPinIncomplete(
+							incidentDir,
+							"sysdig",
+							"provider_request_binding_conflict",
+							sysdigRequest,
+						);
+						this.writeProviderPinIncomplete(incidentDir, "journal", "provider_request_binding_conflict", request);
+						completedCursor = name;
+						continue;
+					}
+				} catch (error) {
+					this.writeProviderPinIncomplete(
+						incidentDir,
+						"sysdig",
+						`pin_processing_failed:${error instanceof Error ? error.message : String(error)}`,
+						sysdigRequest,
+					);
+					this.persistPendingPinCursor(completedCursor);
+					return;
+				}
+			}
+			if (existsSync(manifestPath)) {
+				const retentionProofPath = join(incidentDir, "journal-pin-retention-proof.json");
+				if (this.retentionProofMatchesRequest(retentionProofPath, "journal", request)) {
+					completedCursor = name;
+					continue;
+				}
+				if (existsSync(retentionProofPath)) {
+					this.quarantineInvalidProviderProof(incidentDir, "journal", retentionProofPath);
+				}
+				this.startJournalManifestValidation(incidentDir, manifestPath, request);
+				if (this.journalManifestValidation) this.advanceJournalManifestValidation();
+				this.persistPendingPinCursor(completedCursor);
+				return;
+			}
+			if (nowMs < request.resolveAfterWallTimeMs) {
+				completedCursor = name;
+				continue;
+			}
 			const proofPath = join(incidentDir, "journal-pin-scan-proof.json");
 			if (!existsSync(proofPath)) {
 				this.startPinRangeScan(incidentDir, request);
+				this.persistPendingPinCursor(completedCursor);
 				return;
 			}
 			let scanProof: {
@@ -6690,6 +10067,7 @@ export class IncidentRecorderCompactor {
 			try {
 				scanProof = JSON.parse(readFileSync(proofPath, "utf8")) as typeof scanProof;
 			} catch {
+				completedCursor = name;
 				continue;
 			}
 			if (
@@ -6707,6 +10085,7 @@ export class IncidentRecorderCompactor {
 						reason: "scan_proof_did_not_match_request",
 					});
 				} catch {}
+				completedCursor = name;
 				continue;
 			}
 			let cursorBytes = 0;
@@ -6724,7 +10103,10 @@ export class IncidentRecorderCompactor {
 				}
 				scannedCursors.add(cursor);
 			}
-			if (!valid) continue;
+			if (!valid) {
+				completedCursor = name;
+				continue;
+			}
 			this.activePinTraversal = {
 				incidentDir,
 				request,
@@ -6739,8 +10121,10 @@ export class IncidentRecorderCompactor {
 				linked: new Map(),
 			};
 			this.advancePinTraversal(this.activePinTraversal);
+			this.persistPendingPinCursor(completedCursor);
 			return;
 		}
+		this.persistPendingPinCursor(completedCursor);
 	}
 
 	private advancePinTraversal(state: PinTraversal): void {
@@ -6882,6 +10266,7 @@ export class IncidentRecorderCompactor {
 		}
 		const pinTransaction = acquireIncidentCasTransaction(this.root);
 		if (!pinTransaction) return;
+		const artifactGenerationId = this.journalArtifactGenerationId(state.request);
 		try {
 			for (
 				let count = 0;
@@ -6892,10 +10277,14 @@ export class IncidentRecorderCompactor {
 				if (!match || state.linked.has(match.cas.digest)) continue;
 				const target = join(pinCasDir, `${match.cas.digest}.blob`);
 				try {
-					this.linkOwnedVerified(match.cas.path, target);
-					const stat = statSync(target);
-					if (stat.size === match.cas.bytes && sha256(readFileSync(target)) === match.cas.digest)
-						state.linked.set(match.cas.digest, target);
+					const sealedArtifact = this.materializeJournalPinArtifact(
+						match.cas.path,
+						target,
+						match.cas.bytes,
+						match.cas.digest,
+						artifactGenerationId,
+					);
+					state.linked.set(match.cas.digest, { path: target, sealedArtifact });
 				} catch {}
 			}
 		} finally {
@@ -6909,17 +10298,18 @@ export class IncidentRecorderCompactor {
 			[...state.scannedCursors].every((cursor) => compactedCursors.has(cursor));
 		this.activePinTraversal = undefined;
 		if (!allVerified) {
-			this.writeOwnedJson(join(state.incidentDir, "journal-pin-incomplete.json"), {
-				version: 1,
-				state: "pending_or_incomplete",
-				reason: "occurrence_or_cas_link_verification_failed",
-				runId: state.request.runId,
-			});
+			this.writeProviderPinIncomplete(
+				state.incidentDir,
+				"journal",
+				"occurrence_or_cas_link_verification_failed",
+				state.request,
+			);
 			return;
 		}
 		this.writeOwnedJson(join(state.incidentDir, "journal-pin-manifest.json"), {
 			version: 2,
 			state: "complete_through_requested_window",
+			artifactGenerationId,
 			runId: state.request.runId,
 			fromWallTimeMs: state.request.fromWallTimeMs,
 			throughWallTimeMs: state.request.throughWallTimeMs,
@@ -6929,9 +10319,309 @@ export class IncidentRecorderCompactor {
 				cursors: match.cursors,
 				cas: match.cas,
 				eventWallTimeMs: match.eventWallTimeMs,
-				pinnedCasPath: state.linked.get(match.cas.digest) ?? null,
+				pinnedCasPath: state.linked.get(match.cas.digest)?.path ?? null,
+				sealedArtifact: state.linked.get(match.cas.digest)?.sealedArtifact ?? null,
 			})),
 		});
 		fsyncDirectory(state.incidentDir);
+	}
+
+	/** Read newly committed occurrence events for bounded live service observation. */
+	readLiveRunEvents(input: {
+		runId: string;
+		cursor?: IncidentRecorderLiveRunEventsCursor;
+	}): IncidentRecorderLiveRunEventsPage {
+		const filter = {
+			runId: input.runId,
+			sourceId: SEGMENT_SOURCE_OCCURRENCE,
+			fromObservedAtMs: 0,
+			throughObservedAtMs: Number.MAX_SAFE_INTEGER,
+		};
+		const filterSha256 = sha256(canonicalJson(filter));
+		const initialCursor = (): IncidentRecorderLiveRunEventsCursor => ({
+			version: 1,
+			runId: input.runId,
+			filterSha256,
+			segmentSequence: 0,
+			ordinal: 0,
+		});
+		const cursor = input.cursor;
+		if (!isCanonicalUuid(input.runId)) throw new Error("Invalid live run-event runId");
+		if (
+			cursor &&
+			(cursor.version !== 1 ||
+				cursor.runId !== input.runId ||
+				!/^[0-9a-f]{64}$/.test(cursor.filterSha256) ||
+				!Number.isSafeInteger(cursor.segmentSequence) ||
+				cursor.segmentSequence < 0 ||
+				!Number.isSafeInteger(cursor.ordinal) ||
+				cursor.ordinal < 0)
+		) {
+			throw new Error("Invalid live run-event continuation cursor");
+		}
+		const previous = cursor ?? initialCursor();
+		const incomplete = (
+			reason: string,
+			events: IncidentRecorderRunHistoryEvent[] = [],
+		): IncidentRecorderLiveRunEventsPage => ({
+			version: 1,
+			runId: input.runId,
+			state: "incomplete",
+			events,
+			cursor: previous,
+			reason,
+			scannedSegments: 0,
+			scannedRecords: 0,
+			scannedIndexBytes: 0,
+		});
+		try {
+			const store = this.ensureSegmentStore();
+			const snapshot = store.createReadSnapshot();
+			if (
+				previous.segmentSequence > snapshot.highWaterSegmentSequence ||
+				(previous.segmentSequence === snapshot.highWaterSegmentSequence &&
+					previous.ordinal > snapshot.highWaterOrdinal)
+			) {
+				return incomplete("live_run_event_cursor_beyond_segment_frontier");
+			}
+			const after: IncidentRecorderSegmentQueryCursor | undefined = cursor
+				? {
+						version: 1,
+						snapshotId: snapshot.id,
+						generation: snapshot.generation,
+						highWaterSegmentSequence: snapshot.highWaterSegmentSequence,
+						highWaterOrdinal: snapshot.highWaterOrdinal,
+						filterSha256: cursor.filterSha256,
+						segmentSequence: cursor.segmentSequence,
+						ordinal: cursor.ordinal,
+					}
+				: undefined;
+			const page = store.queryRunWindowPage({
+				runId: input.runId,
+				sourceId: SEGMENT_SOURCE_OCCURRENCE,
+				fromObservedAtMs: 0,
+				throughObservedAtMs: Number.MAX_SAFE_INTEGER,
+				maxRecords: SEGMENT_QUERY_PAGE_RECORDS,
+				maxBytes: SEGMENT_QUERY_PAGE_BYTES,
+				maxScannedSegments: RUN_HISTORY_SEGMENT_PAGE_SCANNED_SEGMENTS,
+				maxScannedRecords: RUN_HISTORY_SEGMENT_PAGE_SCANNED_RECORDS,
+				maxScannedIndexBytes: RUN_HISTORY_SEGMENT_PAGE_SCANNED_INDEX_BYTES,
+				...(after ? { after } : { readSnapshot: snapshot }),
+			});
+			const events: IncidentRecorderRunHistoryEvent[] = [];
+			for (const record of page.records) {
+				let value: unknown;
+				try {
+					value = JSON.parse(record.payload.toString("utf8")) as unknown;
+				} catch {
+					return incomplete("live_run_event_segment_payload_invalid_json", events);
+				}
+				const event = this.parseRunHistoryEvent(
+					value,
+					this.segmentOccurrenceReference(record.locator),
+					input.runId,
+					record,
+				);
+				if (!event) return incomplete("live_run_event_segment_payload_invalid", events);
+				events.push(event);
+			}
+			const frontier = page.nextCursor ?? {
+				segmentSequence: page.snapshot.highWaterSegmentSequence,
+				ordinal: page.snapshot.highWaterOrdinal,
+			};
+			const nextCursor: IncidentRecorderLiveRunEventsCursor = {
+				version: 1,
+				runId: input.runId,
+				filterSha256: page.snapshot.filterSha256,
+				segmentSequence: frontier.segmentSequence,
+				ordinal: frontier.ordinal,
+			};
+			if (
+				!page.complete &&
+				frontier.segmentSequence === previous.segmentSequence &&
+				frontier.ordinal === previous.ordinal
+			) {
+				return {
+					version: 1,
+					runId: input.runId,
+					state: "incomplete",
+					events,
+					cursor: previous,
+					reason: "live_run_event_query_made_no_progress",
+					scannedSegments: page.scannedSegments,
+					scannedRecords: page.scannedRecords,
+					scannedIndexBytes: page.scannedIndexBytes,
+				};
+			}
+			return {
+				version: 1,
+				runId: input.runId,
+				state: page.complete ? "complete" : "pending",
+				events,
+				cursor: nextCursor,
+				scannedSegments: page.scannedSegments,
+				scannedRecords: page.scannedRecords,
+				scannedIndexBytes: page.scannedIndexBytes,
+			};
+		} catch (error) {
+			return incomplete(
+				`live_run_event_query_unavailable:${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+	}
+
+	/** Read bounded, committed gap evidence for live finalization-barrier observation. */
+	readLiveRunGaps(input: {
+		runId: string;
+		cursor?: IncidentRecorderLiveRunEventsCursor;
+	}): IncidentRecorderLiveRunGapsPage {
+		if (input.runId !== "__recorder__" && !isCanonicalUuid(input.runId)) {
+			throw new Error("Invalid live run-gap runId");
+		}
+		const filter = {
+			runId: input.runId,
+			sourceId: SEGMENT_SOURCE_GAP,
+			fromObservedAtMs: 0,
+			throughObservedAtMs: Number.MAX_SAFE_INTEGER,
+		};
+		const filterSha256 = sha256(canonicalJson(filter));
+		const initialCursor = (): IncidentRecorderLiveRunEventsCursor => ({
+			version: 1,
+			runId: input.runId,
+			filterSha256,
+			segmentSequence: 0,
+			ordinal: 0,
+		});
+		const cursor = input.cursor;
+		if (
+			cursor &&
+			(cursor.version !== 1 ||
+				cursor.runId !== input.runId ||
+				!/^[0-9a-f]{64}$/.test(cursor.filterSha256) ||
+				!Number.isSafeInteger(cursor.segmentSequence) ||
+				cursor.segmentSequence < 0 ||
+				!Number.isSafeInteger(cursor.ordinal) ||
+				cursor.ordinal < 0)
+		) {
+			throw new Error("Invalid live run-gap continuation cursor");
+		}
+		const previous = cursor ?? initialCursor();
+		const incomplete = (
+			reason: string,
+			gaps: IncidentRecorderLiveRunGap[] = [],
+		): IncidentRecorderLiveRunGapsPage => ({
+			version: 1,
+			runId: input.runId,
+			state: "incomplete",
+			gaps,
+			cursor: previous,
+			reason,
+			scannedSegments: 0,
+			scannedRecords: 0,
+			scannedIndexBytes: 0,
+		});
+		try {
+			const store = this.ensureSegmentStore();
+			const snapshot = store.createReadSnapshot();
+			if (
+				previous.segmentSequence > snapshot.highWaterSegmentSequence ||
+				(previous.segmentSequence === snapshot.highWaterSegmentSequence &&
+					previous.ordinal > snapshot.highWaterOrdinal)
+			) {
+				return incomplete("live_run_gap_cursor_beyond_segment_frontier");
+			}
+			const after: IncidentRecorderSegmentQueryCursor | undefined = cursor
+				? {
+						version: 1,
+						snapshotId: snapshot.id,
+						generation: snapshot.generation,
+						highWaterSegmentSequence: snapshot.highWaterSegmentSequence,
+						highWaterOrdinal: snapshot.highWaterOrdinal,
+						filterSha256: cursor.filterSha256,
+						segmentSequence: cursor.segmentSequence,
+						ordinal: cursor.ordinal,
+					}
+				: undefined;
+			const page = store.queryRunWindowPage({
+				runId: input.runId,
+				sourceId: SEGMENT_SOURCE_GAP,
+				fromObservedAtMs: 0,
+				throughObservedAtMs: Number.MAX_SAFE_INTEGER,
+				maxRecords: SEGMENT_QUERY_PAGE_RECORDS,
+				maxBytes: SEGMENT_QUERY_PAGE_BYTES,
+				maxScannedSegments: RUN_HISTORY_SEGMENT_PAGE_SCANNED_SEGMENTS,
+				maxScannedRecords: RUN_HISTORY_SEGMENT_PAGE_SCANNED_RECORDS,
+				maxScannedIndexBytes: RUN_HISTORY_SEGMENT_PAGE_SCANNED_INDEX_BYTES,
+				...(after ? { after } : { readSnapshot: snapshot }),
+			});
+			const gaps: IncidentRecorderLiveRunGap[] = [];
+			for (const record of page.records) {
+				let value: unknown;
+				try {
+					value = JSON.parse(record.payload.toString("utf8")) as unknown;
+				} catch {
+					return incomplete("live_run_gap_segment_payload_invalid_json", gaps);
+				}
+				if (!isRecordObject(value) || value.version !== 1 || value.state !== "gap_or_uncertainty") {
+					return incomplete("live_run_gap_segment_payload_invalid", gaps);
+				}
+				const evidence = value.evidence;
+				if (!isRecordObject(evidence)) return incomplete("live_run_gap_segment_payload_invalid", gaps);
+				const serializedEvidence = JSON.stringify(evidence);
+				if (
+					typeof serializedEvidence !== "string" ||
+					sha256(serializedEvidence) !== record.metadata.gapIdentity ||
+					record.metadata.version !== 1 ||
+					record.metadata.state !== "gap_or_uncertainty" ||
+					record.idempotencyKey !== `gap:${sha256(serializedEvidence)}`
+				) {
+					return incomplete("live_run_gap_segment_identity_invalid", gaps);
+				}
+				gaps.push({
+					occurrenceReference: this.segmentOccurrenceReference(record.locator),
+					evidence: JSON.parse(serializedEvidence) as Record<string, unknown>,
+				});
+			}
+			const frontier = page.nextCursor ?? {
+				segmentSequence: page.snapshot.highWaterSegmentSequence,
+				ordinal: page.snapshot.highWaterOrdinal,
+			};
+			const nextCursor: IncidentRecorderLiveRunEventsCursor = {
+				version: 1,
+				runId: input.runId,
+				filterSha256: page.snapshot.filterSha256,
+				segmentSequence: frontier.segmentSequence,
+				ordinal: frontier.ordinal,
+			};
+			if (
+				!page.complete &&
+				frontier.segmentSequence === previous.segmentSequence &&
+				frontier.ordinal === previous.ordinal
+			) {
+				return {
+					version: 1,
+					runId: input.runId,
+					state: "incomplete",
+					gaps,
+					cursor: previous,
+					reason: "live_run_gap_query_made_no_progress",
+					scannedSegments: page.scannedSegments,
+					scannedRecords: page.scannedRecords,
+					scannedIndexBytes: page.scannedIndexBytes,
+				};
+			}
+			return {
+				version: 1,
+				runId: input.runId,
+				state: page.complete ? "complete" : "pending",
+				gaps,
+				cursor: nextCursor,
+				scannedSegments: page.scannedSegments,
+				scannedRecords: page.scannedRecords,
+				scannedIndexBytes: page.scannedIndexBytes,
+			};
+		} catch (error) {
+			return incomplete(`live_run_gap_query_unavailable:${error instanceof Error ? error.message : String(error)}`);
+		}
 	}
 }
