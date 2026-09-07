@@ -1159,6 +1159,53 @@ describe.runIf(process.platform === "linux")("incident recorder CAS v2", () => {
 		expect(admission.transaction.release()).toEqual({ state: "released", cleanupPending: false });
 	});
 
+	it("updates regular-file timestamps through a revocable opaque root capability", () => {
+		const { recorder } = fixture();
+		const admission = acquireIncidentCasTransactionDetailed(recorder);
+		if (admission.state !== "acquired") throw new Error("expected CAS admission");
+		let escaped: (() => void) | undefined;
+		try {
+			expect(
+				admission.transaction.withRoot((root) => {
+					const path = root.relative("timestamp.bin");
+					root.writeFileExclusive(path, "exact bytes\n");
+					root.utimes(path, new Date(1_700_000_000_000), 1_700_000_001);
+					root.fsyncFile(path);
+					expect(root.stat(path).mtimeNs).toBe(1_700_000_001_000_000_000n);
+					expect(() => root.utimes(path, 0, Number.NaN)).toThrow("CAS timestamp is invalid");
+					expect(() => root.utimes(path, 0, -1)).toThrow("CAS timestamp is invalid");
+					expect(root.stat(path).mtimeNs).toBe(1_700_000_001_000_000_000n);
+					escaped = () => root.utimes(path, 0, 0);
+				}),
+			).toMatchObject({ state: "committed" });
+			expect(() => escaped?.()).toThrow();
+			expect(readFileSync(join(recorder, "timestamp.bin"), "utf8")).toBe("exact bytes\n");
+		} finally {
+			admission.transaction.release();
+		}
+	});
+
+	it("refuses timestamp mutation through symlinks or directory targets", () => {
+		const { base, recorder } = fixture();
+		const outside = join(base, "outside-timestamp.bin");
+		writeFileSync(outside, "outside\n");
+		const before = statSync(outside, { bigint: true }).mtimeNs;
+		symlinkSync(outside, join(recorder, "alias"));
+		const admission = acquireIncidentCasTransactionDetailed(recorder);
+		if (admission.state !== "acquired") throw new Error("expected CAS admission");
+		try {
+			expect(
+				admission.transaction.withRoot((root) => {
+					expect(() => root.utimes(root.relative("alias"), 0, 0)).toThrow("requires a regular file");
+					expect(() => root.utimes(root.relative(), 0, 0)).toThrow();
+				}),
+			).toMatchObject({ state: "committed" });
+			expect(statSync(outside, { bigint: true }).mtimeNs).toBe(before);
+		} finally {
+			admission.transaction.release();
+		}
+	});
+
 	it("sanitizes all capability-originated filesystem errors without leaking descriptor paths", () => {
 		const { recorder } = fixture();
 		const admission = acquireIncidentCasTransactionDetailed(recorder);

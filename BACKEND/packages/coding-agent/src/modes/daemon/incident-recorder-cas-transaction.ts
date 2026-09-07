@@ -9,6 +9,7 @@ import {
 	fstatSync,
 	fsyncSync,
 	ftruncateSync,
+	futimesSync,
 	linkSync,
 	lstatSync,
 	mkdirSync,
@@ -230,6 +231,7 @@ export interface IncidentCasRootMutation {
 	rmdir(path: IncidentCasRelativePath): void;
 	rename(source: IncidentCasRelativePath, destination: IncidentCasRelativePath): void;
 	hardLink(source: IncidentCasRelativePath, destination: IncidentCasRelativePath): void;
+	utimes(path: IncidentCasRelativePath, atime: number | Date, mtime: number | Date): void;
 	fsyncFile(path: IncidentCasRelativePath): void;
 	fsyncDirectory(path: IncidentCasRelativePath): void;
 	withFile<T>(
@@ -2818,6 +2820,32 @@ function makeRootMutationCapability(
 							throw new Error("CAS hard-link identity changed during publication");
 						}
 					});
+				});
+			}),
+		utimes: (path, atime, mtime) =>
+			checked(() => {
+				const seconds = (value: number | Date): number => {
+					const result = typeof value === "number" ? value : Date.prototype.getTime.call(value) / 1_000;
+					if (!Number.isFinite(result) || result < 0) throw new RangeError("CAS timestamp is invalid");
+					return result;
+				};
+				const accessTime = seconds(atime);
+				const modificationTime = seconds(mtime);
+				return withRelativeParent(baseDescriptor, tokenComponents(path), (target) => {
+					const before = lstatSync(target, { bigint: true });
+					if (!before.isFile() || before.isSymbolicLink()) throw new Error("CAS utimes requires a regular file");
+					const descriptor = openSync(target, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+					try {
+						const opened = fstatSync(descriptor, { bigint: true });
+						if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino)
+							throw new Error("CAS timestamp target changed before mutation");
+						futimesSync(descriptor, accessTime, modificationTime);
+						const current = lstatSync(target, { bigint: true });
+						if (!current.isFile() || current.dev !== opened.dev || current.ino !== opened.ino)
+							throw new Error("CAS timestamp target changed during mutation");
+					} finally {
+						closeSync(descriptor);
+					}
 				});
 			}),
 		fsyncFile: (path) =>
