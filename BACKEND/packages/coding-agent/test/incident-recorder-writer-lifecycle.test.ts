@@ -20,11 +20,14 @@ const testRuntimeBridge = vi.hoisted(() => {
 });
 
 import type {
-	CasTransaction,
 	IncidentCasFileMutation,
 	IncidentCasRelativePath,
 	IncidentCasRootMutation,
 } from "../src/modes/daemon/incident-recorder-cas-transaction.js";
+import type {
+	IncidentRecorderNamespaceCasTransaction,
+	IncidentRecorderNamespaceRoots,
+} from "../src/modes/daemon/incident-recorder-namespace-admission.js";
 import {
 	acquireIncidentRecorderWriterNormalLease,
 	acquireIncidentRecorderWriterRecoveryLease,
@@ -36,6 +39,7 @@ import {
 	type IncidentRecorderWriterLifecycleProof,
 	type IncidentRecorderWriterLifecycleRuntime,
 	type IncidentRecorderWriterLifecycleTestRuntimeHandle,
+	inspectIncidentRecorderWriterLifecycleLeaseMode,
 	inspectIncidentRecorderWriterLifecycleProof,
 } from "../src/modes/daemon/incident-recorder-writer-lifecycle.js";
 
@@ -149,6 +153,7 @@ function fakeRoot(recorder: string): IncidentCasRootMutation {
 		hardLink: () => undefined,
 		fsyncFile: () => undefined,
 		fsyncDirectory: () => undefined,
+		utimes: () => undefined,
 		withFile: <T>(
 			_path: IncidentCasRelativePath,
 			_options: Parameters<IncidentCasRootMutation["withFile"]>[1],
@@ -205,7 +210,7 @@ function contractHarness(
 			harness.acquireCalls += 1;
 			harness.lastProof = proof;
 			if (options.casState === "unavailable") return { state: "unavailable", reason: "control_artifact_busy" };
-			const transaction: CasTransaction = {
+			const transaction: IncidentRecorderNamespaceCasTransaction = {
 				withRoot: <T>(operation: (capability: IncidentCasRootMutation) => T) => {
 					if (options.rootResult === "root_detached") return { state: "root_detached", evidence: "durable" };
 					const value = operation(root);
@@ -221,6 +226,10 @@ function contractHarness(
 						return Object.freeze(thenable) as never;
 					}
 					if (options.rootResult === "malformed") return { state: "not_committed", value } as never;
+					return { state: "committed", value };
+				},
+				withNamespace: <T>(operation: (roots: IncidentRecorderNamespaceRoots) => T) => {
+					const value = operation({ recorder: root, incidents: root });
 					return { state: "committed", value };
 				},
 				release: () => {
@@ -342,6 +351,7 @@ describe("incident recorder writer lifecycle", () => {
 			const binding = inspectIncidentRecorderWriterLifecycleProof(harness.lastProof);
 			bindingDigest = binding?.digest;
 			serializedBinding = JSON.stringify(binding);
+			root.utimes(root.relative("cas", "object"), 0, 0);
 			return root.publicPath(root.relative("cas", "object"));
 		});
 		expect(mutation).toEqual({ state: "committed", value: join(f.recorder, "cas", "object") });
@@ -356,6 +366,33 @@ describe("incident recorder writer lifecycle", () => {
 		expect(result.lease.release().state).toBe("released");
 	});
 
+	it("identifies only authentic unreleased normal and recovery lease modes", () => {
+		const f = fixture();
+		const harness = contractHarness(f);
+		const normal = acquireIncidentRecorderWriterNormalLease({ agentDir: f.agentDir }, harness.contract);
+		expectAcquired(normal);
+		expect(inspectIncidentRecorderWriterLifecycleLeaseMode(normal.lease)).toBe("normal");
+		expect(inspectIncidentRecorderWriterLifecycleLeaseMode({ ...normal.lease })).toBeUndefined();
+		expect(inspectIncidentRecorderWriterLifecycleLeaseMode(undefined)).toBeUndefined();
+		expect(normal.lease.release().state).toBe("released");
+		expect(inspectIncidentRecorderWriterLifecycleLeaseMode(normal.lease)).toBeUndefined();
+		const recovery = acquireIncidentRecorderWriterRecoveryLease({ agentDir: f.agentDir }, harness.contract);
+		expectAcquired(recovery);
+		expect(inspectIncidentRecorderWriterLifecycleLeaseMode(recovery.lease)).toBe("recovery");
+		expect(recovery.lease.release().state).toBe("released");
+		expect(inspectIncidentRecorderWriterLifecycleLeaseMode(recovery.lease)).toBeUndefined();
+	});
+
+	it("does not present a poisoned lifecycle lease as a usable mode", () => {
+		const f = fixture();
+		const harness = contractHarness(f, { rootResult: "root_detached" });
+		const normal = acquireIncidentRecorderWriterNormalLease({ agentDir: f.agentDir }, harness.contract);
+		expectAcquired(normal);
+		expect(normal.lease.withRoot(() => true).state).toBe("unavailable");
+		expect(inspectIncidentRecorderWriterLifecycleLeaseMode(normal.lease)).toBeUndefined();
+		expect(normal.lease.release().state).toBe("released");
+	});
+
 	it("rejects thenables from synchronous mutation callbacks", () => {
 		const f = fixture();
 		const harness = contractHarness(f);
@@ -363,6 +400,20 @@ describe("incident recorder writer lifecycle", () => {
 		expectAcquired(result);
 		expect(() => result.lease.withRoot(() => Promise.resolve("late"))).toThrow(/synchronously/);
 		expect(inspectIncidentRecorderWriterLifecycleProof(harness.lastProof)).toBeUndefined();
+		expect(result.lease.release().state).toBe("released");
+	});
+
+	it("rejects releasing a lease from inside its mutation callback", () => {
+		const f = fixture();
+		const harness = contractHarness(f);
+		const result = acquireIncidentRecorderWriterNormalLease({ agentDir: f.agentDir }, harness.contract);
+		expectAcquired(result);
+		expect(() =>
+			result.lease.withRoot(() => {
+				result.lease.release();
+				return "must-not-commit";
+			}),
+		).toThrow(/not reentrant/);
 		expect(result.lease.release().state).toBe("released");
 	});
 
@@ -403,6 +454,12 @@ describe("incident recorder writer lifecycle", () => {
 			const result = acquireIncidentRecorderWriterNormalLease({ agentDir: f.agentDir }, harness.contract);
 			expectAcquired(result);
 			expect(result.lease.withRoot(() => "value")).toEqual({ state: "unavailable", reason });
+			if (options.releasePending) {
+				expect(result.lease.withRoot(() => "must-not-run")).toEqual({
+					state: "unavailable",
+					reason: "namespace_changed",
+				});
+			}
 			expect(result.lease.release().state).toBe("released");
 		}
 	});

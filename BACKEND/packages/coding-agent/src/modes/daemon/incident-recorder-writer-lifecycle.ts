@@ -25,9 +25,14 @@ import type {
 	IncidentCasFileOpenOptions,
 	IncidentCasRootMutation,
 	IncidentCasRootMutationResult,
-	IncidentCasTransactionAdmission,
 	IncidentCasTransactionReleaseResult,
 } from "./incident-recorder-cas-transaction.js";
+import type {
+	IncidentRecorderNamespaceCasAdmission,
+	IncidentRecorderNamespaceCasTarget,
+	IncidentRecorderNamespaceCasTransaction,
+	IncidentRecorderNamespaceRoots,
+} from "./incident-recorder-namespace-admission.js";
 
 const CONTROL_PREFIX = ".grimoire-incident-writer-lifecycle-v1-";
 const TEST_RUNTIME_BRIDGE_SYMBOL = Symbol.for("grimoire.incident-writer-lifecycle.test-runtime-bridge.v1");
@@ -105,7 +110,10 @@ export interface IncidentRecorderWriterLifecycleActivationResult {
 export interface IncidentRecorderWriterLifecycleAdmissionContract {
 	activationGenerationDigest: string;
 	revalidateActivation(): IncidentRecorderWriterLifecycleActivationResult;
-	acquireCas(proof: IncidentRecorderWriterLifecycleProof, recorderRoot: string): IncidentCasTransactionAdmission;
+	acquireCas(
+		proof: IncidentRecorderWriterLifecycleProof,
+		target: IncidentRecorderNamespaceCasTarget,
+	): IncidentRecorderNamespaceCasAdmission;
 }
 
 export interface IncidentRecorderWriterLifecycleNamespaceIdentity {
@@ -153,6 +161,10 @@ export type IncidentRecorderWriterLifecycleReleaseResult =
 
 export interface IncidentRecorderWriterLifecycleLease {
 	withRoot<T>(operation: (root: IncidentCasRootMutation) => T): IncidentRecorderWriterLifecycleMutationResult<T>;
+	withIncidents<T>(operation: (root: IncidentCasRootMutation) => T): IncidentRecorderWriterLifecycleMutationResult<T>;
+	withNamespace<T>(
+		operation: (roots: IncidentRecorderNamespaceRoots) => T,
+	): IncidentRecorderWriterLifecycleMutationResult<T>;
 	release(): IncidentRecorderWriterLifecycleReleaseResult;
 }
 
@@ -187,8 +199,8 @@ interface FrozenAdmissionContract {
 	readonly revalidateActivation: () => IncidentRecorderWriterLifecycleActivationResult;
 	readonly acquireCas: (
 		proof: IncidentRecorderWriterLifecycleProof,
-		recorderRoot: string,
-	) => IncidentCasTransactionAdmission;
+		target: IncidentRecorderNamespaceCasTarget,
+	) => IncidentRecorderNamespaceCasAdmission;
 }
 
 interface RuntimeBinding {
@@ -262,6 +274,7 @@ interface LeaseState {
 	recoveryPending?: RecordObservation;
 	released: boolean;
 	poisoned: boolean;
+	mutationActive: boolean;
 }
 
 interface ProofState {
@@ -288,6 +301,7 @@ class LifecycleFailure extends Error {
 
 const registeredTestRuntimes = new WeakMap<object, IncidentRecorderWriterLifecycleRuntime>();
 const proofStates = new WeakMap<object, ProofState>();
+const leaseStates = new WeakMap<object, LeaseState>();
 
 type TestRuntimeRegistrar = (
 	runtime: IncidentRecorderWriterLifecycleRuntime,
@@ -358,14 +372,14 @@ function freezeAdmissionContract(contract: IncidentRecorderWriterLifecycleAdmiss
 		activationGenerationDigest,
 		revalidateActivation: () =>
 			Reflect.apply(revalidateActivation as () => IncidentRecorderWriterLifecycleActivationResult, undefined, []),
-		acquireCas: (proof: IncidentRecorderWriterLifecycleProof, recorderRoot: string) =>
+		acquireCas: (proof: IncidentRecorderWriterLifecycleProof, target: IncidentRecorderNamespaceCasTarget) =>
 			Reflect.apply(
 				acquireCas as (
 					proofValue: IncidentRecorderWriterLifecycleProof,
-					root: string,
-				) => IncidentCasTransactionAdmission,
+					targetValue: IncidentRecorderNamespaceCasTarget,
+				) => IncidentRecorderNamespaceCasAdmission,
 				undefined,
-				[proof, recorderRoot],
+				[proof, target],
 			),
 	});
 }
@@ -1399,6 +1413,10 @@ function makeScopedRoot(root: IncidentCasRootMutation, assertActive: () => void)
 			assertActive();
 			root.fsyncDirectory(path);
 		},
+		utimes: (path, atime, mtime) => {
+			assertActive();
+			root.utimes(path, atime, mtime);
+		},
 		withFile: <T>(
 			path: Parameters<IncidentCasRootMutation["withFile"]>[0],
 			options: IncidentCasFileOpenOptions,
@@ -1480,14 +1498,18 @@ export function inspectIncidentRecorderWriterLifecycleProof(
 	}
 }
 
-function validCasAdmission(value: unknown): value is IncidentCasTransactionAdmission {
+function validCasAdmission(
+	value: unknown,
+	target: IncidentRecorderNamespaceCasTarget,
+): value is IncidentRecorderNamespaceCasAdmission {
 	if (!isPlainObject(value)) return false;
 	if (value.state === "unavailable") return typeof value.reason === "string";
 	return (
 		value.state === "acquired" &&
 		isPlainObject(value.transaction) &&
 		typeof value.transaction.withRoot === "function" &&
-		typeof value.transaction.release === "function"
+		typeof value.transaction.release === "function" &&
+		(target !== "namespace" || typeof value.transaction.withNamespace === "function")
 	);
 }
 
@@ -1517,7 +1539,8 @@ function markNamespaceChanged(state: LeaseState): void {
 
 function mutateThroughLease<T>(
 	state: LeaseState,
-	operation: (root: IncidentCasRootMutation) => T,
+	target: IncidentRecorderNamespaceCasTarget,
+	operation: ((root: IncidentCasRootMutation) => T) | ((roots: IncidentRecorderNamespaceRoots) => T),
 ): IncidentRecorderWriterLifecycleMutationResult<T> {
 	if (state.released) return { state: "unavailable", reason: "released" };
 	if (state.poisoned) return { state: "unavailable", reason: "namespace_changed" };
@@ -1528,67 +1551,122 @@ function mutateThroughLease<T>(
 	if (!recordCurrent(state)) return { state: "unavailable", reason: "lease_lost" };
 	if (!activationValid(state.context.contract)) return { state: "unavailable", reason: "activation_invalid" };
 
+	if (state.mutationActive) throw new TypeError("writer lifecycle namespace mutation is not reentrant");
+	state.mutationActive = true;
 	const scopedProof = makeProof(state);
-	let transaction: CasTransaction | undefined;
-	let rootResult: ReturnType<CasTransaction["withRoot"]> | undefined;
+	let transaction: IncidentRecorderNamespaceCasTransaction | undefined;
+	let rootResult: IncidentCasRootMutationResult<T> | undefined;
 	let operationError: unknown;
 	let callbackInvoked = false;
 	let callbackValue: T | undefined;
 	let rootResultThenable = false;
 	try {
-		let admission: IncidentCasTransactionAdmission;
+		let admission: IncidentRecorderNamespaceCasAdmission;
 		try {
-			admission = state.context.contract.acquireCas(scopedProof.proof, state.context.binding.recorder.path);
+			admission = state.context.contract.acquireCas(scopedProof.proof, target);
 		} catch (error) {
 			operationError = error;
 			admission = { state: "unavailable", reason: "creation_failed" };
 		}
-		if (!validCasAdmission(admission)) return { state: "unavailable", reason: "admission_contract_invalid" };
+		if (!validCasAdmission(admission, target)) return { state: "unavailable", reason: "admission_contract_invalid" };
 		if (operationError !== undefined) throw operationError;
-		if (admission.state === "unavailable") return { state: "unavailable", reason: "cas_unavailable" };
+		if (admission.state === "unavailable") {
+			if (admission.reason === "namespace_changed") markNamespaceChanged(state);
+			return {
+				state: "unavailable",
+				reason: admission.reason === "namespace_changed" ? "namespace_changed" : "cas_unavailable",
+			};
+		}
 		transaction = admission.transaction;
-		rootResult = transaction.withRoot((root) => {
+		const assertScopeActive = (): void => {
+			if (!proofStates.get(scopedProof.proof)?.active)
+				throw new TypeError("writer lifecycle proof is no longer active");
+		};
+		const invokeRoot = (root: IncidentCasRootMutation): T => {
 			if (callbackInvoked) throw new TypeError("CAS admission invoked the lifecycle callback more than once");
 			callbackInvoked = true;
 			let scopeActive = true;
 			const scopedRoot = makeScopedRoot(root, () => {
 				if (!scopeActive) throw new TypeError("writer lifecycle root capability is no longer active");
-				if (!proofStates.get(scopedProof.proof)?.active)
-					throw new TypeError("writer lifecycle proof is no longer active");
+				assertScopeActive();
 			});
 			try {
 				callbackValue = synchronousCallback(
-					() => operation(scopedRoot),
+					() => (operation as (root: IncidentCasRootMutation) => T)(scopedRoot),
 					"writer lifecycle mutation must complete synchronously",
 				);
 				return callbackValue;
 			} finally {
 				scopeActive = false;
 			}
-		});
+		};
+		if (target === "namespace") {
+			rootResult = transaction.withNamespace((roots) => {
+				if (callbackInvoked) throw new TypeError("CAS admission invoked the lifecycle callback more than once");
+				callbackInvoked = true;
+				let scopeActive = true;
+				const scopedRecorder = makeScopedRoot(roots.recorder, () => {
+					if (!scopeActive) throw new TypeError("writer lifecycle root capability is no longer active");
+					assertScopeActive();
+				});
+				const scopedIncidents = makeScopedRoot(roots.incidents, () => {
+					if (!scopeActive) throw new TypeError("writer lifecycle root capability is no longer active");
+					assertScopeActive();
+				});
+				try {
+					callbackValue = synchronousCallback(
+						() =>
+							(operation as (roots: IncidentRecorderNamespaceRoots) => T)(
+								Object.freeze({
+									recorder: scopedRecorder,
+									incidents: scopedIncidents,
+								}),
+							),
+						"writer lifecycle mutation must complete synchronously",
+					);
+					return callbackValue;
+				} finally {
+					scopeActive = false;
+				}
+			});
+		} else {
+			rootResult = transaction.withRoot(invokeRoot);
+		}
 		rootResultThenable = isPromiseLike(rootResult);
 	} catch (error) {
 		operationError = error;
 	} finally {
 		scopedProof.revoke();
+		if (!transaction) state.mutationActive = false;
 	}
-	const casRelease = transaction ? releaseCas(transaction) : undefined;
-	if (operationError !== undefined) throw operationError;
-	if (!transaction) return { state: "unavailable", reason: "admission_contract_invalid" };
-	if (!casRelease || casRelease.state === "pending") return { state: "unavailable", reason: "cas_release_pending" };
-	if (rootResultThenable || !validCasRootResult(rootResult))
-		return { state: "unavailable", reason: "admission_contract_invalid" };
-	if (rootResult.state === "root_detached") return { state: "unavailable", reason: "root_detached" };
-	if (!callbackInvoked) return { state: "unavailable", reason: "admission_contract_invalid" };
-	if (!activationValid(state.context.contract)) return { state: "unavailable", reason: "activation_invalid" };
-	if (!bindingCurrent(state.context)) {
-		markNamespaceChanged(state);
-		return { state: "unavailable", reason: "namespace_changed" };
+	try {
+		const casRelease = transaction ? releaseCas(transaction) : undefined;
+		if (!casRelease || casRelease.state === "pending") {
+			markNamespaceChanged(state);
+			if (operationError !== undefined) throw operationError;
+			return { state: "unavailable", reason: "cas_release_pending" };
+		}
+		if (operationError !== undefined) throw operationError;
+		if (!transaction) return { state: "unavailable", reason: "admission_contract_invalid" };
+		if (rootResultThenable || !validCasRootResult(rootResult))
+			return { state: "unavailable", reason: "admission_contract_invalid" };
+		if (rootResult.state === "root_detached") {
+			markNamespaceChanged(state);
+			return { state: "unavailable", reason: "root_detached" };
+		}
+		if (!callbackInvoked) return { state: "unavailable", reason: "admission_contract_invalid" };
+		if (!activationValid(state.context.contract)) return { state: "unavailable", reason: "activation_invalid" };
+		if (!bindingCurrent(state.context)) {
+			markNamespaceChanged(state);
+			return { state: "unavailable", reason: "namespace_changed" };
+		}
+		if (!recordCurrent(state)) return { state: "unavailable", reason: "lease_lost" };
+		if (!Object.is(rootResult.value, callbackValue))
+			return { state: "unavailable", reason: "admission_contract_invalid" };
+		return { state: "committed", value: callbackValue as T };
+	} finally {
+		state.mutationActive = false;
 	}
-	if (!recordCurrent(state)) return { state: "unavailable", reason: "lease_lost" };
-	if (!Object.is(rootResult.value, callbackValue))
-		return { state: "unavailable", reason: "admission_contract_invalid" };
-	return { state: "committed", value: callbackValue as T };
 }
 
 function closeReleasedLease(state: LeaseState, cleanupPending: boolean): IncidentRecorderWriterLifecycleReleaseResult {
@@ -1609,6 +1687,7 @@ function removePairIfExact(
 
 function releaseLease(state: LeaseState): IncidentRecorderWriterLifecycleReleaseResult {
 	if (state.released) return { state: "released", cleanupPending: false };
+	if (state.mutationActive) throw new TypeError("writer lifecycle release is not reentrant");
 	if (!recordCurrent(state)) {
 		if (!bindingCurrent(state.context)) markNamespaceChanged(state);
 		return closeReleasedLease(state, state.poisoned);
@@ -1652,10 +1731,25 @@ function releaseLease(state: LeaseState): IncidentRecorderWriterLifecycleRelease
 }
 
 function makeLease(state: LeaseState): IncidentRecorderWriterLifecycleLease {
-	return Object.freeze({
-		withRoot: <T>(operation: (root: IncidentCasRootMutation) => T) => mutateThroughLease(state, operation),
+	const lease = Object.freeze({
+		withRoot: <T>(operation: (root: IncidentCasRootMutation) => T) =>
+			mutateThroughLease(state, "recorder", operation),
+		withIncidents: <T>(operation: (root: IncidentCasRootMutation) => T) =>
+			mutateThroughLease(state, "incidents", operation),
+		withNamespace: <T>(operation: (roots: IncidentRecorderNamespaceRoots) => T) =>
+			mutateThroughLease(state, "namespace", operation),
 		release: () => releaseLease(state),
 	});
+	leaseStates.set(lease, state);
+	return lease;
+}
+
+/** Mode identity only; mutations still require the lease's full admission checks. */
+export function inspectIncidentRecorderWriterLifecycleLeaseMode(
+	lease: IncidentRecorderWriterLifecycleLease | undefined,
+): "normal" | "recovery" | undefined {
+	const state = lease === undefined ? undefined : leaseStates.get(lease);
+	return state && !state.released && !state.poisoned ? state.artifact : undefined;
 }
 
 function assertNamespaceReady(context: LifecycleContext): void {
@@ -1842,6 +1936,7 @@ export function acquireIncidentRecorderWriterNormalLease(
 			artifact: "normal",
 			released: false,
 			poisoned: false,
+			mutationActive: false,
 		};
 		context = undefined;
 		return { state: "acquired", lease: makeLease(state) };
@@ -1871,6 +1966,7 @@ export function acquireIncidentRecorderWriterRecoveryLease(
 			recoveryPending: acquired.pending,
 			released: false,
 			poisoned: false,
+			mutationActive: false,
 		};
 		context = undefined;
 		return { state: "acquired", lease: makeLease(state) };
