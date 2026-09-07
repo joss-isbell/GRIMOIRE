@@ -1279,6 +1279,8 @@ type StorageAccountingEffect =
 	| { kind: "account"; metadata: StorageAccountingMetadata; entryCreated: boolean }
 	| { kind: "remove"; metadata: StorageAccountingMetadata; releaseOwnedInode: boolean };
 
+export type IncidentRecorderStorageAccountingEffect = StorageAccountingEffect;
+
 interface IncidentPinRootStorageReservation {
 	bytes: number;
 	entries: number;
