@@ -247,6 +247,8 @@ export interface IncidentCasV1QuiescenceWitness {
 
 export interface IncidentCasV2Activation {
 	readonly [activationBrand]: true;
+	/** Identity of the retained generation, not proof that admission is still valid. */
+	readonly activationGenerationDigest: string;
 	revalidate(): { state: "valid" } | { state: "invalid"; reason: IncidentCasV2UnavailableReason };
 	close(): void;
 }
@@ -2216,6 +2218,9 @@ function boundedRead(path: string, maxBytes: number): Buffer {
 	}
 }
 
+const observedFileFingerprints = new Map<string, { identity: FileIdentity; observed: IncidentCasV2ObservedFile }>();
+const OBSERVED_FILE_FINGERPRINT_MAX_ENTRIES = 16;
+
 function observeRegularFile(path: string, maxBytes: number, requiredMarker?: string): IncidentCasV2ObservedFile {
 	const canonical = realpathSync.native(path);
 	if (canonical !== path) throw new Error("observed file path is not canonical");
@@ -2224,13 +2229,24 @@ function observeRegularFile(path: string, maxBytes: number, requiredMarker?: str
 	const descriptor = openSync(path, noFollowReadFlags());
 	try {
 		const opened = identity(fstatSync(descriptor, { bigint: true }));
+		if (!sameIdentity(before, opened)) throw new Error("observed file changed before open");
+		const cacheKey = JSON.stringify([path, maxBytes, requiredMarker ?? null]);
+		const cached = observedFileFingerprints.get(cacheKey);
+		// Reuse content only while the descriptor and pathname retain the full
+		// nanosecond identity, including ctime. No file bytes or descriptors are cached.
+		if (cached && sameIdentity(cached.identity, opened)) {
+			const after = identity(lstatSync(path, { bigint: true }));
+			if (!sameIdentity(opened, after)) throw new Error("observed file changed");
+			return { ...cached.observed };
+		}
+		observedFileFingerprints.delete(cacheKey);
 		const bytes = readDescriptorBoundFile(descriptor, maxBytes);
 		if (requiredMarker && !bytes.includes(Buffer.from(requiredMarker, "utf8")))
 			throw new Error("required file marker is absent");
 		const after = identity(lstatSync(path, { bigint: true }));
 		if (!sameIdentity(before, opened) || !sameIdentity(opened, after) || after.size !== BigInt(bytes.length))
 			throw new Error("observed file changed");
-		return {
+		const observed: IncidentCasV2ObservedFile = {
 			path,
 			dev: after.dev.toString(),
 			ino: after.ino.toString(),
@@ -2241,6 +2257,12 @@ function observeRegularFile(path: string, maxBytes: number, requiredMarker?: str
 			size: bytes.length,
 			sha256: sha256(bytes),
 		};
+		if (observedFileFingerprints.size >= OBSERVED_FILE_FINGERPRINT_MAX_ENTRIES) {
+			const oldest = observedFileFingerprints.keys().next().value;
+			if (oldest !== undefined) observedFileFingerprints.delete(oldest);
+		}
+		observedFileFingerprints.set(cacheKey, { identity: after, observed });
+		return { ...observed };
 	} finally {
 		closeSync(descriptor);
 	}
@@ -2314,7 +2336,13 @@ function defaultReadLauncher(unitName: string): IncidentCasV2LauncherObservation
 	const result = spawnSync(
 		"/usr/bin/systemctl",
 		["--user", "show", unitName, "--no-pager", ...properties.map((property) => `--property=${property}`)],
-		{ encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: SYSTEMD_OUTPUT_MAX_BYTES },
+		{
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "pipe"],
+			maxBuffer: SYSTEMD_OUTPUT_MAX_BYTES,
+			timeout: 1_000,
+			killSignal: "SIGKILL",
+		},
 	);
 	if (result.error || result.status !== 0) return { state: "unavailable", code: "systemctl_failed" };
 	const values = parseSystemdProperties(result.stdout, properties);
@@ -2906,6 +2934,7 @@ function activationStillValid(
 
 function makeActivation(state: ActivationState): IncidentCasV2Activation {
 	const activation = Object.freeze({
+		activationGenerationDigest: sha256(state.generation.bytes),
 		revalidate(): { state: "valid" } | { state: "invalid"; reason: IncidentCasV2UnavailableReason } {
 			const current = activations.get(activation);
 			return current ? activationStillValid(current) : { state: "invalid", reason: "generation_changed" };

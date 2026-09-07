@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
 	chmodSync,
@@ -8,17 +9,29 @@ import {
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
+	readSync,
 	realpathSync,
 	renameSync,
 	rmSync,
 	statSync,
 	symlinkSync,
 	unlinkSync,
+	utimesSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("node:fs", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("node:fs")>();
+	return { ...actual, readSync: vi.fn(actual.readSync) };
+});
+
+vi.mock("node:child_process", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("node:child_process")>();
+	return { ...actual, spawnSync: vi.fn(actual.spawnSync) };
+});
 
 const testRuntimeBridge = vi.hoisted(() => {
 	let registrar: ((runtime: unknown) => unknown) | undefined;
@@ -65,7 +78,31 @@ function registerTestRuntime(runtime: IncidentCasV2CutoverRuntime): IncidentCasV
 const cleanupPaths: string[] = [];
 
 afterEach(() => {
+	vi.mocked(spawnSync).mockClear();
 	for (const path of cleanupPaths.splice(0).reverse()) rmSync(path, { recursive: true, force: true });
+});
+
+it("bounds unavailable systemd inspection before admitting a cutover", () => {
+	const f = fixture();
+	vi.mocked(spawnSync).mockReturnValueOnce({
+		pid: 0,
+		output: [],
+		stdout: "",
+		stderr: "",
+		status: null,
+		signal: "SIGKILL",
+		error: Object.assign(new Error("systemctl timed out"), { code: "ETIMEDOUT" }),
+	});
+	expect(beginIncidentCasV2Cutover(f.target)).toMatchObject({ state: "unavailable", reason: "launcher_unavailable" });
+	expect(spawnSync).toHaveBeenCalledWith(
+		"/usr/bin/systemctl",
+		expect.any(Array),
+		expect.objectContaining({
+			timeout: 1_000,
+			killSignal: "SIGKILL",
+			maxBuffer: expect.any(Number),
+		}),
+	);
 });
 
 function sha256(value: string | Uint8Array): string {
@@ -372,9 +409,30 @@ describe("incident recorder CAS v2 cutover", () => {
 		const activation = openIncidentCasV2Activation(f.target, f.runtimeHandle);
 		expect(activation).toMatchObject({ state: "active" });
 		if (activation.state !== "active") return;
+		const digest = createHash("sha256").update(readFileSync(paths.generation)).digest("hex");
+		expect(activation.activation.activationGenerationDigest).toBe(digest);
 		expect(activation.activation.revalidate()).toEqual({ state: "valid" });
+		expect(activation.activation.activationGenerationDigest).toBe(digest);
+		expect(Object.isFrozen(activation.activation)).toBe(true);
 		activation.activation.close();
 		expect(activation.activation.revalidate()).toEqual({ state: "invalid", reason: "generation_changed" });
+		expect(activation.activation.activationGenerationDigest).toBe(digest);
+	});
+
+	it("keeps the admitted digest stable while permanently rejecting a replaced generation", () => {
+		const f = fixture();
+		publish(f);
+		const opened = openIncidentCasV2Activation(f.target, f.runtimeHandle);
+		if (opened.state !== "active") throw new Error("expected active generation");
+		const path = artifactPaths(f.agentDir).generation;
+		const original = readFileSync(path);
+		const digest = opened.activation.activationGenerationDigest;
+		writeFileSync(path, Buffer.concat([original, Buffer.from("\n")]), { mode: 0o600 });
+		expect(opened.activation.revalidate()).toEqual({ state: "invalid", reason: "generation_changed" });
+		writeFileSync(path, original, { mode: 0o600 });
+		expect(opened.activation.activationGenerationDigest).toBe(digest);
+		expect(opened.activation.revalidate()).toEqual({ state: "invalid", reason: "generation_changed" });
+		opened.activation.close();
 	});
 
 	it("keeps the outer claim and activation across a private same-path agentDir replacement", () => {
@@ -1159,6 +1217,42 @@ describe("incident recorder CAS v2 cutover", () => {
 			reason: "orchestration_owner_unknown",
 		});
 		expect(readFileSync(artifactPaths(f.agentDir).claim)).toEqual(before);
+	});
+
+	it("reuses unchanged executable fingerprints without repeatedly reading their contents", () => {
+		const f = fixture();
+		writeFileSync(f.nodePath, Buffer.alloc(4 * 1024 * 1024, 1));
+		publish(f);
+		const opened = openIncidentCasV2Activation(f.target, f.runtimeHandle);
+		if (opened.state !== "active") throw new Error("expected active fixture");
+		try {
+			vi.mocked(readSync).mockClear();
+			expect(opened.activation.revalidate()).toEqual({ state: "valid" });
+			expect(
+				vi
+					.mocked(readSync)
+					.mock.calls.some((call) => Buffer.isBuffer(call[1]) && call[1].byteLength >= 4 * 1024 * 1024),
+			).toBe(false);
+		} finally {
+			opened.activation.close();
+		}
+	});
+
+	it("does not reuse a fingerprint after same-inode same-size content changes with restored mtime", () => {
+		const f = fixture();
+		utimesSync(f.nodePath, 1_700_000_000, 1_700_000_000);
+		publish(f);
+		const opened = openIncidentCasV2Activation(f.target, f.runtimeHandle);
+		if (opened.state !== "active") throw new Error("expected active fixture");
+		try {
+			const before = statSync(f.nodePath);
+			writeFileSync(f.nodePath, "#!/bin/zz\n");
+			utimesSync(f.nodePath, before.atime, before.mtime);
+			expect(statSync(f.nodePath).size).toBe(before.size);
+			expect(opened.activation.revalidate()).toEqual({ state: "invalid", reason: "target_mismatch" });
+		} finally {
+			opened.activation.close();
+		}
 	});
 
 	it("invalidates activation when legacy evidence or launcher identity appears", () => {
