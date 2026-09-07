@@ -40,6 +40,8 @@ export type KernelDiagnosticEvent =
 			signal: NodeJS.Signals | null;
 			reason: "process_exit" | "forkserver_unavailable";
 			stderrTail?: Uint8Array;
+			/** Omission denotes an older producer whose capture availability is unknown. */
+			stderrCaptureStatus?: "available" | "unavailable_fork" | "unknown";
 			stderrBytes: number;
 			sourceTruncated: boolean;
 	  });

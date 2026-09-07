@@ -3,13 +3,13 @@ import { Writable } from "node:stream";
 import { describe, expect, it } from "vitest";
 import {
 	encodeKernelDiagnosticBridgeEvent,
-	KERNEL_DIAGNOSTIC_BRIDGE_MAX_LINE_BYTES,
 	isKernelDiagnosticBridgeCapability,
+	KERNEL_DIAGNOSTIC_BRIDGE_MAX_LINE_BYTES,
 	KernelDiagnosticBridgeDecoder,
-	KernelDiagnosticBridgeWriter,
-	ReconnectableKernelDiagnosticBridgeWriter,
 	type KernelDiagnosticBridgeDropCounts,
 	type KernelDiagnosticBridgeLoss,
+	KernelDiagnosticBridgeWriter,
+	ReconnectableKernelDiagnosticBridgeWriter,
 } from "../src/core/kernel/diagnostic-bridge.js";
 import type { KernelDiagnosticEvent } from "../src/core/kernel/diagnostics.js";
 
@@ -87,6 +87,37 @@ function signedPayload(payload: unknown, secret: string): Buffer {
 }
 
 describe("kernel diagnostic worker bridge", () => {
+	it("marks legacy capture availability unknown and rejects an invalid status", () => {
+		const secret = capability();
+		const legacy = { ...unexpectedExit(), stderrTail: undefined };
+		const envelope = (event: unknown) => ({ version: 1, kind: "event", sequence: 1, event });
+		expect(decode(signedPayload(envelope(legacy), secret), secret).events[0]).toMatchObject({
+			stderrCaptureStatus: "unknown",
+		});
+		const invalid = decode(
+			signedPayload(envelope({ ...legacy, stderrCaptureStatus: "definitely_empty" }), secret),
+			secret,
+		);
+		expect(invalid.events).toEqual([]);
+		expect(invalid.losses).toMatchObject([{ reason: "invalid_payload" }]);
+	});
+
+	it("preserves unavailable fork stderr instead of reporting a known empty stream", () => {
+		const secret = capability();
+		const event = {
+			...unexpectedExit(Buffer.alloc(0)),
+			launchMode: "fork" as const,
+			stderrBytes: 0,
+			sourceTruncated: false,
+			stderrCaptureStatus: "unavailable_fork" as const,
+		};
+		const frame = encodeKernelDiagnosticBridgeEvent(event, secret)!;
+		expect(decode(frame, secret).events[0]).toMatchObject({
+			stderrCaptureStatus: "unavailable_fork",
+			stderrBytes: 0,
+		});
+	});
+
 	it("authenticates a correlated crash and preserves the exact stderr tail across fragmented reads", () => {
 		const secret = capability();
 		const expected = unexpectedExit();
@@ -313,8 +344,9 @@ describe("kernel diagnostic worker bridge", () => {
 		expect(isKernelDiagnosticBridgeCapability(secret)).toBe(true);
 		expect(isKernelDiagnosticBridgeCapability(nonCanonicalSecret)).toBe(false);
 		expect(encodeKernelDiagnosticBridgeEvent(unexpectedExit(), nonCanonicalSecret)).toBeUndefined();
-		expect(decode(encodeKernelDiagnosticBridgeEvent(unexpectedExit(), secret)!, nonCanonicalSecret).losses)
-			.toEqual([{ reason: "authentication_failed" }]);
+		expect(decode(encodeKernelDiagnosticBridgeEvent(unexpectedExit(), secret)!, nonCanonicalSecret).losses).toEqual([
+			{ reason: "authentication_failed" },
+		]);
 
 		const frame = encodeKernelDiagnosticBridgeEvent(unexpectedExit(), secret)!;
 		const parts = frame.toString("ascii").trimEnd().split(".");
@@ -403,10 +435,7 @@ describe("kernel diagnostic worker bridge", () => {
 
 		const result = decode(Buffer.concat(stream.writes), secret);
 		expect(result.losses).toEqual([]);
-		expect(result.events.map((event) => event.type)).toEqual([
-			"kernel_unexpected_exit",
-			"kernel_ready",
-		]);
+		expect(result.events.map((event) => event.type)).toEqual(["kernel_unexpected_exit", "kernel_ready"]);
 		writer.close();
 		await writer.whenClosed;
 	});
@@ -433,9 +462,7 @@ describe("kernel diagnostic worker bridge", () => {
 		expect(result.events).toHaveLength(1);
 		if (result.events[0]?.type !== "kernel_unexpected_exit") throw new Error("Expected maximal crash");
 		expect(result.events[0].stderrTail).toEqual(stderrTail);
-		expect(result.drops).toEqual([
-			expect.objectContaining({ queueOverflow: 1 }),
-		]);
+		expect(result.drops).toEqual([expect.objectContaining({ queueOverflow: 1 })]);
 		writer.close();
 		await writer.whenClosed;
 	});

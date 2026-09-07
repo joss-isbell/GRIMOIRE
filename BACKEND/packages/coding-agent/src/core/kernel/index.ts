@@ -10,6 +10,7 @@ import { Dealer, Subscriber } from "zeromq";
 import { recordOrphanProcessState } from "../orphan-process-journal.js";
 import { getProcessStartId } from "../session-lease.js";
 import { ensureKernelPython, type KernelBootstrapProgressHandler, type KernelPythonSkill } from "./bootstrap.js";
+import { type KernelCrashPhase, type KernelDiagnosticIdentity, publishKernelDiagnostic } from "./diagnostics.js";
 import {
 	type ForkedKernelExitStatus,
 	type ForkedKernelHandle,
@@ -17,11 +18,6 @@ import {
 	forkKernel,
 	isForkServerEnabled,
 } from "./fork-server.js";
-import {
-	type KernelCrashPhase,
-	type KernelDiagnosticIdentity,
-	publishKernelDiagnostic,
-} from "./diagnostics.js";
 import {
 	buildListNamesCode,
 	buildRestoreCode,
@@ -760,6 +756,7 @@ export class KernelManager {
 			signal,
 			reason,
 			...(stderrTail.length > 0 ? { stderrTail } : {}),
+			stderrCaptureStatus: identity.launchMode === "direct" ? "available" : "unavailable_fork",
 			stderrBytes,
 			sourceTruncated: stderrBytes > stderrTail.length,
 		});
@@ -845,11 +842,7 @@ export class KernelManager {
 					throw new Error("Kernel start superseded");
 				}
 				this.forkedKernel = handle;
-				this.startKernelDiagnostics(
-					"fork",
-					handle.pid,
-					handle.processStartId ?? getProcessStartId(handle.pid),
-				);
+				this.startKernelDiagnostics("fork", handle.pid, handle.processStartId ?? getProcessStartId(handle.pid));
 				recordOrphanProcessState(handle.pid, true);
 				forked = true;
 			} catch (err) {
@@ -1061,7 +1054,10 @@ export class KernelManager {
 
 			const remaining = READY_TIMEOUT_MS - (Date.now() - startedAt);
 			const winner = await Promise.race([
-				this.translateSocketClosure(shell.receive(), "shell").then((frames) => ({ kind: "frames" as const, frames })),
+				this.translateSocketClosure(shell.receive(), "shell").then((frames) => ({
+					kind: "frames" as const,
+					frames,
+				})),
 				sleep(remaining).then(() => ({ kind: "timeout" as const })),
 			]);
 			if (winner.kind === "timeout") break;

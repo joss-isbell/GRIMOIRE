@@ -1,9 +1,6 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import type { Writable } from "node:stream";
-import {
-	type KernelDiagnosticEvent,
-	subscribeKernelDiagnostics,
-} from "./diagnostics.js";
+import { type KernelDiagnosticEvent, subscribeKernelDiagnostics } from "./diagnostics.js";
 
 export const KERNEL_DIAGNOSTIC_BRIDGE_VERSION = 1;
 export const KERNEL_DIAGNOSTIC_BRIDGE_MAX_STDERR_BYTES = 16 * 1024;
@@ -96,10 +93,7 @@ function emptyDropCounts(): KernelDiagnosticBridgeDropCounts {
 	};
 }
 
-function subtractDropCounts(
-	target: KernelDiagnosticBridgeDropCounts,
-	source: KernelDiagnosticBridgeDropCounts,
-): void {
+function subtractDropCounts(target: KernelDiagnosticBridgeDropCounts, source: KernelDiagnosticBridgeDropCounts): void {
 	for (const key of Object.keys(target) as Array<keyof KernelDiagnosticBridgeDropCounts>) {
 		target[key] = Math.max(0, target[key] - source[key]);
 	}
@@ -135,10 +129,7 @@ function serializeEvent(event: KernelDiagnosticEvent): Record<string, unknown> {
 		kernelPid: event.kernelPid,
 		...(event.kernelProcessStartId !== undefined
 			? {
-					kernelProcessStartId: boundedOptionalString(
-						event.kernelProcessStartId,
-						MAX_PROCESS_START_ID_BYTES,
-					),
+					kernelProcessStartId: boundedOptionalString(event.kernelProcessStartId, MAX_PROCESS_START_ID_BYTES),
 				}
 			: {}),
 		launchMode: event.launchMode,
@@ -177,6 +168,7 @@ function serializeEvent(event: KernelDiagnosticEvent): Record<string, unknown> {
 		signal: event.signal,
 		reason: event.reason,
 		...(stderrTail && stderrTail.byteLength > 0 ? { stderrTailBase64: stderrTail.toString("base64") } : {}),
+		stderrCaptureStatus: event.stderrCaptureStatus ?? "unknown",
 		stderrBytes: event.stderrBytes,
 		sourceTruncated:
 			event.sourceTruncated || (event.stderrTail?.byteLength ?? 0) > KERNEL_DIAGNOSTIC_BRIDGE_MAX_STDERR_BYTES,
@@ -184,11 +176,7 @@ function serializeEvent(event: KernelDiagnosticEvent): Record<string, unknown> {
 }
 
 function isBoundedString(value: unknown, maxBytes: number, allowEmpty = false): value is string {
-	return (
-		typeof value === "string" &&
-		(allowEmpty || value.length > 0) &&
-		Buffer.byteLength(value) <= maxBytes
-	);
+	return typeof value === "string" && (allowEmpty || value.length > 0) && Buffer.byteLength(value) <= maxBytes;
 }
 
 function isOptionalBoundedString(value: unknown, maxBytes: number): value is string | undefined {
@@ -219,9 +207,7 @@ function decodeEvent(value: unknown): KernelDiagnosticEvent | undefined {
 		...(typeof event.sessionId === "string" ? { sessionId: event.sessionId } : {}),
 		kernelInstanceId: event.kernelInstanceId as string,
 		kernelPid: event.kernelPid as number,
-		...(typeof event.kernelProcessStartId === "string"
-			? { kernelProcessStartId: event.kernelProcessStartId }
-			: {}),
+		...(typeof event.kernelProcessStartId === "string" ? { kernelProcessStartId: event.kernelProcessStartId } : {}),
 		launchMode: event.launchMode as "direct" | "fork",
 	};
 	if (event.type === "kernel_process_started" && event.phase === "resolving_ports") {
@@ -268,6 +254,12 @@ function decodeEvent(value: unknown): KernelDiagnosticEvent | undefined {
 		!(event.signal === null || isBoundedString(event.signal, 32)) ||
 		(event.reason !== "process_exit" && event.reason !== "forkserver_unavailable") ||
 		!isSafeNonNegativeInteger(event.stderrBytes) ||
+		!(
+			event.stderrCaptureStatus === undefined ||
+			event.stderrCaptureStatus === "available" ||
+			event.stderrCaptureStatus === "unavailable_fork" ||
+			event.stderrCaptureStatus === "unknown"
+		) ||
 		typeof event.sourceTruncated !== "boolean" ||
 		!(event.stderrTailBase64 === undefined || typeof event.stderrTailBase64 === "string")
 	) {
@@ -292,6 +284,7 @@ function decodeEvent(value: unknown): KernelDiagnosticEvent | undefined {
 		signal: event.signal as NodeJS.Signals | null,
 		reason: event.reason,
 		...(stderrTail && stderrTail.byteLength > 0 ? { stderrTail } : {}),
+		stderrCaptureStatus: event.stderrCaptureStatus ?? "unknown",
 		stderrBytes: event.stderrBytes,
 		sourceTruncated: event.sourceTruncated,
 	};
@@ -361,10 +354,7 @@ export function encodeKernelDiagnosticBridgeDrop(
 	) {
 		return undefined;
 	}
-	return encodePayload(
-		{ version: KERNEL_DIAGNOSTIC_BRIDGE_VERSION, kind: "drop", sequence, counts },
-		capability,
-	);
+	return encodePayload({ version: KERNEL_DIAGNOSTIC_BRIDGE_VERSION, kind: "drop", sequence, counts }, capability);
 }
 
 function decodeLine(
@@ -915,9 +905,7 @@ export class ReconnectableKernelDiagnosticBridgeWriter {
 		return {
 			afterSequence,
 			latestSequence: this.latestSequence,
-			...(this.oldestReplaySequence !== undefined
-				? { oldestReplaySequence: this.oldestReplaySequence }
-				: {}),
+			...(this.oldestReplaySequence !== undefined ? { oldestReplaySequence: this.oldestReplaySequence } : {}),
 			commit: (stream) => {
 				if (settled) {
 					stream.destroy();

@@ -2,10 +2,7 @@ import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import {
-	subscribeKernelDiagnostics,
-	type KernelDiagnosticEvent,
-} from "../src/core/kernel/diagnostics.js";
+import { type KernelDiagnosticEvent, subscribeKernelDiagnostics } from "../src/core/kernel/diagnostics.js";
 import type { ForkedKernelHandle } from "../src/core/kernel/fork-server.js";
 import { KernelManager } from "../src/core/kernel/index.js";
 
@@ -34,11 +31,9 @@ describeIfLinux("KernelManager causal diagnostics", () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-agent-kernel-diagnostic-"));
 		roots.push(root);
 		const python = join(root, "python");
-		writeFileSync(
-			python,
-			["#!/bin/sh", 'echo "direct kernel fatal marker" >&2', "kill -ABRT $$", ""].join("\n"),
-			{ mode: 0o700 },
-		);
+		writeFileSync(python, ["#!/bin/sh", 'echo "direct kernel fatal marker" >&2', "kill -ABRT $$", ""].join("\n"), {
+			mode: 0o700,
+		});
 		chmodSync(python, 0o700);
 		const capture = captureKernelDiagnostics();
 		const manager = new KernelManager({ python, cwd: root, sessionId: "session-direct" });
@@ -68,6 +63,7 @@ describeIfLinux("KernelManager causal diagnostics", () => {
 				code: null,
 				signal: "SIGABRT",
 				reason: "process_exit",
+				stderrCaptureStatus: "available",
 			});
 			if (!exited || exited.type !== "kernel_unexpected_exit") throw new Error("missing direct exit event");
 			expect(Buffer.from(exited.stderrTail ?? []).toString()).toContain("direct kernel fatal marker");
@@ -95,11 +91,7 @@ describeIfLinux("KernelManager causal diagnostics", () => {
 			kernelStderrTail: Buffer;
 			kernelStderrBytes: number;
 			appendKernelStderr(chunk: Buffer | string): void;
-			reportUnexpectedKernelExit(
-				code: number | null,
-				signal: NodeJS.Signals | null,
-				reason: "process_exit",
-			): void;
+			reportUnexpectedKernelExit(code: number | null, signal: NodeJS.Signals | null, reason: "process_exit"): void;
 		};
 		internals.kernelDiagnosticIdentity = {
 			sessionId: "session-stderr-bound",
@@ -192,6 +184,7 @@ describeIfLinux("KernelManager causal diagnostics", () => {
 					code: null,
 					signal: "SIGKILL",
 					reason: "process_exit",
+					stderrCaptureStatus: "unavailable_fork",
 				}),
 			]);
 			expect(reject).toHaveBeenCalledWith(expect.objectContaining({ message: "Kernel has been shut down" }));
