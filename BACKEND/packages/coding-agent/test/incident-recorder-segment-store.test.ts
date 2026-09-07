@@ -30,19 +30,19 @@ import {
 	closeIncidentRecorderDescriptorsForTest,
 	createIncidentRecorderSegmentPruneProtection,
 	IncidentRecorderDescriptorCleanupError,
+	type IncidentRecorderSegmentDurableWrite,
 	IncidentRecorderSegmentPageBudgetExceededError,
 	IncidentRecorderSegmentPruneMutationError,
+	type IncidentRecorderSegmentQueryCursor,
+	type IncidentRecorderSegmentRecoveryGap,
+	type IncidentRecorderSegmentRecoveryGapQueryCursor,
 	IncidentRecorderSegmentStore,
+	type IncidentRecorderSegmentStoreOptions,
 	IncidentRecorderSegmentStorePoisonedError,
 	parseIncidentRecorderProcFdInfoMountIdForTest,
 	planIncidentRecorderSegmentStoreOpen,
 	pruneIncidentRecorderSealedHistoryForRecovery,
 	runIncidentRecorderPruneExpiryCleanupForTest,
-	type IncidentRecorderSegmentDurableWrite,
-	type IncidentRecorderSegmentQueryCursor,
-	type IncidentRecorderSegmentRecoveryGap,
-	type IncidentRecorderSegmentRecoveryGapQueryCursor,
-	type IncidentRecorderSegmentStoreOptions,
 } from "../src/modes/daemon/incident-recorder-segment-store.js";
 
 const roots: string[] = [];
@@ -213,13 +213,9 @@ describe("incident recorder segment store", () => {
 		const undefinedPrimaryDescriptor = openSync(join(directory, "one"), "r");
 		let undefinedPrimaryThrown = false;
 		try {
-			closeIncidentRecorderDescriptorsForTest(
-				[undefinedPrimaryDescriptor],
-				{ error: undefined },
-				() => {
-					throw firstCleanup;
-				},
-			);
+			closeIncidentRecorderDescriptorsForTest([undefinedPrimaryDescriptor], { error: undefined }, () => {
+				throw firstCleanup;
+			});
 		} catch (error) {
 			undefinedPrimaryThrown = true;
 			expect(error).toBeInstanceOf(IncidentRecorderDescriptorCleanupError);
@@ -244,6 +240,75 @@ describe("incident recorder segment store", () => {
 		).not.toThrow();
 		expect(expiryCleanupCalled).toBe(true);
 		expect(expiryDiagnostic).toBeInstanceOf(Error);
+	});
+
+	it("does not retain an active segment descriptor between synchronous operations", () => {
+		if (process.platform !== "linux") return;
+		const target = fixture();
+		const activeDescriptors = (path: string): OpenFileDescriptorIdentity[] => {
+			if (!existsSync(path)) return [];
+			const status = lstatSync(path, { bigint: true });
+			return snapshotOpenFileDescriptors().filter(
+				(entry) => entry.deviceId === status.dev.toString() && entry.inodeId === status.ino.toString(),
+			);
+		};
+
+		target.store.append({
+			runId: "descriptor-lifetime",
+			sourceId: "daemon",
+			observedAtMs: 0,
+			order: "0",
+			metadata: {},
+			payload: Buffer.from("first"),
+		});
+		const activeName = readdirSync(join(target.directory, "active")).find((name) => name.endsWith(".open"));
+		expect(activeName).toBeDefined();
+		const activePath = join(target.directory, "active", activeName ?? "missing.open");
+		expect(activeDescriptors(activePath)).toEqual([]);
+
+		target.store.close();
+		appendFileSync(activePath, Buffer.from("torn-tail"));
+		const reopened = new IncidentRecorderSegmentStore({ directory: target.directory });
+		expect(activeDescriptors(activePath)).toEqual([]);
+		reopened.seal("descriptor-lifetime");
+		expect(activeDescriptors(activePath)).toEqual([]);
+		reopened.close();
+		expect(activeDescriptors(activePath)).toEqual([]);
+	});
+
+	it("refuses to write a successor when the active path identity changes", () => {
+		const target = fixture();
+		target.store.append({
+			runId: "active-identity",
+			sourceId: "daemon",
+			observedAtMs: 0,
+			order: "0",
+			metadata: {},
+			payload: Buffer.from("first"),
+		});
+		const activeName = readdirSync(join(target.directory, "active")).find((name) => name.endsWith(".open"));
+		expect(activeName).toBeDefined();
+		const activePath = join(target.directory, "active", activeName ?? "missing.open");
+		const displacedPath = `${activePath}.displaced`;
+		renameSync(activePath, displacedPath);
+		writeFileSync(activePath, Buffer.from("successor"), { mode: 0o600 });
+
+		expect(() =>
+			target.store.append({
+				runId: "active-identity",
+				sourceId: "daemon",
+				observedAtMs: 1,
+				order: "1",
+				metadata: {},
+				payload: Buffer.from("second"),
+			}),
+		).toThrow(/identity changed/);
+		expect(readFileSync(activePath, "utf8")).toBe("successor");
+		try {
+			target.store.close();
+		} catch {
+			// A poisoned store may retain the replaced path as recovery evidence.
+		}
 	});
 
 	it("durably round-trips exact arbitrary bytes, metadata, identity, and a stable locator", () => {
@@ -389,7 +454,9 @@ describe("incident recorder segment store", () => {
 
 		const reopened = new IncidentRecorderSegmentStore({ directory: target.directory });
 		expect(reopened.append(input)).toEqual({ status: "existing", locator: appended.locator });
-		expect(() => reopened.append({ ...input, payload: Buffer.from("different") })).toThrow(/different canonical content/);
+		expect(() => reopened.append({ ...input, payload: Buffer.from("different") })).toThrow(
+			/different canonical content/,
+		);
 		expect(reopened.getStats().records).toBe(1);
 		reopened.close();
 	});
@@ -423,9 +490,7 @@ describe("incident recorder segment store", () => {
 				indexReads += 1;
 			},
 		});
-		expect(() => bounded.append(firstInput)).toThrow(
-			/cannot prove absence.*maxIdempotencyLookupRecords/,
-		);
+		expect(() => bounded.append(firstInput)).toThrow(/cannot prove absence.*maxIdempotencyLookupRecords/);
 		expect(indexReads).toBe(0);
 		expect(bounded.getStats().records).toBe(2);
 		bounded.close();
@@ -444,11 +509,7 @@ describe("incident recorder segment store", () => {
 		};
 		const appended = target.store.append(input);
 		target.store.close();
-		const segmentPath = join(
-			target.directory,
-			"sealed",
-			`${appended.locator.segmentId}.segment`,
-		);
+		const segmentPath = join(target.directory, "sealed", `${appended.locator.segmentId}.segment`);
 		const descriptor = openSync(segmentPath, "r+");
 		try {
 			const fileBytes = lstatSync(segmentPath).size;
@@ -545,11 +606,13 @@ describe("incident recorder segment store", () => {
 		});
 		expect(gaps[0]?.discardedSha256).toMatch(/^[a-f0-9]{64}$/);
 		expect(
-			recovered.queryRunWindow({
-				runId: "run-recovery",
-				fromObservedAtMs: 0,
-				throughObservedAtMs: 100,
-			})[0]?.payload.toString("utf8"),
+			recovered
+				.queryRunWindow({
+					runId: "run-recovery",
+					fromObservedAtMs: 0,
+					throughObservedAtMs: 100,
+				})[0]
+				?.payload.toString("utf8"),
 		).toBe("valid-prefix");
 		recovered.close();
 
@@ -740,11 +803,13 @@ describe("incident recorder segment store", () => {
 		expect(gaps[0]).toMatchObject({ reason: "invalid_or_torn_active_tail", discardedBytes: 200_000 });
 		expect(largestRecoveryRead).toBeLessThanOrEqual(64 * 1024);
 		expect(
-			recovered.queryRunWindow({
-				runId: "recovery-order",
-				fromObservedAtMs: 0,
-				throughObservedAtMs: 10,
-			})[0]?.payload.toString("utf8"),
+			recovered
+				.queryRunWindow({
+					runId: "recovery-order",
+					fromObservedAtMs: 0,
+					throughObservedAtMs: 10,
+				})[0]
+				?.payload.toString("utf8"),
 		).toBe("committed");
 		recovered.close();
 	});
@@ -807,7 +872,8 @@ describe("incident recorder segment store", () => {
 			}),
 		).toThrow(/unique segment identity/);
 		expect(
-			duplicate.queryRunWindow({ runId: "no-clobber", fromObservedAtMs: 0, throughObservedAtMs: 10 })[0]
+			duplicate
+				.queryRunWindow({ runId: "no-clobber", fromObservedAtMs: 0, throughObservedAtMs: 10 })[0]
 				?.payload.toString("utf8"),
 		).toBe("keep");
 		duplicate.close();
@@ -885,8 +951,8 @@ describe("incident recorder segment store", () => {
 			isOwnerAlive: () => false,
 		});
 		expect(
-			reopened.queryRunWindow({ runId: "reader-policy", fromObservedAtMs: 0, throughObservedAtMs: 10 })[0]
-				?.payload.byteLength,
+			reopened.queryRunWindow({ runId: "reader-policy", fromObservedAtMs: 0, throughObservedAtMs: 10 })[0]?.payload
+				.byteLength,
 		).toBe(512);
 		expect(() =>
 			reopened.append({
@@ -940,15 +1006,11 @@ describe("incident recorder segment store", () => {
 		expect(record?.payload).toEqual(Buffer.from([0, 0, 0xff]));
 		expect(indexReads).toBe(1);
 		expect(() => reopened.readRecord({ ...locator, offset: locator.offset + 1 })).toThrow(/locator/);
-		expect(() =>
-			reopened.readRecord({ ...locator, payloadSha256: "0".repeat(64) }),
-		).toThrow(/locator/);
-		expect(() =>
-			reopened.readRecord({ ...locator, segmentSequence: locator.segmentSequence + 1 }),
-		).toThrow(/segment identity/);
-		expect(
-			reopened.readRecord({ ...locator, segmentId: "cleanly-missing-or-pruned-segment" }),
-		).toBeUndefined();
+		expect(() => reopened.readRecord({ ...locator, payloadSha256: "0".repeat(64) })).toThrow(/locator/);
+		expect(() => reopened.readRecord({ ...locator, segmentSequence: locator.segmentSequence + 1 })).toThrow(
+			/segment identity/,
+		);
+		expect(reopened.readRecord({ ...locator, segmentId: "cleanly-missing-or-pruned-segment" })).toBeUndefined();
 		const pruned = reopened.pruneSealedSegments({
 			sealedBeforeMs: Number.MAX_SAFE_INTEGER,
 			protection: pruneProtection(),
@@ -1154,7 +1216,9 @@ describe("incident recorder segment store", () => {
 			cursor = page.nextCursor;
 		}
 		expect(observed.map((record) => record.order)).toEqual(["1", "3", "5"]);
-		expect(new Set(observed.map((record) => `${record.locator.segmentSequence}:${record.locator.ordinal}`)).size).toBe(3);
+		expect(
+			new Set(observed.map((record) => `${record.locator.segmentSequence}:${record.locator.ordinal}`)).size,
+		).toBe(3);
 		const otherFilter = target.store.queryRunWindowPage({
 			runId: "paged",
 			sourceId: "daemon",
@@ -1226,18 +1290,22 @@ describe("incident recorder segment store", () => {
 			metadata: {},
 			payload: Buffer.from("late"),
 		});
-		expect(target.store.queryRunWindowPage({
-			runId: "leased",
-			fromObservedAtMs: 0,
-			throughObservedAtMs: Number.MAX_SAFE_INTEGER,
-			readLease: lease,
-		})).toMatchObject({ complete: true, records: [{ order: "1" }] });
-		expect(target.store.queryRunWindowPage({
-			runId: "anchor",
-			fromObservedAtMs: 0,
-			throughObservedAtMs: Number.MAX_SAFE_INTEGER,
-			readLease: lease,
-		})).toMatchObject({ complete: true, records: [{ order: "2" }] });
+		expect(
+			target.store.queryRunWindowPage({
+				runId: "leased",
+				fromObservedAtMs: 0,
+				throughObservedAtMs: Number.MAX_SAFE_INTEGER,
+				readLease: lease,
+			}),
+		).toMatchObject({ complete: true, records: [{ order: "1" }] });
+		expect(
+			target.store.queryRunWindowPage({
+				runId: "anchor",
+				fromObservedAtMs: 0,
+				throughObservedAtMs: Number.MAX_SAFE_INTEGER,
+				readLease: lease,
+			}),
+		).toMatchObject({ complete: true, records: [{ order: "2" }] });
 
 		const blocked = target.store.pruneSealedSegments({
 			sealedBeforeMs: Number.MAX_SAFE_INTEGER,
@@ -1254,21 +1322,25 @@ describe("incident recorder segment store", () => {
 		expect(existsSync(join(target.directory, "sealed", `${oldLocator.segmentId}.segment`))).toBe(true);
 
 		const mismatched = Object.freeze({ ...lease, highWaterOrdinal: lease.highWaterOrdinal + 1 });
-		expect(() => target.store.queryRunWindowPage({
-			runId: "leased",
-			fromObservedAtMs: 0,
-			throughObservedAtMs: Number.MAX_SAFE_INTEGER,
-			readLease: mismatched,
-		})).toThrow(/exact registered object/);
+		expect(() =>
+			target.store.queryRunWindowPage({
+				runId: "leased",
+				fromObservedAtMs: 0,
+				throughObservedAtMs: Number.MAX_SAFE_INTEGER,
+				readLease: mismatched,
+			}),
+		).toThrow(/exact registered object/);
 		expect(target.store.releaseReadLease(lease)).toBe(true);
 		expect(target.store.releaseReadLease(lease)).toBe(false);
 		expect(() => target.store.assertReadLeaseUsable(lease)).toThrow(/lease.*not active/);
-		expect(target.store.pruneSealedSegments({
-			sealedBeforeMs: Number.MAX_SAFE_INTEGER,
-			protection: pruneProtection(),
-			maxSegments: 10,
-			maxBytes: 1024 * 1024,
-		}).deletedSegmentIds).toEqual([oldLocator.segmentId, anchorLocator.segmentId]);
+		expect(
+			target.store.pruneSealedSegments({
+				sealedBeforeMs: Number.MAX_SAFE_INTEGER,
+				protection: pruneProtection(),
+				maxSegments: 10,
+				maxBytes: 1024 * 1024,
+			}).deletedSegmentIds,
+		).toEqual([oldLocator.segmentId, anchorLocator.segmentId]);
 
 		const expiring = target.store.acquireReadLease(now + 10);
 		now += 11;
@@ -1286,12 +1358,14 @@ describe("incident recorder segment store", () => {
 		const leases = Array.from({ length: 8 }, () => target.store.acquireReadLease(now + 100));
 		expect(() => target.store.acquireReadLease(now + 100)).toThrow(/8-lease ceiling/);
 		const ordinary = target.store.createReadSnapshot();
-		expect(target.store.queryRunWindowPage({
-			runId: "ordinary",
-			fromObservedAtMs: 0,
-			throughObservedAtMs: Number.MAX_SAFE_INTEGER,
-			readSnapshot: ordinary,
-		})).toMatchObject({ complete: true, records: [] });
+		expect(
+			target.store.queryRunWindowPage({
+				runId: "ordinary",
+				fromObservedAtMs: 0,
+				throughObservedAtMs: Number.MAX_SAFE_INTEGER,
+				readSnapshot: ordinary,
+			}),
+		).toMatchObject({ complete: true, records: [] });
 		now += 101;
 		const replacement = target.store.acquireReadLease(now + 1);
 		expect(replacement.acquiredAtMs).toBe(now);
@@ -1323,21 +1397,25 @@ describe("incident recorder segment store", () => {
 		const frozenClone = Object.freeze({ ...lease });
 		expect(() => target.store.assertReadLeaseUsable(frozenClone)).toThrow(/exact registered object/);
 		expect(() => target.store.releaseReadLease(frozenClone)).toThrow(/exact registered object/);
-		expect(target.store.pruneSealedSegments({
-			sealedBeforeMs: Number.MAX_SAFE_INTEGER,
-			protection: pruneProtection(),
-			maxSegments: 10,
-			maxBytes: 1024 * 1024,
-		})).toMatchObject({ deletedSegmentIds: [], blockedByReadSnapshot: true, moreWork: true });
+		expect(
+			target.store.pruneSealedSegments({
+				sealedBeforeMs: Number.MAX_SAFE_INTEGER,
+				protection: pruneProtection(),
+				maxSegments: 10,
+				maxBytes: 1024 * 1024,
+			}),
+		).toMatchObject({ deletedSegmentIds: [], blockedByReadSnapshot: true, moreWork: true });
 		now += 11;
 		expect(() => target.store.assertReadLeaseUsable(frozenClone)).toThrow(/exact registered object/);
 		expect(() => target.store.releaseReadLease(frozenClone)).toThrow(/exact registered object/);
-		expect(target.store.pruneSealedSegments({
-			sealedBeforeMs: Number.MAX_SAFE_INTEGER,
-			protection: pruneProtection(),
-			maxSegments: 10,
-			maxBytes: 1024 * 1024,
-		}).deletedSegmentIds).toContain(old.segmentId);
+		expect(
+			target.store.pruneSealedSegments({
+				sealedBeforeMs: Number.MAX_SAFE_INTEGER,
+				protection: pruneProtection(),
+				maxSegments: 10,
+				maxBytes: 1024 * 1024,
+			}).deletedSegmentIds,
+		).toContain(old.segmentId);
 		target.store.close();
 	});
 
@@ -1536,16 +1614,22 @@ describe("incident recorder segment store", () => {
 		expect(observed.every((gap) => gap.observedAtMs > 20)).toBe(true);
 		expect(observed.every((gap) => gap.reason === "invalid_or_torn_active_tail")).toBe(true);
 		expect(observed.every((gap) => !("locator" in gap))).toBe(true);
-		expect(mixed.queryRunWindow({
-			runId: "discarded",
-			fromObservedAtMs: 0,
-			throughObservedAtMs: Number.MAX_SAFE_INTEGER,
-		})).toEqual([]);
-		expect(mixed.queryRunWindow({
-			runId: "retained",
-			fromObservedAtMs: 0,
-			throughObservedAtMs: Number.MAX_SAFE_INTEGER,
-		})[0]?.payload.toString("utf8")).toBe("retained");
+		expect(
+			mixed.queryRunWindow({
+				runId: "discarded",
+				fromObservedAtMs: 0,
+				throughObservedAtMs: Number.MAX_SAFE_INTEGER,
+			}),
+		).toEqual([]);
+		expect(
+			mixed
+				.queryRunWindow({
+					runId: "retained",
+					fromObservedAtMs: 0,
+					throughObservedAtMs: Number.MAX_SAFE_INTEGER,
+				})[0]
+				?.payload.toString("utf8"),
+		).toBe("retained");
 		mixed.close();
 	});
 
@@ -1594,11 +1678,7 @@ describe("incident recorder segment store", () => {
 		});
 		target.store.commitAppendPlan(appendPlan);
 		expect(events.map((event) => event.kind)).toEqual(["segment-created", "record", "sealed"]);
-		expect(events.map((event) => event.entryChange)).toEqual([
-			"published",
-			"same-inode-growth",
-			"same-inode-move",
-		]);
+		expect(events.map((event) => event.entryChange)).toEqual(["published", "same-inode-growth", "same-inode-move"]);
 		expect(events.map((event) => [event.entryDelta, event.inodeDelta])).toEqual([
 			[1, 1],
 			[0, 0],
@@ -1627,8 +1707,7 @@ describe("incident recorder segment store", () => {
 			(sealedReceipt?.allocatedBytes ?? 0) + parentAllocationGrowth,
 		);
 		expect(new Set(events.map((event) => event.eventId)).size).toBe(events.length);
-		const fillerName = (index: number): string =>
-			`f${String(index).padStart(35, "0")}.segment`;
+		const fillerName = (index: number): string => `f${String(index).padStart(35, "0")}.segment`;
 		const probe = fixture();
 		probe.store.close();
 		const probeSealedDirectory = join(probe.directory, "sealed");
@@ -1661,24 +1740,21 @@ describe("incident recorder segment store", () => {
 			});
 			boundary.store.commitAppendPlan(boundaryPlan);
 			const boundaryInodeGrowth = boundaryEvents.reduce(
-				(total, event) =>
-					total + Math.max(0, event.allocatedBytes - event.previousAllocatedBytes),
+				(total, event) => total + Math.max(0, event.allocatedBytes - event.previousAllocatedBytes),
 				0,
 			);
 			const boundaryDirectoryGrowth = boundaryEvents.reduce(
 				(total, event) =>
 					total +
 					event.parentEffects.reduce(
-					(parentTotal, effect) =>
-						parentTotal + Math.max(0, effect.afterAllocatedBytes - effect.beforeAllocatedBytes),
-					0,
-				),
+						(parentTotal, effect) =>
+							parentTotal + Math.max(0, effect.afterAllocatedBytes - effect.beforeAllocatedBytes),
+						0,
+					),
 				0,
 			);
 			expect(boundaryDirectoryGrowth).toBeGreaterThan(0);
-			expect(boundaryAdmission).toBeGreaterThanOrEqual(
-				boundaryInodeGrowth + boundaryDirectoryGrowth,
-			);
+			expect(boundaryAdmission).toBeGreaterThanOrEqual(boundaryInodeGrowth + boundaryDirectoryGrowth);
 			boundary.store.close();
 		}
 		target.store.close();
@@ -1822,9 +1898,7 @@ describe("incident recorder segment store", () => {
 			continuation: first.continuation!,
 		});
 		expect(second.deletedSegmentIds).toEqual([deletableLocator.segmentId]);
-		expect(
-			existsSync(join(target.directory, "sealed", `${mixedLocator.segmentId}.segment`)),
-		).toBe(true);
+		expect(existsSync(join(target.directory, "sealed", `${mixedLocator.segmentId}.segment`))).toBe(true);
 		target.store.close();
 	});
 
@@ -1881,9 +1955,7 @@ describe("incident recorder segment store", () => {
 		});
 		expect(completed.deletedSegmentIds).toEqual([]);
 		expect(completed.moreWork).toBe(false);
-		expect(
-			existsSync(join(target.directory, "sealed", `${locators[1]!.segmentId}.segment`)),
-		).toBe(true);
+		expect(existsSync(join(target.directory, "sealed", `${locators[1]!.segmentId}.segment`))).toBe(true);
 		target.store.close();
 	});
 
@@ -2029,7 +2101,9 @@ describe("incident recorder segment store", () => {
 		const lateSealedLocators = lateLocators;
 		expect(lateSealedLocators.every((locator) => locator.segmentSequence > frozenHighWater)).toBe(true);
 		expect(
-			lateSealedLocators.every((locator) => existsSync(join(target.directory, "sealed", `${locator.segmentId}.segment`))),
+			lateSealedLocators.every((locator) =>
+				existsSync(join(target.directory, "sealed", `${locator.segmentId}.segment`)),
+			),
 		).toBe(true);
 		target.store.close();
 	});
@@ -2770,9 +2844,7 @@ describe("incident recorder segment store", () => {
 		expect(typedMutation.result.continuation).toBeUndefined();
 		expect(Object.isFrozen(typedMutation.result)).toBe(true);
 		expect(Object.isFrozen(typedMutation.result.deletedSegmentIds)).toBe(true);
-		expect(
-			existsSync(join(target.directory, "sealed", `${locators[0]!.segmentId}.segment`)),
-		).toBe(false);
+		expect(existsSync(join(target.directory, "sealed", `${locators[0]!.segmentId}.segment`))).toBe(false);
 		expect(durableWrites.some((event) => event.kind === "pruned")).toBe(false);
 		target.store.close();
 	});
@@ -3033,11 +3105,12 @@ describe("incident recorder segment store", () => {
 		target.store.close();
 		const sealedBefore = readdirSync(join(target.directory, "sealed")).sort();
 		const filesBefore = regularFileCount(target.directory);
-		expect(() =>
-			new IncidentRecorderSegmentStore({
-				directory: target.directory,
-				maxStartupCatalogBytes: 1000,
-			}),
+		expect(
+			() =>
+				new IncidentRecorderSegmentStore({
+					directory: target.directory,
+					maxStartupCatalogBytes: 1000,
+				}),
 		).toThrow(/segment catalog exceeds maxStartupCatalogBytes/);
 		expect(readdirSync(join(target.directory, "sealed")).sort()).toEqual(sealedBefore);
 		expect(regularFileCount(target.directory)).toBe(filesBefore);
@@ -3081,9 +3154,7 @@ describe("incident recorder segment store", () => {
 			moreWork: false,
 		});
 		expect(mutableProtectedSegmentIds.size).toBe(0);
-		expect(
-			existsSync(join(target.directory, "sealed", `${locators[1]!.segmentId}.segment`)),
-		).toBe(true);
+		expect(existsSync(join(target.directory, "sealed", `${locators[1]!.segmentId}.segment`))).toBe(true);
 		expect(readdirSync(target.directory).sort()).toEqual(beforeRootEntries);
 		expect(regularFileCount(target.directory)).toBe(beforeInodes - 1);
 		expect(existsSync(join(target.directory, ".writer-owner.json"))).toBe(false);
@@ -3201,9 +3272,7 @@ describe("incident recorder segment store", () => {
 		expect(Object.isFrozen(mutation.result)).toBe(true);
 		expect(Object.isFrozen(mutation.result.deletedSegmentIds)).toBe(true);
 		expect(ownershipChecks).toBe(2);
-		expect(
-			existsSync(join(target.directory, "sealed", `${locators[1]!.segmentId}.segment`)),
-		).toBe(false);
+		expect(existsSync(join(target.directory, "sealed", `${locators[1]!.segmentId}.segment`))).toBe(false);
 		expect(regularFileCount(target.directory)).toBe(filesBefore - 1);
 		expect(() =>
 			pruneIncidentRecorderSealedHistoryForRecovery({
@@ -3516,12 +3585,7 @@ describe("incident recorder segment store", () => {
 			});
 			expect(first.continuation).toBeDefined();
 			const descriptorsWithLease = snapshotOpenFileDescriptors();
-			expectAdditionalRecoveryScopeLeases(
-				descriptorBaseline,
-				descriptorsWithLease,
-				target.directory,
-				1,
-			);
+			expectAdditionalRecoveryScopeLeases(descriptorBaseline, descriptorsWithLease, target.directory, 1);
 			expect(vi.getTimerCount()).toBe(timerBaseline + 1);
 			const blocked = pruneIncidentRecorderSealedHistoryForRecovery({
 				directory: target.directory,
@@ -3589,12 +3653,7 @@ describe("incident recorder segment store", () => {
 				maxBytes: 1024 * 1024,
 			});
 			expect(first.continuation).toBeDefined();
-			expectAdditionalRecoveryScopeLeases(
-				descriptorBaseline,
-				snapshotOpenFileDescriptors(),
-				target.directory,
-				1,
-			);
+			expectAdditionalRecoveryScopeLeases(descriptorBaseline, snapshotOpenFileDescriptors(), target.directory, 1);
 			expect(vi.getTimerCount()).toBe(timerBaseline + 1);
 			let ownershipChecks = 0;
 			expect(() =>
@@ -3818,7 +3877,9 @@ describe("incident recorder segment store", () => {
 		const lateSealedLocators = lateLocators;
 		expect(lateSealedLocators.every((locator) => locator.segmentSequence > frozenHighWater)).toBe(true);
 		expect(
-			lateSealedLocators.every((locator) => existsSync(join(target.directory, "sealed", `${locator.segmentId}.segment`))),
+			lateSealedLocators.every((locator) =>
+				existsSync(join(target.directory, "sealed", `${locator.segmentId}.segment`)),
+			),
 		).toBe(true);
 	});
 
@@ -3939,12 +4000,7 @@ describe("incident recorder segment store", () => {
 			});
 			expect(replacement.continuation).toBeDefined();
 			const descriptorsBeforeRotation = snapshotOpenFileDescriptors();
-			expectAdditionalRecoveryScopeLeases(
-				descriptorBaseline,
-				descriptorsBeforeRotation,
-				target.directory,
-				1,
-			);
+			expectAdditionalRecoveryScopeLeases(descriptorBaseline, descriptorsBeforeRotation, target.directory, 1);
 			expect(vi.getTimerCount()).toBe(timerBaseline + 1);
 			expect(() =>
 				pruneIncidentRecorderSealedHistoryForRecovery({
@@ -3974,12 +4030,7 @@ describe("incident recorder segment store", () => {
 			expect(rotated.continuation).toBeDefined();
 			expect(rotated.continuation).not.toBe(replacement.continuation);
 			const descriptorsAfterRotation = snapshotOpenFileDescriptors();
-			expectAdditionalRecoveryScopeLeases(
-				descriptorBaseline,
-				descriptorsAfterRotation,
-				target.directory,
-				1,
-			);
+			expectAdditionalRecoveryScopeLeases(descriptorBaseline, descriptorsAfterRotation, target.directory, 1);
 			expect(descriptorsAfterRotation).toEqual(descriptorsBeforeRotation);
 			expect(vi.getTimerCount()).toBe(timerBaseline + 1);
 			expect(() =>
@@ -4048,12 +4099,7 @@ describe("incident recorder segment store", () => {
 			});
 			expect(first.continuation).toBeDefined();
 			const descriptorsBeforeRotation = snapshotOpenFileDescriptors();
-			expectAdditionalRecoveryScopeLeases(
-				descriptorBaseline,
-				descriptorsBeforeRotation,
-				target.directory,
-				1,
-			);
+			expectAdditionalRecoveryScopeLeases(descriptorBaseline, descriptorsBeforeRotation, target.directory, 1);
 			expect(vi.getTimerCount()).toBe(timerBaseline + 1);
 			let crossedTtl = false;
 			const rotated = pruneIncidentRecorderSealedHistoryForRecovery({
@@ -4143,17 +4189,10 @@ describe("incident recorder segment store", () => {
 			});
 			expect(first.continuation).toBeDefined();
 			const descriptorsBeforeNestedRotation = snapshotOpenFileDescriptors();
-			expectAdditionalRecoveryScopeLeases(
-				descriptorBaseline,
-				descriptorsBeforeNestedRotation,
-				target.directory,
-				1,
-			);
+			expectAdditionalRecoveryScopeLeases(descriptorBaseline, descriptorsBeforeNestedRotation, target.directory, 1);
 			expect(vi.getTimerCount()).toBe(timerBaseline + 1);
 
-			let nested:
-				| ReturnType<typeof pruneIncidentRecorderSealedHistoryForRecovery>
-				| undefined;
+			let nested: ReturnType<typeof pruneIncidentRecorderSealedHistoryForRecovery> | undefined;
 			expect(() =>
 				pruneIncidentRecorderSealedHistoryForRecovery({
 					directory: target.directory,
@@ -4259,12 +4298,7 @@ describe("incident recorder segment store", () => {
 			});
 			expect(first.continuation).toBeDefined();
 			const descriptorsWithLease = snapshotOpenFileDescriptors();
-			expectAdditionalRecoveryScopeLeases(
-				descriptorBaseline,
-				descriptorsWithLease,
-				target.directory,
-				1,
-			);
+			expectAdditionalRecoveryScopeLeases(descriptorBaseline, descriptorsWithLease, target.directory, 1);
 			closeHeldSealedDescriptor(descriptorsWithLease);
 			vi.setSystemTime(100 + 5 * 60 * 1000 + 1);
 			let expiredThrown: unknown;
@@ -4301,12 +4335,7 @@ describe("incident recorder segment store", () => {
 			});
 			expect(second.continuation).toBeDefined();
 			const secondDescriptorsWithLease = snapshotOpenFileDescriptors();
-			expectAdditionalRecoveryScopeLeases(
-				descriptorBaseline,
-				secondDescriptorsWithLease,
-				target.directory,
-				1,
-			);
+			expectAdditionalRecoveryScopeLeases(descriptorBaseline, secondDescriptorsWithLease, target.directory, 1);
 			closeHeldSealedDescriptor(secondDescriptorsWithLease);
 			expect(() => vi.advanceTimersByTime(5 * 60 * 1000 + 1)).not.toThrow();
 			expect(snapshotOpenFileDescriptors()).toEqual(descriptorBaseline);
@@ -4360,12 +4389,7 @@ describe("incident recorder segment store", () => {
 			});
 			expect(third.continuation).toBeDefined();
 			const thirdDescriptorsWithLease = snapshotOpenFileDescriptors();
-			expectAdditionalRecoveryScopeLeases(
-				descriptorBaseline,
-				thirdDescriptorsWithLease,
-				target.directory,
-				1,
-			);
+			expectAdditionalRecoveryScopeLeases(descriptorBaseline, thirdDescriptorsWithLease, target.directory, 1);
 			closeHeldSealedDescriptor(thirdDescriptorsWithLease);
 			expect(() => vi.advanceTimersByTime(5 * 60 * 1000 + 1)).not.toThrow();
 			expect(expiryDiagnostics).toHaveLength(1);
@@ -4434,12 +4458,7 @@ describe("incident recorder segment store", () => {
 			});
 			expect(first.continuation).toBeDefined();
 			const descriptorsAfterRegistration = snapshotOpenFileDescriptors();
-			expectAdditionalRecoveryScopeLeases(
-				descriptorBaseline,
-				descriptorsAfterRegistration,
-				target.directory,
-				1,
-			);
+			expectAdditionalRecoveryScopeLeases(descriptorBaseline, descriptorsAfterRegistration, target.directory, 1);
 			expect(vi.getTimerCount()).toBe(timerBaseline + 1);
 			vi.advanceTimersByTime(2);
 			expect(snapshotOpenFileDescriptors()).toEqual(descriptorsAfterRegistration);
@@ -4673,12 +4692,7 @@ describe("incident recorder segment store", () => {
 			});
 			expect(first.continuation).toBeDefined();
 			const sealedNames = readdirSync(join(target.directory, "sealed")).sort();
-			expectAdditionalRecoveryScopeLeases(
-				descriptorBaseline,
-				snapshotOpenFileDescriptors(),
-				target.directory,
-				1,
-			);
+			expectAdditionalRecoveryScopeLeases(descriptorBaseline, snapshotOpenFileDescriptors(), target.directory, 1);
 			expect(vi.getTimerCount()).toBe(timerBaseline + 1);
 			chmodSync(target.directory, changedMode);
 			expect(() =>
@@ -4751,10 +4765,7 @@ describe("incident recorder segment store", () => {
 		source.store.close();
 		const sourceFile = readdirSync(join(source.directory, "sealed")).find((name) => name.endsWith(".segment"));
 		expect(sourceFile).toBeDefined();
-		copyFileSync(
-			join(source.directory, "sealed", sourceFile!),
-			join(target.directory, "sealed", sourceFile!),
-		);
+		copyFileSync(join(source.directory, "sealed", sourceFile!), join(target.directory, "sealed", sourceFile!));
 		const sealedBefore = readdirSync(join(target.directory, "sealed")).sort();
 		const filesBefore = regularFileCount(target.directory);
 		expect(() =>
@@ -4897,12 +4908,10 @@ describe("incident recorder segment store", () => {
 		expect(opened?.entries.reduce((total, entry) => total + entry.allocatedBytes, 0)).toBe(
 			opened?.entries.reduce((total, entry) => total + lstatSync(entry.path).blocks * 512, 0),
 		);
-		const openedEntryBytes =
-			opened?.entries.reduce((total, entry) => total + entry.allocatedBytes, 0) ?? 0;
+		const openedEntryBytes = opened?.entries.reduce((total, entry) => total + entry.allocatedBytes, 0) ?? 0;
 		const openedParentGrowth =
 			opened?.parentEffects.reduce(
-				(total, effect) =>
-					total + Math.max(0, effect.afterAllocatedBytes - effect.beforeAllocatedBytes),
+				(total, effect) => total + Math.max(0, effect.afterAllocatedBytes - effect.beforeAllocatedBytes),
 				0,
 			) ?? 0;
 		expect(plan.peakAdditionalBytes).toBeGreaterThanOrEqual(openedEntryBytes + openedParentGrowth);
@@ -4912,14 +4921,15 @@ describe("incident recorder segment store", () => {
 
 		const blockedDirectory = join(parent, "blocked");
 		const blockedPlan = planIncidentRecorderSegmentStoreOpen(blockedDirectory);
-		expect(() =>
-			new IncidentRecorderSegmentStore({
-				directory: blockedDirectory,
-				openPlan: blockedPlan,
-				onOpenAdmission: () => {
-					throw new Error("admission denied");
-				},
-			}),
+		expect(
+			() =>
+				new IncidentRecorderSegmentStore({
+					directory: blockedDirectory,
+					openPlan: blockedPlan,
+					onOpenAdmission: () => {
+						throw new Error("admission denied");
+					},
+				}),
 		).toThrow(/admission denied/);
 		expect(existsSync(blockedDirectory)).toBe(false);
 
@@ -4937,9 +4947,9 @@ describe("incident recorder segment store", () => {
 		const changedDirectory = join(parent, "changed-after-plan");
 		const changedPlan = planIncidentRecorderSegmentStoreOpen(changedDirectory);
 		mkdirSync(changedDirectory, { mode: 0o700 });
-		expect(
-			() => new IncidentRecorderSegmentStore({ directory: changedDirectory, openPlan: changedPlan }),
-		).toThrow(/open plan is stale/);
+		expect(() => new IncidentRecorderSegmentStore({ directory: changedDirectory, openPlan: changedPlan })).toThrow(
+			/open plan is stale/,
+		);
 
 		const parentMode = lstatSync(parent).mode & 0o777;
 		const admissionChangedDirectory = join(parent, "parent-changed-during-admission");
@@ -4987,9 +4997,7 @@ describe("incident recorder segment store", () => {
 			reconciliation: "full-dev-inode-required",
 		});
 		expect(existsSync(temporaryPath)).toBe(false);
-		expect(
-			readdirSync(target.directory).some((name) => name.startsWith(".writer-owner-stale-")),
-		).toBe(false);
+		expect(readdirSync(target.directory).some((name) => name.startsWith(".writer-owner-stale-"))).toBe(false);
 		reopened.close();
 	});
 
@@ -5009,15 +5017,16 @@ describe("incident recorder segment store", () => {
 		appendFileSync(join(target.directory, "active", activeName ?? "missing"), Buffer.alloc(4096, 0xaa));
 		const results: Array<{ phase: string; complete: boolean; entries: readonly { kind: string }[] }> = [];
 		const plan = planIncidentRecorderSegmentStoreOpen(target.directory);
-		expect(() =>
-			new IncidentRecorderSegmentStore({
-				directory: target.directory,
-				openPlan: plan,
-				faultInjector: (point) => {
-					if (point === "after-recovery-gap-fsync-before-truncate") throw new Error("partial open crash");
-				},
-				onOpenStorageResult: (result) => results.push(result),
-			}),
+		expect(
+			() =>
+				new IncidentRecorderSegmentStore({
+					directory: target.directory,
+					openPlan: plan,
+					faultInjector: (point) => {
+						if (point === "after-recovery-gap-fsync-before-truncate") throw new Error("partial open crash");
+					},
+					onOpenStorageResult: (result) => results.push(result),
+				}),
 		).toThrow(/partial open crash/);
 		expect(results.at(-1)).toMatchObject({ phase: "failed", complete: false });
 		expect(results.at(-1)?.entries.some((entry) => entry.kind === "owner-file")).toBe(false);
