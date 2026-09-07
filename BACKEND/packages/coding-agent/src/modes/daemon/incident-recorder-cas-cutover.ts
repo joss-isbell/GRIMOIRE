@@ -291,11 +291,16 @@ interface ControlBinding {
 	mode: number;
 }
 
+type TransitionKind = "bootstrap" | "upgrade";
+type PredecessorGenerationDigest = string | null;
+
 interface GenerationRecord {
 	schemaVersion: 1;
 	kind: "incident_cas_v2_generation";
 	state: "draining" | "v2";
 	cutoverId: string;
+	transitionKind: TransitionKind;
+	predecessorGenerationDigest: PredecessorGenerationDigest;
 	canonicalAgentDirPath: string;
 	incidentRecorderPath: string;
 	incidentsPath: string;
@@ -304,11 +309,15 @@ interface GenerationRecord {
 	launcherConfigurationDigest: string;
 }
 
+type LegacyGenerationRecord = Omit<GenerationRecord, "transitionKind" | "predecessorGenerationDigest">;
+
 interface ClaimRecord {
 	schemaVersion: 1;
 	kind: "incident_cas_v2_orchestration_claim";
 	cutoverId: string;
 	claimId: string;
+	transitionKind: TransitionKind;
+	predecessorGenerationDigest: PredecessorGenerationDigest;
 	canonicalAgentDirPath: string;
 	incidentRecorderPath: string;
 	incidentsPath: string;
@@ -317,6 +326,8 @@ interface ClaimRecord {
 	launcherConfigurationDigest: string;
 	owner: IncidentCasV2ProcessIdentity;
 }
+
+type LegacyClaimRecord = Omit<ClaimRecord, "transitionKind" | "predecessorGenerationDigest">;
 
 type ControlRecord = GenerationRecord | ClaimRecord;
 
@@ -624,6 +635,43 @@ function validGenerationRecord(value: unknown): value is GenerationRecord {
 			"kind",
 			"state",
 			"cutoverId",
+			"transitionKind",
+			"predecessorGenerationDigest",
+			"canonicalAgentDirPath",
+			"incidentRecorderPath",
+			"incidentsPath",
+			"historicalCopyBoundary",
+			"control",
+			"launcherConfigurationDigest",
+		]) &&
+		value.schemaVersion === SCHEMA_VERSION &&
+		value.kind === "incident_cas_v2_generation" &&
+		(value.state === "draining" || value.state === "v2") &&
+		typeof value.cutoverId === "string" &&
+		UUID_V4.test(value.cutoverId) &&
+		(value.transitionKind === "bootstrap" || value.transitionKind === "upgrade") &&
+		validTransition(value.transitionKind, value.predecessorGenerationDigest) &&
+		typeof value.canonicalAgentDirPath === "string" &&
+		isAbsolute(value.canonicalAgentDirPath) &&
+		resolve(value.canonicalAgentDirPath) === value.canonicalAgentDirPath &&
+		typeof value.incidentRecorderPath === "string" &&
+		value.incidentRecorderPath === join(value.canonicalAgentDirPath, "incident-recorder") &&
+		typeof value.incidentsPath === "string" &&
+		value.incidentsPath === join(value.canonicalAgentDirPath, "incidents") &&
+		value.historicalCopyBoundary === HISTORICAL_COPY_BOUNDARY &&
+		validControlBinding(value.control) &&
+		isDigest(value.launcherConfigurationDigest)
+	);
+}
+
+function validLegacyGenerationRecord(value: unknown): value is LegacyGenerationRecord {
+	return (
+		isPlainObject(value) &&
+		exactKeys(value, [
+			"schemaVersion",
+			"kind",
+			"state",
+			"cutoverId",
 			"canonicalAgentDirPath",
 			"incidentRecorderPath",
 			"incidentsPath",
@@ -650,6 +698,46 @@ function validGenerationRecord(value: unknown): value is GenerationRecord {
 }
 
 function validClaimRecord(value: unknown): value is ClaimRecord {
+	return (
+		isPlainObject(value) &&
+		exactKeys(value, [
+			"schemaVersion",
+			"kind",
+			"cutoverId",
+			"claimId",
+			"transitionKind",
+			"predecessorGenerationDigest",
+			"canonicalAgentDirPath",
+			"incidentRecorderPath",
+			"incidentsPath",
+			"historicalCopyBoundary",
+			"control",
+			"launcherConfigurationDigest",
+			"owner",
+		]) &&
+		value.schemaVersion === SCHEMA_VERSION &&
+		value.kind === "incident_cas_v2_orchestration_claim" &&
+		typeof value.cutoverId === "string" &&
+		UUID_V4.test(value.cutoverId) &&
+		typeof value.claimId === "string" &&
+		UUID_V4.test(value.claimId) &&
+		(value.transitionKind === "bootstrap" || value.transitionKind === "upgrade") &&
+		validTransition(value.transitionKind, value.predecessorGenerationDigest) &&
+		typeof value.canonicalAgentDirPath === "string" &&
+		isAbsolute(value.canonicalAgentDirPath) &&
+		resolve(value.canonicalAgentDirPath) === value.canonicalAgentDirPath &&
+		typeof value.incidentRecorderPath === "string" &&
+		value.incidentRecorderPath === join(value.canonicalAgentDirPath, "incident-recorder") &&
+		typeof value.incidentsPath === "string" &&
+		value.incidentsPath === join(value.canonicalAgentDirPath, "incidents") &&
+		value.historicalCopyBoundary === HISTORICAL_COPY_BOUNDARY &&
+		validControlBinding(value.control) &&
+		isDigest(value.launcherConfigurationDigest) &&
+		validOwner(value.owner)
+	);
+}
+
+function validLegacyClaimRecord(value: unknown): value is LegacyClaimRecord {
 	return (
 		isPlainObject(value) &&
 		exactKeys(value, [
@@ -685,6 +773,10 @@ function validClaimRecord(value: unknown): value is ClaimRecord {
 	);
 }
 
+function validTransition(kind: unknown, predecessor: unknown): boolean {
+	return kind === "bootstrap" ? predecessor === null : isDigest(predecessor);
+}
+
 function serializeRecord(record: ControlRecord): Buffer {
 	return Buffer.from(`${JSON.stringify(record)}\n`, "utf8");
 }
@@ -696,8 +788,17 @@ function parseRecord(bytes: Buffer): ControlRecord | undefined {
 	} catch {
 		return undefined;
 	}
-	if (!validGenerationRecord(value) && !validClaimRecord(value)) return undefined;
-	return serializeRecord(value).equals(bytes) ? value : undefined;
+	if (validGenerationRecord(value) || validClaimRecord(value))
+		return serializeRecord(value).equals(bytes) ? value : undefined;
+	if (validLegacyGenerationRecord(value)) {
+		if (!Buffer.from(`${JSON.stringify(value)}\n`, "utf8").equals(bytes)) return undefined;
+		return { ...value, transitionKind: "bootstrap", predecessorGenerationDigest: null };
+	}
+	if (validLegacyClaimRecord(value)) {
+		if (!Buffer.from(`${JSON.stringify(value)}\n`, "utf8").equals(bytes)) return undefined;
+		return { ...value, transitionKind: "bootstrap", predecessorGenerationDigest: null };
+	}
+	return undefined;
 }
 
 function noFollowDirectoryFlags(): number {
@@ -1152,7 +1253,7 @@ function readArtifacts(context: RootContext): ArtifactState {
 	return artifacts;
 }
 
-function assertRecordMatchesContext(record: ControlRecord, context: RootContext, target: NormalizedTarget): void {
+function assertRecordContext(record: ControlRecord, context: RootContext): void {
 	if (
 		record.canonicalAgentDirPath !== context.canonicalAgentDirPath ||
 		record.incidentRecorderPath !== context.incidentRecorderPath ||
@@ -1160,14 +1261,18 @@ function assertRecordMatchesContext(record: ControlRecord, context: RootContext,
 		!sameControlBinding(record.control, context.controlBinding)
 	)
 		throw new CutoverFailure("invalid_control_artifact");
-	if (record.launcherConfigurationDigest !== target.launcherConfigurationDigest)
-		throw new CutoverFailure("target_mismatch");
 	if (
 		record.kind === "incident_cas_v2_orchestration_claim" &&
 		(record.owner.uid.toString() !== context.controlBinding.uid ||
 			record.owner.gid.toString() !== context.controlBinding.gid)
 	)
 		throw new CutoverFailure("invalid_control_artifact");
+}
+
+function assertRecordMatchesContext(record: ControlRecord, context: RootContext, target: NormalizedTarget): void {
+	assertRecordContext(record, context);
+	if (record.launcherConfigurationDigest !== target.launcherConfigurationDigest)
+		throw new CutoverFailure("target_mismatch");
 }
 
 function fsyncControl(context: RootContext): void {
@@ -1286,12 +1391,18 @@ function createClaim(
 	runtime: RuntimeBinding,
 	cutoverId: string,
 	owner: IncidentCasV2ProcessIdentity,
+	transitionKind: TransitionKind = "bootstrap",
+	predecessorGenerationDigest: PredecessorGenerationDigest = null,
 ): ArtifactSnapshot {
+	if (!validTransition(transitionKind, predecessorGenerationDigest))
+		throw new CutoverFailure("invalid_control_artifact");
 	const record: ClaimRecord = {
 		schemaVersion: SCHEMA_VERSION,
 		kind: "incident_cas_v2_orchestration_claim",
 		cutoverId,
 		claimId: randomUUID(),
+		transitionKind,
+		predecessorGenerationDigest,
 		canonicalAgentDirPath: context.canonicalAgentDirPath,
 		incidentRecorderPath: context.incidentRecorderPath,
 		incidentsPath: context.incidentsPath,
@@ -1326,6 +1437,8 @@ function createDrainingGeneration(
 		kind: "incident_cas_v2_generation",
 		state: "draining",
 		cutoverId,
+		transitionKind: "bootstrap",
+		predecessorGenerationDigest: null,
 		canonicalAgentDirPath: context.canonicalAgentDirPath,
 		incidentRecorderPath: context.incidentRecorderPath,
 		incidentsPath: context.incidentsPath,
@@ -1518,16 +1631,38 @@ function recoverKnownLinkedPrepare(
 	return readArtifacts(context);
 }
 
-function validateClaimGenerationPair(claim: ArtifactSnapshot, generation: ArtifactSnapshot): void {
+function generationDigest(generation: ArtifactSnapshot): string {
+	return sha256(generation.bytes);
+}
+
+function validatePublishedClaimGenerationPair(claim: ArtifactSnapshot, generation: ArtifactSnapshot): void {
 	if (claim.record.kind !== "incident_cas_v2_orchestration_claim")
 		throw new CutoverFailure("invalid_control_artifact");
 	if (generation.record.kind !== "incident_cas_v2_generation") throw new CutoverFailure("invalid_control_artifact");
-	if (claim.record.cutoverId !== generation.record.cutoverId) throw new CutoverFailure("invalid_control_artifact");
+	if (
+		claim.record.cutoverId !== generation.record.cutoverId ||
+		claim.record.transitionKind !== generation.record.transitionKind ||
+		claim.record.predecessorGenerationDigest !== generation.record.predecessorGenerationDigest ||
+		claim.record.launcherConfigurationDigest !== generation.record.launcherConfigurationDigest
+	)
+		throw new CutoverFailure("invalid_control_artifact");
+}
+
+function validateUpgradeClaimAgainstPredecessor(claim: ArtifactSnapshot, predecessor: ArtifactSnapshot): void {
+	if (
+		claim.record.kind !== "incident_cas_v2_orchestration_claim" ||
+		predecessor.record.kind !== "incident_cas_v2_generation" ||
+		predecessor.record.state !== "v2" ||
+		claim.record.cutoverId !== predecessor.record.cutoverId ||
+		claim.record.transitionKind !== "upgrade" ||
+		claim.record.predecessorGenerationDigest !== generationDigest(predecessor) ||
+		claim.record.launcherConfigurationDigest === predecessor.record.launcherConfigurationDigest
+	)
+		throw new CutoverFailure("invalid_control_artifact");
 }
 
 function recoverStandalonePrepare(
 	context: RootContext,
-	target: NormalizedTarget,
 	runtime: RuntimeBinding,
 	artifacts: ArtifactState,
 	current: IncidentCasV2ProcessIdentity,
@@ -1535,7 +1670,10 @@ function recoverStandalonePrepare(
 	const prepare = artifacts.prepare;
 	if (!prepare) return artifacts;
 	if (prepare.identity.nlink !== 1n) throw new CutoverFailure("invalid_control_artifact");
-	assertRecordMatchesContext(prepare.record, context, target);
+	// A standalone prepare may belong to a predecessor target whose successor is
+	// being recovered. Bind it to this control namespace first, then validate its
+	// generation/claim pair before consulting the owner's liveness.
+	assertRecordContext(prepare.record, context);
 	if (prepare.record.kind === "incident_cas_v2_orchestration_claim") {
 		if (artifacts.claim) throw new CutoverFailure("invalid_control_artifact");
 		if (
@@ -1544,11 +1682,36 @@ function recoverStandalonePrepare(
 				artifacts.generation.record.cutoverId !== prepare.record.cutoverId)
 		)
 			throw new CutoverFailure("invalid_control_artifact");
+		if (artifacts.generation) assertRecordContext(artifacts.generation.record, context);
+		if (
+			artifacts.generation?.record.kind === "incident_cas_v2_generation" &&
+			artifacts.generation.record.state === "draining"
+		)
+			validatePublishedClaimGenerationPair(prepare, artifacts.generation);
 		if (
 			artifacts.generation?.record.kind === "incident_cas_v2_generation" &&
 			artifacts.generation.record.state === "v2"
 		) {
+			if (prepare.record.transitionKind === "upgrade") {
+				if (prepare.record.launcherConfigurationDigest === artifacts.generation.record.launcherConfigurationDigest)
+					validatePublishedClaimGenerationPair(prepare, artifacts.generation);
+				else validateUpgradeClaimAgainstPredecessor(prepare, artifacts.generation);
+				const disposition = claimDisposition(prepare.record, current, runtime);
+				if (disposition === "live") throw new CutoverFailure("orchestration_in_progress");
+				if (disposition === "unknown") throw new CutoverFailure("orchestration_owner_unknown");
+			} else if (
+				prepare.record.transitionKind !== "bootstrap" ||
+				prepare.record.cutoverId !== artifacts.generation.record.cutoverId ||
+				artifacts.generation.record.transitionKind !== "bootstrap" ||
+				prepare.record.predecessorGenerationDigest !== null ||
+				artifacts.generation.record.predecessorGenerationDigest !== null ||
+				prepare.record.launcherConfigurationDigest !== artifacts.generation.record.launcherConfigurationDigest
+			)
+				throw new CutoverFailure("invalid_control_artifact");
 			// Publication is authoritative; this is a bounded claim-retirement seam.
+			const disposition = claimDisposition(prepare.record, current, runtime);
+			if (disposition === "live") throw new CutoverFailure("orchestration_in_progress");
+			if (disposition === "unknown") throw new CutoverFailure("orchestration_owner_unknown");
 			discardPrepare(context, prepare, runtime);
 			return readArtifacts(context);
 		}
@@ -1570,14 +1733,37 @@ function recoverStandalonePrepare(
 		if (
 			!artifacts.generation ||
 			artifacts.generation.record.kind !== "incident_cas_v2_generation" ||
-			artifacts.generation.record.state !== "draining" ||
-			artifacts.generation.record.cutoverId !== prepare.record.cutoverId ||
 			!artifacts.claim
 		)
 			throw new CutoverFailure("invalid_control_artifact");
-		validateClaimGenerationPair(artifacts.claim, artifacts.generation);
 		if (artifacts.claim.record.kind !== "incident_cas_v2_orchestration_claim")
 			throw new CutoverFailure("invalid_control_artifact");
+		assertRecordContext(artifacts.generation.record, context);
+		assertRecordContext(artifacts.claim.record, context);
+		if (prepare.record.transitionKind === "bootstrap") {
+			if (
+				artifacts.generation.record.state !== "draining" ||
+				prepare.record.cutoverId !== artifacts.generation.record.cutoverId
+			)
+				throw new CutoverFailure("invalid_control_artifact");
+			validatePublishedClaimGenerationPair(artifacts.claim, artifacts.generation);
+			if (
+				prepare.record.cutoverId !== artifacts.claim.record.cutoverId ||
+				prepare.record.transitionKind !== artifacts.claim.record.transitionKind ||
+				prepare.record.predecessorGenerationDigest !== artifacts.claim.record.predecessorGenerationDigest ||
+				prepare.record.launcherConfigurationDigest !== artifacts.claim.record.launcherConfigurationDigest
+			)
+				throw new CutoverFailure("invalid_control_artifact");
+		} else {
+			validateUpgradeClaimAgainstPredecessor(artifacts.claim, artifacts.generation);
+			if (
+				prepare.record.cutoverId !== artifacts.claim.record.cutoverId ||
+				prepare.record.transitionKind !== "upgrade" ||
+				prepare.record.predecessorGenerationDigest !== generationDigest(artifacts.generation) ||
+				prepare.record.launcherConfigurationDigest !== artifacts.claim.record.launcherConfigurationDigest
+			)
+				throw new CutoverFailure("invalid_control_artifact");
+		}
 		const disposition = claimDisposition(artifacts.claim.record, current, runtime);
 		if (disposition === "live") throw new CutoverFailure("orchestration_in_progress");
 		if (disposition === "unknown") throw new CutoverFailure("orchestration_owner_unknown");
@@ -1591,6 +1777,8 @@ function recoverStandalonePrepare(
 		artifacts.claim.record.cutoverId !== prepare.record.cutoverId
 	)
 		throw new CutoverFailure("invalid_control_artifact");
+	assertRecordContext(artifacts.claim.record, context);
+	validatePublishedClaimGenerationPair(artifacts.claim, prepare);
 	const disposition = claimDisposition(artifacts.claim.record, current, runtime);
 	if (disposition === "live") throw new CutoverFailure("orchestration_in_progress");
 	if (disposition === "unknown") throw new CutoverFailure("orchestration_owner_unknown");
@@ -1604,25 +1792,41 @@ function recoverStandalonePrepare(
 
 function cleanupPublishedResidue(
 	context: RootContext,
-	target: NormalizedTarget,
-	artifacts: ArtifactState,
 	runtime: RuntimeBinding,
+	artifacts: ArtifactState,
 ): ArtifactState {
 	const generation = artifacts.generation;
 	if (!generation || generation.record.kind !== "incident_cas_v2_generation" || generation.record.state !== "v2")
 		return artifacts;
-	assertRecordMatchesContext(generation.record, context, target);
+	assertRecordContext(generation.record, context);
 	if (artifacts.prepare) throw new CutoverFailure("invalid_control_artifact");
-	if (artifacts.claim) {
-		if (
-			artifacts.claim.record.kind !== "incident_cas_v2_orchestration_claim" ||
-			artifacts.claim.record.cutoverId !== generation.record.cutoverId
-		)
-			throw new CutoverFailure("invalid_control_artifact");
-		assertRecordMatchesContext(artifacts.claim.record, context, target);
-		retireClaimBound(context, artifacts.claim, runtime);
+	const claim = artifacts.claim;
+	if (!claim) return artifacts;
+	if (claim.record.kind !== "incident_cas_v2_orchestration_claim")
+		throw new CutoverFailure("invalid_control_artifact");
+	assertRecordContext(claim.record, context);
+	if (claim.record.launcherConfigurationDigest === generation.record.launcherConfigurationDigest) {
+		validatePublishedClaimGenerationPair(claim, generation);
+		const current = readCurrentOwner(runtime);
+		const disposition = claimDisposition(claim.record, current, runtime);
+		if (disposition === "live") throw new CutoverFailure("orchestration_in_progress");
+		if (disposition === "unknown") throw new CutoverFailure("orchestration_owner_unknown");
+		// Published residue may belong to the previous target. Retire only after
+		// the context/pair and owner have been proved; recoverAndClaim then decides
+		// whether the current target can reuse the generation or needs an upgrade.
+		retireClaimBound(context, claim, runtime);
+		return readArtifacts(context);
 	}
+	// An unpublished upgrade claim remains target-bound. Its owner must still be
+	// classified before a changed target can retire it and continue the upgrade.
+	validateUpgradeClaimAgainstPredecessor(claim, generation);
 	return readArtifacts(context);
+}
+
+function validateExistingDrainingTarget(context: RootContext, target: NormalizedTarget): void {
+	const generation = readArtifact(context.generationPath, context);
+	if (generation?.record.kind === "incident_cas_v2_generation" && generation.record.state === "draining")
+		assertRecordMatchesContext(generation.record, context, target);
 }
 
 function systemdUnescape(value: string): string | undefined {
@@ -2163,6 +2367,15 @@ function assertCutoverCurrent(state: CutoverState, allowPrepare = false): void {
 	assertKnownControlNamespace(state.context);
 	assertLegacyAbsent(state.context);
 	if (!sameSnapshot(state.context.claimPath, state.claim, state.context)) throw new CutoverFailure("claim_lost");
+	if (state.generation.record.kind !== "incident_cas_v2_generation") throw new CutoverFailure("generation_changed");
+	assertRecordContext(state.generation.record, state.context);
+	if (state.claim.record.kind !== "incident_cas_v2_orchestration_claim") throw new CutoverFailure("claim_lost");
+	if (state.claim.record.transitionKind === "upgrade") {
+		validateUpgradeClaimAgainstPredecessor(state.claim, state.generation);
+	} else {
+		assertRecordMatchesContext(state.generation.record, state.context, state.target);
+		validatePublishedClaimGenerationPair(state.claim, state.generation);
+	}
 	if (!sameSnapshot(state.context.generationPath, state.generation, state.context))
 		throw new CutoverFailure("generation_changed");
 	if (!allowPrepare && pathExistsNoFollow(state.context.preparePath))
@@ -2693,46 +2906,103 @@ function recoverAndClaim(
 	const current = readCurrentOwner(runtime);
 	if (current.uid.toString() !== context.controlBinding.uid || current.gid.toString() !== context.controlBinding.gid)
 		throw new CutoverFailure("orchestration_owner_unknown");
+	validateExistingDrainingTarget(context, target);
 	recoverPrepareScratch(context, runtime);
 	let artifacts = recoverKnownLinkedPrepare(context, readArtifacts(context), runtime);
-	artifacts = recoverStandalonePrepare(context, target, runtime, artifacts, current);
-	artifacts = cleanupPublishedResidue(context, target, artifacts, runtime);
-	if (artifacts.generation) assertRecordMatchesContext(artifacts.generation.record, context, target);
-	if (artifacts.claim) assertRecordMatchesContext(artifacts.claim.record, context, target);
+	artifacts = recoverStandalonePrepare(context, runtime, artifacts, current);
+	artifacts = cleanupPublishedResidue(context, runtime, artifacts);
 	if (artifacts.generation?.record.kind !== "incident_cas_v2_generation" && artifacts.generation)
 		throw new CutoverFailure("invalid_control_artifact");
-	if (
-		artifacts.generation?.record.kind === "incident_cas_v2_generation" &&
-		artifacts.generation.record.state === "v2"
-	) {
-		if (artifacts.claim || artifacts.prepare) throw new CutoverFailure("invalid_control_artifact");
-		return { state: "v2" };
+	if (artifacts.prepare) throw new CutoverFailure("invalid_control_artifact");
+	if (artifacts.generation?.record.kind === "incident_cas_v2_generation") {
+		if (artifacts.generation.record.state === "draining")
+			assertRecordMatchesContext(artifacts.generation.record, context, target);
+	}
+	const generation = artifacts.generation;
+	const generationIsV2 = generation?.record.kind === "incident_cas_v2_generation" && generation.record.state === "v2";
+	if (generationIsV2 && !artifacts.claim) {
+		if (generation?.record.launcherConfigurationDigest === target.launcherConfigurationDigest) return { state: "v2" };
+		// An installed package changed. The old v2 record remains authoritative until
+		// a new target has claimed it and a successor is atomically published.
+		const claim = createClaim(
+			context,
+			target,
+			runtime,
+			generation.record.cutoverId,
+			current,
+			"upgrade",
+			generationDigest(generation),
+		);
+		return { state: "draining", claim, generation };
 	}
 	let cutoverId =
-		artifacts.generation?.record.kind === "incident_cas_v2_generation"
-			? artifacts.generation.record.cutoverId
-			: randomUUID();
+		generation?.record.kind === "incident_cas_v2_generation" ? generation.record.cutoverId : randomUUID();
 	let claim = artifacts.claim;
 	if (claim) {
 		if (claim.record.kind !== "incident_cas_v2_orchestration_claim")
 			throw new CutoverFailure("invalid_control_artifact");
-		if (artifacts.generation) validateClaimGenerationPair(claim, artifacts.generation);
-		else cutoverId = claim.record.cutoverId;
+		assertRecordContext(claim.record, context);
+		if (generation) {
+			if (generation.record.kind !== "incident_cas_v2_generation")
+				throw new CutoverFailure("invalid_control_artifact");
+			if (generation.record.state === "v2") {
+				validateUpgradeClaimAgainstPredecessor(claim, generation);
+			} else {
+				validatePublishedClaimGenerationPair(claim, generation);
+				if (
+					generation.record.state !== "draining" ||
+					claim.record.transitionKind !== "bootstrap" ||
+					claim.record.predecessorGenerationDigest !== null
+				)
+					throw new CutoverFailure("invalid_control_artifact");
+			}
+		} else {
+			if (claim.record.transitionKind !== "bootstrap" || claim.record.predecessorGenerationDigest !== null)
+				throw new CutoverFailure("invalid_control_artifact");
+			cutoverId = claim.record.cutoverId;
+		}
 		const disposition = claimDisposition(claim.record, current, runtime);
 		if (disposition === "live") throw new CutoverFailure("orchestration_in_progress");
 		if (disposition === "unknown") throw new CutoverFailure("orchestration_owner_unknown");
-		if (disposition === "stale") {
+		if (
+			disposition === "stale" ||
+			(disposition === "current" && claim.record.launcherConfigurationDigest !== target.launcherConfigurationDigest)
+		) {
 			retireClaimBound(context, claim, runtime);
 			claim = undefined;
 		}
 	}
+	if (generationIsV2) {
+		if (!generation) throw new CutoverFailure("invalid_control_artifact");
+		if (!claim && generation.record.launcherConfigurationDigest === target.launcherConfigurationDigest)
+			return { state: "v2" };
+		if (!claim) {
+			if (generation.record.kind !== "incident_cas_v2_generation")
+				throw new CutoverFailure("invalid_control_artifact");
+			claim = createClaim(
+				context,
+				target,
+				runtime,
+				generation.record.cutoverId,
+				current,
+				"upgrade",
+				generationDigest(generation),
+			);
+		}
+		return { state: "draining", claim, generation };
+	}
 	if (!claim) claim = createClaim(context, target, runtime, cutoverId, current);
-	let generation = artifacts.generation;
-	if (!generation) generation = createDrainingGeneration(context, target, runtime, cutoverId);
-	validateClaimGenerationPair(claim, generation);
-	if (generation.record.kind !== "incident_cas_v2_generation" || generation.record.state !== "draining")
+	let drainingGeneration = generation;
+	if (!drainingGeneration) drainingGeneration = createDrainingGeneration(context, target, runtime, cutoverId);
+	if (
+		drainingGeneration.record.kind !== "incident_cas_v2_generation" ||
+		drainingGeneration.record.state !== "draining" ||
+		claim.record.transitionKind !== "bootstrap" ||
+		claim.record.predecessorGenerationDigest !== null
+	)
 		throw new CutoverFailure("invalid_control_artifact");
-	return { state: "draining", claim, generation };
+	validatePublishedClaimGenerationPair(claim, drainingGeneration);
+	return { state: "draining", claim, generation: drainingGeneration };
 }
 
 export function beginIncidentCasV2Cutover(
@@ -2810,6 +3080,77 @@ function prepareV2(state: CutoverState, record: GenerationRecord): ArtifactSnaps
 	return prepared;
 }
 
+function successorGeneration(state: CutoverState): GenerationRecord {
+	if (state.claim.record.kind !== "incident_cas_v2_orchestration_claim") throw new CutoverFailure("claim_lost");
+	if (state.generation.record.kind !== "incident_cas_v2_generation") throw new CutoverFailure("generation_changed");
+	if (state.claim.record.transitionKind === "bootstrap") {
+		if (state.generation.record.state !== "draining") throw new CutoverFailure("generation_changed");
+		return {
+			schemaVersion: state.generation.record.schemaVersion,
+			kind: state.generation.record.kind,
+			state: "v2",
+			cutoverId: state.generation.record.cutoverId,
+			transitionKind: "bootstrap",
+			predecessorGenerationDigest: null,
+			canonicalAgentDirPath: state.generation.record.canonicalAgentDirPath,
+			incidentRecorderPath: state.generation.record.incidentRecorderPath,
+			incidentsPath: state.generation.record.incidentsPath,
+			historicalCopyBoundary: state.generation.record.historicalCopyBoundary,
+			control: state.generation.record.control,
+			launcherConfigurationDigest: state.generation.record.launcherConfigurationDigest,
+		};
+	}
+	validateUpgradeClaimAgainstPredecessor(state.claim, state.generation);
+	return {
+		schemaVersion: state.generation.record.schemaVersion,
+		kind: state.generation.record.kind,
+		state: "v2",
+		cutoverId: state.generation.record.cutoverId,
+		transitionKind: "upgrade",
+		predecessorGenerationDigest: generationDigest(state.generation),
+		canonicalAgentDirPath: state.generation.record.canonicalAgentDirPath,
+		incidentRecorderPath: state.generation.record.incidentRecorderPath,
+		incidentsPath: state.generation.record.incidentsPath,
+		historicalCopyBoundary: state.generation.record.historicalCopyBoundary,
+		control: state.generation.record.control,
+		launcherConfigurationDigest: state.claim.record.launcherConfigurationDigest,
+	};
+}
+
+function verifyPreparedSuccessorBinding(state: CutoverState, prepared: ArtifactSnapshot): void {
+	if (prepared.record.kind !== "incident_cas_v2_generation" || prepared.record.state !== "v2")
+		throw new CutoverFailure("generation_changed");
+	if (state.claim.record.kind !== "incident_cas_v2_orchestration_claim") throw new CutoverFailure("claim_lost");
+	if (
+		prepared.record.cutoverId !== state.claim.record.cutoverId ||
+		prepared.record.transitionKind !== state.claim.record.transitionKind ||
+		prepared.record.launcherConfigurationDigest !== state.claim.record.launcherConfigurationDigest ||
+		prepared.record.canonicalAgentDirPath !== state.claim.record.canonicalAgentDirPath ||
+		prepared.record.incidentRecorderPath !== state.claim.record.incidentRecorderPath ||
+		prepared.record.incidentsPath !== state.claim.record.incidentsPath ||
+		!sameControlBinding(prepared.record.control, state.claim.record.control)
+	)
+		throw new CutoverFailure("claim_lost");
+	if (state.claim.record.transitionKind === "upgrade") {
+		if (prepared.record.predecessorGenerationDigest !== generationDigest(state.generation))
+			throw new CutoverFailure("generation_changed");
+		validateUpgradeClaimAgainstPredecessor(state.claim, state.generation);
+	} else if (prepared.record.predecessorGenerationDigest !== null) {
+		throw new CutoverFailure("generation_changed");
+	}
+	if (!sameSnapshot(state.context.generationPath, state.generation, state.context))
+		throw new CutoverFailure("generation_changed");
+	if (!sameSnapshot(state.context.claimPath, state.claim, state.context)) throw new CutoverFailure("claim_lost");
+	const currentPrepare = readArtifact(state.context.preparePath, state.context);
+	if (
+		!currentPrepare ||
+		currentPrepare.identity.nlink !== 1n ||
+		!sameIdentity(currentPrepare.identity, prepared.identity) ||
+		!currentPrepare.bytes.equals(prepared.bytes)
+	)
+		throw new CutoverFailure("generation_changed");
+}
+
 function commitPreparedV2(state: CutoverState, prepared: ArtifactSnapshot, expectedLauncher: LauncherEvidence): void {
 	assertCutoverCurrent(state, true);
 	const launcher = launcherEvidence(
@@ -2825,6 +3166,7 @@ function commitPreparedV2(state: CutoverState, prepared: ArtifactSnapshot, expec
 	)
 		throw new CutoverFailure("witness_stale");
 	assertCutoverCurrent(state, true);
+	verifyPreparedSuccessorBinding(state, prepared);
 	renameSync(state.context.preparePath, state.context.generationPath);
 	state.runtime.onStep?.("v2_published");
 	fsyncControl(state.context);
@@ -2864,7 +3206,7 @@ export function publishIncidentCasV2(
 		assertCutoverCurrent(state);
 		if (state.generation.record.kind !== "incident_cas_v2_generation")
 			return { state: "unavailable", reason: "generation_changed" };
-		const v2: GenerationRecord = { ...state.generation.record, state: "v2" };
+		const v2 = successorGeneration(state);
 		const prepared = prepareV2(state, v2);
 		state.runtime.onStep?.("before_v2_publish");
 		const finalEvidence = observeQuiescence(state);

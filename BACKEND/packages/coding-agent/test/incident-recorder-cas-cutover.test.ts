@@ -109,6 +109,141 @@ function sha256(value: string | Uint8Array): string {
 	return createHash("sha256").update(value).digest("hex");
 }
 
+it("resumes the original target after retiring an abandoned upgrade claim", () => {
+	const f = fixture();
+	publish(f);
+	const targetB = successorTarget(f);
+	const started = beginIncidentCasV2Cutover(targetB, f.runtimeHandle);
+	if (started.state !== "draining") throw new Error("expected upgrade");
+	started.cutover.close();
+	writeFileSync(f.unitPath, f.unitContents, { mode: 0o600 });
+	cloneLauncher(f, { fragment: observedFile(f.unitPath) });
+	const resumed = beginIncidentCasV2Cutover(f.target, f.runtimeHandle);
+	if (resumed.state === "draining") resumed.cutover.close();
+	expect(resumed).toEqual({ state: "v2" });
+});
+
+it.each(["current", "stale", "live", "unknown"] as const)(
+	"classifies an abandoned upgrade claim before resuming the original target for a %s owner",
+	(disposition) => {
+		const f = fixture();
+		publish(f);
+		const targetB = successorTarget(f);
+		const started = beginIncidentCasV2Cutover(targetB, f.runtimeHandle);
+		if (started.state !== "draining") throw new Error("expected upgrade");
+		started.cutover.close();
+
+		const paths = artifactPaths(f.agentDir);
+		const generationBefore = readFileSync(paths.generation);
+		const claimBefore = readFileSync(paths.claim);
+		writeFileSync(f.unitPath, f.unitContents, { mode: 0o600 });
+		cloneLauncher(f, { fragment: observedFile(f.unitPath) });
+		const retryOwner: IncidentCasV2ProcessIdentity = {
+			...f.owner,
+			pid: f.owner.pid + 4,
+			startId: "606",
+		};
+		const retryRuntime: IncidentCasV2CutoverRuntime = {
+			...f.runtime,
+			readCurrentProcessIdentity: () =>
+				disposition === "current"
+					? { state: "present", identity: f.owner }
+					: { state: "present", identity: retryOwner },
+			readProcessIdentity: () =>
+				disposition === "stale"
+					? { state: "absent" }
+					: disposition === "live"
+						? { state: "present", identity: f.owner }
+						: { state: "unavailable", code: "proc_unavailable" },
+		};
+		const result =
+			disposition === "current"
+				? beginIncidentCasV2Cutover(f.target, f.runtimeHandle)
+				: beginIncidentCasV2Cutover(f.target, registerTestRuntime(retryRuntime));
+
+		expect(readFileSync(paths.generation)).toEqual(generationBefore);
+		if (disposition === "current" || disposition === "stale") {
+			expect(result).toEqual({ state: "v2" });
+			expect(existsSync(paths.claim)).toBe(false);
+			expect(existsSync(paths.prepare)).toBe(false);
+			const activation = openIncidentCasV2Activation(f.target, f.runtimeHandle);
+			expect(activation).toMatchObject({ state: "active" });
+			if (activation.state === "active") {
+				expect(activation.activation.revalidate()).toEqual({ state: "valid" });
+				activation.activation.close();
+			}
+		} else {
+			expect(result).toEqual({
+				state: "unavailable",
+				reason: disposition === "live" ? "orchestration_in_progress" : "orchestration_owner_unknown",
+			});
+			expect(readFileSync(paths.claim)).toEqual(claimBefore);
+			expect(existsSync(paths.prepare)).toBe(false);
+		}
+	},
+);
+
+it.each(["current", "stale"] as const)(
+	"recovers the original target after an abandoned partial upgrade prepare for a %s owner",
+	(disposition) => {
+		const f = fixture();
+		publish(f);
+		const targetB = successorTarget(f, "fixture-successor-b-partial");
+		const started = beginIncidentCasV2Cutover(targetB, f.runtimeHandle);
+		if (started.state !== "draining") throw new Error("expected upgrade cutover");
+		const witness = prove(started.cutover);
+		f.setStepFault("v2_scratch_partially_written");
+		expect(publishIncidentCasV2(started.cutover, witness)).toEqual({
+			state: "unavailable",
+			reason: "io_error",
+		});
+		started.cutover.close();
+
+		const paths = artifactPaths(f.agentDir);
+		const generationBefore = readFileSync(paths.generation);
+		const claimBefore = readFileSync(paths.claim);
+		expect(existsSync(paths.prepare)).toBe(true);
+		writeFileSync(f.unitPath, f.unitContents, { mode: 0o600 });
+		cloneLauncher(f, { fragment: observedFile(f.unitPath) });
+		const retryOwner: IncidentCasV2ProcessIdentity = {
+			...f.owner,
+			pid: f.owner.pid + 5,
+			startId: "707",
+		};
+		const retryRuntime: IncidentCasV2CutoverRuntime = {
+			...f.runtime,
+			readCurrentProcessIdentity: () => ({
+				state: "present",
+				identity: disposition === "current" ? f.owner : retryOwner,
+			}),
+			readProcessIdentity: () =>
+				disposition === "stale" ? { state: "absent" } : { state: "present", identity: f.owner },
+		};
+		const retryHandle = disposition === "current" ? f.runtimeHandle : registerTestRuntime(retryRuntime);
+
+		expect(beginIncidentCasV2Cutover(f.target, retryHandle)).toEqual({
+			state: "unavailable",
+			reason: "orchestration_in_progress",
+		});
+		expect(readFileSync(paths.generation)).toEqual(generationBefore);
+		expect(readFileSync(paths.claim)).toEqual(claimBefore);
+		expect(existsSync(paths.prepare)).toBe(true);
+
+		f.monotonicMs += 1_001;
+		const resumed = beginIncidentCasV2Cutover(f.target, retryHandle);
+		expect(readFileSync(paths.generation)).toEqual(generationBefore);
+		expect(resumed).toEqual({ state: "v2" });
+		expect(existsSync(paths.claim)).toBe(false);
+		expect(existsSync(paths.prepare)).toBe(false);
+		const activation = openIncidentCasV2Activation(f.target, retryHandle);
+		expect(activation).toMatchObject({ state: "active" });
+		if (activation.state === "active") {
+			expect(activation.activation.revalidate()).toEqual({ state: "valid" });
+			activation.activation.close();
+		}
+	},
+);
+
 function quote(value: string): string {
 	return `"${value.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
 }
@@ -337,6 +472,26 @@ function cloneLauncher(
 	f.launcher = { ...f.launcher, ...change };
 }
 
+function successorTarget(f: Fixture, description = "fixture-successor"): IncidentCasV2CutoverTarget {
+	const unitContents = `[Unit]\nDescription=${description}\n\n[Service]\nExecStart=${f.target.launcher.argv.map(quote).join(" ")}\n`;
+	writeFileSync(f.unitPath, unitContents, { mode: 0o600 });
+	if (f.launcher.state !== "observed") throw new Error("fixture launcher is unavailable");
+	f.launcher = { ...f.launcher, fragment: observedFile(f.unitPath) };
+	return {
+		...f.target,
+		launcher: { ...f.target.launcher, unitContents },
+	};
+}
+
+function rewriteAsLegacyRecord(path: string): Buffer {
+	const record = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+	delete record.transitionKind;
+	delete record.predecessorGenerationDigest;
+	const bytes = Buffer.from(`${JSON.stringify(record)}\n`, "utf8");
+	writeFileSync(path, bytes, { mode: 0o600 });
+	return bytes;
+}
+
 function replaceAgentDir(f: Fixture, suffix: string): void {
 	renameSync(f.agentDir, `${f.agentDir}.${suffix}`);
 	mkdirSync(f.agentDir, { mode: 0o700 });
@@ -417,6 +572,371 @@ describe("incident recorder CAS v2 cutover", () => {
 		activation.activation.close();
 		expect(activation.activation.revalidate()).toEqual({ state: "invalid", reason: "generation_changed" });
 		expect(activation.activation.activationGenerationDigest).toBe(digest);
+	});
+
+	it("claims a changed target as a predecessor-bound successor and publishes it atomically", () => {
+		const f = fixture();
+		const initial = begin(f);
+		const paths = artifactPaths(f.agentDir);
+		const initialClaim = JSON.parse(readFileSync(paths.claim, "utf8")) as Record<string, unknown>;
+		const initialWitness = prove(initial);
+		expect(publishIncidentCasV2(initial, initialWitness)).toEqual({ state: "published" });
+		const initialGeneration = readFileSync(paths.generation);
+		const initialGenerationRecord = JSON.parse(initialGeneration.toString("utf8")) as Record<string, unknown>;
+		const predecessorDigest = sha256(initialGeneration);
+		const initialCutoverId = initialGenerationRecord.cutoverId;
+		const targetB = successorTarget(f);
+
+		const successor = beginIncidentCasV2Cutover(targetB, f.runtimeHandle);
+		expect(successor).toMatchObject({ state: "draining" });
+		if (successor.state !== "draining") return;
+		expect(readFileSync(paths.generation)).toEqual(initialGeneration);
+		const successorClaim = JSON.parse(readFileSync(paths.claim, "utf8")) as Record<string, unknown>;
+		expect(successorClaim).toMatchObject({
+			cutoverId: initialCutoverId,
+			transitionKind: "upgrade",
+			predecessorGenerationDigest: predecessorDigest,
+		});
+		expect(successorClaim.claimId).not.toBe(initialClaim.claimId);
+
+		const witness = prove(successor.cutover);
+		expect(publishIncidentCasV2(successor.cutover, witness)).toEqual({ state: "published" });
+		const published = JSON.parse(readFileSync(paths.generation, "utf8")) as Record<string, unknown>;
+		expect(published).toMatchObject({
+			state: "v2",
+			cutoverId: initialCutoverId,
+			transitionKind: "upgrade",
+			predecessorGenerationDigest: predecessorDigest,
+		});
+		expect(published.launcherConfigurationDigest).not.toBe(initialGenerationRecord.launcherConfigurationDigest);
+		expect(existsSync(paths.claim)).toBe(false);
+		expect(beginIncidentCasV2Cutover(targetB, f.runtimeHandle)).toEqual({ state: "v2" });
+		initial.close();
+	});
+
+	it.each([
+		"v2_prepared",
+		"before_v2_publish",
+		"after_final_quiescence",
+		"v2_published",
+		"v2_directory_fsynced",
+		"claim_retirement_linked",
+		"claim_unlinked",
+		"cleanup_directory_fsynced",
+	] satisfies IncidentCasV2CutoverStep[])("recovers an upgrade through the fixed slots after %s", (step) => {
+		const f = fixture();
+		publish(f);
+		const targetB = successorTarget(f);
+		const started = beginIncidentCasV2Cutover(targetB, f.runtimeHandle);
+		if (started.state !== "draining") throw new Error("expected upgrade cutover");
+		const witness = prove(started.cutover);
+		f.setStepFault(step);
+		expect(publishIncidentCasV2(started.cutover, witness)).toEqual({ state: "unavailable", reason: "io_error" });
+		started.cutover.close();
+		const resumed = beginIncidentCasV2Cutover(targetB, f.runtimeHandle);
+		if (step === "v2_prepared" || step === "before_v2_publish" || step === "after_final_quiescence") {
+			expect(resumed).toMatchObject({ state: "draining" });
+			if (resumed.state === "draining") {
+				const fresh = prove(resumed.cutover);
+				expect(publishIncidentCasV2(resumed.cutover, fresh)).toEqual({ state: "published" });
+			}
+		} else expect(resumed).toEqual({ state: "v2" });
+		const paths = artifactPaths(f.agentDir);
+		expect(existsSync(paths.prepare)).toBe(false);
+		expect(existsSync(paths.claim)).toBe(false);
+	});
+
+	it.each(["live", "unknown"] as const)("rejects a %s claimant while an upgrade is pending", (disposition) => {
+		const f = fixture();
+		publish(f);
+		const targetB = successorTarget(f);
+		const started = beginIncidentCasV2Cutover(targetB, f.runtimeHandle);
+		if (started.state !== "draining") throw new Error("expected upgrade cutover");
+		started.cutover.close();
+		const successorOwner: IncidentCasV2ProcessIdentity = {
+			...f.owner,
+			pid: f.owner.pid + 1,
+			startId: "303",
+		};
+		const successorRuntime: IncidentCasV2CutoverRuntime = {
+			...f.runtime,
+			readCurrentProcessIdentity: () => ({ state: "present", identity: successorOwner }),
+			readProcessIdentity: () =>
+				disposition === "live"
+					? { state: "present", identity: f.owner }
+					: { state: "unavailable", code: "proc_unavailable" },
+		};
+		expect(beginIncidentCasV2Cutover(targetB, registerTestRuntime(successorRuntime))).toEqual({
+			state: "unavailable",
+			reason: disposition === "live" ? "orchestration_in_progress" : "orchestration_owner_unknown",
+		});
+	});
+
+	it.each(["stale", "live", "unknown"] as const)(
+		"handles target-C retry after published target-B residue owned by a %s claimant",
+		(disposition) => {
+			const f = fixture();
+			publish(f);
+			const targetB = successorTarget(f);
+			const started = beginIncidentCasV2Cutover(targetB, f.runtimeHandle);
+			if (started.state !== "draining") throw new Error("expected upgrade cutover");
+			const witness = prove(started.cutover);
+			f.setStepFault("claim_retirement_linked");
+			expect(publishIncidentCasV2(started.cutover, witness)).toEqual({ state: "unavailable", reason: "io_error" });
+			started.cutover.close();
+
+			const paths = artifactPaths(f.agentDir);
+			const publishedB = readFileSync(paths.generation);
+			const targetC = successorTarget(f, "fixture-successor-c");
+			const retryOwner: IncidentCasV2ProcessIdentity = { ...f.owner, pid: f.owner.pid + 2, startId: "404" };
+			const retryRuntime: IncidentCasV2CutoverRuntime = {
+				...f.runtime,
+				readCurrentProcessIdentity: () => ({ state: "present", identity: retryOwner }),
+				readProcessIdentity: () =>
+					disposition === "stale"
+						? { state: "absent" }
+						: disposition === "live"
+							? { state: "present", identity: f.owner }
+							: { state: "unavailable", code: "proc_unavailable" },
+			};
+			const result = beginIncidentCasV2Cutover(targetC, registerTestRuntime(retryRuntime));
+			if (disposition === "stale") {
+				expect(result).toMatchObject({ state: "draining" });
+				expect(readFileSync(paths.generation)).toEqual(publishedB);
+				if (result.state === "draining") {
+					const claim = JSON.parse(readFileSync(paths.claim, "utf8")) as Record<string, unknown>;
+					expect(claim).toMatchObject({
+						transitionKind: "upgrade",
+						predecessorGenerationDigest: sha256(publishedB),
+					});
+					result.cutover.close();
+				}
+			} else {
+				expect(result).toEqual({
+					state: "unavailable",
+					reason: disposition === "live" ? "orchestration_in_progress" : "orchestration_owner_unknown",
+				});
+				expect(readFileSync(paths.generation)).toEqual(publishedB);
+				expect(existsSync(paths.claim)).toBe(true);
+			}
+		},
+	);
+
+	it("rejects a mixed bootstrap claim instead of adopting it as an upgrade", () => {
+		const f = fixture();
+		publish(f);
+		const targetB = successorTarget(f);
+		const started = beginIncidentCasV2Cutover(targetB, f.runtimeHandle);
+		if (started.state !== "draining") throw new Error("expected upgrade cutover");
+		started.cutover.close();
+		const paths = artifactPaths(f.agentDir);
+		const claim = JSON.parse(readFileSync(paths.claim, "utf8")) as Record<string, unknown>;
+		writeFileSync(
+			paths.claim,
+			`${JSON.stringify({ ...claim, transitionKind: "bootstrap", predecessorGenerationDigest: null })}\n`,
+			{ mode: 0o600 },
+		);
+		expect(beginIncidentCasV2Cutover(targetB, f.runtimeHandle)).toEqual({
+			state: "unavailable",
+			reason: "invalid_control_artifact",
+		});
+		expect(JSON.parse(readFileSync(paths.generation, "utf8"))).toMatchObject({ state: "v2" });
+	});
+
+	it("accepts exact legacy generation and claim bytes as implicit bootstrap records", () => {
+		const f = fixture();
+		const cutover = begin(f);
+		cutover.close();
+		const paths = artifactPaths(f.agentDir);
+		const legacyGeneration = rewriteAsLegacyRecord(paths.generation);
+		const legacyClaim = rewriteAsLegacyRecord(paths.claim);
+		expect(JSON.parse(legacyGeneration.toString("utf8"))).not.toHaveProperty("transitionKind");
+		expect(JSON.parse(legacyClaim.toString("utf8"))).not.toHaveProperty("predecessorGenerationDigest");
+
+		const resumed = beginIncidentCasV2Cutover(f.target, f.runtimeHandle);
+		expect(resumed).toMatchObject({ state: "draining" });
+		expect(readFileSync(paths.generation)).toEqual(legacyGeneration);
+		expect(readFileSync(paths.claim)).toEqual(legacyClaim);
+		if (resumed.state === "draining") resumed.cutover.close();
+	});
+
+	it("publishes and activates a legacy draining generation with canonical successor bytes", () => {
+		const f = fixture();
+		const initial = begin(f);
+		initial.close();
+		const paths = artifactPaths(f.agentDir);
+		const legacyGeneration = rewriteAsLegacyRecord(paths.generation);
+		rewriteAsLegacyRecord(paths.claim);
+
+		const resumed = beginIncidentCasV2Cutover(f.target, f.runtimeHandle);
+		expect(resumed).toMatchObject({ state: "draining" });
+		if (resumed.state !== "draining") return;
+		const witness = prove(resumed.cutover);
+		expect(publishIncidentCasV2(resumed.cutover, witness)).toEqual({ state: "published" });
+		const publishedBytes = readFileSync(paths.generation);
+		const published = JSON.parse(publishedBytes.toString("utf8")) as Record<string, unknown>;
+		expect(Object.keys(published)).toEqual([
+			"schemaVersion",
+			"kind",
+			"state",
+			"cutoverId",
+			"transitionKind",
+			"predecessorGenerationDigest",
+			"canonicalAgentDirPath",
+			"incidentRecorderPath",
+			"incidentsPath",
+			"historicalCopyBoundary",
+			"control",
+			"launcherConfigurationDigest",
+		]);
+		expect(published.state).toBe("v2");
+		expect(published.predecessorGenerationDigest).toBeNull();
+		expect(sha256(publishedBytes)).not.toBe(sha256(legacyGeneration));
+		expect(existsSync(paths.claim)).toBe(false);
+		expect(existsSync(paths.prepare)).toBe(false);
+		expect(openIncidentCasV2Activation(f.target, f.runtimeHandle)).toMatchObject({ state: "active" });
+		expect(beginIncidentCasV2Cutover(f.target, f.runtimeHandle)).toEqual({ state: "v2" });
+	});
+
+	it("retains raw legacy generation bytes when binding an upgrade predecessor", () => {
+		const f = fixture();
+		publish(f);
+		const paths = artifactPaths(f.agentDir);
+		const legacyGeneration = rewriteAsLegacyRecord(paths.generation);
+		const targetB = successorTarget(f);
+
+		const resumed = beginIncidentCasV2Cutover(targetB, f.runtimeHandle);
+		expect(resumed).toMatchObject({ state: "draining" });
+		expect(readFileSync(paths.generation)).toEqual(legacyGeneration);
+		const claim = JSON.parse(readFileSync(paths.claim, "utf8")) as Record<string, unknown>;
+		expect(claim).toMatchObject({
+			transitionKind: "upgrade",
+			predecessorGenerationDigest: sha256(legacyGeneration),
+		});
+		if (resumed.state === "draining") resumed.cutover.close();
+	});
+
+	it("publishes and activates an upgrade from a legacy v2 generation with canonical successor bytes", () => {
+		const f = fixture();
+		publish(f);
+		const paths = artifactPaths(f.agentDir);
+		const legacyGeneration = rewriteAsLegacyRecord(paths.generation);
+		const targetB = successorTarget(f);
+		const resumed = beginIncidentCasV2Cutover(targetB, f.runtimeHandle);
+		expect(resumed).toMatchObject({ state: "draining" });
+		if (resumed.state !== "draining") return;
+		const witness = prove(resumed.cutover);
+		expect(publishIncidentCasV2(resumed.cutover, witness)).toEqual({ state: "published" });
+		const publishedBytes = readFileSync(paths.generation);
+		const published = JSON.parse(publishedBytes.toString("utf8")) as Record<string, unknown>;
+		expect(Object.keys(published)).toEqual([
+			"schemaVersion",
+			"kind",
+			"state",
+			"cutoverId",
+			"transitionKind",
+			"predecessorGenerationDigest",
+			"canonicalAgentDirPath",
+			"incidentRecorderPath",
+			"incidentsPath",
+			"historicalCopyBoundary",
+			"control",
+			"launcherConfigurationDigest",
+		]);
+		expect(published).toMatchObject({
+			state: "v2",
+			transitionKind: "upgrade",
+			predecessorGenerationDigest: sha256(legacyGeneration),
+		});
+		expect(existsSync(paths.claim)).toBe(false);
+		expect(existsSync(paths.prepare)).toBe(false);
+		expect(openIncidentCasV2Activation(targetB, f.runtimeHandle)).toMatchObject({ state: "active" });
+		expect(beginIncidentCasV2Cutover(targetB, f.runtimeHandle)).toEqual({ state: "v2" });
+	});
+
+	it.each([
+		"v2_prepared",
+		"before_v2_publish",
+		"after_final_quiescence",
+		"claim_unlinked",
+	] satisfies IncidentCasV2CutoverStep[])(
+		"recovers target C from target B residue at %s and publishes a readable successor",
+		(step) => {
+			const f = fixture();
+			publish(f);
+			const targetB = successorTarget(f, "fixture-successor-b");
+			const started = beginIncidentCasV2Cutover(targetB, f.runtimeHandle);
+			expect(started).toMatchObject({ state: "draining" });
+			if (started.state !== "draining") return;
+			const witness = prove(started.cutover);
+			f.setStepFault(step);
+			expect(publishIncidentCasV2(started.cutover, witness)).toEqual({ state: "unavailable", reason: "io_error" });
+			started.cutover.close();
+
+			const paths = artifactPaths(f.agentDir);
+			const targetBGeneration = readFileSync(paths.generation);
+			const targetC = successorTarget(f, "fixture-successor-c");
+			const recovered = beginIncidentCasV2Cutover(targetC, f.runtimeHandle);
+			expect(recovered).toMatchObject({ state: "draining" });
+			if (recovered.state !== "draining") return;
+			const recoveredWitness = prove(recovered.cutover);
+			expect(publishIncidentCasV2(recovered.cutover, recoveredWitness)).toEqual({ state: "published" });
+			const published = JSON.parse(readFileSync(paths.generation, "utf8")) as Record<string, unknown>;
+			expect(published).toMatchObject({ state: "v2", transitionKind: "upgrade" });
+			expect(published.predecessorGenerationDigest).toBe(sha256(targetBGeneration));
+			expect(existsSync(paths.prepare)).toBe(false);
+			expect(existsSync(paths.claim)).toBe(false);
+			expect(openIncidentCasV2Activation(targetC, f.runtimeHandle)).toMatchObject({ state: "active" });
+			expect(beginIncidentCasV2Cutover(targetC, f.runtimeHandle)).toEqual({ state: "v2" });
+		},
+	);
+
+	it("rejects a wrong target for a draining generation before creating a replacement claim", () => {
+		const f = fixture();
+		const cutover = begin(f);
+		cutover.close();
+		const paths = artifactPaths(f.agentDir);
+		const generationBefore = readFileSync(paths.generation);
+		unlinkSync(paths.claim);
+		const targetB = successorTarget(f, "fixture-wrong-draining-target");
+
+		expect(beginIncidentCasV2Cutover(targetB, f.runtimeHandle)).toEqual({
+			state: "unavailable",
+			reason: "target_mismatch",
+		});
+		expect(readFileSync(paths.generation)).toEqual(generationBefore);
+		expect(existsSync(paths.claim)).toBe(false);
+		expect(existsSync(paths.prepare)).toBe(false);
+	});
+
+	it.each([
+		["missing transition metadata", (record: Record<string, unknown>) => delete record.transitionKind],
+		["missing predecessor metadata", (record: Record<string, unknown>) => delete record.predecessorGenerationDigest],
+		[
+			"bootstrap with a predecessor digest",
+			(record: Record<string, unknown>) => {
+				record.transitionKind = "bootstrap";
+				record.predecessorGenerationDigest = "a".repeat(64);
+			},
+		],
+		[
+			"upgrade without a predecessor digest",
+			(record: Record<string, unknown>) => {
+				record.transitionKind = "upgrade";
+				record.predecessorGenerationDigest = null;
+			},
+		],
+	] as const)("rejects %s generation metadata", (_name, mutate) => {
+		const f = fixture();
+		publish(f);
+		const path = artifactPaths(f.agentDir).generation;
+		const record = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+		mutate(record);
+		writeFileSync(path, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+		expect(beginIncidentCasV2Cutover(f.target, f.runtimeHandle)).toEqual({
+			state: "unavailable",
+			reason: "invalid_control_artifact",
+		});
 	});
 
 	it("keeps the admitted digest stable while permanently rejecting a replaced generation", () => {
@@ -1076,6 +1596,56 @@ describe("incident recorder CAS v2 cutover", () => {
 			expect(existsSync(paths.prepare)).toBe(false);
 			expect(readdirSync(f.base).filter((name) => name.startsWith(paths.baseName)).length).toBeLessThanOrEqual(2);
 			if (resumed.state === "draining") resumed.cutover.close();
+		},
+	);
+
+	it.each(["v2_prepared", "claim_unlinked"] satisfies IncidentCasV2CutoverStep[])(
+		"preserves target B standalone residue when its owner is %s",
+		(step) => {
+			for (const disposition of ["live", "unknown"] as const) {
+				const f = fixture();
+				publish(f);
+				const targetB = successorTarget(f, "fixture-successor-b");
+				const started = beginIncidentCasV2Cutover(targetB, f.runtimeHandle);
+				if (started.state !== "draining") throw new Error("expected upgrade cutover");
+				const witness = prove(started.cutover);
+				f.setStepFault(step);
+				expect(publishIncidentCasV2(started.cutover, witness)).toEqual({
+					state: "unavailable",
+					reason: "io_error",
+				});
+				started.cutover.close();
+
+				const paths = artifactPaths(f.agentDir);
+				const before = readdirSync(f.base)
+					.filter((name) => name.startsWith(paths.baseName))
+					.sort()
+					.map((name) => [name, readFileSync(join(f.base, name))] as const);
+				const targetC = successorTarget(f, "fixture-successor-c");
+				const currentOwner: IncidentCasV2ProcessIdentity = {
+					...f.owner,
+					pid: f.owner.pid + 3,
+					startId: "505",
+				};
+				const retryRuntime: IncidentCasV2CutoverRuntime = {
+					...f.runtime,
+					readCurrentProcessIdentity: () => ({ state: "present", identity: currentOwner }),
+					readProcessIdentity: () =>
+						disposition === "live"
+							? { state: "present", identity: f.owner }
+							: { state: "unavailable", code: "proc_unavailable" },
+				};
+				expect(beginIncidentCasV2Cutover(targetC, registerTestRuntime(retryRuntime))).toEqual({
+					state: "unavailable",
+					reason: disposition === "live" ? "orchestration_in_progress" : "orchestration_owner_unknown",
+				});
+				expect(
+					readdirSync(f.base)
+						.filter((name) => name.startsWith(paths.baseName))
+						.sort()
+						.map((name) => [name, readFileSync(join(f.base, name))] as const),
+				).toEqual(before);
+			}
 		},
 	);
 
