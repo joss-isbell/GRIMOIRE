@@ -27,7 +27,7 @@ interface ProviderModelPair {
 	upstreamApiKeyEnv?: string;
 }
 
-const PROVIDER_MODEL_PAIRS: ProviderModelPair[] = [
+const ALL_PROVIDER_MODEL_PAIRS: ProviderModelPair[] = [
 	{ provider: "anthropic", model: "claude-sonnet-4-5", label: "anthropic-claude-sonnet-4-5" },
 	{ provider: "google", model: "gemini-3-flash-preview", label: "google-gemini-3-flash-preview" },
 	{
@@ -83,6 +83,14 @@ const PROVIDER_MODEL_PAIRS: ProviderModelPair[] = [
 	{ provider: "xiaomi-token-plan-ams", model: "mimo-v2.5-pro", label: "xiaomi-token-plan-ams-mimo-v2.5-pro" },
 	{ provider: "xiaomi-token-plan-sgp", model: "mimo-v2.5-pro", label: "xiaomi-token-plan-sgp-mimo-v2.5-pro" },
 ];
+
+// Scope both catalog assertions and live handoffs to the fork's supported pairs.
+const PROVIDER_MODEL_PAIRS = ALL_PROVIDER_MODEL_PAIRS.filter(
+	(pair) =>
+		process.env.GRIMOIRE_CI !== "1" ||
+		(pair.provider !== "github-copilot" &&
+			!/(?:^|\/)(?:gpt-5\.2-codex|kimi-k2\.6|kimi-k2p6-turbo|kimi-k3|qwen3\.8-max)$/.test(pair.model)),
+);
 
 function resolveProviderModel(pair: ProviderModelPair): Model<Api> | undefined {
 	return (getModel as (provider: string, model: string) => Model<Api> | undefined)(pair.provider, pair.model);

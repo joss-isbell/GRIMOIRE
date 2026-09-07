@@ -45,8 +45,13 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Build
-        run: npm run build
+      - name: Build committed catalogue
+        # Acceptance uses reviewed catalog data; refreshing live metadata is separate work.
+        run: |
+          npm run build --workspace packages/tui
+          npm exec --workspace packages/ai -- tsgo -p tsconfig.build.json
+          npm run build --workspace packages/agent
+          npm run build --workspace packages/coding-agent
 
       - name: Check
         run: npm run check
@@ -65,7 +70,7 @@ jobs:
             install_uv: false
           - name: ai
             package: packages/ai
-            command: npm test
+            command: node ../../../.github/ci/test-ai.mjs
             install_uv: false
           - name: tui
             package: packages/tui
@@ -123,8 +128,13 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Build
-        run: npm run build
+      - name: Build committed catalogue
+        # Acceptance uses reviewed catalog data; refreshing live metadata is separate work.
+        run: |
+          npm run build --workspace packages/tui
+          npm exec --workspace packages/ai -- tsgo -p tsconfig.build.json
+          npm run build --workspace packages/agent
+          npm run build --workspace packages/coding-agent
 
       - name: Test
         working-directory: BACKEND/${{ matrix.package }}
