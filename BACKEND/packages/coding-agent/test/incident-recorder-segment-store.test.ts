@@ -26,6 +26,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+	acquireIncidentCasTransactionDetailed,
+	type IncidentCasRootMutation,
+} from "../src/modes/daemon/incident-recorder-cas-transaction.js";
+import {
 	assertIncidentRecorderProcFdMountIdsForTest,
 	closeIncidentRecorderDescriptorsForTest,
 	createIncidentRecorderSegmentPruneProtection,
@@ -69,6 +73,30 @@ function fixture(options: Omit<IncidentRecorderSegmentStoreOptions, "directory">
 		directory,
 		store: new IncidentRecorderSegmentStore({ directory, createSegmentId, ...options }),
 	};
+}
+
+function withRootStore<T>(
+	options: Omit<IncidentRecorderSegmentStoreOptions, "directory">,
+	operation: (root: IncidentCasRootMutation, store: IncidentRecorderSegmentStore) => T,
+): T {
+	const parent = mkdtempSync(join(tmpdir(), "prime-agent-root-segment-store-"));
+	const directory = join(parent, "recorder");
+	mkdirSync(directory, { mode: 0o700 });
+	roots.push(parent);
+	const admission = acquireIncidentCasTransactionDetailed(directory);
+	if (admission.state !== "acquired") throw new Error(`root transaction unavailable: ${admission.reason}`);
+	try {
+		const mutation = admission.transaction.withRoot((root) => {
+			const store = IncidentRecorderSegmentStore.openWithinRoot(root, { directory: ["segments"], ...options });
+			const value = operation(root, store);
+			store.closeWithinRoot(root);
+			return value;
+		});
+		if (mutation.state !== "committed") throw new Error(`root transaction detached: ${mutation.state}`);
+		return mutation.value;
+	} finally {
+		admission.transaction.release();
+	}
 }
 
 function regularFileCount(directory: string): number {
@@ -154,6 +182,191 @@ function expectAdditionalRecoveryScopeLeases(
 }
 
 describe("incident recorder segment store", () => {
+	it("prunes sealed history through the scoped root capability and emits exact accounting", () => {
+		let sealedDirectory = "";
+		const target = withRootStore(
+			{
+				maxRecordsPerSegment: 1,
+				createSegmentId: (() => {
+					let nextId = 0;
+					return () => `00000000-0000-4000-8000-${String(++nextId).padStart(12, "0")}`;
+				})(),
+				now: () => 100,
+			},
+			(root, store) => {
+				sealedDirectory = root.publicPath(root.relative("segments", "sealed"));
+				const first = store.appendWithinRoot(root, {
+					runId: "root-prune-first",
+					sourceId: "daemon",
+					observedAtMs: 1,
+					order: "1",
+					metadata: {},
+					payload: Buffer.from("first"),
+				});
+				store.sealWithinRoot(root, "root-prune-first");
+				store.appendWithinRoot(root, {
+					runId: "root-prune-active",
+					sourceId: "daemon",
+					observedAtMs: 2,
+					order: "2",
+					metadata: {},
+					payload: Buffer.from("active"),
+				});
+				const result = store.pruneSealedSegmentsWithinRoot(root, {
+					sealedBeforeMs: Number.MAX_SAFE_INTEGER,
+					protection: pruneProtection(),
+					maxSegments: 10,
+					maxDeletes: 10,
+					maxBytes: 1024 * 1024,
+				});
+				const receipts = store.drainWithinRootReceipts();
+				return { first: first.locator, receipts, result };
+			},
+		);
+		const pruned = target.receipts.find((receipt) => receipt.kind === "durable" && receipt.event.kind === "pruned");
+		expect(target.result.deletedSegmentIds).toEqual([target.first.segmentId]);
+		expect(target.result.deletedBytes).toBeGreaterThan(0);
+		expect(target.result.locatorsInvalidated).toBe(true);
+		expect(target.result.requiresFullReconciliation).toBe(false);
+		expect(existsSync(join(sealedDirectory, `${target.first.segmentId}.segment`))).toBe(false);
+		expect(pruned).toMatchObject({
+			kind: "durable",
+			event: {
+				kind: "pruned",
+				entryDelta: -1,
+				inodeDelta: -1,
+				parentEffects: [{ path: sealedDirectory }],
+			},
+		});
+	});
+
+	it("reports a root-scoped post-unlink interruption as recoverable prune mutation", () => {
+		let sealedDirectory = "";
+		let firstSegmentId = "";
+		let thrown: unknown;
+		try {
+			withRootStore(
+				{
+					maxRecordsPerSegment: 1,
+					createSegmentId: (() => {
+						let nextId = 0;
+						return () => `00000000-0000-4000-8000-${String(++nextId).padStart(12, "0")}`;
+					})(),
+					faultInjector: (point) => {
+						if (point === "after-prune-unlink-before-directory-fsync")
+							throw new Error("injected root post-unlink interruption");
+					},
+				},
+				(root, store) => {
+					sealedDirectory = root.publicPath(root.relative("segments", "sealed"));
+					const first = store.appendWithinRoot(root, {
+						runId: "root-prune-first",
+						sourceId: "daemon",
+						observedAtMs: 1,
+						order: "1",
+						metadata: {},
+						payload: Buffer.from("first"),
+					});
+					firstSegmentId = first.locator.segmentId;
+					store.sealWithinRoot(root, "root-prune-first");
+					store.appendWithinRoot(root, {
+						runId: "root-prune-active",
+						sourceId: "daemon",
+						observedAtMs: 2,
+						order: "2",
+						metadata: {},
+						payload: Buffer.from("active"),
+					});
+					store.pruneSealedSegmentsWithinRoot(root, {
+						sealedBeforeMs: Number.MAX_SAFE_INTEGER,
+						protection: pruneProtection(),
+						maxSegments: 10,
+						maxDeletes: 10,
+						maxBytes: 1024 * 1024,
+					});
+				},
+			);
+		} catch (error) {
+			thrown = error;
+		}
+		expect(thrown).toBeInstanceOf(IncidentRecorderSegmentStorePoisonedError);
+		const mutation = (thrown as IncidentRecorderSegmentStorePoisonedError).cause;
+		expect(mutation).toBeInstanceOf(IncidentRecorderSegmentPruneMutationError);
+		expect(mutation).toMatchObject({
+			directoryDurability: "unknown",
+			result: {
+				deletedSegmentIds: [firstSegmentId],
+				locatorsInvalidated: true,
+				requiresFullReconciliation: true,
+				moreWork: true,
+			},
+		});
+		expect(existsSync(join(sealedDirectory, `${firstSegmentId}.segment`))).toBe(false);
+	});
+
+	it("keeps root prune authority bound when the sealed directory is replaced", () => {
+		let sealedDirectory = "";
+		let displacedDirectory = "";
+		let targetName = "";
+		let thrown: unknown;
+		try {
+			withRootStore(
+				{
+					maxRecordsPerSegment: 1,
+					createSegmentId: (() => {
+						let nextId = 0;
+						return () => `00000000-0000-4000-8000-${String(++nextId).padStart(12, "0")}`;
+					})(),
+					faultInjector: (point) => {
+						if (point !== "before-prune-unlink-after-verify") return;
+						renameSync(sealedDirectory, displacedDirectory);
+						mkdirSync(sealedDirectory, { mode: 0o700 });
+						linkSync(join(displacedDirectory, targetName), join(sealedDirectory, targetName));
+					},
+				},
+				(root, store) => {
+					sealedDirectory = root.publicPath(root.relative("segments", "sealed"));
+					displacedDirectory = `${sealedDirectory}.displaced`;
+					const first = store.appendWithinRoot(root, {
+						runId: "root-prune-first",
+						sourceId: "daemon",
+						observedAtMs: 1,
+						order: "1",
+						metadata: {},
+						payload: Buffer.from("first"),
+					});
+					targetName = `${first.locator.segmentId}.segment`;
+					store.sealWithinRoot(root, "root-prune-first");
+					store.appendWithinRoot(root, {
+						runId: "root-prune-active",
+						sourceId: "daemon",
+						observedAtMs: 2,
+						order: "2",
+						metadata: {},
+						payload: Buffer.from("active"),
+					});
+					store.pruneSealedSegmentsWithinRoot(root, {
+						sealedBeforeMs: Number.MAX_SAFE_INTEGER,
+						protection: pruneProtection(),
+						maxSegments: 10,
+						maxDeletes: 10,
+						maxBytes: 1024 * 1024,
+					});
+				},
+			);
+		} catch (error) {
+			thrown = error;
+		}
+		expect(thrown).toBeInstanceOf(IncidentRecorderSegmentStorePoisonedError);
+		expect((thrown as IncidentRecorderSegmentStorePoisonedError).cause).toMatchObject({
+			message: expect.stringMatching(
+				/sealed segment directory identity changed|prune target identity changed after verification/,
+			),
+		});
+		expect(existsSync(join(displacedDirectory, targetName))).toBe(true);
+		expect(existsSync(join(sealedDirectory, targetName))).toBe(true);
+	});
+
 	it("strictly rejects forged, malformed, and oversized proc fdinfo mount identities", () => {
 		expect(parseIncidentRecorderProcFdInfoMountIdForTest("pos:\t0\nmnt_id:\t123\n")).toBe(123n);
 		expect(() => assertIncidentRecorderProcFdMountIdsForTest(123n, [123n, 123n])).not.toThrow();
