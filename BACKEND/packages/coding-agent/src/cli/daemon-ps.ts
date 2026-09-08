@@ -13,6 +13,7 @@ import { DaemonClient } from "../modes/daemon/daemon-client.js";
 import {
 	DAEMON_PROTOCOL_VERSION,
 	DAEMON_SCHEMA_ID,
+	type DaemonObservationStatus,
 	type DaemonRuntimeIdentity,
 } from "../modes/daemon/daemon-protocol.js";
 import { defaultDaemonSocketDir, defaultDaemonSocketPath, normalizeSocketPath } from "../modes/daemon/daemon-socket.js";
@@ -65,6 +66,7 @@ export interface DaemonInfo {
 	executablePath?: string;
 	pidSource?: "listener" | "hello";
 	sessionCount?: number;
+	sessionObservation?: DaemonObservationStatus | "unknown";
 	status: DaemonStatus;
 	isDefault: boolean;
 	hasTrackedWorkers?: boolean;
@@ -102,7 +104,7 @@ export function parseSsListeners(stdout: string, appName: string): DiscoveredDae
 			continue;
 		}
 		const socketPath = fields[4];
-		if (!socketPath?.startsWith("/")) {
+		if (!socketPath?.startsWith("/") || isInternalSocketPath(socketPath)) {
 			continue;
 		}
 		const owner = line.match(/users:\(\("([^"]+)",pid=(\d+)/);
@@ -126,6 +128,7 @@ export function parseLsofListeners(stdout: string): DiscoveredDaemonProcess[] {
 			pid = Number.parseInt(value, 10);
 		} else if (field === "n" && pid !== undefined && value.startsWith("/")) {
 			const socketPath = normalizeSocketPath(value);
+			if (isInternalSocketPath(socketPath)) continue;
 			const key = `${pid}:${socketPath}`;
 			if (!seen.has(key)) {
 				seen.add(key);
@@ -249,6 +252,7 @@ interface ProbeResult {
 	schemaId?: string;
 	runtime?: DaemonRuntimeIdentity;
 	sessionCount?: number;
+	sessionObservation?: DaemonObservationStatus | "unknown";
 	supervisorPid?: number;
 	supervisorProcessStartId?: string;
 	reachable: boolean;
@@ -270,6 +274,7 @@ async function probeDaemon(socketPath: string): Promise<ProbeResult> {
 		let supervisorPid: number | undefined;
 		let supervisorProcessStartId: string | undefined;
 		let greeted = false;
+		let observationSupported = false;
 		try {
 			const hello = await client.waitForHello(1500);
 			version = hello.appVersion;
@@ -279,16 +284,25 @@ async function probeDaemon(socketPath: string): Promise<ProbeResult> {
 			supervisorPid = hello.supervisorPid;
 			supervisorProcessStartId = hello.supervisorProcessStartId;
 			greeted = true;
+			observationSupported = hello.serverCapabilities?.includes("list_observation") === true;
 		} catch {
 			// Connected but no recognizable greeting: an old/foreign daemon.
 		}
 		let sessionCount: number | undefined;
+		let sessionObservation: ProbeResult["sessionObservation"] = observationSupported ? "unavailable" : "unknown";
 		try {
-			const response = await client.request({ type: "list" }, greeted ? 30000 : 1500);
-			if (response.success) {
+			const response = greeted ? await client.request({ type: "list" }, 1500) : undefined;
+			if (response?.success) {
 				const sessions = (response.data as { sessions?: unknown })?.sessions;
 				if (Array.isArray(sessions)) {
 					sessionCount = sessions.length;
+				}
+				const observation = (response.data as { observation?: { status?: unknown } })?.observation?.status;
+				if (
+					observationSupported &&
+					(observation === "fresh" || observation === "stale" || observation === "unavailable")
+				) {
+					sessionObservation = observation;
 				}
 			}
 		} catch {
@@ -300,6 +314,7 @@ async function probeDaemon(socketPath: string): Promise<ProbeResult> {
 			schemaId,
 			runtime,
 			sessionCount,
+			sessionObservation,
 			supervisorPid,
 			supervisorProcessStartId,
 			reachable: true,
@@ -347,7 +362,7 @@ export function verifyHelloSupervisorPid(
 export async function discoverDaemons(): Promise<DaemonInfo[]> {
 	const processBySocket = new Map<string, DiscoveredDaemonProcess>();
 	for (const daemon of scanListeningDaemons()) {
-		if (isWorkerSocketPath(daemon.socketPath)) {
+		if (isInternalSocketPath(daemon.socketPath)) {
 			continue;
 		}
 		processBySocket.set(daemon.socketPath, daemon);
@@ -358,8 +373,8 @@ export async function discoverDaemons(): Promise<DaemonInfo[]> {
 	);
 	const sockets = new Set<string>([
 		...processBySocket.keys(),
-		...scanSocketDir().filter((socketPath) => !isWorkerSocketPath(socketPath)),
-		...workerSockets,
+		...scanSocketDir().filter((socketPath) => !isInternalSocketPath(socketPath)),
+		...[...workerSockets].filter((socketPath) => !isInternalSocketPath(socketPath)),
 	]);
 	const defaultSocket = normalizeSocketPath(defaultDaemonSocketPath());
 
@@ -386,6 +401,7 @@ export async function discoverDaemons(): Promise<DaemonInfo[]> {
 					probe.runtime?.launcherPath ?? probe.runtime?.entrypointPath ?? probe.runtime?.executablePath,
 				...(pid !== undefined ? { pidSource: proc ? ("listener" as const) : ("hello" as const) } : {}),
 				sessionCount: probe.sessionCount,
+				sessionObservation: probe.sessionObservation ?? "unavailable",
 				status,
 				isDefault: socketPath === defaultSocket,
 				...(hasTrackedWorkers ? { hasTrackedWorkers: true } : {}),
@@ -470,6 +486,9 @@ export function planReap(daemons: readonly DaemonInfo[], force: boolean): ReapAc
 				};
 			}
 			return { kind: "kill", daemon };
+		}
+		if (daemon.sessionObservation === "stale" || daemon.sessionObservation === "unavailable") {
+			return { kind: "skip", daemon, reason: "session observation is stale or unavailable" };
 		}
 		if (daemon.sessionCount !== 0) {
 			return { kind: "skip", daemon, reason: `has ${daemon.sessionCount ?? "unknown"} session(s)` };
@@ -882,6 +901,23 @@ function recordShutdownFailure(
 	failed.push({ socketPath, reason });
 }
 
+/** Process titles identify owners, not the protocol each of their sockets speaks. */
+export function isInternalSocketPath(socketPath: string): boolean {
+	if (process.platform === "win32") return false;
+	const path = resolve(socketPath);
+	const parent = dirname(path);
+	const name = basename(path);
+	// Discovery spans users and TMPDIRs; comparing only this process's default
+	// directory would still probe other workers' private control channels.
+	const serviceDirectory = (directory: string): boolean =>
+		/^prime-agent-\d+$/.test(basename(directory)) || directory === resolve(defaultDaemonSocketDir());
+	return (
+		(name === "control.sock" && basename(parent).startsWith("prime-agent-forkserver-")) ||
+		(name.startsWith("worker-") && name.endsWith(".sock") && serviceDirectory(parent)) ||
+		(basename(parent) === "diagnostics" && serviceDirectory(dirname(parent)))
+	);
+}
+
 export function isWorkerSocketPath(socketPath: string): boolean {
 	return (
 		process.platform !== "win32" &&
@@ -1194,6 +1230,9 @@ async function reapReachableDaemon(socketPath: string, pid: number | undefined):
 	const probe = await probeDaemon(socketPath);
 	if (!probe.reachable) {
 		return { skipped: "no longer reachable" };
+	}
+	if (probe.sessionObservation === "stale" || probe.sessionObservation === "unavailable") {
+		return { skipped: "session observation is stale or unavailable" };
 	}
 	if (probe.sessionCount !== 0) {
 		return { skipped: `now has ${probe.sessionCount ?? "unknown"} session(s)` };

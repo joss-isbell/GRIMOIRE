@@ -8,6 +8,7 @@ import {
 	ensureInteractiveDaemonRunning,
 	probeDaemonVersion,
 	probeRunningDaemonSessions,
+	StaleDaemonError,
 	shouldStartDaemonEarly,
 	shutdownDaemonAndWait,
 } from "../src/cli/daemon-launch.js";
@@ -29,6 +30,7 @@ interface FakeDaemonOptions {
 	serverCapabilities?: string[];
 	shouldSendHello?: (connectionIndex: number) => boolean;
 	onConnection?: (connectionIndex: number) => void;
+	observation?: { status: string; workers: unknown[] };
 	onCommand?: (command: { type: string }) => void;
 }
 
@@ -93,6 +95,7 @@ async function startFakeDaemon(options: FakeDaemonOptions = {}): Promise<FakeDae
 									data: {
 										sessions: options.sessions ?? [],
 										busyClientOwnedSessionCount: options.busyClientOwnedSessionCount ?? 0,
+										observation: options.observation,
 									},
 								}),
 					});
@@ -208,6 +211,15 @@ describe("probeRunningDaemonSessions", () => {
 		cleanups.push(daemon.close);
 		expect(await probeRunningDaemonSessions(daemon.socketPath)).toEqual({ reachable: true });
 	});
+
+	it.each(["stale", "unavailable", "missing"])("treats %s observations as possibly busy", async (status) => {
+		const daemon = await startFakeDaemon({
+			serverCapabilities: ["list_observation"],
+			observation: status === "missing" ? undefined : { status, workers: [] },
+		});
+		cleanups.push(daemon.close);
+		expect(await probeRunningDaemonSessions(daemon.socketPath)).toEqual({ reachable: true });
+	});
 });
 
 describe("shouldStartDaemonEarly", () => {
@@ -239,6 +251,25 @@ describe("ensureInteractiveDaemonRunning", () => {
 	afterEach(async () => {
 		await Promise.all(cleanups.splice(0).map((fn) => fn()));
 	});
+
+	it.each(["stale", "unavailable", "missing"])(
+		"does not replace a daemon using a %s idle observation",
+		async (status) => {
+			const commands: string[] = [];
+			const daemon = await startFakeDaemon({
+				appVersion: VERSION,
+				schemaId: "previous-schema",
+				serverCapabilities: ["list_observation"],
+				observation: status === "missing" ? undefined : { status, workers: [] },
+				sessions: [{ id: "idle", activeSessionId: "idle", isStreaming: false }],
+				onCommand: (command) => commands.push(command.type),
+			});
+			cleanups.push(daemon.close);
+			await expect(ensureInteractiveDaemonRunning(daemon.socketPath)).rejects.toThrow(StaleDaemonError);
+			expect(commands).toContain("list");
+			expect(commands).not.toContain("shutdown");
+		},
+	);
 
 	it("rejects a busy pre-session-action daemon before attach", async () => {
 		const commands: string[] = [];

@@ -16,13 +16,19 @@ export function formatDaemonListTable(daemons: readonly DaemonInfo[]): string {
 		pid: daemon.pid !== undefined ? String(daemon.pid) : "",
 		version: daemon.version ?? "",
 		status: daemon.status,
-		sessions: daemon.sessionCount !== undefined ? String(daemon.sessionCount) : "",
+		sessions: formatSessionObservation(daemon),
 		uptime: formatUptime(daemon.uptimeSeconds),
 	}));
 	const table = formatTable(["socket", "pid", "version", "status", "sessions", "uptime"], rows, formatDaemonCell);
 	return daemons.some((daemon) => daemon.isDefault)
 		? `${table}\n\n${chalk.dim("* default background service")}`
 		: table;
+}
+
+function formatSessionObservation(daemon: DaemonInfo): string {
+	const count = daemon.sessionCount !== undefined ? String(daemon.sessionCount) : "?";
+	const observation = daemon.sessionObservation ?? "unknown";
+	return observation === "fresh" ? count : `${count} (${observation})`;
 }
 
 function formatDaemonCell(_row: DaemonRow, column: keyof DaemonRow, value: string): string {

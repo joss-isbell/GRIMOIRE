@@ -32,6 +32,7 @@ import { DaemonClient, getDaemonSocketCloseReason } from "../daemon/daemon-clien
 import { DaemonSessionRecoveringError } from "../daemon/daemon-errors.js";
 import {
 	collectDaemonClientEnv,
+	collectDaemonLaunchEnv,
 	type DaemonClosingReason,
 	type DaemonCommand,
 	type DaemonResponse,
@@ -330,7 +331,7 @@ export function resolveAgentsViewOpenCwd(
 	};
 }
 
-async function openAgentsViewSession(
+export async function openAgentsViewSession(
 	options: AgentsViewModeOptions,
 	summary: SessionSummary,
 ): Promise<OpenedAgentsViewSession> {
@@ -397,6 +398,7 @@ async function resumeSavedAgentsViewSession(
 		type: "create",
 		config: createAgentsViewResumeConfig(config, overrideCwd),
 		sessionPath: summary.sessionFile,
+		launchEnv: collectDaemonLaunchEnv(),
 	});
 	const createdSummary = expectSessionSummary(requireDaemonData(response));
 	return {

@@ -54,6 +54,11 @@ export class DaemonWorkerClient {
 		}
 	>();
 	private requestId = 0;
+	private readonly pendingListWrites = new Set<{
+		channel: PrivateFramedChannel<DaemonWorkerFrameHeader>;
+		timedOut: boolean;
+	}>();
+
 	private helloMessage?: DaemonHello;
 	private directPeer = false;
 	private directClosingReason?: DaemonClosingReason;
@@ -242,6 +247,7 @@ export class DaemonWorkerClient {
 
 	close(): void {
 		this.rejectAll(new Error("Daemon worker client closed"));
+		this.pendingListWrites.clear();
 		this.channel?.close();
 		this.channel = undefined;
 		this.socket?.destroy();
@@ -262,6 +268,14 @@ export class DaemonWorkerClient {
 			});
 			throw error;
 		}
+		const channel = this.channel;
+		if (
+			command.type === "list" &&
+			[...this.pendingListWrites].some((write) => write.channel === channel && write.timedOut)
+		) {
+			throw new Error("Daemon worker observation unavailable: an earlier list write is still blocked");
+		}
+		const listWrite = command.type === "list" ? { channel, timedOut: false } : undefined;
 		const diagnosticStarted = process.hrtime.bigint();
 		const id = `worker_${++this.requestId}`;
 		const fullCommand = { ...command, id } as DaemonWorkerWireCommand;
@@ -278,6 +292,7 @@ export class DaemonWorkerClient {
 		const response = new Promise<DaemonResponse>((resolve, reject) => {
 			const timeout = setTimeout(() => {
 				this.pending.delete(id);
+				if (listWrite) listWrite.timedOut = true;
 				const error = new DaemonWorkerProbeTimeoutError(
 					`Timed out waiting for daemon worker response to ${command.type}`,
 				);
@@ -286,9 +301,14 @@ export class DaemonWorkerClient {
 			}, timeoutMs);
 			this.pending.set(id, { resolve, reject, timeout });
 		});
-		try {
-			await this.channel.send(frameHeader, wirePayload);
-		} catch (error) {
+		// A write can remain blocked after the response deadline. Observe the
+		// response immediately, and handle a late write failure independently.
+		if (listWrite) this.pendingListWrites.add(listWrite);
+		const writeSettled = () => {
+			if (listWrite) this.pendingListWrites.delete(listWrite);
+		};
+		void channel.send(frameHeader, wirePayload).then(writeSettled, (error: unknown) => {
+			writeSettled();
 			appendSupervisorDiagnosticEvent("worker_request_send_error", { ...diagnosticRequest, error });
 			const pending = this.pending.get(id);
 			if (pending) {
@@ -296,7 +316,7 @@ export class DaemonWorkerClient {
 				this.pending.delete(id);
 				pending.reject(error instanceof Error ? error : new Error(String(error)));
 			}
-		}
+		});
 		try {
 			const result = await response;
 			const durationMs = Number(process.hrtime.bigint() - diagnosticStarted) / 1_000_000;
@@ -442,6 +462,7 @@ export class DaemonWorkerClient {
 		}
 		this.socket = undefined;
 		this.channel = undefined;
+		this.pendingListWrites.clear();
 		appendSupervisorDiagnosticEvent("worker_socket_closed", {
 			...this.diagnosticContext,
 			socketPath: this.socketPath,
