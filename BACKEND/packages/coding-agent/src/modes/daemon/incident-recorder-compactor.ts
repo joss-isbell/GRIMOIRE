@@ -1,5 +1,5 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import { createHash, type Hash } from "node:crypto";
+import { createHash, type Hash, randomUUID } from "node:crypto";
 import {
 	type BigIntStats,
 	chmodSync,
@@ -23,12 +23,29 @@ import {
 	statfsSync,
 	writeSync,
 } from "node:fs";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import {
 	acquireIncidentCasTransaction,
 	type IncidentCasRelativePath,
 	type IncidentCasRootMutation,
 } from "./incident-recorder-cas-transaction.js";
+import {
+	persistIncidentFinalizationSealWithinRoot,
+	prepareIncidentFinalizationSeal,
+} from "./incident-recorder-finalizer.js";
+import {
+	type IncidentRecorderLiveIncidentPublicationRequest,
+	type IncidentRecorderLiveIncidentPublicationResult,
+	liveIncidentPublicationIdentity,
+	publishLiveIncidentObservationWithinRoot,
+} from "./incident-recorder-live-publication.js";
+import {
+	type IncidentRecorderLiveTriggerIntentCandidate,
+	type IncidentRecorderLiveTriggerIntentPersistenceResult as IncidentRecorderLiveTriggerIntentComponentResult,
+	persistIncidentRecorderLiveTriggerIntentWithinRoot,
+	validateIncidentRecorderLiveTriggerIntentCandidate,
+} from "./incident-recorder-live-trigger-intent.js";
+import type { IncidentRecorderNamespaceRoots } from "./incident-recorder-namespace-admission.js";
 import {
 	encodeIncidentRecorderFrame,
 	INCIDENT_RECORDER_FRAME_FLAGS,
@@ -111,6 +128,9 @@ const STORAGE_LOW_WATER_INODES = 131_072;
 const STORAGE_HIGH_WATER_ENTRIES = 196_608;
 const STORAGE_LOW_WATER_ENTRIES = 131_072;
 const STORAGE_FREE_RESERVE_BYTES = 8 * 1024 ** 3;
+const SERVICE_FINALIZATION_RETRY_GRACE_MS = 60_000;
+const SERVICE_CONTROL_FUTURE_SKEW_MS = 5 * 60_000;
+const SERVICE_BARRIER_CONTROL_MAX_BYTES = 64 * 1024;
 const JOURNAL_CATCHUP_MAX_ENTRIES = 256;
 const JOURNAL_CATCHUP_MAX_BYTES = 64 * 1024 * 1024;
 const JOURNAL_CATCHUP_SLICE_MS = 5_000;
@@ -1303,6 +1323,32 @@ function abortError(message: string): Error {
 	return error;
 }
 
+const INCIDENT_RECORDER_SEGMENT_OWNERSHIP_REASON_MAX_BYTES = 128;
+
+function boundedIncidentRecorderSegmentOwnershipReason(reason: string): string {
+	if (Buffer.byteLength(reason, "utf8") <= INCIDENT_RECORDER_SEGMENT_OWNERSHIP_REASON_MAX_BYTES) return reason;
+	let bounded = "";
+	let bytes = 0;
+	for (const character of reason) {
+		const characterBytes = Buffer.byteLength(character, "utf8");
+		if (bytes + characterBytes > INCIDENT_RECORDER_SEGMENT_OWNERSHIP_REASON_MAX_BYTES) break;
+		bounded += character;
+		bytes += characterBytes;
+	}
+	return bounded;
+}
+
+export class IncidentRecorderSegmentOwnershipUncertainError extends Error {
+	readonly reason: string;
+
+	constructor(reason: string) {
+		const boundedReason = boundedIncidentRecorderSegmentOwnershipReason(reason);
+		super(`Incident recorder segment ownership is uncertain: ${boundedReason}`);
+		this.name = "IncidentRecorderSegmentOwnershipUncertainError";
+		this.reason = boundedReason;
+	}
+}
+
 function childEnvironment(): NodeJS.ProcessEnv {
 	const environment = { ...process.env };
 	delete environment.NOTIFY_SOCKET;
@@ -1409,6 +1455,21 @@ type RecorderRootMutationResult<T> =
 	| { state: "committed"; value: T }
 	| { state: "unavailable"; reason: RecorderRootLifecycleUnavailableReason };
 
+export interface IncidentRecorderServiceFinalizationBarrierDeadlineInput {
+	runDirectory: string;
+	runId: string;
+	runToken: string;
+	nowMs: number;
+}
+
+export type IncidentRecorderServiceFinalizationBarrierDeadlineResult =
+	| { state: "available"; elapsed: boolean; retryThroughWallTimeMs: number }
+	| { state: "unavailable"; reason: string };
+
+export type IncidentRecorderLiveTriggerIntentPersistenceResult =
+	| IncidentRecorderLiveTriggerIntentComponentResult
+	| { state: "unavailable"; reason: string; fileName?: string; peakStorageBytes?: number };
+
 export class IncidentRecorderCompactor {
 	private readonly root: string;
 	private readonly checkpointPath: string;
@@ -1428,6 +1489,7 @@ export class IncidentRecorderCompactor {
 	private storageReservedEntries = 0;
 	private storageReservedInodes = 0;
 	private incidentPinRootStorageReservation?: IncidentPinRootStorageReservation;
+	private incidentLivePublicationRootStorageReservation?: IncidentPinRootStorageReservation;
 	private storageAccountingReadyState = false;
 	/**
 	 * Monotonic invalidation generation for scans that may overlap an uncertain
@@ -1445,6 +1507,8 @@ export class IncidentRecorderCompactor {
 	private segmentStore?: IncidentRecorderSegmentStore;
 	private segmentStoreCloseFailure?: unknown;
 	private segmentStoreCloseUncertain = false;
+	private readonly internalAbortController = new AbortController();
+	private segmentOwnershipUncertainError?: IncidentRecorderSegmentOwnershipUncertainError;
 	private transientFileCloseFailure?: Error;
 	private readonly segmentOpenStorageEntries = new Map<string, IncidentRecorderSegmentOpenStorageEntry>();
 	private readonly segmentAccountingSequences = new Map<string, number>();
@@ -1571,6 +1635,32 @@ export class IncidentRecorderCompactor {
 		let mutation: IncidentRecorderWriterLifecycleMutationResult<T>;
 		try {
 			mutation = admission.lease.withIncidents(operation);
+		} finally {
+			this.segmentRootCallbackDepth -= 1;
+		}
+		if (mutation.state === "committed") return mutation;
+		switch (mutation.reason) {
+			case "released":
+				return { state: "unavailable", reason: "writer_lifecycle_lease_released" };
+			case "lease_lost":
+				return { state: "unavailable", reason: "writer_lifecycle_lease_lost" };
+			case "namespace_changed":
+			case "root_detached":
+				return { state: "unavailable", reason: "writer_lifecycle_namespace_changed" };
+			default:
+				return { state: "unavailable", reason: "writer_lifecycle_unavailable" };
+		}
+	}
+
+	private withRecorderNamespace<T>(
+		operation: (roots: IncidentRecorderNamespaceRoots) => T,
+	): RecorderRootMutationResult<T> {
+		const admission = this.normalWriterLifecycleLease();
+		if (admission.state === "unavailable") return admission;
+		this.segmentRootCallbackDepth += 1;
+		let mutation: IncidentRecorderWriterLifecycleMutationResult<T>;
+		try {
+			mutation = admission.lease.withNamespace(operation);
 		} finally {
 			this.segmentRootCallbackDepth -= 1;
 		}
@@ -2360,6 +2450,23 @@ export class IncidentRecorderCompactor {
 		this.releaseReservedCapacity(reservation.bytes, reservation.entries, reservation.inodes);
 	}
 
+	private reserveIncidentLivePublicationRootStorage(bytes: number, entries: number, inodes: number): void {
+		this.reserveStorage(bytes, entries, inodes);
+		const reservation = this.incidentLivePublicationRootStorageReservation;
+		if (!reservation) return;
+		reservation.bytes += bytes;
+		reservation.entries += entries;
+		reservation.inodes += inodes;
+	}
+
+	private releaseIncidentLivePublicationRootStorageReservation(reservation: IncidentPinRootStorageReservation): void {
+		if (reservation.released) return;
+		reservation.released = true;
+		if (this.incidentLivePublicationRootStorageReservation === reservation)
+			this.incidentLivePublicationRootStorageReservation = undefined;
+		this.releaseReservedCapacity(reservation.bytes, reservation.entries, reservation.inodes);
+	}
+
 	private consumeStorageReservation(
 		state: StoppedTargetArtifactStream,
 		bytes: number,
@@ -2923,6 +3030,391 @@ export class IncidentRecorderCompactor {
 	}
 	get accountedStorageBytes(): number {
 		return this.storageBytes;
+	}
+
+	ensureServiceFinalizationBarrierDeadline(
+		input: IncidentRecorderServiceFinalizationBarrierDeadlineInput,
+	): IncidentRecorderServiceFinalizationBarrierDeadlineResult {
+		if (
+			typeof input !== "object" ||
+			input === null ||
+			!isCanonicalUuid(input.runId) ||
+			!isCanonicalUuid(input.runToken) ||
+			!Number.isSafeInteger(input.nowMs) ||
+			input.nowMs < 0 ||
+			typeof input.runDirectory !== "string" ||
+			!isAbsolute(input.runDirectory)
+		) {
+			return { state: "unavailable", reason: "service_barrier_deadline_invalid_input" };
+		}
+		let runName: string;
+		try {
+			runName = basename(input.runDirectory);
+			if (
+				runName.length === 0 ||
+				runName === "." ||
+				runName === ".." ||
+				resolve(input.runDirectory) !== resolve(this.root, "runs", runName)
+			) {
+				return { state: "unavailable", reason: "service_barrier_deadline_non_direct_run" };
+			}
+		} catch {
+			return { state: "unavailable", reason: "service_barrier_deadline_non_direct_run" };
+		}
+
+		const deadlineName = `service-finalization-barrier-deadline-${createHash("sha256")
+			.update(`${input.runId}\0${input.runToken}`)
+			.digest("hex")}.json`;
+		const deadlineValue = {
+			schemaVersion: 1,
+			kind: "service_finalization_barrier_deadline",
+			runId: input.runId,
+			runToken: input.runToken,
+			createdWallTimeMs: input.nowMs,
+			retryThroughWallTimeMs: input.nowMs + SERVICE_FINALIZATION_RETRY_GRACE_MS,
+		};
+		if (!Number.isSafeInteger(deadlineValue.retryThroughWallTimeMs)) {
+			return { state: "unavailable", reason: "service_barrier_deadline_invalid_input" };
+		}
+
+		let reservation: { bytes: number; entries: number; inodes: number; released: boolean } | undefined;
+		let callbackInvoked = false;
+		const releaseReservation = (): void => {
+			if (!reservation || reservation.released) return;
+			reservation.released = true;
+			this.releaseReservedCapacity(reservation.bytes, reservation.entries, reservation.inodes);
+		};
+		try {
+			const mutation = this.withRecorderRoot((root, assertCurrent) => {
+				callbackInvoked = true;
+				assertCurrent();
+				const runs = root.relative("runs");
+				return root.withDirectory(runs, (runsRoot) =>
+					runsRoot.withDirectory(runsRoot.relative(runName), (runRoot) => {
+						const deadline = runRoot.relative(deadlineName);
+						const existing = runRoot.lstat(deadline);
+						if (existing) {
+							let parsedExisting: Record<string, unknown> | undefined;
+							try {
+								if (
+									!existing.isFile() ||
+									existing.isSymbolicLink() ||
+									(existing.nlink !== 1n && existing.nlink !== 2n) ||
+									(typeof process.getuid === "function" && existing.uid !== BigInt(process.getuid())) ||
+									(existing.mode & 0o077n) !== 0n ||
+									existing.size > BigInt(SERVICE_BARRIER_CONTROL_MAX_BYTES)
+								)
+									throw new Error("invalid service barrier deadline occupant");
+								const bytes = runRoot.readFile(deadline, SERVICE_BARRIER_CONTROL_MAX_BYTES);
+								const after = runRoot.lstat(deadline);
+								if (
+									!after ||
+									!sameStableFilesystemIdentity(
+										stableFilesystemIdentity(existing),
+										stableFilesystemIdentity(after),
+									)
+								)
+									throw new Error("service barrier deadline changed during read");
+								const parsed = JSON.parse(bytes.toString("utf8")) as unknown;
+								if (
+									!isRecordObject(parsed) ||
+									Object.keys(parsed).sort().join("\0") !==
+										[
+											"schemaVersion",
+											"kind",
+											"runId",
+											"runToken",
+											"createdWallTimeMs",
+											"retryThroughWallTimeMs",
+										]
+											.sort()
+											.join("\0") ||
+									parsed.schemaVersion !== 1 ||
+									parsed.kind !== "service_finalization_barrier_deadline" ||
+									parsed.runId !== input.runId ||
+									parsed.runToken !== input.runToken ||
+									!Number.isSafeInteger(parsed.createdWallTimeMs) ||
+									Number(parsed.createdWallTimeMs) < 0 ||
+									Number(parsed.createdWallTimeMs) > input.nowMs + SERVICE_CONTROL_FUTURE_SKEW_MS ||
+									!Number.isSafeInteger(parsed.retryThroughWallTimeMs) ||
+									Number(parsed.retryThroughWallTimeMs) !==
+										Number(parsed.createdWallTimeMs) + SERVICE_FINALIZATION_RETRY_GRACE_MS ||
+									!Buffer.from(`${JSON.stringify(parsed)}\n`, "utf8").equals(bytes)
+								) {
+									throw new Error("invalid service barrier deadline occupant");
+								}
+								parsedExisting = parsed;
+							} catch {}
+							if (parsedExisting) {
+								const existingResult = {
+									state: "available" as const,
+									elapsed: input.nowMs >= Number(parsedExisting.retryThroughWallTimeMs),
+									retryThroughWallTimeMs: Number(parsedExisting.retryThroughWallTimeMs),
+								};
+								if (existing.nlink === 1n) {
+									return { kind: "existing" as const, result: existingResult };
+								}
+								const preparedExisting = prepareIncidentFinalizationSeal(parsedExisting);
+								const blockSize = Math.max(4096, Number(runRoot.statfs(runRoot.relative()).bsize));
+								if (!Number.isSafeInteger(blockSize) || blockSize <= 0)
+									throw new Error("invalid service root block size");
+								const sealBytes = Math.ceil(preparedExisting.byteLength / blockSize) * blockSize;
+								const sealPeakBytes =
+									sealBytes + preparedExisting.peakStorageFootprint.metadataBlocks * blockSize;
+								const reservedBytes = sealPeakBytes + 4 * blockSize;
+								const reservedEntries = preparedExisting.peakStorageFootprint.entries + 2;
+								const reservedInodes = preparedExisting.peakStorageFootprint.inodes + 1;
+								this.reserveStorage(reservedBytes, reservedEntries, reservedInodes);
+								reservation = {
+									bytes: reservedBytes,
+									entries: reservedEntries,
+									inodes: reservedInodes,
+									released: false,
+								};
+								const effects: StorageAccountingEffect[] = [];
+								const persisted = persistIncidentFinalizationSealWithinRoot(
+									runRoot,
+									deadlineName,
+									preparedExisting,
+								);
+								for (const effect of persisted.effects) {
+									effects.push(
+										effect.kind === "account"
+											? { kind: "account", metadata: effect.metadata, entryCreated: effect.entryCreated }
+											: {
+													kind: "remove",
+													metadata: effect.metadata,
+													releaseOwnedInode: effect.releaseOwnedInode,
+												},
+									);
+								}
+								assertCurrent();
+								return { kind: "persisted" as const, result: existingResult, persisted, effects };
+							}
+						}
+
+						const quarantine = runRoot.relative(".service-control-quarantine");
+						const quarantineMetadata = runRoot.lstat(quarantine);
+						if (
+							quarantineMetadata &&
+							(!quarantineMetadata.isDirectory() ||
+								quarantineMetadata.isSymbolicLink() ||
+								(typeof process.getuid === "function" && quarantineMetadata.uid !== BigInt(process.getuid())) ||
+								(quarantineMetadata.mode & 0o077n) !== 0n)
+						) {
+							throw new Error("invalid service control quarantine directory");
+						}
+						const prepared = prepareIncidentFinalizationSeal(deadlineValue);
+						const blockSize = Math.max(4096, Number(runRoot.statfs(runRoot.relative()).bsize));
+						if (!Number.isSafeInteger(blockSize) || blockSize <= 0)
+							throw new Error("invalid service root block size");
+						const sealBytes = Math.ceil(prepared.byteLength / blockSize) * blockSize;
+						const sealPeakBytes = sealBytes + prepared.peakStorageFootprint.metadataBlocks * blockSize;
+						const reservedBytes = sealPeakBytes + 4 * blockSize;
+						const reservedEntries = prepared.peakStorageFootprint.entries + 2;
+						const reservedInodes = prepared.peakStorageFootprint.inodes + 1;
+						this.reserveStorage(reservedBytes, reservedEntries, reservedInodes);
+						reservation = {
+							bytes: reservedBytes,
+							entries: reservedEntries,
+							inodes: reservedInodes,
+							released: false,
+						};
+						const effects: StorageAccountingEffect[] = [];
+						if (existing) {
+							if (!quarantineMetadata) {
+								runRoot.mkdirPrivate(quarantine);
+								effects.push({ kind: "account", metadata: runRoot.stat(quarantine), entryCreated: true });
+								effects.push({
+									kind: "account",
+									metadata: runRoot.stat(runRoot.relative()),
+									entryCreated: false,
+								});
+								runRoot.fsyncDirectory(runRoot.relative());
+							}
+							const quarantineName = `barrier-deadline-${randomUUID()}.invalid`;
+							const quarantined = runRoot.relative(".service-control-quarantine", quarantineName);
+							runRoot.rename(deadline, quarantined);
+							const moved = runRoot.lstat(quarantined);
+							if (!moved) throw new Error("service barrier deadline quarantine disappeared");
+							effects.push({ kind: "remove", metadata: existing, releaseOwnedInode: false });
+							effects.push({ kind: "account", metadata: moved, entryCreated: true });
+							effects.push({ kind: "account", metadata: runRoot.stat(runRoot.relative()), entryCreated: false });
+							effects.push({ kind: "account", metadata: runRoot.stat(quarantine), entryCreated: false });
+							runRoot.fsyncDirectory(runRoot.relative());
+							runRoot.fsyncDirectory(quarantine);
+						}
+						const persisted = persistIncidentFinalizationSealWithinRoot(runRoot, deadlineName, prepared);
+						for (const effect of persisted.effects) {
+							effects.push(
+								effect.kind === "account"
+									? { kind: "account", metadata: effect.metadata, entryCreated: effect.entryCreated }
+									: { kind: "remove", metadata: effect.metadata, releaseOwnedInode: effect.releaseOwnedInode },
+							);
+						}
+						assertCurrent();
+						return {
+							kind: "persisted" as const,
+							result: {
+								state: "available" as const,
+								elapsed: input.nowMs >= deadlineValue.retryThroughWallTimeMs,
+								retryThroughWallTimeMs: deadlineValue.retryThroughWallTimeMs,
+							},
+							persisted,
+							effects,
+						};
+					}),
+				);
+			});
+			if (mutation.state !== "committed") {
+				if (callbackInvoked) this.invalidateStorageAccounting();
+				return { state: "unavailable", reason: mutation.reason };
+			}
+			if (mutation.value.kind === "existing") return mutation.value.result;
+			try {
+				this.applyStorageAccountingEffects(mutation.value.effects);
+			} catch {
+				this.invalidateStorageAccounting();
+				return {
+					state: "unavailable",
+					reason: "service_barrier_deadline_accounting_failed",
+				};
+			}
+			if (mutation.value.persisted.state !== "applied" && mutation.value.persisted.state !== "noop") {
+				this.invalidateStorageAccounting();
+				return { state: "unavailable", reason: "service_barrier_deadline_persistence_unavailable" };
+			}
+			return mutation.value.result;
+		} catch {
+			this.invalidateStorageAccounting();
+			return { state: "unavailable", reason: "service_barrier_deadline_root_unavailable" };
+		} finally {
+			releaseReservation();
+		}
+	}
+
+	/** Persist one live trigger intent while the normal recorder root lease is held. */
+	persistLiveTriggerIntent(input: {
+		runDirectory: string;
+		candidate: IncidentRecorderLiveTriggerIntentCandidate;
+	}): IncidentRecorderLiveTriggerIntentPersistenceResult {
+		if (
+			typeof input !== "object" ||
+			input === null ||
+			typeof input.runDirectory !== "string" ||
+			!isAbsolute(input.runDirectory)
+		) {
+			return { state: "unavailable", reason: "live_trigger_intent_invalid_input" };
+		}
+		try {
+			// Validation must happen before root admission or any storage reservation.
+			validateIncidentRecorderLiveTriggerIntentCandidate(input.candidate);
+		} catch {
+			return { state: "unavailable", reason: "live_trigger_intent_invalid_candidate" };
+		}
+
+		let runName: string;
+		try {
+			runName = basename(input.runDirectory);
+			if (
+				runName.length === 0 ||
+				runName === "." ||
+				runName === ".." ||
+				resolve(input.runDirectory) !== resolve(this.root, "runs", runName) ||
+				!runName.endsWith(input.candidate.runId)
+			) {
+				return { state: "unavailable", reason: "live_trigger_intent_non_direct_run" };
+			}
+		} catch {
+			return { state: "unavailable", reason: "live_trigger_intent_non_direct_run" };
+		}
+
+		if (this.diskPaused) return { state: "unavailable", reason: "live_trigger_intent_storage_unavailable" };
+
+		const reservation = { bytes: 0, entries: 0, inodes: 0, released: false };
+		const reserve = (bytes: number, entries: number, inodes: number): { accepted: true } => {
+			this.reserveStorage(bytes, entries, inodes);
+			reservation.bytes += bytes;
+			reservation.entries += entries;
+			reservation.inodes += inodes;
+			return { accepted: true };
+		};
+		const releaseReservation = (): void => {
+			if (reservation.released) return;
+			reservation.released = true;
+			this.releaseReservedCapacity(reservation.bytes, reservation.entries, reservation.inodes);
+		};
+		let callbackInvoked = false;
+		try {
+			let mutation: RecorderRootMutationResult<
+				| { kind: "blocked"; reason: string }
+				| {
+						kind: "persisted";
+						result: IncidentRecorderLiveTriggerIntentComponentResult;
+						effects: StorageAccountingEffect[];
+				  }
+			>;
+			try {
+				mutation = this.withRecorderRoot((root, assertCurrent) => {
+					callbackInvoked = true;
+					assertCurrent();
+					const runs = root.relative("runs");
+					return root.withDirectory(runs, (runsRoot) =>
+						runsRoot.withDirectory(runsRoot.relative(runName), (runRoot) => {
+							for (const name of [
+								"service-finalization-seal-intent.json",
+								"service-finalization-seal.json",
+								"service-finalization-seal-replay-ambiguity.json",
+							] as const) {
+								if (runRoot.lstat(runRoot.relative(name)))
+									return { kind: "blocked" as const, reason: "service_finalization_already_started" };
+							}
+							const effects: StorageAccountingEffect[] = [];
+							const result = persistIncidentRecorderLiveTriggerIntentWithinRoot(runRoot, input.candidate, {
+								reserve,
+								effects,
+							});
+							assertCurrent();
+							return { kind: "persisted" as const, result, effects };
+						}),
+					);
+				});
+			} catch (error) {
+				if (callbackInvoked) this.invalidateStorageAccounting();
+				return {
+					state: "unavailable",
+					reason: `live_trigger_intent_root_failed:${error instanceof Error ? error.message : String(error)}`,
+				};
+			}
+			if (mutation.state !== "committed") {
+				if (callbackInvoked) this.invalidateStorageAccounting();
+				return { state: "unavailable", reason: mutation.reason };
+			}
+			if (mutation.value.kind === "blocked") return { state: "unavailable", reason: mutation.value.reason };
+
+			const component = mutation.value.result;
+			if (component.state === "ambiguous") {
+				this.invalidateStorageAccounting();
+				return {
+					state: "unavailable",
+					reason: `live_trigger_intent_${component.reason}`,
+					fileName: component.fileName,
+					peakStorageBytes: component.peakStorageBytes,
+				};
+			}
+			try {
+				this.applyStorageAccountingEffects(mutation.value.effects);
+			} catch (error) {
+				this.invalidateStorageAccounting();
+				return {
+					state: "unavailable",
+					reason: `live_trigger_intent_accounting_failed:${error instanceof Error ? error.message : String(error)}`,
+				};
+			}
+			return component;
+		} finally {
+			releaseReservation();
+		}
 	}
 
 	admitObservation(worstCaseBytes = 256 * 1024): boolean {
@@ -3587,10 +4079,12 @@ export class IncidentRecorderCompactor {
 	}
 
 	async run(options: IncidentRecorderCompactorRunOptions): Promise<void> {
-		const { signal } = options;
+		this.throwIfSegmentOwnershipUncertain();
+		const signal = AbortSignal.any([options.signal, this.internalAbortController.signal]);
 		try {
 			await this.initializeStorageAccounting(signal);
 		} catch (error) {
+			this.throwIfSegmentOwnershipUncertain();
 			if (signal.aborted && error instanceof Error && error.name === "AbortError") return;
 			throw error;
 		}
@@ -3610,6 +4104,7 @@ export class IncidentRecorderCompactor {
 		try {
 			await this.waitUntilAdmitted(signal, options, reportStorageMode);
 		} catch (error) {
+			this.throwIfSegmentOwnershipUncertain();
 			if (signal.aborted && error instanceof Error && error.name === "AbortError") return;
 			throw error;
 		}
@@ -3751,9 +4246,21 @@ export class IncidentRecorderCompactor {
 			this.discardTransientJournalState();
 			this.discardTransientFileState();
 		}
+		this.throwIfSegmentOwnershipUncertain();
 		if (hasRunError) throw runError;
 		if (hasShutdownFlushError) throw shutdownFlushError;
 		if (hasSegmentCloseError) throw segmentCloseError;
+	}
+
+	private throwIfSegmentOwnershipUncertain(): void {
+		if (this.segmentOwnershipUncertainError) throw this.segmentOwnershipUncertainError;
+	}
+
+	private latchSegmentOwnershipUncertain(reason: string): void {
+		if (this.segmentOwnershipUncertainError) return;
+		const error = new IncidentRecorderSegmentOwnershipUncertainError(reason);
+		this.segmentOwnershipUncertainError = error;
+		this.internalAbortController.abort(error);
 	}
 
 	private journalCatchupMaxEntries(): number {
@@ -3999,7 +4506,10 @@ export class IncidentRecorderCompactor {
 		let unchangedScans = 0;
 		for (;;) {
 			if (!this.diskPaused) {
-				if (!recovery?.onNormalWriterAdmission || (await recovery.onNormalWriterAdmission())) return;
+				if (!recovery?.onNormalWriterAdmission || (await recovery.onNormalWriterAdmission())) {
+					this.throwIfSegmentOwnershipUncertain();
+					return;
+				}
 				await this.abortableDelay(positiveBound(recovery.storageRecoveryCadenceMs, 250), signal);
 				continue;
 			}
@@ -10976,6 +11486,75 @@ export class IncidentRecorderCompactor {
 		runId: string;
 		cursor?: IncidentRecorderLiveRunEventsCursor;
 	}): IncidentRecorderLiveRunEventsPage {
+		this.validateLiveRunEventsInput(input);
+		try {
+			return this.withSegmentStoreRoot((root, store) => this.readLiveRunEventsWithinRoot(input, root, store), false);
+		} catch (error) {
+			return this.liveRunEventsIncomplete(
+				input,
+				`live_run_event_query_unavailable:${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+	}
+
+	private validateLiveRunEventsInput(input: { runId: string; cursor?: IncidentRecorderLiveRunEventsCursor }): void {
+		if (!isCanonicalUuid(input.runId)) throw new Error("Invalid live run-event runId");
+		const cursor = input.cursor;
+		if (
+			cursor &&
+			(cursor.version !== 1 ||
+				cursor.runId !== input.runId ||
+				!/^[0-9a-f]{64}$/.test(cursor.filterSha256) ||
+				!Number.isSafeInteger(cursor.segmentSequence) ||
+				cursor.segmentSequence < 0 ||
+				!Number.isSafeInteger(cursor.ordinal) ||
+				cursor.ordinal < 0)
+		)
+			throw new Error("Invalid live run-event continuation cursor");
+	}
+
+	private liveRunEventsIncomplete(
+		input: { runId: string; cursor?: IncidentRecorderLiveRunEventsCursor },
+		reason: string,
+		events: IncidentRecorderRunHistoryEvent[] = [],
+	): IncidentRecorderLiveRunEventsPage {
+		const filterSha256 = sha256(
+			canonicalJson({
+				runId: input.runId,
+				sourceId: SEGMENT_SOURCE_OCCURRENCE,
+				fromObservedAtMs: 0,
+				throughObservedAtMs: Number.MAX_SAFE_INTEGER,
+			}),
+		);
+		const previous = input.cursor ?? {
+			version: 1 as const,
+			runId: input.runId,
+			filterSha256,
+			segmentSequence: 0,
+			ordinal: 0,
+		};
+		return {
+			version: 1,
+			runId: input.runId,
+			state: "incomplete",
+			events,
+			cursor: previous,
+			reason,
+			scannedSegments: 0,
+			scannedRecords: 0,
+			scannedIndexBytes: 0,
+		};
+	}
+
+	private readLiveRunEventsWithinRoot(
+		input: {
+			runId: string;
+			cursor?: IncidentRecorderLiveRunEventsCursor;
+		},
+		root: IncidentCasRootMutation,
+		store: IncidentRecorderSegmentStore,
+	): IncidentRecorderLiveRunEventsPage {
+		this.validateLiveRunEventsInput(input);
 		const filter = {
 			runId: input.runId,
 			sourceId: SEGMENT_SOURCE_OCCURRENCE,
@@ -10991,19 +11570,6 @@ export class IncidentRecorderCompactor {
 			ordinal: 0,
 		});
 		const cursor = input.cursor;
-		if (!isCanonicalUuid(input.runId)) throw new Error("Invalid live run-event runId");
-		if (
-			cursor &&
-			(cursor.version !== 1 ||
-				cursor.runId !== input.runId ||
-				!/^[0-9a-f]{64}$/.test(cursor.filterSha256) ||
-				!Number.isSafeInteger(cursor.segmentSequence) ||
-				cursor.segmentSequence < 0 ||
-				!Number.isSafeInteger(cursor.ordinal) ||
-				cursor.ordinal < 0)
-		) {
-			throw new Error("Invalid live run-event continuation cursor");
-		}
 		const previous = cursor ?? initialCursor();
 		const incomplete = (
 			reason: string,
@@ -11019,107 +11585,195 @@ export class IncidentRecorderCompactor {
 			scannedRecords: 0,
 			scannedIndexBytes: 0,
 		});
-		try {
-			const segmentRead = this.withSegmentStoreRoot((root, store) => {
-				const snapshot = store.createReadSnapshot();
-				if (
-					previous.segmentSequence > snapshot.highWaterSegmentSequence ||
-					(previous.segmentSequence === snapshot.highWaterSegmentSequence &&
-						previous.ordinal > snapshot.highWaterOrdinal)
-				) {
-					return {
-						kind: "incomplete" as const,
-						page: incomplete("live_run_event_cursor_beyond_segment_frontier"),
-					};
-				}
-				const after: IncidentRecorderSegmentQueryCursor | undefined = cursor
-					? {
-							version: 1,
-							snapshotId: snapshot.id,
-							generation: snapshot.generation,
-							highWaterSegmentSequence: snapshot.highWaterSegmentSequence,
-							highWaterOrdinal: snapshot.highWaterOrdinal,
-							filterSha256: cursor.filterSha256,
-							segmentSequence: cursor.segmentSequence,
-							ordinal: cursor.ordinal,
-						}
-					: undefined;
-				const page = store.queryRunWindowPageWithinRoot(root, {
-					runId: input.runId,
-					sourceId: SEGMENT_SOURCE_OCCURRENCE,
-					fromObservedAtMs: 0,
-					throughObservedAtMs: Number.MAX_SAFE_INTEGER,
-					maxRecords: SEGMENT_QUERY_PAGE_RECORDS,
-					maxBytes: SEGMENT_QUERY_PAGE_BYTES,
-					maxScannedSegments: RUN_HISTORY_SEGMENT_PAGE_SCANNED_SEGMENTS,
-					maxScannedRecords: RUN_HISTORY_SEGMENT_PAGE_SCANNED_RECORDS,
-					maxScannedIndexBytes: RUN_HISTORY_SEGMENT_PAGE_SCANNED_INDEX_BYTES,
-					...(after ? { after } : { readSnapshot: snapshot }),
-				});
-				return { kind: "page" as const, snapshot, page };
-			}, false);
-			if (segmentRead.kind === "incomplete") return segmentRead.page;
-			const { page } = segmentRead;
-			const events: IncidentRecorderRunHistoryEvent[] = [];
-			for (const record of page.records) {
-				let value: unknown;
-				try {
-					value = JSON.parse(record.payload.toString("utf8")) as unknown;
-				} catch {
-					return incomplete("live_run_event_segment_payload_invalid_json", events);
-				}
-				const event = this.parseRunHistoryEvent(
-					value,
-					this.segmentOccurrenceReference(record.locator),
-					input.runId,
-					record,
-				);
-				if (!event) return incomplete("live_run_event_segment_payload_invalid", events);
-				events.push(event);
-			}
-			const frontier = page.nextCursor ?? {
-				segmentSequence: page.snapshot.highWaterSegmentSequence,
-				ordinal: page.snapshot.highWaterOrdinal,
-			};
-			const nextCursor: IncidentRecorderLiveRunEventsCursor = {
-				version: 1,
-				runId: input.runId,
-				filterSha256: page.snapshot.filterSha256,
-				segmentSequence: frontier.segmentSequence,
-				ordinal: frontier.ordinal,
-			};
+		const segmentRead = (() => {
+			const snapshot = store.createReadSnapshot();
 			if (
-				!page.complete &&
-				frontier.segmentSequence === previous.segmentSequence &&
-				frontier.ordinal === previous.ordinal
+				previous.segmentSequence > snapshot.highWaterSegmentSequence ||
+				(previous.segmentSequence === snapshot.highWaterSegmentSequence &&
+					previous.ordinal > snapshot.highWaterOrdinal)
 			) {
 				return {
-					version: 1,
-					runId: input.runId,
-					state: "incomplete",
-					events,
-					cursor: previous,
-					reason: "live_run_event_query_made_no_progress",
-					scannedSegments: page.scannedSegments,
-					scannedRecords: page.scannedRecords,
-					scannedIndexBytes: page.scannedIndexBytes,
+					kind: "incomplete" as const,
+					page: incomplete("live_run_event_cursor_beyond_segment_frontier"),
 				};
 			}
+			const after: IncidentRecorderSegmentQueryCursor | undefined = cursor
+				? {
+						version: 1,
+						snapshotId: snapshot.id,
+						generation: snapshot.generation,
+						highWaterSegmentSequence: snapshot.highWaterSegmentSequence,
+						highWaterOrdinal: snapshot.highWaterOrdinal,
+						filterSha256: cursor.filterSha256,
+						segmentSequence: cursor.segmentSequence,
+						ordinal: cursor.ordinal,
+					}
+				: undefined;
+			const page = store.queryRunWindowPageWithinRoot(root, {
+				runId: input.runId,
+				sourceId: SEGMENT_SOURCE_OCCURRENCE,
+				fromObservedAtMs: 0,
+				throughObservedAtMs: Number.MAX_SAFE_INTEGER,
+				maxRecords: SEGMENT_QUERY_PAGE_RECORDS,
+				maxBytes: SEGMENT_QUERY_PAGE_BYTES,
+				maxScannedSegments: RUN_HISTORY_SEGMENT_PAGE_SCANNED_SEGMENTS,
+				maxScannedRecords: RUN_HISTORY_SEGMENT_PAGE_SCANNED_RECORDS,
+				maxScannedIndexBytes: RUN_HISTORY_SEGMENT_PAGE_SCANNED_INDEX_BYTES,
+				...(after ? { after } : { readSnapshot: snapshot }),
+			});
+			return { kind: "page" as const, snapshot, page };
+		})();
+		if (segmentRead.kind === "incomplete") return segmentRead.page;
+		const { page } = segmentRead;
+		const events: IncidentRecorderRunHistoryEvent[] = [];
+		for (const record of page.records) {
+			let value: unknown;
+			try {
+				value = JSON.parse(record.payload.toString("utf8")) as unknown;
+			} catch {
+				return incomplete("live_run_event_segment_payload_invalid_json", events);
+			}
+			const event = this.parseRunHistoryEvent(
+				value,
+				this.segmentOccurrenceReference(record.locator),
+				input.runId,
+				record,
+			);
+			if (!event) return incomplete("live_run_event_segment_payload_invalid", events);
+			events.push(event);
+		}
+		const frontier = page.nextCursor ?? {
+			segmentSequence: page.snapshot.highWaterSegmentSequence,
+			ordinal: page.snapshot.highWaterOrdinal,
+		};
+		const nextCursor: IncidentRecorderLiveRunEventsCursor = {
+			version: 1,
+			runId: input.runId,
+			filterSha256: page.snapshot.filterSha256,
+			segmentSequence: frontier.segmentSequence,
+			ordinal: frontier.ordinal,
+		};
+		if (
+			!page.complete &&
+			frontier.segmentSequence === previous.segmentSequence &&
+			frontier.ordinal === previous.ordinal
+		) {
 			return {
 				version: 1,
 				runId: input.runId,
-				state: page.complete ? "complete" : "pending",
+				state: "incomplete",
 				events,
-				cursor: nextCursor,
+				cursor: previous,
+				reason: "live_run_event_query_made_no_progress",
 				scannedSegments: page.scannedSegments,
 				scannedRecords: page.scannedRecords,
 				scannedIndexBytes: page.scannedIndexBytes,
 			};
-		} catch (error) {
-			return incomplete(
-				`live_run_event_query_unavailable:${error instanceof Error ? error.message : String(error)}`,
-			);
 		}
+		return {
+			version: 1,
+			runId: input.runId,
+			state: page.complete ? "complete" : "pending",
+			events,
+			cursor: nextCursor,
+			scannedSegments: page.scannedSegments,
+			scannedRecords: page.scannedRecords,
+			scannedIndexBytes: page.scannedIndexBytes,
+		};
+	}
+
+	/** Publish one live observation through the single recorder+incidents namespace lease. */
+	publishLiveIncidentObservation(
+		input: IncidentRecorderLiveIncidentPublicationRequest,
+	): IncidentRecorderLiveIncidentPublicationResult {
+		const identity = liveIncidentPublicationIdentity(input);
+		if (this.incidentLivePublicationRootStorageReservation)
+			throw new TypeError("Live incident publication is not reentrant");
+		const reservation: IncidentPinRootStorageReservation = {
+			bytes: 0,
+			entries: 0,
+			inodes: 0,
+			released: false,
+		};
+		this.incidentLivePublicationRootStorageReservation = reservation;
+		let publication:
+			| RecorderRootMutationResult<{
+					result: IncidentRecorderLiveIncidentPublicationResult;
+					effects: StorageAccountingEffect[];
+					receipts: readonly IncidentRecorderSegmentRootReceipt[];
+			  }>
+			| undefined;
+		try {
+			try {
+				publication = this.withRecorderNamespace((roots) => {
+					const store = this.ensureSegmentStoreWithinRoot(roots.recorder);
+					const effects: StorageAccountingEffect[] = [];
+					const result = publishLiveIncidentObservationWithinRoot({
+						...input,
+						incidents: roots.incidents,
+						readLiveRunEvents: (query) => this.readLiveRunEventsWithinRoot(query, roots.recorder, store),
+						storage: {
+							reserve: (bytes, entries, inodes) =>
+								this.reserveIncidentLivePublicationRootStorage(bytes, entries, inodes),
+							effects,
+						},
+					});
+					return { result, effects, receipts: store.drainWithinRootReceipts() };
+				});
+			} catch (error) {
+				this.handleLivePublicationUncertainty(
+					"live_publication_operation_failed",
+					"live_publication_root_mutation_failed",
+				);
+				return {
+					state: "uncertain",
+					incidentId: identity.incidentId,
+					publicationId: identity.publicationId,
+					reason: `live_observation_root_mutation_failed:${error instanceof Error ? error.message : String(error)}`,
+				};
+			}
+			if (publication.state === "unavailable") {
+				this.handleLivePublicationUncertainty(publication.reason, "live_publication_root_unavailable");
+				return {
+					state: "uncertain",
+					incidentId: identity.incidentId,
+					publicationId: identity.publicationId,
+					reason: publication.reason,
+				};
+			}
+			try {
+				this.applySegmentRootReceipts(publication.value.receipts);
+				this.assertSegmentAccountingReadyAfterRootReceipt();
+				this.applyStorageAccountingEffects(publication.value.effects);
+			} catch (error) {
+				this.handleLivePublicationUncertainty(
+					"live_publication_receipt_application_failed",
+					"live_publication_accounting_failed",
+				);
+				return {
+					state: "uncertain",
+					incidentId: identity.incidentId,
+					publicationId: identity.publicationId,
+					reason: `live_observation_accounting_failed:${error instanceof Error ? error.message : String(error)}`,
+				};
+			}
+			if (publication.value.result.state === "uncertain") {
+				this.handleLivePublicationUncertainty(
+					"live_publication_partial_filesystem_failure",
+					"live_publication_partial_filesystem_failure",
+				);
+			}
+			return publication.value.result;
+		} finally {
+			this.releaseSegmentRootReservations();
+			this.releaseIncidentLivePublicationRootStorageReservation(reservation);
+		}
+	}
+
+	private handleLivePublicationUncertainty(storageReason: string, fatalReason: string): void {
+		const ownedRootBackedStore = this.segmentStore?.isRootBacked === true;
+		this.discardSegmentStoreAfterRootFailure(storageReason);
+		if (ownedRootBackedStore) this.latchSegmentOwnershipUncertain(fatalReason);
 	}
 
 	/** Read bounded, committed gap evidence for live finalization-barrier observation. */

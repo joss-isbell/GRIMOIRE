@@ -7,6 +7,30 @@ export interface CliSubprocessLaunchSpec {
 	args: string[];
 }
 
+/** systemd-cat execs the daemon after connecting its streams to journald. */
+export function routeDetachedDaemonDiagnostics(
+	launch: CliSubprocessLaunchSpec,
+	environment: NodeJS.ProcessEnv,
+): CliSubprocessLaunchSpec {
+	if (environment.PRIME_AGENT_DIAGNOSTICS !== "native") return launch;
+	if (process.platform !== "linux") throw new Error("Native daemon diagnostics require Linux journald");
+	const namespace = environment.PRIME_AGENT_DIAGNOSTIC_JOURNAL_NAMESPACE ?? "grimoire";
+	const identifier = environment.PRIME_AGENT_DIAGNOSTIC_JOURNAL_IDENTIFIER ?? "prime-agent";
+	if ((namespace !== "" && !/^[A-Za-z0-9_.-]{1,64}$/.test(namespace)) || !/^[A-Za-z0-9_.-]{1,64}$/.test(identifier)) {
+		throw new Error("Invalid native diagnostic journal namespace or identifier");
+	}
+	return {
+		command: "/usr/bin/systemd-cat",
+		args: [
+			...(namespace ? [`--namespace=${namespace}`] : []),
+			`--identifier=${identifier}`,
+			"--level-prefix=false",
+			launch.command,
+			...launch.args,
+		],
+	};
+}
+
 export function createCliSubprocessEnv(
 	source: NodeJS.ProcessEnv = process.env,
 	entrypoint = process.argv[1],

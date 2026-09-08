@@ -11,7 +11,7 @@ import {
 	KernelDiagnosticBridgeWriter,
 	ReconnectableKernelDiagnosticBridgeWriter,
 } from "../src/core/kernel/diagnostic-bridge.js";
-import type { KernelDiagnosticEvent } from "../src/core/kernel/diagnostics.js";
+import type { ForkServerDiagnosticEvent, KernelDiagnosticEvent } from "../src/core/kernel/diagnostics.js";
 
 const settle = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
 
@@ -19,7 +19,9 @@ function capability(): string {
 	return randomBytes(32).toString("base64url");
 }
 
-function unexpectedExit(stderrTail = Buffer.from([0x00, 0xff, 0x41, 0x0a])): KernelDiagnosticEvent {
+function unexpectedExit(
+	stderrTail = Buffer.from([0x00, 0xff, 0x41, 0x0a]),
+): Extract<KernelDiagnosticEvent, { type: "kernel_unexpected_exit" }> {
 	return {
 		type: "kernel_unexpected_exit",
 		sessionId: "session-worker-boundary",
@@ -35,6 +37,63 @@ function unexpectedExit(stderrTail = Buffer.from([0x00, 0xff, 0x41, 0x0a])): Ker
 		stderrTail,
 		stderrBytes: stderrTail.byteLength + 91,
 		sourceTruncated: true,
+	};
+}
+
+function lifecycleIntent(): Extract<KernelDiagnosticEvent, { type: "kernel_lifecycle_intent" }> {
+	return {
+		type: "kernel_lifecycle_intent",
+		sessionId: "session-lifecycle",
+		kernelInstanceId: "lifecycle-kernel",
+		kernelPid: 4242,
+		kernelProcessStartId: "proc:kernel-start",
+		launchMode: "direct",
+		ownerPid: 4000,
+		ownerProcessStartId: "proc:owner-start",
+		kernelGeneration: 3,
+		observedAt: "2026-09-08T00:00:00.000Z",
+		monotonicNs: "12345678901234567",
+		crashPhase: "executing",
+		requestMsgId: "execution-request",
+		operation: "shutdown",
+		caller: "KernelManager.shutdown",
+		reason: "requested",
+		callerStack: ["at observedCaller (/test/caller.ts:12:4)"],
+	};
+}
+
+function processExitObserved(): Extract<KernelDiagnosticEvent, { type: "kernel_process_exit_observed" }> {
+	const {
+		operation: _operation,
+		caller: _caller,
+		reason: _reason,
+		callerStack: _stack,
+		...observation
+	} = lifecycleIntent();
+	return {
+		...observation,
+		type: "kernel_process_exit_observed",
+		lifecycleState: "shutdown",
+		code: null,
+		signal: "SIGTERM",
+	};
+}
+
+function forkserverLifecycle(phase: ForkServerDiagnosticEvent["phase"]): ForkServerDiagnosticEvent {
+	return {
+		type: "forkserver_lifecycle",
+		forkserverInstanceId: "forkserver-instance",
+		forkserverPid: 4243,
+		forkserverProcessStartId: "proc:forkserver-start",
+		ownerPid: 4000,
+		ownerProcessStartId: "proc:owner-start",
+		observedAt: "2026-09-08T00:00:00.000Z",
+		monotonicNs: "12345678901234567",
+		phase,
+		reason: "control_closed",
+		connectionId: "connection-1",
+		code: null,
+		signal: "SIGTERM",
 	};
 }
 
@@ -87,6 +146,255 @@ function signedPayload(payload: unknown, secret: string): Buffer {
 }
 
 describe("kernel diagnostic worker bridge", () => {
+	it.each([
+		"peer_rejected",
+		"peer_authenticated",
+		"control_closed",
+		"control_error",
+		"process_error",
+		"process_exit",
+		"shutdown_requested",
+		"disposed",
+	] as const)("round-trips shared forkserver %s evidence without claiming a kernel identity", (phase) => {
+		const secret = capability();
+		const event = forkserverLifecycle(phase);
+		const encoded = encodeKernelDiagnosticBridgeEvent(event, secret)!;
+		expect(decode(encoded, secret)).toEqual({ events: [event], losses: [], drops: [] });
+		const extra = signedPayload(
+			{
+				version: 1,
+				kind: "event",
+				sequence: 1,
+				event: { ...event, kernelInstanceId: "invented", capability: "must-not-survive" },
+			},
+			secret,
+		);
+		expect(decode(extra, secret).events).toEqual([event]);
+	});
+
+	it("rejects invalid shared forkserver fields with explicit loss", () => {
+		const secret = capability();
+		for (const invalid of [
+			{ phase: "false_phase" },
+			{ forkserverPid: -1 },
+			{ forkserverInstanceId: "" },
+			{ code: 0.5 },
+			{ signal: 9 },
+		]) {
+			const result = decode(
+				signedPayload(
+					{
+						version: 1,
+						kind: "event",
+						sequence: 1,
+						event: { ...forkserverLifecycle("process_exit"), ...invalid },
+					},
+					secret,
+				),
+				secret,
+			);
+			expect(result.events).toEqual([]);
+			expect(result.losses).toEqual([{ reason: "invalid_payload" }]);
+		}
+	});
+
+	it("retains forkserver close, shutdown intent and actual exit during bridge close", async () => {
+		const secret = capability();
+		const stream = new ControlledWritable({ highWaterMark: 1 });
+		const writer = new ReconnectableKernelDiagnosticBridgeWriter(secret);
+		writer.attach(stream);
+		const expected = [
+			forkserverLifecycle("control_closed"),
+			forkserverLifecycle("shutdown_requested"),
+			forkserverLifecycle("process_exit"),
+		];
+		for (const event of expected) writer.publish(event);
+		writer.close();
+		while (stream.blockedWrites > 0) {
+			stream.release();
+			await settle();
+		}
+		await writer.whenClosed;
+		expect(decode(Buffer.concat(stream.writes), secret)).toEqual({ events: expected, losses: [], drops: [] });
+	});
+	it("preserves the original observer namespace through the real writer and decoder", async () => {
+		const secret = capability();
+		const stream = new ControlledWritable({ highWaterMark: 1 });
+		const writer = new ReconnectableKernelDiagnosticBridgeWriter(secret);
+		writer.attach(stream);
+		const expected = {
+			...unexpectedExit(),
+			stderrCaptureStatus: "unknown" as const,
+			observerPid: 88,
+			observerProcessStartId: "12345678901234567890",
+			observerPidNamespace: "pid:[4026532290]",
+			observerBoottimeOffsetNs: "-1000000000",
+		};
+		writer.publish(expected);
+		writer.close();
+		while (stream.blockedWrites) {
+			stream.release();
+			await settle();
+		}
+		await writer.whenClosed;
+		expect(decode(Buffer.concat(stream.writes), secret)).toEqual({ events: [expected], losses: [], drops: [] });
+	});
+	it.each([
+		{ observerPid: -1 },
+		{ observerProcessStartId: "1".repeat(21) },
+		{ observerPidNamespace: "different namespace" },
+		{ observerBoottimeOffsetNs: "NaN" },
+	])("rejects invalid observer metadata instead of truncating its identity %j", (invalid) => {
+		const secret = capability();
+		expect(() => encodeKernelDiagnosticBridgeEvent({ ...unexpectedExit(), ...invalid }, secret)).toThrow(
+			/invalid_diagnostic_observer_identity/,
+		);
+	});
+	it.each([lifecycleIntent(), processExitObserved()])(
+		"round-trips every causal $type field without unknown payloads",
+		(event) => {
+			const secret = capability();
+			const extra = { ...event, secretPayload: "must-not-be-serialized" };
+			const encoded = encodeKernelDiagnosticBridgeEvent(extra, secret)!;
+			expect(Buffer.from(encoded.toString().split(".")[1], "base64url").toString()).not.toContain(
+				"must-not-be-serialized",
+			);
+			expect(decode(encoded, secret)).toEqual({ events: [event], drops: [], losses: [] });
+			const signedExtra = signedPayload({ version: 1, kind: "event", sequence: 1, event: extra }, secret);
+			expect(decode(signedExtra, secret).events).toEqual([event]);
+		},
+	);
+
+	it("rejects malformed causal identity, clock, operation and stack fields with explicit loss", () => {
+		const secret = capability();
+		for (const invalid of [
+			{ ownerPid: 0 },
+			{ ownerProcessStartId: 99 },
+			{ kernelGeneration: -1 },
+			{ observedAt: "not-a-date" },
+			{ monotonicNs: "1e6" },
+			{ operation: "restart_everything" },
+			{ caller: "" },
+			{ reason: "" },
+			{ callerStack: [123] },
+			{ callerStack: Array(9).fill("at caller") },
+		]) {
+			const result = decode(
+				signedPayload(
+					{ version: 1, kind: "event", sequence: 1, event: { ...lifecycleIntent(), ...invalid } },
+					secret,
+				),
+				secret,
+			);
+			expect(result.events).toEqual([]);
+			expect(result.losses).toEqual([{ reason: "invalid_payload" }]);
+		}
+		const future = decode(
+			signedPayload(
+				{ version: 1, kind: "event", sequence: 1, event: { ...lifecycleIntent(), type: "kernel_future_event" } },
+				secret,
+			),
+			secret,
+		);
+		expect(future.events).toEqual([]);
+		expect(future.losses).toEqual([{ reason: "invalid_payload" }]);
+	});
+
+	it("bounds caller locations while retaining causal fields", () => {
+		const secret = capability();
+		const event = lifecycleIntent();
+		event.callerStack = Array(20).fill("漢".repeat(1024));
+		const result = decode(encodeKernelDiagnosticBridgeEvent(event, secret)!, secret);
+		expect(result.losses).toEqual([]);
+		const received = result.events[0];
+		if (received.type !== "kernel_lifecycle_intent") throw new Error("missing lifecycle intent");
+		expect(received.callerStack).toHaveLength(8);
+		for (const frame of received.callerStack!) expect(Buffer.byteLength(frame)).toBeLessThanOrEqual(512);
+	});
+
+	it("preserves lifecycle intent and observed exit through queue pressure and close", async () => {
+		const secret = capability();
+		const stream = new ControlledWritable({ highWaterMark: 1 });
+		const writer = new KernelDiagnosticBridgeWriter(stream, secret, 1800);
+		const normal: KernelDiagnosticEvent = {
+			type: "kernel_ready",
+			kernelInstanceId: "normal",
+			kernelPid: 1,
+			launchMode: "direct",
+			phase: "idle",
+		};
+		writer.publish(normal);
+		for (let i = 0; i < 40; i++) writer.publish(normal);
+		writer.publish(lifecycleIntent());
+		writer.publish(processExitObserved());
+		expect(writer.bufferedBytes).toBeLessThanOrEqual(1800);
+		writer.close();
+		while (stream.blockedWrites > 0) {
+			stream.release();
+			await settle();
+		}
+		const result = decode(Buffer.concat(stream.writes), secret);
+		expect(result.losses).toEqual([]);
+		expect(result.events).toContainEqual(lifecycleIntent());
+		expect(result.events).toContainEqual(processExitObserved());
+		expect(result.drops.some((drop) => drop.evictedNormal > 0)).toBe(true);
+	});
+
+	it("retains lifecycle intent and observed exit in reconnect replay through close", async () => {
+		const secret = capability();
+		const stream = new ControlledWritable({ highWaterMark: 1 });
+		const writer = new ReconnectableKernelDiagnosticBridgeWriter(secret);
+		writer.attach(stream);
+		writer.publish(lifecycleIntent());
+		writer.publish(processExitObserved());
+		writer.close();
+		while (stream.blockedWrites > 0) {
+			stream.release();
+			await settle();
+		}
+		await writer.whenClosed;
+		expect(decode(Buffer.concat(stream.writes), secret)).toEqual({
+			events: [lifecycleIntent(), processExitObserved()],
+			losses: [],
+			drops: [],
+		});
+	});
+
+	it("does not send later loss frames ahead of retained causal events during reconnect close", async () => {
+		const secret = capability();
+		const stream = new ControlledWritable({ highWaterMark: 1 });
+		const writer = new ReconnectableKernelDiagnosticBridgeWriter(secret, {
+			maxReplayBytes: KERNEL_DIAGNOSTIC_BRIDGE_MAX_LINE_BYTES,
+		});
+		writer.attach(stream);
+		writer.publish({
+			type: "kernel_ready",
+			kernelInstanceId: "active-normal",
+			kernelPid: 1,
+			launchMode: "direct",
+			phase: "idle",
+		});
+		writer.publish(lifecycleIntent());
+		writer.publish(processExitObserved());
+		writer.publish({
+			type: "kernel_ready",
+			kernelInstanceId: "queued-normal",
+			kernelPid: 1,
+			launchMode: "direct",
+			phase: "idle",
+		});
+		writer.close();
+		while (stream.blockedWrites > 0) {
+			stream.release();
+			await settle();
+		}
+		await writer.whenClosed;
+		const result = decode(Buffer.concat(stream.writes), secret);
+		expect(result.events).toContainEqual(lifecycleIntent());
+		expect(result.events).toContainEqual(processExitObserved());
+		expect(result.losses.some((loss) => loss.reason === "sequence_replay")).toBe(false);
+		expect(result.drops).toEqual([expect.objectContaining({ shutdown: 1 })]);
+	});
 	it("marks legacy capture availability unknown and rejects an invalid status", () => {
 		const secret = capability();
 		const legacy = { ...unexpectedExit(), stderrTail: undefined };
@@ -396,7 +704,7 @@ describe("kernel diagnostic worker bridge", () => {
 		expect(losses).toEqual([{ reason: "trailing_partial_frame" }]);
 	});
 
-	it("bounds reconnect replay and schedules canonical loss before a retained critical crash", async () => {
+	it("bounds reconnect replay and preserves sequence order through loss and a retained crash", async () => {
 		const secret = capability();
 		const writer = new ReconnectableKernelDiagnosticBridgeWriter(secret, {
 			maxReplayBytes: KERNEL_DIAGNOSTIC_BRIDGE_MAX_LINE_BYTES,
@@ -431,7 +739,9 @@ describe("kernel diagnostic worker bridge", () => {
 		expect(firstTwo.losses.some((loss) => loss.reason === "sequence_gap")).toBe(true);
 		expect(firstTwo.drops).toHaveLength(1);
 		expect(firstTwo.drops[0].evictedNormal + firstTwo.drops[0].queueOverflow).toBeGreaterThan(0);
-		expect(firstTwo.events.some((event) => event.type === "kernel_unexpected_exit")).toBe(true);
+		const replay = decode(Buffer.concat(stream.writes), secret);
+		expect(replay.events.some((event) => event.type === "kernel_unexpected_exit")).toBe(true);
+		expect(replay.losses.some((loss) => loss.reason === "sequence_replay")).toBe(false);
 		writer.close();
 		await writer.whenClosed;
 	});

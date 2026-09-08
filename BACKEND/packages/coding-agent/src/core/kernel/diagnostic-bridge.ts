@@ -1,6 +1,14 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import type { Writable } from "node:stream";
-import { type KernelDiagnosticEvent, subscribeKernelDiagnostics } from "./diagnostics.js";
+import {
+	type ForkServerDiagnosticEvent,
+	type KernelCausalObservation,
+	type KernelDiagnosticEvent,
+	type KernelDiagnosticIdentity,
+	type KernelLifecycleOperation,
+	type KernelProtocolDetail,
+	subscribeKernelDiagnostics,
+} from "./diagnostics.js";
 
 export const KERNEL_DIAGNOSTIC_BRIDGE_VERSION = 1;
 export const KERNEL_DIAGNOSTIC_BRIDGE_MAX_STDERR_BYTES = 16 * 1024;
@@ -17,6 +25,27 @@ const MAX_KERNEL_INSTANCE_ID_BYTES = 128;
 const MAX_PROCESS_START_ID_BYTES = 256;
 const MAX_REQUEST_MESSAGE_ID_BYTES = 512;
 const MAX_REASON_BYTES = 4096;
+const MAX_CALLER_BYTES = 256;
+const MAX_CALLER_STACK_FRAMES = 8;
+const MAX_CALLER_STACK_FRAME_BYTES = 512;
+const LIFECYCLE_OPERATIONS: ReadonlySet<KernelLifecycleOperation> = new Set([
+	"shutdown",
+	"interrupt",
+	"kill",
+	"dispose",
+	"dispose_sync",
+	"cleanup_resources",
+]);
+const FORKSERVER_PHASES: ReadonlySet<ForkServerDiagnosticEvent["phase"]> = new Set([
+	"peer_rejected",
+	"peer_authenticated",
+	"control_closed",
+	"control_error",
+	"process_error",
+	"process_exit",
+	"shutdown_requested",
+	"disposed",
+]);
 
 export interface KernelDiagnosticBridgeDropCounts {
 	queueOverflow: number;
@@ -120,6 +149,35 @@ function boundedOptionalString(value: string | undefined, maxBytes: number): str
 }
 
 function serializeEvent(event: KernelDiagnosticEvent): Record<string, unknown> {
+	const observation = decodeObservationProcess(event as unknown as Record<string, unknown>);
+	if (!observation) throw new Error("invalid_diagnostic_observer_identity");
+	return { ...serializeEventBody(event), ...observation };
+}
+
+function serializeEventBody(event: KernelDiagnosticEvent): Record<string, unknown> {
+	if (event.type === "forkserver_lifecycle") {
+		return {
+			type: event.type,
+			forkserverInstanceId: truncateUtf8(event.forkserverInstanceId, MAX_KERNEL_INSTANCE_ID_BYTES),
+			...(event.forkserverPid !== undefined ? { forkserverPid: event.forkserverPid } : {}),
+			...(event.forkserverProcessStartId !== undefined
+				? { forkserverProcessStartId: truncateUtf8(event.forkserverProcessStartId, MAX_PROCESS_START_ID_BYTES) }
+				: {}),
+			ownerPid: event.ownerPid,
+			...(event.ownerProcessStartId !== undefined
+				? { ownerProcessStartId: truncateUtf8(event.ownerProcessStartId, MAX_PROCESS_START_ID_BYTES) }
+				: {}),
+			observedAt: event.observedAt,
+			monotonicNs: event.monotonicNs,
+			phase: event.phase,
+			...(event.reason !== undefined ? { reason: truncateUtf8(event.reason, MAX_REASON_BYTES) } : {}),
+			...(event.connectionId !== undefined
+				? { connectionId: truncateUtf8(event.connectionId, MAX_REQUEST_MESSAGE_ID_BYTES) }
+				: {}),
+			...(event.code !== undefined ? { code: event.code } : {}),
+			...(event.signal !== undefined ? { signal: event.signal } : {}),
+		};
+	}
 	const identity = {
 		type: event.type,
 		...(event.sessionId !== undefined
@@ -147,12 +205,71 @@ function serializeEvent(event: KernelDiagnosticEvent): Record<string, unknown> {
 	if (event.type === "kernel_channel_fault") {
 		return {
 			...identity,
+			...(event.kernelGeneration !== undefined
+				? {
+						ownerPid: event.ownerPid,
+						ownerProcessStartId: event.ownerProcessStartId,
+						kernelGeneration: event.kernelGeneration,
+						observedAt: event.observedAt,
+						monotonicNs: event.monotonicNs,
+					}
+				: {}),
 			channel: event.channel,
 			crashPhase: event.crashPhase,
 			...(event.requestMsgId !== undefined
 				? { requestMsgId: boundedOptionalString(event.requestMsgId, MAX_REQUEST_MESSAGE_ID_BYTES) }
 				: {}),
 			reason: truncateUtf8(event.reason, MAX_REASON_BYTES),
+		};
+	}
+	if (
+		event.type === "kernel_lifecycle_intent" ||
+		event.type === "kernel_process_exit_observed" ||
+		event.type === "kernel_protocol_observation"
+	) {
+		const observation = {
+			...identity,
+			ownerPid: event.ownerPid,
+			...(event.ownerProcessStartId !== undefined
+				? { ownerProcessStartId: truncateUtf8(event.ownerProcessStartId, MAX_PROCESS_START_ID_BYTES) }
+				: {}),
+			kernelGeneration: event.kernelGeneration,
+			observedAt: event.observedAt,
+			monotonicNs: event.monotonicNs,
+			crashPhase: event.crashPhase,
+			...(event.requestMsgId !== undefined
+				? { requestMsgId: truncateUtf8(event.requestMsgId, MAX_REQUEST_MESSAGE_ID_BYTES) }
+				: {}),
+		};
+		if (event.type === "kernel_protocol_observation") {
+			return {
+				...observation,
+				observation: event.observation,
+				...("probeId" in event ? { probeId: truncateUtf8(event.probeId, MAX_REQUEST_MESSAGE_ID_BYTES) } : {}),
+				...("protocolMsgId" in event && event.protocolMsgId !== undefined
+					? { protocolMsgId: truncateUtf8(event.protocolMsgId, MAX_REQUEST_MESSAGE_ID_BYTES) }
+					: {}),
+				...("status" in event ? { status: event.status } : {}),
+				...("reason" in event ? { reason: event.reason } : {}),
+				...("durationMs" in event ? { durationMs: event.durationMs } : {}),
+				...("completionSource" in event ? { completionSource: event.completionSource } : {}),
+			};
+		}
+		if (event.type === "kernel_process_exit_observed") {
+			return { ...observation, lifecycleState: event.lifecycleState, code: event.code, signal: event.signal };
+		}
+		return {
+			...observation,
+			operation: event.operation,
+			caller: truncateUtf8(event.caller, MAX_CALLER_BYTES),
+			reason: truncateUtf8(event.reason, MAX_REASON_BYTES),
+			...(event.callerStack !== undefined
+				? {
+						callerStack: event.callerStack
+							.slice(0, MAX_CALLER_STACK_FRAMES)
+							.map((frame) => truncateUtf8(frame, MAX_CALLER_STACK_FRAME_BYTES)),
+					}
+				: {}),
 		};
 	}
 	const stderrTail = event.stderrTail
@@ -188,6 +305,19 @@ function isSafeNonNegativeInteger(value: unknown): value is number {
 	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
+function hasCausalClock(event: Record<string, unknown>): boolean {
+	return (
+		isSafeNonNegativeInteger(event.ownerPid) &&
+		event.ownerPid > 0 &&
+		isOptionalBoundedString(event.ownerProcessStartId, MAX_PROCESS_START_ID_BYTES) &&
+		isBoundedString(event.observedAt, 32) &&
+		/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(event.observedAt) &&
+		Number.isFinite(Date.parse(event.observedAt)) &&
+		isBoundedString(event.monotonicNs, 32) &&
+		/^\d+$/.test(event.monotonicNs)
+	);
+}
+
 function isKernelIdentity(value: Record<string, unknown>): boolean {
 	return (
 		isOptionalBoundedString(value.sessionId, MAX_SESSION_ID_BYTES) &&
@@ -200,9 +330,134 @@ function isKernelIdentity(value: Record<string, unknown>): boolean {
 	);
 }
 
+function decodeProtocolDetail(event: Record<string, unknown>): KernelProtocolDetail | undefined {
+	const observation = event.observation;
+	if (observation === "heartbeat_echo" || observation === "heartbeat_unavailable") {
+		if (!isBoundedString(event.probeId, MAX_REQUEST_MESSAGE_ID_BYTES) || !isSafeNonNegativeInteger(event.durationMs))
+			return undefined;
+		if (observation === "heartbeat_echo")
+			return { observation, probeId: event.probeId, durationMs: event.durationMs };
+		const reason = event.reason;
+		if (
+			reason !== "timeout" &&
+			reason !== "mismatched_echo" &&
+			reason !== "transport_error" &&
+			reason !== "setup_failed"
+		)
+			return undefined;
+		return { observation, probeId: event.probeId, durationMs: event.durationMs, reason };
+	}
+	if (observation === "shell_unavailable" && event.reason === "receive_failed")
+		return { observation, reason: event.reason };
+	if (
+		!isBoundedString(event.requestMsgId, MAX_REQUEST_MESSAGE_ID_BYTES) ||
+		!isOptionalBoundedString(event.protocolMsgId, MAX_REQUEST_MESSAGE_ID_BYTES)
+	)
+		return undefined;
+	const requestMsgId = event.requestMsgId;
+	const protocolMsgId = typeof event.protocolMsgId === "string" ? { protocolMsgId: event.protocolMsgId } : {};
+	if (observation === "iopub_busy" || observation === "iopub_idle")
+		return { observation, requestMsgId, ...protocolMsgId };
+	if (
+		observation === "shell_reply" &&
+		(event.status === "ok" || event.status === "error" || event.status === "aborted" || event.status === "unknown")
+	)
+		return { observation, requestMsgId, ...protocolMsgId, status: event.status };
+	if (
+		observation === "shell_reply_unavailable" &&
+		(event.reason === "not_observed_after_idle" ||
+			event.reason === "tracking_capacity" ||
+			event.reason === "execution_send_failed")
+	)
+		return { observation, requestMsgId, reason: event.reason };
+	if (
+		observation === "execution_completed" &&
+		(event.status === "ok" ||
+			event.status === "error" ||
+			event.status === "aborted" ||
+			event.status === "rejected") &&
+		(event.completionSource === "iopub_idle" ||
+			event.completionSource === "abort_grace" ||
+			event.completionSource === "rejected") &&
+		isSafeNonNegativeInteger(event.durationMs)
+	)
+		return {
+			observation,
+			requestMsgId,
+			status: event.status,
+			completionSource: event.completionSource,
+			durationMs: event.durationMs,
+		};
+	return undefined;
+}
+
+function decodeObservationProcess(event: Record<string, unknown>): Record<string, unknown> | undefined {
+	const result: Record<string, unknown> = {};
+	if (event.observerPid !== undefined) {
+		if (!isSafeNonNegativeInteger(event.observerPid) || event.observerPid === 0) return undefined;
+		result.observerPid = event.observerPid;
+	}
+	for (const [key, expression] of [
+		["observerProcessStartId", /^\d{1,20}$/],
+		["observerPidNamespace", /^pid:\[[1-9]\d{0,19}\]$/],
+		["observerBoottimeOffsetNs", /^-?\d{1,20}$/],
+	] as const) {
+		const value = event[key];
+		if (value === undefined) continue;
+		if (typeof value !== "string" || !expression.test(value)) return undefined;
+		result[key] = value;
+	}
+	return result;
+}
+
 function decodeEvent(value: unknown): KernelDiagnosticEvent | undefined {
+	const event = decodeEventBody(value);
+	if (!event) return undefined;
+	const observation = decodeObservationProcess(value as Record<string, unknown>);
+	return observation ? { ...event, ...observation } : undefined;
+}
+
+function decodeEventBody(value: unknown): KernelDiagnosticEvent | undefined {
 	if (!value || typeof value !== "object") return undefined;
 	const event = value as Record<string, unknown>;
+	if (event.type === "forkserver_lifecycle") {
+		if (
+			!hasCausalClock(event) ||
+			!isBoundedString(event.forkserverInstanceId, MAX_KERNEL_INSTANCE_ID_BYTES) ||
+			!(
+				event.forkserverPid === undefined ||
+				(isSafeNonNegativeInteger(event.forkserverPid) && event.forkserverPid > 0)
+			) ||
+			!isOptionalBoundedString(event.forkserverProcessStartId, MAX_PROCESS_START_ID_BYTES) ||
+			!FORKSERVER_PHASES.has(event.phase as ForkServerDiagnosticEvent["phase"]) ||
+			!isOptionalBoundedString(event.reason, MAX_REASON_BYTES) ||
+			!isOptionalBoundedString(event.connectionId, MAX_REQUEST_MESSAGE_ID_BYTES) ||
+			!(
+				event.code === undefined ||
+				event.code === null ||
+				(typeof event.code === "number" && Number.isSafeInteger(event.code))
+			) ||
+			!(event.signal === undefined || event.signal === null || isBoundedString(event.signal, 32))
+		)
+			return undefined;
+		return {
+			type: event.type,
+			forkserverInstanceId: event.forkserverInstanceId,
+			...(typeof event.forkserverPid === "number" ? { forkserverPid: event.forkserverPid } : {}),
+			...(typeof event.forkserverProcessStartId === "string"
+				? { forkserverProcessStartId: event.forkserverProcessStartId }
+				: {}),
+			ownerPid: event.ownerPid as number,
+			...(typeof event.ownerProcessStartId === "string" ? { ownerProcessStartId: event.ownerProcessStartId } : {}),
+			observedAt: event.observedAt as string,
+			monotonicNs: event.monotonicNs as string,
+			phase: event.phase as ForkServerDiagnosticEvent["phase"],
+			...(typeof event.reason === "string" ? { reason: event.reason } : {}),
+			...(typeof event.connectionId === "string" ? { connectionId: event.connectionId } : {}),
+			...(event.code !== undefined ? { code: event.code as number | null } : {}),
+			...(event.signal !== undefined ? { signal: event.signal as NodeJS.Signals | null } : {}),
+		};
+	}
 	if (!isKernelIdentity(event)) return undefined;
 	const identity = {
 		...(typeof event.sessionId === "string" ? { sessionId: event.sessionId } : {}),
@@ -239,13 +494,98 @@ function decodeEvent(value: unknown): KernelDiagnosticEvent | undefined {
 		isOptionalBoundedString(event.requestMsgId, MAX_REQUEST_MESSAGE_ID_BYTES) &&
 		isBoundedString(event.reason, MAX_REASON_BYTES)
 	) {
+		const causal = [
+			event.ownerPid,
+			event.ownerProcessStartId,
+			event.kernelGeneration,
+			event.observedAt,
+			event.monotonicNs,
+		].some((value) => value !== undefined);
+		if (causal && (!hasCausalClock(event) || !isSafeNonNegativeInteger(event.kernelGeneration))) return undefined;
 		return {
 			...identity,
+			...(causal
+				? {
+						ownerPid: event.ownerPid as number,
+						...(typeof event.ownerProcessStartId === "string"
+							? { ownerProcessStartId: event.ownerProcessStartId }
+							: {}),
+						kernelGeneration: event.kernelGeneration as number,
+						observedAt: event.observedAt as string,
+						monotonicNs: event.monotonicNs as string,
+					}
+				: {}),
 			type: event.type,
 			channel: event.channel,
 			crashPhase,
 			...(typeof event.requestMsgId === "string" ? { requestMsgId: event.requestMsgId } : {}),
 			reason: event.reason,
+		};
+	}
+	if (
+		event.type === "kernel_lifecycle_intent" ||
+		event.type === "kernel_process_exit_observed" ||
+		event.type === "kernel_protocol_observation"
+	) {
+		if (
+			!hasCausalClock(event) ||
+			!isSafeNonNegativeInteger(event.kernelGeneration) ||
+			!isOptionalBoundedString(event.requestMsgId, MAX_REQUEST_MESSAGE_ID_BYTES)
+		)
+			return undefined;
+		const observation: KernelDiagnosticIdentity & KernelCausalObservation = {
+			...identity,
+			ownerPid: event.ownerPid as number,
+			...(typeof event.ownerProcessStartId === "string" ? { ownerProcessStartId: event.ownerProcessStartId } : {}),
+			kernelGeneration: event.kernelGeneration,
+			observedAt: event.observedAt as string,
+			monotonicNs: event.monotonicNs as string,
+			crashPhase,
+			...(typeof event.requestMsgId === "string" ? { requestMsgId: event.requestMsgId } : {}),
+		};
+		if (event.type === "kernel_protocol_observation") {
+			const detail = decodeProtocolDetail(event);
+			return detail ? { ...observation, ...detail, type: event.type } : undefined;
+		}
+		if (event.type === "kernel_process_exit_observed") {
+			if (
+				!(event.code === null || (typeof event.code === "number" && Number.isSafeInteger(event.code))) ||
+				!(event.signal === null || isBoundedString(event.signal, 32)) ||
+				!(
+					event.lifecycleState === "idle" ||
+					event.lifecycleState === "starting" ||
+					event.lifecycleState === "running" ||
+					event.lifecycleState === "shutdown"
+				)
+			)
+				return undefined;
+			return {
+				...observation,
+				type: event.type,
+				lifecycleState: event.lifecycleState,
+				code: event.code,
+				signal: event.signal as NodeJS.Signals | null,
+			};
+		}
+		if (
+			!LIFECYCLE_OPERATIONS.has(event.operation as KernelLifecycleOperation) ||
+			!isBoundedString(event.caller, MAX_CALLER_BYTES) ||
+			!isBoundedString(event.reason, MAX_REASON_BYTES) ||
+			!(
+				event.callerStack === undefined ||
+				(Array.isArray(event.callerStack) &&
+					event.callerStack.length <= MAX_CALLER_STACK_FRAMES &&
+					event.callerStack.every((frame) => isBoundedString(frame, MAX_CALLER_STACK_FRAME_BYTES)))
+			)
+		)
+			return undefined;
+		return {
+			...observation,
+			type: event.type,
+			operation: event.operation as KernelLifecycleOperation,
+			caller: event.caller,
+			reason: event.reason,
+			...(Array.isArray(event.callerStack) ? { callerStack: event.callerStack as string[] } : {}),
 		};
 	}
 	if (
@@ -311,6 +651,21 @@ function isDropCounts(value: unknown): value is KernelDiagnosticBridgeDropCounts
 		Object.keys(counts).length === keys.length &&
 		Object.keys(counts).every((key) => keys.includes(key as keyof KernelDiagnosticBridgeDropCounts)) &&
 		keys.every((key) => isSafeNonNegativeInteger(counts[key]))
+	);
+}
+
+function isCriticalEvent(event: KernelDiagnosticEvent): boolean {
+	return (
+		event.type === "kernel_channel_fault" ||
+		event.type === "kernel_unexpected_exit" ||
+		event.type === "kernel_lifecycle_intent" ||
+		event.type === "kernel_process_exit_observed" ||
+		event.type === "forkserver_lifecycle" ||
+		(event.type === "kernel_protocol_observation" &&
+			(event.observation === "heartbeat_unavailable" ||
+				event.observation === "shell_reply_unavailable" ||
+				event.observation === "shell_unavailable" ||
+				event.observation === "execution_completed"))
 	);
 }
 
@@ -585,7 +940,7 @@ export class KernelDiagnosticBridgeWriter {
 			this.pump();
 			return;
 		}
-		const critical = event.type === "kernel_channel_fault" || event.type === "kernel_unexpected_exit";
+		const critical = isCriticalEvent(event);
 		if (!this.reserve(estimatedBytes, critical)) {
 			if (critical) this.drops.criticalOverflow += 1;
 			else this.drops.queueOverflow += 1;
@@ -738,6 +1093,7 @@ interface ReplayEntry {
 	frame: Buffer;
 	critical: boolean;
 	kind: "event" | "drop";
+	writeCompleted?: boolean;
 	dropSnapshot?: KernelDiagnosticBridgeDropCounts;
 }
 
@@ -775,7 +1131,6 @@ export class ReconnectableKernelDiagnosticBridgeWriter {
 	private closed = false;
 	private closing = false;
 	private lastDeliveredSequence = 0;
-	private lastDeliveredKind?: "event" | "drop";
 	private handoffPending = false;
 	private readonly activeWaiters: Array<() => void> = [];
 	readonly whenClosed: Promise<void>;
@@ -827,7 +1182,7 @@ export class ReconnectableKernelDiagnosticBridgeWriter {
 			this.ensureDropEntry();
 			return;
 		}
-		const critical = event.type === "kernel_channel_fault" || event.type === "kernel_unexpected_exit";
+		const critical = isCriticalEvent(event);
 		const entry: ReplayEntry = { sequence, frame, critical, kind: "event" };
 		if (!this.addEntry(entry)) {
 			this.incrementDrop(critical ? "criticalOverflow" : "queueOverflow");
@@ -968,8 +1323,13 @@ export class ReconnectableKernelDiagnosticBridgeWriter {
 			(entry) => entry.critical || this.active?.entry === entry || pendingSequences.has(entry.sequence),
 		);
 		this.ensureDropEntry();
-		if (this.outstandingDrop && !this.outbound.includes(this.outstandingDrop)) {
-			this.outbound.unshift(this.outstandingDrop);
+		if (
+			this.outstandingDrop &&
+			this.active?.entry !== this.outstandingDrop &&
+			!this.outbound.includes(this.outstandingDrop)
+		) {
+			this.outbound.push(this.outstandingDrop);
+			this.outbound.sort((a, b) => a.sequence - b.sequence);
 		}
 		if (!this.stream && !this.handoffPending) {
 			this.finishClose();
@@ -985,9 +1345,16 @@ export class ReconnectableKernelDiagnosticBridgeWriter {
 	private addEntry(entry: ReplayEntry): boolean {
 		if (entry.frame.byteLength > this.maxReplayBytes) return false;
 		while (this.replayBytes + entry.frame.byteLength > this.maxReplayBytes) {
+			// Completed local writes are replay history, not pending delivery.
+			// Expiring that history remains visible through the reconnect cursor.
 			let evictionIndex = this.entries.findIndex(
-				(candidate) => !candidate.critical && candidate !== this.active?.entry,
+				(candidate) => candidate.writeCompleted && candidate !== this.active?.entry,
 			);
+			if (evictionIndex === -1) {
+				evictionIndex = this.entries.findIndex(
+					(candidate) => !candidate.critical && candidate !== this.active?.entry,
+				);
+			}
 			if (evictionIndex === -1 && entry.critical) {
 				evictionIndex = this.entries.findIndex((candidate) => candidate !== this.active?.entry);
 			}
@@ -1015,7 +1382,7 @@ export class ReconnectableKernelDiagnosticBridgeWriter {
 				}
 			}
 		}
-		if (accountEviction && entry.kind === "event") {
+		if (accountEviction && !entry.writeCompleted && entry.kind === "event") {
 			this.incrementDrop(entry.critical ? "criticalOverflow" : "evictedNormal");
 		}
 	}
@@ -1041,17 +1408,9 @@ export class ReconnectableKernelDiagnosticBridgeWriter {
 
 	private pump(): void {
 		if (this.active || !this.stream || this.closed || this.handoffPending) return;
-		const criticalEventIndex = this.outbound.findIndex(
-			(candidate) => candidate.critical && candidate.kind === "event",
-		);
-		const dropIndex = this.outbound.findIndex((candidate) => candidate.kind === "drop");
-		const nextIndex =
-			dropIndex !== -1 && !(this.lastDeliveredKind === "drop" && criticalEventIndex !== -1)
-				? dropIndex
-				: criticalEventIndex !== -1
-					? criticalEventIndex
-					: 0;
-		const [entry] = this.outbound.splice(nextIndex, 1);
+		// Replay frames are already numbered; priority must govern retention, not
+		// delivery order, or the decoder will reject earlier retained evidence.
+		const entry = this.outbound.shift();
 		if (!entry) {
 			if (this.closing) this.finishClose();
 			return;
@@ -1066,8 +1425,8 @@ export class ReconnectableKernelDiagnosticBridgeWriter {
 					return;
 				}
 				this.active = undefined;
+				entry.writeCompleted = true;
 				this.lastDeliveredSequence = Math.max(this.lastDeliveredSequence, entry.sequence);
-				this.lastDeliveredKind = entry.kind;
 				this.resolveActiveWaiters();
 				if (this.outstandingDrop === entry) {
 					this.outstandingDrop = undefined;

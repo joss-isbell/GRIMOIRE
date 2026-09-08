@@ -1,2 +1,2 @@
-- Added automatic private diagnostic incident recording for daemon supervisor and worker failures.
-- Retains diagnostic runs, finalized incident bundles, references, CAS blobs, journal evidence, atop data, and Sysdig incident pins for three days, with bounded fail-closed cleanup.
+- Added native journal capture with a transactional SQLite evidence store, live incident publication, and restartable native artifact exports.
+- Added process, signal, and Jupyter protocol observations with explicit identity, coverage, and missing-evidence reporting.

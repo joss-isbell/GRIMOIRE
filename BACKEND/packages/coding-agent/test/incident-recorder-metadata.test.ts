@@ -47,6 +47,35 @@ const EMITTER_METADATA_KEYS = [
 ] as const;
 
 describe("incident recorder diagnostic metadata", () => {
+	it("preserves optional kernel stderr capture completion and omits it for legacy/fork records", async () => {
+		for (const stderrCaptureComplete of [true, false]) {
+			expect(await emittedMetadata({ stderrCaptureComplete })).toMatchObject({ stderrCaptureComplete });
+		}
+		const legacyForkMetadata = await emittedMetadata({ stderrCaptureStatus: "unavailable_fork" });
+		expect(legacyForkMetadata).toMatchObject({ stderrCaptureStatus: "unavailable_fork" });
+		expect(legacyForkMetadata).not.toHaveProperty("stderrCaptureComplete");
+	});
+
+	it("retains bounded worker timeout metadata without serializing unrelated data", async () => {
+		const metadata = await emittedMetadata({
+			requestType: "list",
+			timeoutMs: 25,
+			requestId: "worker_7",
+			outcome: "timeout",
+			durationMs: 25,
+			nested: { unbounded: "must-not-expand" },
+		});
+
+		expect(metadata).toMatchObject({
+			requestType: "list",
+			timeoutMs: 25,
+			requestId: "worker_7",
+			outcome: "timeout",
+			durationMs: 25,
+		});
+		expect(metadata).not.toHaveProperty("nested");
+	});
+
 	it("preserves the explicit causal schema without invoking getters or walking nested data", async () => {
 		let getterReads = 0;
 		const error: Record<string, unknown> = {};
@@ -151,6 +180,18 @@ describe("incident recorder diagnostic metadata", () => {
 				"launchMode",
 				"channel",
 				"origin",
+				"payloadAccessorOmissions",
+				"payloadBinaryTruncations",
+				"payloadBytes",
+				"payloadDepthOmissions",
+				"payloadNodes",
+				"payloadOmissions",
+				"payloadProperties",
+				"payloadState",
+				"payloadStoredBytes",
+				"payloadStringTruncations",
+				"payloadUnavailable",
+				"payloadUnsupported",
 				"requestId",
 				"requestMsgId",
 				"rootActiveSessionId",
@@ -213,7 +254,9 @@ describe("incident recorder diagnostic metadata", () => {
 		expect(metadata.errorStackTruncated).toBe(true);
 		expect(metadata.errorStackDigestScope).toBe("retained_prefix");
 		expect(metadata.errorStackSha256).toBe(
-			createHash("sha256").update("💥".repeat((64 * 1024) / 4)).digest("hex"),
+			createHash("sha256")
+				.update("💥".repeat((64 * 1024) / 4))
+				.digest("hex"),
 		);
 		expect(metadata.diagnosticMetadataTruncated).toBe(true);
 		expect(Buffer.byteLength(JSON.stringify(metadata))).toBeLessThanOrEqual(

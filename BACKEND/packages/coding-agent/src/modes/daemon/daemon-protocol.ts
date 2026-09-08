@@ -73,8 +73,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 25 adds capability-gated direct worker peer transport discovery.
 // Revision 26 publishes own-session usage totals on session summary and saved-session rows.
 // Revision 27 adds structured session_recovering failure info for known-but-unaddressable sessions.
-export const DAEMON_SCHEMA_REVISION = 27;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-27-962b8b4c5e35";
+// Revision 28 adds optional roster observation freshness to list responses.
+export const DAEMON_SCHEMA_REVISION = 28;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-28-28c0b8cc2d6b";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -121,7 +122,8 @@ export type DaemonServerCapability =
 	| "session_input_pause"
 	| "owned_prompt_cancellation"
 	| "acp_mcp_servers"
-	| "direct_peer_transport";
+	| "direct_peer_transport"
+	| "list_observation";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -166,6 +168,7 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"rlm_quiescence_barrier",
 	"session_input_pause",
 	"acp_mcp_servers",
+	"list_observation",
 ];
 
 /** Single-use short-lived credential for one direct TUI connection to one worker process incarnation. */
@@ -682,6 +685,21 @@ export type DaemonCommand =
 	| { id?: string; type: "restart" }
 	| { id?: string; type: "shutdown"; force?: boolean };
 
+export type DaemonObservationStatus = "fresh" | "stale" | "unavailable";
+
+export interface DaemonListObservation {
+	/** A recent sample is not proof that a session is currently idle. */
+	status: DaemonObservationStatus;
+	workers: Array<{ workerId: string; status: DaemonObservationStatus; observedAt?: string }>;
+}
+
+export interface DaemonListResult {
+	sessions: SessionSummary[];
+	busyClientOwnedSessionCount?: number;
+	/** Optional, capability-gated metadata; old daemons omit it. */
+	observation?: DaemonListObservation;
+}
+
 type DaemonCommandName = DaemonCommand["type"];
 
 export interface DaemonCommandCompatibility {
@@ -746,6 +764,7 @@ const DIRECT_PEER_TRANSPORT_COMMAND = {
 
 export const DAEMON_COMMAND_COMPATIBILITY = {
 	ack_result: LEGACY_DAEMON_COMMAND,
+	// Optional list observation metadata does not change legacy command admission.
 	list: LEGACY_DAEMON_COMMAND,
 	list_saved_sessions: LEGACY_DAEMON_COMMAND,
 	list_agent_peers: AGENT_PEER_LIST_COMMAND,
@@ -1198,6 +1217,7 @@ export type DaemonOutbound =
 	  };
 
 export const DAEMON_OUTBOUND_COMPATIBILITY = {
+	// list_observation is optional; the response envelope remains compatible.
 	response: LEGACY_DAEMON_COMMAND,
 	session_list_progress: LEGACY_DAEMON_COMMAND,
 	session_list_item: LEGACY_DAEMON_COMMAND,

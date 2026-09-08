@@ -1,9 +1,10 @@
 import { realpathSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getAgentDir } from "./config.js";
 import { ensureKernelPython } from "./core/kernel/bootstrap.js";
 import { installIncidentRecorderSystemdService } from "./modes/daemon/incident-recorder.js";
+import { INCIDENT_CAS_V2_SERVICE_ENTRYPOINT } from "./modes/daemon/incident-recorder-cas-cutover.js";
 import { ensureTool } from "./utils/tools-manager.js";
 
 const bootstrapKernel = process.env.PRIME_AGENT_BOOTSTRAP_KERNEL_ON_INSTALL === "1";
@@ -36,7 +37,7 @@ try {
 		const distDir = fileURLToPath(new URL(".", import.meta.url));
 		const result = installIncidentRecorderSystemdService({
 			nodePath: realpathSync(process.execPath),
-			entrypointPath: realpathSync(join(distDir, "bundle", "cli.js")),
+			entrypointPath: realpathSync(join(dirname(distDir), INCIDENT_CAS_V2_SERVICE_ENTRYPOINT)),
 			agentDir: getAgentDir(),
 		});
 		if (result.status === "failed" || result.status === "unavailable") {

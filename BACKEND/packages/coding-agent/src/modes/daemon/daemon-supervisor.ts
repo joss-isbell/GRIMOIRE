@@ -107,6 +107,8 @@ import {
 	type DaemonClientCapability,
 	type DaemonClosingReason,
 	type DaemonCommand,
+	type DaemonListResult,
+	type DaemonObservationStatus,
 	type DaemonOutbound,
 	type DaemonPeerTransportTicket,
 	type DaemonResponse,
@@ -413,6 +415,7 @@ interface ResidentWorker {
 	diagnosticInitialHandoffPending?: boolean;
 	lastFrameAt?: number;
 	rosterStale?: boolean;
+	rosterObservationDegraded?: boolean;
 	/** worker_auth advertised peer-transport support; absent on workers from older builds. */
 	peerTransportCapable?: boolean;
 	/** In-flight replacement connection during authentication; an allowed frame source alongside client. */
@@ -3127,9 +3130,47 @@ export class DaemonSupervisor {
 				active.push(summary);
 			}
 		}
-		const data = {
+		const observedWorkers = [...this.workers.values()].filter(
+			(worker) => command.includeClientOwned || this.isVisibleWorker(worker),
+		);
+		const observations = observedWorkers.map((worker) => {
+			const observedAt = worker.lastFrameAt;
+			const status: DaemonObservationStatus =
+				observedAt === undefined
+					? "unavailable"
+					: worker.client === undefined ||
+							this.isWorkerStopping(worker) ||
+							worker.descriptor.lifecycle !== "ready" ||
+							worker.rosterStale ||
+							worker.rosterObservationDegraded ||
+							worker.rosterApplyChain !== undefined ||
+							worker.rosterRepairPull !== undefined ||
+							Date.now() - observedAt > ROSTER_STALE_AFTER_MS
+						? "stale"
+						: "fresh";
+			return { worker, status, observedAt };
+		});
+		const data: DaemonListResult = {
 			sessions: active,
 			...(command.includeClientOwned ? { busyClientOwnedSessionCount } : {}),
+			observation: {
+				status: observations.some(({ status }) => status === "unavailable")
+					? "unavailable"
+					: observations.some(({ status }) => status === "stale")
+						? "stale"
+						: "fresh",
+				workers: observations
+					.filter(
+						({ worker }) =>
+							this.isVisibleWorker(worker) ||
+							(command.includeClientOwned === true && this.isWorkerAccessibleToClient(client, worker)),
+					)
+					.map(({ worker, status, observedAt }) => ({
+						workerId: worker.descriptor.workerId,
+						status,
+						...(observedAt !== undefined ? { observedAt: new Date(observedAt).toISOString() } : {}),
+					})),
+			},
 		};
 		if (!command.all) {
 			return success(command.id, "list", data);
@@ -3301,48 +3342,67 @@ export class DaemonSupervisor {
 			createCommand = { ...command, name: normalizedName };
 		}
 		const ownerClientId = command.lifecycle === "client_owned" ? clientId : undefined;
+		let key: string;
 		if (command.sessionPath) {
 			const activeMatches = this.matchWorkers(command.sessionPath);
-			if (
-				activeMatches.length === 1 &&
-				!(await this.reclaimStaleWorkerRegistration(activeMatches[0]!.worker, command.launchEnv !== undefined))
-			) {
-				return this.reuseWorkerForCreate(activeMatches[0]!.worker, ownerClientId, command.sessionPath);
-			}
 			if (activeMatches.length > 1) {
 				throw new Error(`Ambiguous active session "${command.sessionPath}"`);
 			}
-			const config = mergeAgentSessionRuntimeConfig(this.defaultSessionConfig, command.config);
-			const sessionPath = looksLikeSessionPath(command.sessionPath)
-				? resolve(command.sessionPath)
-				: await this.catalog.resolve(command.sessionPath, config.cwd ?? process.cwd(), config.sessionDir);
-			createCommand = { ...createCommand, sessionPath };
+			const match = activeMatches[0];
+			const matchedPath = match?.summary.sessionFile ?? match?.worker.descriptor.sessionFile;
+			if (matchedPath) {
+				createCommand = { ...createCommand, sessionPath: matchedPath };
+				key = canonicalSessionPath(matchedPath);
+			} else if (match) {
+				// Live ephemeral sessions have no saved file to canonicalize.
+				createCommand = { ...createCommand, sessionPath: match.summary.activeSessionId ?? match.summary.id };
+				key = `resident:${match.worker.descriptor.workerId}`;
+			} else {
+				const config = mergeAgentSessionRuntimeConfig(this.defaultSessionConfig, command.config);
+				const sessionPath = looksLikeSessionPath(command.sessionPath)
+					? resolve(command.sessionPath)
+					: await this.catalog.resolve(command.sessionPath, config.cwd ?? process.cwd(), config.sessionDir);
+				createCommand = { ...createCommand, sessionPath };
+				key = canonicalSessionPath(sessionPath);
+			}
+		} else {
+			key = `new:${command.id ? createCommandIdempotencyKey(clientId, command.id) : createActiveSessionId()}`;
 		}
-		const key = createCommand.sessionPath
-			? canonicalSessionPath(createCommand.sessionPath)
-			: `new:${command.id ? createCommandIdempotencyKey(clientId, command.id) : createActiveSessionId()}`;
 		const pending = this.openingWorkers.get(key);
 		if (pending) {
 			return this.joinOpeningWorker(pending, ownerClientId, createCommand.sessionPath ?? key);
 		}
-		if (createCommand.sessionPath) {
-			const existing = this.findWorkerBySessionFile(createCommand.sessionPath);
-			if (existing && !(await this.reclaimStaleWorkerRegistration(existing, command.launchEnv !== undefined))) {
-				return this.reuseWorkerForCreate(existing, ownerClientId, createCommand.sessionPath);
+		const assertOpeningCurrent = () => {
+			if (this.shuttingDown || this.openingWorkers.get(key) !== opening) {
+				throw new Error("Session opening was superseded before worker launch");
 			}
-			// The reclaim await may have let a concurrent opener register; join it instead of double-launching.
-			const opened = this.openingWorkers.get(key);
-			if (opened) {
-				return this.joinOpeningWorker(opened, ownerClientId, createCommand.sessionPath);
+		};
+		// Publish the reservation before reclaim can await a failed worker's exit.
+		// The promise identity also fences obsolete continuations after cleanup.
+		const opening = Promise.resolve().then(async () => {
+			assertOpeningCurrent();
+			if (createCommand.sessionPath) {
+				const activeMatches = this.matchWorkers(createCommand.sessionPath);
+				if (activeMatches.length > 1) throw new Error(`Ambiguous active session "${createCommand.sessionPath}"`);
+				if (activeMatches.length === 1) {
+					const worker = activeMatches[0]!.worker;
+					const reclaimed = await this.reclaimStaleWorkerRegistration(worker, command.launchEnv !== undefined);
+					assertOpeningCurrent();
+					if (!reclaimed) return this.reuseWorkerForCreate(worker, ownerClientId, createCommand.sessionPath);
+				}
+				const config = mergeAgentSessionRuntimeConfig(this.defaultSessionConfig, command.config);
+				const sessionPath = looksLikeSessionPath(createCommand.sessionPath)
+					? resolve(createCommand.sessionPath)
+					: await this.catalog.resolve(createCommand.sessionPath, config.cwd ?? process.cwd(), config.sessionDir);
+				assertOpeningCurrent();
+				createCommand = { ...createCommand, sessionPath };
+				const existing = this.findWorkerBySessionFile(sessionPath);
+				if (existing) {
+					const reclaimed = await this.reclaimStaleWorkerRegistration(existing, command.launchEnv !== undefined);
+					assertOpeningCurrent();
+					if (!reclaimed) return this.reuseWorkerForCreate(existing, ownerClientId, sessionPath);
+				}
 			}
-		}
-		if (createCommand.sessionPath) {
-			const existing = this.findWorkerBySessionFile(createCommand.sessionPath);
-			if (existing && !(await this.reclaimStaleWorkerRegistration(existing, command.launchEnv !== undefined))) {
-				return this.reuseWorkerForCreate(existing, ownerClientId, createCommand.sessionPath);
-			}
-		}
-		const opening = (async () => {
 			if (!createCommand.name) return this.launchWorker(createCommand, undefined, ownerClientId);
 			const savedSiblings = createCommand.sessionPath ? await this.rlmLedgerSiblings(createCommand.sessionPath) : [];
 			const target = savedSiblings.find(
@@ -3356,9 +3416,10 @@ export class DaemonSupervisor {
 				} else {
 					await this.assertSupervisorSessionNameAvailable(targetSummary, createCommand.name!);
 				}
+				assertOpeningCurrent();
 				return this.launchWorker(createCommand, undefined, ownerClientId);
 			});
-		})();
+		});
 		this.openingWorkers.set(key, opening);
 		try {
 			return await opening;
@@ -5170,6 +5231,7 @@ export class DaemonSupervisor {
 	}
 
 	private scheduleRosterRepairPull(worker: ResidentWorker): void {
+		worker.rosterObservationDegraded = true;
 		if (worker.rosterRepairPull || !this.isWorkerRosterApplyCurrent(worker, worker.client)) return;
 		// The marker stays set while the repair's own fill applies, so a failing repair never respawns itself.
 		worker.rosterRepairPull = this.refreshWorkerSummaries(worker, false, true)
@@ -5262,6 +5324,7 @@ export class DaemonSupervisor {
 			}
 			this.roster().write(seededEntries.get(entry.agentId) ?? { ...entry, seededCwd: true });
 		}
+		worker.rosterObservationDegraded = false;
 	}
 
 	private syncRootDescriptorFromRosterEntry(worker: ResidentWorker, entry: WorkerRosterEntry): void {

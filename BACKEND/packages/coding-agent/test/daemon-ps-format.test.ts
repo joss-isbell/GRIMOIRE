@@ -19,6 +19,31 @@ describe("formatUptime", () => {
 });
 
 describe("formatDaemonListTable", () => {
+	it("distinguishes stale session observations from a current runtime build", () => {
+		const table = stripAnsi(
+			formatDaemonListTable([
+				{
+					socketPath: "/tmp/current.sock",
+					status: "current",
+					isDefault: false,
+					sessionCount: 3,
+					sessionObservation: "stale",
+				},
+				{ socketPath: "/tmp/missing.sock", status: "current", isDefault: false, sessionObservation: "unavailable" },
+				{
+					socketPath: "/tmp/legacy.sock",
+					status: "stale",
+					isDefault: false,
+					sessionCount: 2,
+					sessionObservation: "unknown",
+				},
+			]),
+		);
+		expect(table).toContain("3 (stale)");
+		expect(table).toContain("? (unavailable)");
+		expect(table).toContain("2 (unknown)");
+		expect(table).toContain("current");
+	});
 	it("renders columns, marks the default daemon, and shows blanks for missing fields", () => {
 		const daemons: DaemonInfo[] = [
 			{

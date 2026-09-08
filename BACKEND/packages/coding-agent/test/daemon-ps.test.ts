@@ -145,6 +145,18 @@ describe("sortDaemons", () => {
 });
 
 describe("planReap", () => {
+	it.each(["stale", "unavailable"] as const)(
+		"does not mistake a %s zero for confirmed idleness",
+		(sessionObservation) => {
+			const daemon = makeDaemon({
+				socketPath: "/tmp/cached.sock",
+				status: "current",
+				sessionCount: 0,
+				sessionObservation,
+			});
+			expect(planReap([daemon], false)[0]!.kind).toBe("skip");
+		},
+	);
 	it("never touches the default daemon or daemons with live sessions", () => {
 		const plan = planReap(
 			[

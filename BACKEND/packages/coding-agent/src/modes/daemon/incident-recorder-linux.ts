@@ -86,6 +86,19 @@ export interface LinuxIncidentCollectorDependencies {
 	recordRawSource?: LinuxRawSourceRecorder;
 }
 
+/** The stable identity and exact process-membership observation for one cgroup v2 directory. */
+export interface ResolvedLinuxCgroupV2Directory {
+	directory: string;
+	dev: number;
+	ino: number;
+	identityHash: string;
+	membershipRaw: Buffer;
+	membershipSourcePath: string;
+	membershipSha256: string;
+}
+
+export type LinuxCgroupV2ResolutionDependencies = Pick<LinuxIncidentCollectorDependencies, "readBounded" | "stat">;
+
 export interface LinuxIncidentPreparationOptions {
 	runDir: string;
 	dependencies?: Partial<LinuxIncidentCollectorDependencies>;
@@ -443,6 +456,11 @@ function dependencies(
 	};
 }
 
+export function defaultLinuxCgroupV2ResolutionDependencies(): LinuxCgroupV2ResolutionDependencies {
+	const resolved = dependencies(undefined);
+	return { readBounded: resolved.readBounded, stat: resolved.stat };
+}
+
 function evidenceDir(runDir: string): string {
 	return join(runDir, "evidence");
 }
@@ -702,7 +720,7 @@ function writeMonitor(runDir: string, monitor: LinuxMonitorState): boolean {
 }
 
 function safeAbsoluteComponents(value: string): string[] | undefined {
-	if (!posix.isAbsolute(value) || /[\0\r\n]/.test(value)) return undefined;
+	if (!posix.isAbsolute(value) || /[\0\r\n]/.test(value) || value.includes("(deleted)")) return undefined;
 	if (value === "/") return [];
 	const components = value.slice(1).split("/");
 	if (components.some((component) => component.length === 0 || component === "." || component === ".."))
@@ -718,7 +736,13 @@ function decodeMountField(value: string): string | undefined {
 	return safeAbsoluteComponents(decoded) ? decoded : undefined;
 }
 
+function exactBoundedBytes(value: BoundedText): Buffer | undefined {
+	const bytes = Buffer.from(value.rawValue ?? Buffer.from(value.value, "utf8"));
+	return Buffer.from(value.value, "utf8").equals(bytes) ? bytes : undefined;
+}
+
 function safeCgroupRelativePath(value: string): string | undefined {
+	if (value.includes("\\")) return undefined;
 	const components = safeAbsoluteComponents(value);
 	return components ? components.join("/") : undefined;
 }
@@ -738,11 +762,16 @@ function insideMount(mountPoint: string, candidate: string): boolean {
 }
 
 function unifiedCgroupPath(value: string): string | undefined {
+	let selected: string | undefined;
 	for (const line of value.split("\n").slice(0, 64)) {
 		const match = line.match(/^0::(\/[^\r\n]*)$/);
-		if (match) return safeCgroupRelativePath(match[1]);
+		if (match) {
+			if (selected !== undefined) return undefined;
+			selected = safeCgroupRelativePath(match[1]);
+			if (selected === undefined) return undefined;
+		} else if (line.startsWith("0:")) return undefined;
 	}
-	return undefined;
+	return selected;
 }
 
 function currentCgroupIdentityHash(
@@ -757,13 +786,26 @@ function currentCgroupIdentityHash(
 	return relative === undefined ? undefined : createHash("sha256").update(`${relative}\0${dev}\0${ino}`).digest("hex");
 }
 
-function resolveCgroupDirectory(
+export function resolveCgroupDirectory(
 	pid: number,
-	deps: LinuxIncidentCollectorDependencies,
-): { directory: string; dev: number; ino: number; identityHash: string } | undefined {
-	const cgroup = deps.readBounded(`/proc/${pid}/cgroup`, SOURCE_READ_LIMIT);
+	deps: LinuxCgroupV2ResolutionDependencies,
+): ResolvedLinuxCgroupV2Directory | undefined {
+	const membershipSourcePath = `/proc/${pid}/cgroup`;
+	const cgroup = deps.readBounded(membershipSourcePath, SOURCE_READ_LIMIT);
 	const mountinfo = deps.readBounded("/proc/self/mountinfo", MOUNTINFO_READ_LIMIT);
-	if (!cgroup || cgroup.truncated || !mountinfo || mountinfo.truncated) return undefined;
+	const membershipRaw = cgroup && !cgroup.truncated ? exactBoundedBytes(cgroup) : undefined;
+	const mountinfoRaw = mountinfo && !mountinfo.truncated ? exactBoundedBytes(mountinfo) : undefined;
+	if (
+		!cgroup ||
+		cgroup.truncated ||
+		!membershipRaw ||
+		membershipRaw.length > SOURCE_READ_LIMIT ||
+		!mountinfo ||
+		mountinfo.truncated ||
+		!mountinfoRaw ||
+		mountinfoRaw.length > MOUNTINFO_READ_LIMIT
+	)
+		return undefined;
 	const relativeCgroup = unifiedCgroupPath(cgroup.value);
 	if (relativeCgroup === undefined) return undefined;
 	const resolved: Array<{ directory: string; dev: number; ino: number }> = [];
@@ -785,12 +827,13 @@ function resolveCgroupDirectory(
 			const identity = deps.stat(directory);
 			if (!identity?.isDirectory || !Number.isSafeInteger(identity.dev) || !Number.isSafeInteger(identity.ino))
 				continue;
-			const cgroupRecheck = deps.readBounded(`/proc/${pid}/cgroup`, SOURCE_READ_LIMIT);
+			const cgroupRecheck = deps.readBounded(membershipSourcePath, SOURCE_READ_LIMIT);
 			const identityRecheck = deps.stat(directory);
 			if (
 				!cgroupRecheck ||
 				cgroupRecheck.truncated ||
-				unifiedCgroupPath(cgroupRecheck.value) !== relativeCgroup ||
+				!exactBoundedBytes(cgroupRecheck) ||
+				!exactBoundedBytes(cgroupRecheck)?.equals(membershipRaw) ||
 				!identityRecheck?.isDirectory ||
 				identityRecheck.dev !== identity.dev ||
 				identityRecheck.ino !== identity.ino
@@ -806,7 +849,13 @@ function resolveCgroupDirectory(
 	const identityHash = createHash("sha256")
 		.update(`${relativeCgroup}\0${selected.dev}\0${selected.ino}`)
 		.digest("hex");
-	return { ...selected, identityHash };
+	return {
+		...selected,
+		identityHash,
+		membershipRaw,
+		membershipSourcePath,
+		membershipSha256: createHash("sha256").update(membershipRaw).digest("hex"),
+	};
 }
 
 function parseCounterFile(value: BoundedText | undefined): Record<string, number> | undefined {

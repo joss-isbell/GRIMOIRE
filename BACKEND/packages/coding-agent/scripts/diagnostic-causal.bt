@@ -1,0 +1,474 @@
+// bpftrace 0.25; arguments: target UID, root PID in the observer's namespace.
+// Root PID zero selects all self-named roots for that UID. Tests never use zero.
+// JSON lines contain metadata only. Kernel pointers never leave the maps.
+config = { max_map_keys=4096; max_strlen=64; }
+
+let @owned = hash(4096);
+let @signal = hash(4096);
+let @socket = hash(4096);
+let @fds = hash(4096);
+let @exec = hash(4096);
+let @oom = hash(64);
+let @oom_send = hash(64);
+let @ancestry_limits = percpuhash(1);
+let @observer_namespace = hash(1);
+
+// Verified x86 CONFIG_PREEMPT_COUNT, non-RT contract. BPF execution itself
+// contributes a preempt-disable count; zero also rejects an unavailable read.
+// Linux include/linux/preempt.h: NMI_MASK | HARDIRQ_MASK | SOFTIRQ_OFFSET.
+macro oom_task_context() {
+  $counter = (uint32 *)percpu_kaddr("__preempt_count");
+  $count = $counter ? (*$counter & 0x7fffffff) : 0;
+  ($count & 0xff) && !($count & 0xff0100) ? $count : 0
+}
+
+macro seed(task, @namespace) {
+  $identity = task->thread_pid;
+  $level = $identity->level;
+  $2 == 0 || ($level <= 32 && $identity->numbers[$level].nr == $2 && $identity->numbers[$level].ns->ns.inum == @namespace[0])
+}
+
+macro named(name) {
+  $name = (uint8 *)name;
+  // "prime-agent\0", bounded reads without exporting the process name.
+  $name[0] == 112 && $name[1] == 114 && $name[2] == 105 && $name[3] == 109 &&
+  $name[4] == 101 && $name[5] == 45 && $name[6] == 97 && $name[7] == 103 &&
+  $name[8] == 101 && $name[9] == 110 && $name[10] == 116 && $name[11] == 0
+}
+
+macro owned(task, @owners) {
+  @owners[task->pid] == task->start_boottime && task->start_boottime != 0
+}
+
+macro owned_group(task, @owners) {
+  $leader = task->group_leader;
+  $identity = task->thread_pid;
+  $leaderIdentity = $leader->thread_pid;
+  $level = $identity->level;
+  task->pid != $leader->pid && task->tgid == $leader->pid &&
+  task->cred->uid.val == $1 && $leader->cred->uid.val == $1 &&
+  $leader->start_boottime <= task->start_boottime && owned($leader, @owners) &&
+  $level <= 32 && $level == $leaderIdentity->level &&
+  $identity->numbers[$level].ns == $leaderIdentity->numbers[$level].ns
+}
+
+macro task_identity(task) {
+  $pid = task->thread_pid;
+  $leader = task->group_leader->thread_pid;
+  $level = $pid->level;
+  $leaderLevel = $leader->level;
+  if ($level <= 32 && $leaderLevel <= 32) {
+    printf("{\"event\":\"task_identity\",\"time_ns\":\"%llu\",\"init_pid\":%d,\"init_tid\":%d,\"subject_pid\":%d,\"subject_tid\":%d,\"pidns_inode\":%u,\"start_boottime_ns\":\"%llu\",\"process_start_boottime_ns\":\"%llu\"}\n", nsecs(boot), task->tgid, task->pid, $leader->numbers[$leaderLevel].nr, $pid->numbers[$level].nr, $pid->numbers[$level].ns->ns.inum, task->start_boottime, task->group_leader->start_boottime);
+  } else {
+    printf("{\"event\":\"coverage_gap\",\"time_ns\":\"%llu\",\"kind\":\"pid_namespace_unavailable\"}\n", nsecs(boot));
+  }
+}
+
+macro admit_thread(task, @owners) {
+  if (!owned(task, @owners) && owned_group(task, @owners)) {
+    @owners[task->pid] = task->start_boottime;
+    if (owned(task, @owners)) {
+      task_identity(task);
+      printf("{\"event\":\"thread_admitted\",\"time_ns\":\"%llu\",\"init_pid\":%d,\"init_tid\":%d,\"start_boottime_ns\":\"%llu\",\"process_start_boottime_ns\":\"%llu\",\"prior_coverage\":\"unavailable\"}\n", nsecs(boot), task->tgid, task->pid, task->start_boottime, task->group_leader->start_boottime);
+    } else {
+      printf("{\"event\":\"coverage_gap\",\"time_ns\":\"%llu\",\"kind\":\"ownership_capacity\"}\n", nsecs(boot));
+    }
+  }
+}
+
+macro discover(task, @owners, @limits) {
+  admit_thread(task, @owners);
+  if (!owned(task, @owners) && task->cred->uid.val == $1) {
+    $parent = task;
+    $depth = 0;
+    $valid = 1;
+    while ($depth < 16 && $valid && !owned($parent, @owners)) {
+      $next = $parent->real_parent;
+      if ($next->pid == $parent->pid || $next->start_boottime > $parent->start_boottime || $next->cred->uid.val != $1) {
+        $valid = 0;
+      } else {
+        $parent = $next;
+        $depth++;
+      }
+    }
+    if ($valid && owned($parent, @owners)) {
+      @owners[task->pid] = task->start_boottime;
+      if (owned(task, @owners)) {
+        printf("{\"event\":\"ancestry_admitted\",\"time_ns\":\"%llu\",\"init_pid\":%d,\"init_tid\":%d,\"start_boottime_ns\":\"%llu\",\"ancestor_init_tid\":%d,\"ancestor_start_boottime_ns\":\"%llu\",\"depth\":%d,\"prior_coverage\":\"unavailable\"}\n", nsecs(boot), task->tgid, task->pid, task->start_boottime, $parent->pid, $parent->start_boottime, $depth);
+        task_identity(task);
+      } else {
+        printf("{\"event\":\"coverage_gap\",\"time_ns\":\"%llu\",\"kind\":\"ownership_capacity\"}\n", nsecs(boot));
+      }
+    } else if ($valid && $depth == 16) {
+      @limits[0] = sum(1);
+    }
+  }
+}
+
+macro admit(task, reason, @owners) {
+  if (!owned(task, @owners)) {
+    @owners[task->pid] = task->start_boottime;
+    if (owned(task, @owners)) {
+      printf("{\"event\":\"root_admitted\",\"time_ns\":\"%llu\",\"pid\":%d,\"tid\":%d,\"init_pid\":%d,\"init_tid\":%d,\"start_boottime_ns\":\"%llu\",\"reason\":%d}\n", nsecs(boot), pid, tid, task->tgid, task->pid, task->start_boottime, reason);
+      task_identity(task);
+    } else {
+      printf("{\"event\":\"coverage_gap\",\"time_ns\":\"%llu\",\"kind\":\"ownership_capacity\"}\n", nsecs(boot));
+    }
+  }
+}
+
+macro begin_signal(kind, target, signo, group, @calls, @owners) {
+  admit_thread(curtask, @owners);
+  @calls[tid(init)] = (nsecs(boot), curtask->start_boottime, kind, (int64)target, (int64)signo, (int64)group, 0);
+  if (@calls[tid(init)].1 != curtask->start_boottime) {
+    printf("{\"event\":\"coverage_gap\",\"time_ns\":\"%llu\",\"kind\":\"signal_call_capacity\"}\n", nsecs(boot));
+  }
+}
+
+macro publish_signal(@calls) {
+  $call = @calls[tid(init)];
+  if ($call.0 && $call.1 == curtask->start_boottime && !$call.6) {
+    printf("{\"event\":\"signal_call\",\"time_ns\":\"%llu\",\"context_pid\":%d,\"context_tid\":%d,\"context_init_pid\":%d,\"context_init_tid\":%d,\"context_start_boottime_ns\":\"%llu\",\"kind\":%d,\"target_argument\":%lld,\"signal\":%d,\"group_argument\":%lld}\n", $call.0, pid, tid, pid(init), tid(init), $call.1, $call.2, $call.3, $call.4, $call.5);
+    @calls[tid(init)] = ($call.0, $call.1, $call.2, $call.3, $call.4, $call.5, 1);
+  }
+}
+
+macro file_identity(fd) {
+  $table = curtask->files->fdt;
+  $file = kptr((struct file *)0);
+  if ((int64)fd >= 0 && kptr((uint64)fd) < (uint64)$table->max_fds) { $file = $table->fd[(uint32)fd]; }
+  $file
+}
+
+macro tracked(fd, @descriptors) {
+  $file = file_identity(fd);
+  $entry = @descriptors[pid(init), (int64)fd];
+  $file && $entry.0 == curtask->group_leader->start_boottime && $entry.1 == (uint64)$file
+}
+
+macro remember(fd, @descriptors) {
+  $file = file_identity(fd);
+  if ($file) {
+    @descriptors[pid(init), (int64)fd] = (curtask->group_leader->start_boottime, (uint64)$file);
+    if (!tracked(fd, @descriptors)) {
+      printf("{\"event\":\"coverage_gap\",\"time_ns\":\"%llu\",\"kind\":\"socket_capacity\"}\n", nsecs(boot));
+    }
+  }
+}
+
+macro begin_socket(kind, descriptor, @calls) {
+  @calls[tid(init)] = (nsecs(boot), curtask->start_boottime, kind, (int64)descriptor);
+  if (@calls[tid(init)].1 != curtask->start_boottime) {
+    printf("{\"event\":\"coverage_gap\",\"time_ns\":\"%llu\",\"kind\":\"socket_call_capacity\"}\n", nsecs(boot));
+  }
+  printf("{\"event\":\"socket_call\",\"time_ns\":\"%llu\",\"init_pid\":%d,\"init_tid\":%d,\"start_boottime_ns\":\"%llu\",\"kind\":%d,\"fd\":%d}\n", @calls[tid(init)].0, pid(init), tid(init), curtask->start_boottime, kind, descriptor);
+}
+
+BEGIN {
+  @ancestry_limits[0] = sum(0);
+  $identity = curtask->thread_pid;
+  @observer_namespace[0] = $identity->numbers[$identity->level].ns->ns.inum;
+  printf("{\"event\":\"probe_ready\",\"schema\":1,\"time_ns\":\"%llu\",\"clock\":\"CLOCK_BOOTTIME\",\"target_uid\":%d,\"root_pid\":%d,\"map_entries\":4096,\"ancestry_depth\":16,\"limitations\":[\"pre_admission_history\",\"unobserved_inherited_socket_descriptors\",\"socket_addresses\",\"close_range\"]}\n", nsecs(boot), $1, $2);
+}
+
+rawtracepoint:vmlinux:task_rename
+/uid == $1 && args.task->pid == tid(init) && pid(init) == tid(init) && named(args.comm) && seed(args.task, @observer_namespace)/
+{ admit(args.task, 1, @owned); }
+
+tracepoint:syscalls:sys_enter_getuid
+/uid == $1 && pid(init) == tid(init) && named(curtask->comm) && seed(curtask, @observer_namespace)/
+{ admit(curtask, 2, @owned); }
+
+rawtracepoint:vmlinux:sched_process_fork
+{
+  discover(args.parent, @owned, @ancestry_limits);
+  if (owned(args.parent, @owned)) {
+  @owned[args.child->pid] = args.child->start_boottime;
+  if (owned(args.child, @owned)) {
+    printf("{\"event\":\"process_fork\",\"time_ns\":\"%llu\",\"parent_init_pid\":%d,\"parent_init_tid\":%d,\"parent_start_boottime_ns\":\"%llu\",\"child_init_pid\":%d,\"child_init_tid\":%d,\"child_start_boottime_ns\":\"%llu\"}\n", nsecs(boot), args.parent->tgid, args.parent->pid, args.parent->start_boottime, args.child->tgid, args.child->pid, args.child->start_boottime);
+    task_identity(args.child);
+  } else {
+    printf("{\"event\":\"coverage_gap\",\"time_ns\":\"%llu\",\"kind\":\"ownership_capacity\"}\n", nsecs(boot));
+  }
+  }
+}
+
+rawtracepoint:vmlinux:sched_process_exec
+{
+  $prepared = @exec[(uint64)args.p];
+  $verified = $prepared.0 == args.old_pid && $prepared.2 == args.p->tgid && $prepared.1 != 0 &&
+    ($prepared.1 == args.p->start_boottime || $prepared.3 == args.p->start_boottime);
+  if ($verified || owned(args.p, @owned)) {
+    if ($verified && @owned[args.old_pid] == $prepared.1) {
+      $old = delete(@owned, args.old_pid);
+    }
+    @owned[args.p->pid] = args.p->start_boottime;
+    task_identity(args.p);
+    printf("{\"event\":\"process_exec\",\"time_ns\":\"%llu\",\"pid\":%d,\"tid\":%d,\"init_pid\":%d,\"init_tid\":%d,\"old_init_tid\":%d,\"old_start_boottime_ns\":\"%llu\",\"preparation_observed\":%d,\"start_boottime_ns\":\"%llu\"}\n", nsecs(boot), pid, tid, pid(init), tid(init), args.old_pid, $verified ? $prepared.1 : 0, $verified, args.p->start_boottime);
+  }
+  $pending = delete(@exec, (uint64)args.p);
+}
+
+// Before de_thread changes a nonleader's TID and group leader, retain its
+// generation through the still-verifiable owning process.
+rawtracepoint:vmlinux:sched_prepare_exec
+{
+  discover(args.task->group_leader, @owned, @ancestry_limits);
+  discover(args.task, @owned, @ancestry_limits);
+  if (owned(args.task, @owned)) {
+    @exec[(uint64)args.task] = (args.task->pid, args.task->start_boottime, args.task->tgid, args.task->group_leader->start_boottime);
+    if (@exec[(uint64)args.task].1 != args.task->start_boottime) {
+      printf("{\"event\":\"coverage_gap\",\"time_ns\":\"%llu\",\"kind\":\"exec_preparation_capacity\"}\n", nsecs(boot));
+    }
+  }
+}
+
+// Signal kind: 1 kill, 2 tkill, 3 tgkill, 4 pidfd_send_signal. Target arguments
+// use the caller's namespace (or its FD table for kind 4), not initial IDs.
+tracepoint:syscalls:sys_enter_kill
+{ begin_signal(1, (int64)(int32)args.pid, args.sig, 0, @signal, @owned); if (owned(curtask, @owned)) { publish_signal(@signal); } }
+tracepoint:syscalls:sys_enter_tkill
+{ begin_signal(2, (int64)(int32)args.pid, args.sig, 0, @signal, @owned); if (owned(curtask, @owned)) { publish_signal(@signal); } }
+tracepoint:syscalls:sys_enter_tgkill
+{ begin_signal(3, (int64)(int32)args.pid, args.sig, (int64)(int32)args.tgid, @signal, @owned); if (owned(curtask, @owned)) { publish_signal(@signal); } }
+tracepoint:syscalls:sys_enter_pidfd_send_signal
+{ begin_signal(4, (int64)(int32)args.pidfd, args.sig, 0, @signal, @owned); if (owned(curtask, @owned)) { publish_signal(@signal); } }
+
+tracepoint:syscalls:sys_exit_kill,
+tracepoint:syscalls:sys_exit_tkill,
+tracepoint:syscalls:sys_exit_tgkill,
+tracepoint:syscalls:sys_exit_pidfd_send_signal
+/@signal[tid(init)].0 && @signal[tid(init)].1 == curtask->start_boottime/
+{
+  $call = @signal[tid(init)];
+  if ($call.6) {
+    printf("{\"event\":\"signal_return\",\"time_ns\":\"%llu\",\"call_time_ns\":\"%llu\",\"context_init_tid\":%d,\"context_start_boottime_ns\":\"%llu\",\"kind\":%d,\"result\":%lld}\n", nsecs(boot), $call.0, tid(init), $call.1, $call.2, args.ret);
+  }
+  $old = delete(@signal, tid(init));
+}
+
+rawtracepoint:vmlinux:signal_generate
+{
+  discover(args.task, @owned, @ancestry_limits);
+  admit_thread(curtask, @owned);
+  if (owned(args.task, @owned) || owned(curtask, @owned)) {
+  $info = (uint64)args.info;
+  // SEND_SIG_NOINFO and SEND_SIG_PRIV are sentinel pointers, not siginfo structs.
+  $code = $info == 0 ? 0 : ($info == 1 ? 128 : args.info->si_code);
+  $call = @signal[tid(init)];
+  $callTime = $call.1 == curtask->start_boottime && kptr($call.4) == kptr((int64)args.sig) && $code <= 0 ? $call.0 : 0;
+  if ($callTime) { publish_signal(@signal); }
+  $oom = @oom[tid(init)];
+  $send = @oom_send[tid(init)];
+  $preempt = 0;
+  $oomTime = 0;
+  $sendTime = 0;
+  if (args.sig == 9 && $code == 128 && args.group == 1 && $oom.0 && $oom.1 == curtask->start_boottime) {
+    $preempt = oom_task_context();
+    if ($oom.4 && $preempt && $send.7 && $send.1 == curtask->start_boottime && $send.2 == $oom.0 &&
+        $send.3 == args.task->tgid && $send.4 == args.task->pid && $send.5 == args.task->start_boottime &&
+        $oom.2 == args.task->tgid && $oom.3 == args.task->group_leader->start_boottime) {
+      $oomTime = $oom.0;
+      $sendTime = $send.0;
+    } else {
+      printf("{\"event\":\"coverage_gap\",\"time_ns\":\"%llu\",\"kind\":\"oom_signal_origin_unverified\"}\n", nsecs(boot));
+    }
+  }
+  // Current context is evidence, never an unconditional sender assertion.
+  printf("{\"event\":\"signal_generate\",\"time_ns\":\"%llu\",\"context_init_pid\":%d,\"context_init_tid\":%d,\"context_start_boottime_ns\":\"%llu\",\"target_init_pid\":%d,\"target_init_tid\":%d,\"target_start_boottime_ns\":\"%llu\",\"signal\":%d,\"code\":%d,\"group\":%d,\"result\":%d,\"call_time_ns\":\"%llu\",\"oom_call_time_ns\":\"%llu\",\"oom_send_time_ns\":\"%llu\",\"oom_preempt_count\":%u}\n", nsecs(boot), pid(init), tid(init), curtask->start_boottime, args.task->tgid, args.task->pid, args.task->start_boottime, args.sig, $code, args.group, args.result, $callTime, $oomTime, $sendTime, $preempt);
+  }
+}
+
+tracepoint:signal:signal_deliver
+/(owned(curtask, @owned) || owned_group(curtask, @owned))/
+{
+  admit_thread(curtask, @owned);
+  printf("{\"event\":\"signal_deliver\",\"time_ns\":\"%llu\",\"pid\":%d,\"tid\":%d,\"init_pid\":%d,\"init_tid\":%d,\"start_boottime_ns\":\"%llu\",\"signal\":%d,\"code\":%d}\n", nsecs(boot), pid, tid, pid(init), tid(init), curtask->start_boottime, args.sig, args.code);
+}
+
+// Socket kind: 1 connect, 2 bind, 3 accept/accept4. No addresses or I/O payloads.
+tracepoint:syscalls:sys_enter_connect
+{ discover(curtask, @owned, @ancestry_limits); if (owned(curtask, @owned)) { begin_socket(1, args.fd, @socket); } }
+tracepoint:syscalls:sys_enter_bind
+{ discover(curtask, @owned, @ancestry_limits); if (owned(curtask, @owned)) { begin_socket(2, args.fd, @socket); } }
+tracepoint:syscalls:sys_enter_accept,
+tracepoint:syscalls:sys_enter_accept4
+{ discover(curtask, @owned, @ancestry_limits); if (owned(curtask, @owned)) { begin_socket(3, args.fd, @socket); } }
+
+tracepoint:syscalls:sys_exit_connect,
+tracepoint:syscalls:sys_exit_bind,
+tracepoint:syscalls:sys_exit_accept,
+tracepoint:syscalls:sys_exit_accept4
+/@socket[tid(init)].0 && @socket[tid(init)].1 == curtask->start_boottime/
+{
+  $call = @socket[tid(init)];
+  $fd = $call.2 == 3 ? args.ret : $call.3;
+  // EINPROGRESS still establishes a descriptor whose future close matters.
+  if (args.ret >= 0 || ($call.2 == 1 && args.ret == -115)) { remember($fd, @fds); }
+  $file = file_identity($fd);
+  printf("{\"event\":\"socket_return\",\"time_ns\":\"%llu\",\"call_time_ns\":\"%llu\",\"init_pid\":%d,\"init_tid\":%d,\"kind\":%d,\"fd\":%d,\"inode\":\"%llu\",\"result\":%lld}\n", nsecs(boot), $call.0, pid(init), tid(init), $call.2, $fd, $file ? $file->f_inode->i_ino : 0, args.ret);
+  $old = delete(@socket, tid(init));
+}
+
+tracepoint:syscalls:sys_enter_close
+/(owned(curtask, @owned) || owned_group(curtask, @owned)) && tracked(args.fd, @fds)/
+{
+  admit_thread(curtask, @owned);
+  @socket[tid(init)] = (nsecs(boot), curtask->start_boottime, 5, (int64)args.fd);
+  printf("{\"event\":\"socket_close\",\"time_ns\":\"%llu\",\"init_pid\":%d,\"init_tid\":%d,\"start_boottime_ns\":\"%llu\",\"fd\":%d,\"inode\":\"%llu\"}\n", @socket[tid(init)].0, pid(init), tid(init), curtask->start_boottime, args.fd, file_identity(args.fd)->f_inode->i_ino);
+  $old = delete(@fds, (pid(init), (int64)args.fd));
+}
+
+tracepoint:syscalls:sys_enter_shutdown
+/(owned(curtask, @owned) || owned_group(curtask, @owned)) && tracked(args.fd, @fds)/
+{
+  admit_thread(curtask, @owned);
+  @socket[tid(init)] = (nsecs(boot), curtask->start_boottime, 6, (int64)args.fd);
+  printf("{\"event\":\"socket_shutdown\",\"time_ns\":\"%llu\",\"init_pid\":%d,\"init_tid\":%d,\"fd\":%d,\"how\":%d}\n", @socket[tid(init)].0, pid(init), tid(init), args.fd, args.how);
+}
+
+tracepoint:syscalls:sys_exit_close,
+tracepoint:syscalls:sys_exit_shutdown
+/@socket[tid(init)].0 && @socket[tid(init)].1 == curtask->start_boottime/
+{
+  $call = @socket[tid(init)];
+  printf("{\"event\":\"socket_lifecycle_result\",\"time_ns\":\"%llu\",\"call_time_ns\":\"%llu\",\"init_pid\":%d,\"init_tid\":%d,\"kind\":%d,\"fd\":%d,\"result\":%lld}\n", nsecs(boot), $call.0, pid(init), tid(init), $call.2, $call.3, args.ret);
+  $old = delete(@socket, tid(init));
+}
+
+tracepoint:syscalls:sys_enter_dup
+/(owned(curtask, @owned) || owned_group(curtask, @owned)) && tracked(args.fildes, @fds)/
+{ admit_thread(curtask, @owned); @socket[tid(init)] = (nsecs(boot), curtask->start_boottime, 4, (int64)args.fildes); }
+tracepoint:syscalls:sys_enter_dup2,
+tracepoint:syscalls:sys_enter_dup3
+/(owned(curtask, @owned) || owned_group(curtask, @owned)) && tracked(args.oldfd, @fds)/
+{ admit_thread(curtask, @owned); @socket[tid(init)] = (nsecs(boot), curtask->start_boottime, 4, (int64)args.oldfd); }
+tracepoint:syscalls:sys_enter_fcntl
+/(owned(curtask, @owned) || owned_group(curtask, @owned)) && (args.cmd == 0 || args.cmd == 1030) && tracked(args.fd, @fds)/
+{ admit_thread(curtask, @owned); @socket[tid(init)] = (nsecs(boot), curtask->start_boottime, 4, (int64)args.fd); }
+
+tracepoint:syscalls:sys_exit_dup,
+tracepoint:syscalls:sys_exit_dup2,
+tracepoint:syscalls:sys_exit_dup3,
+tracepoint:syscalls:sys_exit_fcntl
+/@socket[tid(init)].0 && @socket[tid(init)].1 == curtask->start_boottime/
+{
+  $call = @socket[tid(init)];
+  if (args.ret >= 0) { remember(args.ret, @fds); }
+  printf("{\"event\":\"socket_dup\",\"time_ns\":\"%llu\",\"init_pid\":%d,\"init_tid\":%d,\"old_fd\":%d,\"result\":%lld}\n", nsecs(boot), pid(init), tid(init), $call.3, args.ret);
+  $old = delete(@socket, tid(init));
+}
+
+// This function can return without killing; its dynamic extent alone is not
+// cause. A separate send entry, noninterrupt generation and send return are
+// required. Shared-mm victims in different groups are outside this contract.
+fentry:vmlinux:__oom_kill_process
+{
+  discover(args.victim->group_leader, @owned, @ancestry_limits);
+  discover(args.victim, @owned, @ancestry_limits);
+  if (owned(args.victim, @owned)) {
+    $prior = @oom[tid(init)];
+    if ($prior.0 && $prior.1 == curtask->start_boottime) {
+      @oom[tid(init)] = ($prior.0, $prior.1, $prior.2, $prior.3, 0);
+      printf("{\"event\":\"coverage_gap\",\"time_ns\":\"%llu\",\"kind\":\"oom_nested_context\"}\n", nsecs(boot));
+    } else {
+      @oom[tid(init)] = (nsecs(boot), curtask->start_boottime, args.victim->tgid, args.victim->group_leader->start_boottime, 1);
+      if (@oom[tid(init)].1 == curtask->start_boottime) {
+        printf("{\"event\":\"oom_kill_enter\",\"time_ns\":\"%llu\",\"context_init_tid\":%d,\"context_start_boottime_ns\":\"%llu\",\"selected_init_pid\":%d,\"selected_process_start_boottime_ns\":\"%llu\",\"scope\":\"selected_thread_group\",\"context_contract\":\"x86_non_rt_preempt_count\"}\n", @oom[tid(init)].0, tid(init), curtask->start_boottime, args.victim->tgid, args.victim->group_leader->start_boottime);
+      } else {
+        printf("{\"event\":\"coverage_gap\",\"time_ns\":\"%llu\",\"kind\":\"oom_context_capacity\"}\n", nsecs(boot));
+      }
+    }
+  }
+}
+
+fexit:vmlinux:__oom_kill_process
+/@oom[tid(init)].0 && @oom[tid(init)].1 == curtask->start_boottime/
+{
+  printf("{\"event\":\"oom_kill_return\",\"time_ns\":\"%llu\",\"call_time_ns\":\"%llu\",\"context_init_tid\":%d,\"context_start_boottime_ns\":\"%llu\",\"context_valid\":%d}\n", nsecs(boot), @oom[tid(init)].0, tid(init), curtask->start_boottime, @oom[tid(init)].4);
+  $old = delete(@oom, tid(init));
+  $pending = delete(@oom_send, tid(init));
+}
+
+fentry:vmlinux:do_send_sig_info
+/@oom[tid(init)].0 && @oom[tid(init)].1 == curtask->start_boottime && args.sig == 9 && (uint64)args.info == 1 && args.type == 1/
+{
+  $oom = @oom[tid(init)];
+  $prior = @oom_send[tid(init)];
+  $preempt = oom_task_context();
+  if ($prior.0 && $prior.1 == curtask->start_boottime) {
+    @oom_send[tid(init)] = ($prior.0, $prior.1, $prior.2, $prior.3, $prior.4, $prior.5, $prior.6, 0);
+    printf("{\"event\":\"coverage_gap\",\"time_ns\":\"%llu\",\"kind\":\"oom_nested_signal\"}\n", nsecs(boot));
+  } else if ($oom.4 && $preempt && $oom.2 == args.p->tgid && $oom.3 == args.p->group_leader->start_boottime) {
+    discover(args.p, @owned, @ancestry_limits);
+    if (owned(args.p, @owned)) {
+      @oom_send[tid(init)] = (nsecs(boot), curtask->start_boottime, $oom.0, args.p->tgid, args.p->pid, args.p->start_boottime, $preempt, 1);
+      if (@oom_send[tid(init)].1 == curtask->start_boottime) {
+        printf("{\"event\":\"oom_signal_enter\",\"time_ns\":\"%llu\",\"oom_call_time_ns\":\"%llu\",\"context_init_tid\":%d,\"context_start_boottime_ns\":\"%llu\",\"target_init_pid\":%d,\"target_init_tid\":%d,\"target_start_boottime_ns\":\"%llu\",\"signal\":9,\"code\":128,\"pid_type\":1,\"preempt_count\":%u}\n", @oom_send[tid(init)].0, $oom.0, tid(init), curtask->start_boottime, args.p->tgid, args.p->pid, args.p->start_boottime, $preempt);
+      } else {
+        printf("{\"event\":\"coverage_gap\",\"time_ns\":\"%llu\",\"kind\":\"oom_send_capacity\"}\n", nsecs(boot));
+      }
+    }
+  } else {
+    printf("{\"event\":\"coverage_gap\",\"time_ns\":\"%llu\",\"kind\":\"oom_send_origin_unverified\"}\n", nsecs(boot));
+  }
+}
+
+fexit:vmlinux:do_send_sig_info
+/@oom_send[tid(init)].0 && @oom_send[tid(init)].1 == curtask->start_boottime && args.sig == 9 && (uint64)args.info == 1 && args.type == 1 && @oom_send[tid(init)].3 == args.p->tgid && @oom_send[tid(init)].4 == args.p->pid && @oom_send[tid(init)].5 == args.p->start_boottime/
+{
+  printf("{\"event\":\"oom_signal_return\",\"time_ns\":\"%llu\",\"call_time_ns\":\"%llu\",\"oom_call_time_ns\":\"%llu\",\"context_init_tid\":%d,\"context_start_boottime_ns\":\"%llu\",\"context_valid\":%d,\"result\":%d}\n", nsecs(boot), @oom_send[tid(init)].0, @oom_send[tid(init)].2, tid(init), curtask->start_boottime, @oom_send[tid(init)].7, retval);
+  $old = delete(@oom_send, tid(init));
+}
+
+// A mark also occurs for tasks already exiting or with SIGKILL pending.
+rawtracepoint:vmlinux:mark_victim
+{
+  discover(args.task, @owned, @ancestry_limits);
+  if (owned(args.task, @owned)) {
+  printf("{\"event\":\"oom_victim\",\"time_ns\":\"%llu\",\"init_pid\":%d,\"init_tid\":%d,\"start_boottime_ns\":\"%llu\"}\n", nsecs(boot), args.task->tgid, args.task->pid, args.task->start_boottime);
+  }
+}
+
+rawtracepoint:vmlinux:sched_process_exit
+{
+  discover(args.p, @owned, @ancestry_limits);
+  if (owned(args.p, @owned)) {
+    $leaderIdentity = args.p->group_leader->thread_pid;
+    $leaderLevel = $leaderIdentity->level;
+    $subjectPid = 0;
+    $namespaceInode = 0;
+    if ($leaderLevel <= 32) {
+      $subjectPid = $leaderIdentity->numbers[$leaderLevel].nr;
+      $namespaceInode = $leaderIdentity->numbers[$leaderLevel].ns->ns.inum;
+    } else {
+      printf("{\"event\":\"coverage_gap\",\"time_ns\":\"%llu\",\"kind\":\"pid_namespace_unavailable\"}\n", nsecs(boot));
+    }
+    printf("{\"event\":\"process_exit\",\"time_ns\":\"%llu\",\"pid\":%d,\"tid\":%d,\"init_pid\":%d,\"init_tid\":%d,\"start_boottime_ns\":\"%llu\",\"subject_pid\":%d,\"pidns_inode\":%u,\"process_start_boottime_ns\":\"%llu\",\"raw_exit_code\":%d,\"group_dead\":%d}\n", nsecs(boot), pid, tid, args.p->tgid, args.p->pid, args.p->start_boottime, $subjectPid, $namespaceInode, args.p->group_leader->start_boottime, args.p->exit_code, args.group_dead);
+    // A departed leader still identifies its live thread group until group_dead.
+    if (args.p->pid != args.p->tgid || args.group_dead) {
+      $old = delete(@owned, args.p->pid);
+    }
+    if (args.group_dead) {
+      $leader = delete(@owned, args.p->tgid);
+      $deadPid = args.p->tgid;
+      $deadStart = args.p->group_leader->start_boottime;
+      for ($entry : @fds) {
+        if ($entry.0.0 == $deadPid && $entry.1.0 == $deadStart) {
+          $removed = delete(@fds, $entry.0);
+        }
+      }
+    }
+  }
+  $call = delete(@signal, args.p->pid);
+  $socketCall = delete(@socket, args.p->pid);
+  $pendingExec = delete(@exec, (uint64)args.p);
+  $pendingOom = delete(@oom, args.p->pid);
+  $pendingOomSignal = delete(@oom_send, args.p->pid);
+}
+
+interval:s:10 {
+  printf("{\"event\":\"probe_health\",\"time_ns\":\"%llu\",\"ancestry_limit_count\":%llu}\n", nsecs(boot), (uint64)@ancestry_limits[0]);
+}
+
+END { clear(@owned); clear(@signal); clear(@socket); clear(@fds); clear(@exec); clear(@oom); clear(@oom_send); clear(@ancestry_limits); clear(@observer_namespace); }

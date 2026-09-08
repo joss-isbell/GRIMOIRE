@@ -121,14 +121,14 @@ export async function probeDaemonVersion(socketPath: string, helloTimeoutMs = 20
 
 export async function listActiveDaemonSessionSummaries(
 	client: DaemonClient,
-	options: { includeClientOwned?: boolean } = {},
+	options: { includeClientOwned?: boolean; requireFresh?: boolean } = {},
 ): Promise<SessionSummary[]> {
 	return (await queryActiveDaemonSessions(client, options)).sessions;
 }
 
 async function queryActiveDaemonSessions(
 	client: DaemonClient,
-	options: { includeClientOwned?: boolean } = {},
+	options: { includeClientOwned?: boolean; requireFresh?: boolean } = {},
 ): Promise<{ sessions: SessionSummary[]; busyClientOwnedSessionCount: number }> {
 	const response = await client.request({ type: "list", includeClientOwned: options.includeClientOwned });
 	if (!response.success) {
@@ -137,6 +137,13 @@ async function queryActiveDaemonSessions(
 	const data = response.data;
 	if (!data || typeof data !== "object" || !("sessions" in data)) {
 		throw new Error("Daemon returned an invalid session list response");
+	}
+	if (
+		options.requireFresh &&
+		client.hello?.serverCapabilities?.includes("list_observation") &&
+		(data as { observation?: { status?: unknown } }).observation?.status !== "fresh"
+	) {
+		throw new Error("Daemon session observation is stale or unavailable; idleness is unknown");
 	}
 	const sessions = (data as { sessions: unknown }).sessions;
 	if (!Array.isArray(sessions)) {
@@ -295,7 +302,7 @@ export async function probeRunningDaemonSessions(socketPath: string): Promise<Ru
 		return { reachable: false };
 	}
 	try {
-		const result = await queryActiveDaemonSessions(client, { includeClientOwned: true });
+		const result = await queryActiveDaemonSessions(client, { includeClientOwned: true, requireFresh: true });
 		return {
 			reachable: true,
 			activeSessions: result.sessions.filter((summary) => summary.activeSessionId !== undefined),
@@ -326,7 +333,7 @@ async function shutdownStaleDaemonIfNotBusy(socketPath: string): Promise<StaleDa
 	let loadedSessionCount = 0;
 	let hasBusySessions = true;
 	try {
-		const result = await queryActiveDaemonSessions(client, { includeClientOwned: true });
+		const result = await queryActiveDaemonSessions(client, { includeClientOwned: true, requireFresh: true });
 		loadedSessionCount = result.sessions.length;
 		hasBusySessions =
 			result.busyClientOwnedSessionCount !== 0 || result.sessions.some((summary) => isSessionBusy(summary));

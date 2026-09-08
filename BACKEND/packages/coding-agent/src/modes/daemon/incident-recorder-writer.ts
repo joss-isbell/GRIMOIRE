@@ -15,6 +15,11 @@ import {
 } from "node:fs";
 import type { Readable as ReadableStream } from "node:stream";
 import {
+	type IncidentRecorderDiagnosticPayloadState,
+	type IncidentRecorderDiagnosticPayloadSummary,
+	serializeIncidentRecorderDiagnostic,
+} from "./incident-recorder-diagnostic-serializer.js";
+import {
 	decodeIncidentRecorderFrame,
 	encodeIncidentRecorderFrame,
 	INCIDENT_RECORDER_FRAME_FLAGS,
@@ -56,6 +61,9 @@ const JOURNAL_RECONNECT_MS = 1_000;
 const JOURNAL_RELAY_MAX_BYTES = 8 * 1024 * 1024;
 const SERVICE_EMITTER_MAX_BYTES = 256 * 1024;
 const SERVICE_EMITTER_MAX_IDENTITIES = 32;
+export const INCIDENT_RECORDER_WRAPPER_FRONTIER_MAX_IDENTITIES = 4_096;
+export const INCIDENT_RECORDER_SERVICE_SEAL_RESULT_MAX_IDENTITIES = 64;
+export const INCIDENT_RECORDER_SERVICE_SEAL_FENCE_MAX_IDENTITIES = 4_096;
 // One tombstone per occurrence that can be admitted inside the producer's bounded
 // transport window. Real old-sequence duplicates remain fenced by sequence state
 // after this LRU rolls over.
@@ -67,6 +75,152 @@ type Scalar = string | number | boolean | null;
 type ScalarMetadata = Readonly<Record<string, Scalar>>;
 type CaptureSource = string;
 
+export interface IncidentRecorderWrapperFrontierIdentity {
+	runId: string;
+	runToken: string;
+}
+
+/**
+ * Raised when this process can no longer retain a new wrapper/run identity.
+ * Existing identities remain usable so a bounded frontier never turns a
+ * recoverable lifecycle transition into a silent queue-capacity loss.
+ */
+export class IncidentRecorderWrapperFrontierSaturatedError extends Error {
+	readonly code = "INCIDENT_RECORDER_WRAPPER_FRONTIER_SATURATED" as const;
+	readonly runId: string;
+	readonly runToken: string;
+	readonly maxIdentities: number;
+
+	constructor(identity: IncidentRecorderWrapperFrontierIdentity, maxIdentities: number) {
+		super(`Incident recorder wrapper sequence frontier is saturated at ${maxIdentities} identities`);
+		this.name = "IncidentRecorderWrapperFrontierSaturatedError";
+		this.runId = identity.runId;
+		this.runToken = identity.runToken;
+		this.maxIdentities = maxIdentities;
+	}
+}
+
+export interface IncidentRecorderWrapperFrontier {
+	readonly maxIdentities: number;
+	reserve(identity: IncidentRecorderWrapperFrontierIdentity): void;
+	allocate(identity: IncidentRecorderWrapperFrontierIdentity, count: number): bigint;
+}
+
+class ProcessLifetimeWrapperFrontier implements IncidentRecorderWrapperFrontier {
+	private readonly lastSequences = new Map<string, bigint>();
+
+	constructor(readonly maxIdentities: number) {
+		if (
+			!Number.isSafeInteger(maxIdentities) ||
+			maxIdentities < 1 ||
+			maxIdentities > INCIDENT_RECORDER_WRAPPER_FRONTIER_MAX_IDENTITIES
+		)
+			throw new Error("Invalid incident recorder wrapper frontier capacity");
+	}
+
+	private key(identity: IncidentRecorderWrapperFrontierIdentity): string {
+		return `${identity.runId}\0${identity.runToken}`;
+	}
+
+	reserve(identity: IncidentRecorderWrapperFrontierIdentity): void {
+		const key = this.key(identity);
+		if (this.lastSequences.has(key)) return;
+		if (this.lastSequences.size >= this.maxIdentities)
+			throw new IncidentRecorderWrapperFrontierSaturatedError(identity, this.maxIdentities);
+		this.lastSequences.set(key, 0n);
+	}
+
+	allocate(identity: IncidentRecorderWrapperFrontierIdentity, count: number): bigint {
+		if (!Number.isSafeInteger(count) || count < 1)
+			throw new Error("Invalid incident recorder wrapper sequence count");
+		const key = this.key(identity);
+		const previous = this.lastSequences.get(key);
+		if (previous === undefined) {
+			this.reserve(identity);
+			return this.allocate(identity, count);
+		}
+		const first = previous + 1n;
+		const last = previous + BigInt(count);
+		if (last > (1n << 64n) - 1n) throw new Error("Incident recorder wrapper sequence frontier overflowed");
+		this.lastSequences.set(key, last);
+		return first;
+	}
+}
+
+/** A test- and embedding-friendly bounded frontier with the production rules. */
+export function createIncidentRecorderWrapperFrontier(
+	maxIdentities = INCIDENT_RECORDER_WRAPPER_FRONTIER_MAX_IDENTITIES,
+): IncidentRecorderWrapperFrontier {
+	return new ProcessLifetimeWrapperFrontier(maxIdentities);
+}
+
+// This module-level instance intentionally survives writer construction and
+// teardown for the lifetime of the process. Wrapper sequences are therefore
+// monotonic across writer replacement/recovery for one run identity.
+const processLifetimeWrapperFrontier = createIncidentRecorderWrapperFrontier();
+
+export interface IncidentRecorderServiceIdentity {
+	runId: string;
+	runToken: string;
+}
+
+/**
+ * Raised when this writer cannot retain a new exact service-identity fence.
+ * Existing fences and emitters remain usable; this is deliberately narrower
+ * than a service-wide fail-closed state.
+ */
+export class IncidentRecorderServiceIdentitySealFenceSaturatedError extends Error {
+	readonly code = "INCIDENT_RECORDER_SERVICE_IDENTITY_SEAL_FENCE_SATURATED" as const;
+	readonly identity: Readonly<IncidentRecorderServiceIdentity>;
+	readonly runId: string;
+	readonly runToken: string;
+	readonly maxIdentities: number;
+
+	constructor(identity: IncidentRecorderServiceIdentity, maxIdentities: number) {
+		super(`Incident recorder service identity seal fence is saturated at ${maxIdentities} identities`);
+		this.name = "IncidentRecorderServiceIdentitySealFenceSaturatedError";
+		this.identity = Object.freeze({ ...identity });
+		this.runId = identity.runId;
+		this.runToken = identity.runToken;
+		this.maxIdentities = maxIdentities;
+	}
+}
+
+interface ServiceIdentitySealFence {
+	readonly maxIdentities: number;
+	reserve(identity: IncidentRecorderServiceIdentity): void;
+	has(identity: IncidentRecorderServiceIdentity): boolean;
+}
+
+class ExactServiceIdentitySealFence implements ServiceIdentitySealFence {
+	private readonly keys = new Set<string>();
+
+	constructor(readonly maxIdentities: number) {
+		if (
+			!Number.isSafeInteger(maxIdentities) ||
+			maxIdentities < 1 ||
+			maxIdentities > INCIDENT_RECORDER_SERVICE_SEAL_FENCE_MAX_IDENTITIES
+		)
+			throw new Error("Invalid incident recorder service identity seal fence capacity");
+	}
+
+	private key(identity: IncidentRecorderServiceIdentity): string {
+		return `${identity.runId}\0${identity.runToken}`;
+	}
+
+	reserve(identity: IncidentRecorderServiceIdentity): void {
+		const key = this.key(identity);
+		if (this.keys.has(key)) return;
+		if (this.keys.size >= this.maxIdentities)
+			throw new IncidentRecorderServiceIdentitySealFenceSaturatedError(identity, this.maxIdentities);
+		this.keys.add(key);
+	}
+
+	has(identity: IncidentRecorderServiceIdentity): boolean {
+		return this.keys.has(this.key(identity));
+	}
+}
+
 const DIAGNOSTIC_METADATA_MAX_BYTES = INCIDENT_RECORDER_PROTOCOL_MAX_METADATA_BYTES - 1024;
 const DIAGNOSTIC_CAUSAL_TEXT_MAX_BYTES = 96;
 const DIAGNOSTIC_TEXT_MAX_BYTES = 512;
@@ -77,6 +231,7 @@ const DIAGNOSTIC_ERROR_STACK_HASH_MAX_BYTES = 64 * 1024;
 // These fields are ordered ahead of general diagnostics so a crowded metadata
 // envelope retains the identities needed to correlate a daemon or kernel crash.
 const DIAGNOSTIC_CAUSAL_SCALAR_KEYS = [
+	"captureId",
 	"origin",
 	"supervisorGeneration",
 	"workerPid",
@@ -93,6 +248,19 @@ const DIAGNOSTIC_CAUSAL_SCALAR_KEYS = [
 	"requestId",
 	"requestMsgId",
 	"toolCallId",
+	"type",
+	"exitOccurrenceId",
+	"exitAdmissionReason",
+	"tailOccurrenceId",
+	"tailAdmissionReason",
+	"tailCaptureStatus",
+	"triggerOccurrenceId",
+	"sourceBytes",
+	"selectedSubjectsSha256",
+	"membershipSha256",
+	"retainedBytes",
+	"classification",
+	"causeLayer",
 	"crashPhase",
 	"launchMode",
 	"channel",
@@ -111,6 +279,9 @@ const DIAGNOSTIC_SCALAR_KEYS = [
 	"bytesSinceLastMarker",
 	"cadenceMs",
 	"category",
+	"cgroupDirectory",
+	"cgroupDev",
+	"cgroupIno",
 	"childPid",
 	"clientId",
 	"code",
@@ -126,6 +297,9 @@ const DIAGNOSTIC_SCALAR_KEYS = [
 	"drainTimeoutUncertainBytes",
 	"drainTimeoutUncertainRecords",
 	"encoding",
+	"format",
+	"exitAdmissionReason",
+	"exitOccurrenceId",
 	"fd",
 	"incompleteBytes",
 	"launchBytes",
@@ -133,6 +307,7 @@ const DIAGNOSTIC_SCALAR_KEYS = [
 	"lostBytes",
 	"lostRecords",
 	"message",
+	"membershipSourcePath",
 	"monotonicNs",
 	"name",
 	"nodeFatalReportsEnabled",
@@ -145,9 +320,12 @@ const DIAGNOSTIC_SCALAR_KEYS = [
 	"processStartId",
 	"producerOccurrenceId",
 	"provider",
+	"rootPid",
+	"rootProcessStartId",
 	"reason",
 	"recordsSinceLastMarker",
 	"registrationOnly",
+	"requestType",
 	"runId",
 	"runName",
 	"signal",
@@ -157,6 +335,8 @@ const DIAGNOSTIC_SCALAR_KEYS = [
 	"sourceBytes",
 	"retainedBytes",
 	"sourceTruncated",
+	"stderrCaptureStatus",
+	"stderrCaptureComplete",
 	"stderrSha256",
 	"transportCorruptPackets",
 	"transportCorruptPacketsSinceLastMarker",
@@ -168,11 +348,36 @@ const DIAGNOSTIC_SCALAR_KEYS = [
 	"transportSequenceGapEventsSinceLastMarker",
 	"protocolClientId",
 	"sourcePath",
+	"sourceIndex",
+	"subjectCount",
+	"recordCount",
+	"errorCount",
+	"directoryEntriesSeen",
+	"descriptorLimit",
+	"livePopulation",
+	"coherentSnapshot",
+	"treeCompleteness",
+	"beforeDev",
+	"beforeIno",
+	"beforeSize",
+	"beforeMtimeNs",
+	"afterDev",
+	"afterIno",
+	"afterSize",
+	"afterMtimeNs",
+	"grew",
+	"shrank",
+	"changedDuringRead",
+	"additiveOnly",
 	"sourceProducerId",
 	"state",
+	"tailAdmissionReason",
+	"tailCaptureStatus",
+	"tailOccurrenceId",
 	"targetPid",
 	"targetProcessStartId",
 	"thresholdMs",
+	"timeoutMs",
 	"type",
 	"wallTime",
 	"workerId",
@@ -188,7 +393,34 @@ const DIAGNOSTIC_SCALAR_KEYS = [
 	"observedSequence",
 	"wrapperPid",
 	"wrapperStartId",
+	"payloadState",
+	"payloadBytes",
+	"payloadStoredBytes",
+	"payloadNodes",
+	"payloadProperties",
+	"payloadOmissions",
+	"payloadUnsupported",
+	"payloadAccessorOmissions",
+	"payloadDepthOmissions",
+	"payloadStringTruncations",
+	"payloadBinaryTruncations",
+	"payloadUnavailable",
 ] as const;
+const DIAGNOSTIC_PAYLOAD_SUMMARY_KEYS = [
+	"payloadState",
+	"payloadBytes",
+	"payloadStoredBytes",
+	"payloadNodes",
+	"payloadProperties",
+	"payloadOmissions",
+	"payloadUnsupported",
+	"payloadAccessorOmissions",
+	"payloadDepthOmissions",
+	"payloadStringTruncations",
+	"payloadBinaryTruncations",
+	"payloadUnavailable",
+] as const;
+const DIAGNOSTIC_PAYLOAD_SUMMARY_KEY_SET = new Set<string>(DIAGNOSTIC_PAYLOAD_SUMMARY_KEYS);
 
 function linuxIdentity(path: string, pattern: RegExp): string | undefined {
 	if (process.platform !== "linux") return undefined;
@@ -430,9 +662,7 @@ type OwnDataProperty = { found: true; value: unknown } | { found: false };
 function ownDataProperty(value: object, key: string): OwnDataProperty {
 	try {
 		const descriptor = Object.getOwnPropertyDescriptor(value, key);
-		return descriptor && "value" in descriptor
-			? { found: true, value: descriptor.value }
-			: { found: false };
+		return descriptor && "value" in descriptor ? { found: true, value: descriptor.value } : { found: false };
 	} catch {
 		return { found: false };
 	}
@@ -466,26 +696,66 @@ function metadataBytes(metadata: Readonly<Record<string, Scalar>>): number {
 	return Buffer.byteLength(JSON.stringify(metadata));
 }
 
-function addMetadataValue(result: Record<string, Scalar>, key: string, value: Scalar): boolean {
+function addMetadataValue(
+	result: Record<string, Scalar>,
+	key: string,
+	value: Scalar,
+	reserved?: Readonly<Record<string, Scalar>>,
+): boolean {
 	result[key] = value;
-	if (metadataBytes(result) <= DIAGNOSTIC_METADATA_MAX_BYTES) return true;
+	if (
+		metadataBytes(result) <= DIAGNOSTIC_METADATA_MAX_BYTES &&
+		(reserved === undefined || metadataBytes({ ...result, ...reserved }) <= DIAGNOSTIC_METADATA_MAX_BYTES)
+	)
+		return true;
 	delete result[key];
 	return false;
+}
+
+function replaceMetadataValue(result: Record<string, Scalar>, key: string, value: Scalar): boolean {
+	const previous = result[key];
+	result[key] = value;
+	if (metadataBytes(result) <= DIAGNOSTIC_METADATA_MAX_BYTES) return true;
+	if (previous === undefined) delete result[key];
+	else result[key] = previous;
+	return false;
+}
+
+function payloadSummaryMetadata(
+	summary: IncidentRecorderDiagnosticPayloadSummary,
+	state: IncidentRecorderDiagnosticPayloadState | "queue_dropped" = summary.state,
+	storedBytes = summary.storedBytes,
+): Record<string, Scalar> {
+	return {
+		payloadState: state,
+		payloadBytes: summary.bytes,
+		payloadStoredBytes: storedBytes,
+		payloadNodes: summary.nodes,
+		payloadProperties: summary.properties,
+		payloadOmissions: summary.omissions,
+		payloadUnsupported: summary.unsupported,
+		payloadAccessorOmissions: summary.accessorOmissions,
+		payloadDepthOmissions: summary.depthOmissions,
+		payloadStringTruncations: summary.stringTruncations,
+		payloadBinaryTruncations: summary.binaryTruncations,
+		payloadUnavailable: summary.unavailable,
+	};
 }
 
 function normalizeErrorMetadata(
 	fields: Record<string, unknown>,
 	result: Record<string, Scalar>,
 	markTruncated: () => void,
+	reserved?: Readonly<Record<string, Scalar>>,
 ): void {
 	const errorProperty = ownDataProperty(fields, "error");
 	if (!errorProperty.found) return;
 	const error = errorProperty.value;
 	if (typeof error === "string") {
 		const message = boundedUtf8(error, DIAGNOSTIC_ERROR_MESSAGE_MAX_BYTES);
-		if (!addMetadataValue(result, "errorName", "Error")) markTruncated();
-		if (!addMetadataValue(result, "errorMessage", message.value)) markTruncated();
-		if (!addMetadataValue(result, "errorMessageTruncated", message.truncated)) markTruncated();
+		if (!addMetadataValue(result, "errorName", "Error", reserved)) markTruncated();
+		if (!addMetadataValue(result, "errorMessage", message.value, reserved)) markTruncated();
+		if (!addMetadataValue(result, "errorMessageTruncated", message.truncated, reserved)) markTruncated();
 		if (message.truncated) markTruncated();
 		return;
 	}
@@ -500,28 +770,37 @@ function normalizeErrorMetadata(
 
 	const rawName = nameProperty.found && typeof nameProperty.value === "string" ? nameProperty.value : "Error";
 	const name = boundedUtf8(rawName, DIAGNOSTIC_ERROR_NAME_MAX_BYTES);
-	if (!addMetadataValue(result, "errorName", name.value)) markTruncated();
+	if (!addMetadataValue(result, "errorName", name.value, reserved)) markTruncated();
 	if (name.truncated) markTruncated();
 
 	if (hasMessage) {
 		const message = boundedUtf8(messageProperty.value as string, DIAGNOSTIC_ERROR_MESSAGE_MAX_BYTES);
-		if (!addMetadataValue(result, "errorMessage", message.value)) markTruncated();
-		if (!addMetadataValue(result, "errorMessageTruncated", message.truncated)) markTruncated();
+		if (!addMetadataValue(result, "errorMessage", message.value, reserved)) markTruncated();
+		if (!addMetadataValue(result, "errorMessageTruncated", message.truncated, reserved)) markTruncated();
 		if (message.truncated) markTruncated();
 	}
 	if (hasStack) {
 		const stack = boundedUtf8(stackProperty.value as string, DIAGNOSTIC_ERROR_STACK_HASH_MAX_BYTES);
 		const digest = createHash("sha256").update(stack.value).digest("hex");
-		if (!addMetadataValue(result, "errorStackSha256", digest)) markTruncated();
-		if (!addMetadataValue(result, "errorStackDigestScope", stack.truncated ? "retained_prefix" : "complete"))
+		if (!addMetadataValue(result, "errorStackSha256", digest, reserved)) markTruncated();
+		if (
+			!addMetadataValue(result, "errorStackDigestScope", stack.truncated ? "retained_prefix" : "complete", reserved)
+		)
 			markTruncated();
-		if (!addMetadataValue(result, "errorStackTruncated", stack.truncated)) markTruncated();
+		if (!addMetadataValue(result, "errorStackTruncated", stack.truncated, reserved)) markTruncated();
 		if (stack.truncated) markTruncated();
 	}
 }
 
-function scalarMetadata(fields: Record<string, unknown>): Record<string, Scalar> {
+function scalarMetadata(
+	fields: Record<string, unknown>,
+	payloadSummary?: IncidentRecorderDiagnosticPayloadSummary,
+): Record<string, Scalar> {
 	const result: Record<string, Scalar> = { diagnosticMetadataTruncated: false };
+	// A body that is rejected later is relabeled queue_dropped. Reserve that
+	// longer state, while retaining the original stored-byte value as the
+	// conservative fallback envelope bound.
+	const reserved = payloadSummary === undefined ? undefined : payloadSummaryMetadata(payloadSummary, "queue_dropped");
 	const markTruncated = (): void => {
 		result.diagnosticMetadataTruncated = true;
 	};
@@ -529,19 +808,32 @@ function scalarMetadata(fields: Record<string, unknown>): Record<string, Scalar>
 		const property = ownDataProperty(fields, key);
 		if (!property.found) continue;
 		const normalized = scalarValue(property.value, DIAGNOSTIC_CAUSAL_TEXT_MAX_BYTES);
-		if (normalized.value !== undefined && !addMetadataValue(result, key, normalized.value)) markTruncated();
+		if (normalized.value !== undefined && !addMetadataValue(result, key, normalized.value, reserved)) markTruncated();
 		if (normalized.truncated) markTruncated();
 	}
-	normalizeErrorMetadata(fields, result, markTruncated);
+	normalizeErrorMetadata(fields, result, markTruncated, reserved);
+	if (payloadSummary !== undefined) addDiagnosticPayloadSummary(result, payloadSummary);
 	for (const key of DIAGNOSTIC_SCALAR_KEYS) {
-		if (DIAGNOSTIC_CAUSAL_SCALAR_KEY_SET.has(key)) continue;
+		if (DIAGNOSTIC_CAUSAL_SCALAR_KEY_SET.has(key) || DIAGNOSTIC_PAYLOAD_SUMMARY_KEY_SET.has(key)) continue;
 		const property = ownDataProperty(fields, key);
 		if (!property.found) continue;
 		const normalized = scalarValue(property.value, DIAGNOSTIC_TEXT_MAX_BYTES);
-		if (normalized.value !== undefined && !addMetadataValue(result, key, normalized.value)) markTruncated();
+		if (normalized.value !== undefined && !addMetadataValue(result, key, normalized.value, reserved)) markTruncated();
 		if (normalized.truncated) markTruncated();
 	}
 	return result;
+}
+
+function addDiagnosticPayloadSummary(
+	metadata: Record<string, Scalar>,
+	summary: IncidentRecorderDiagnosticPayloadSummary,
+	state: "serialized" | "unavailable" | "queue_dropped" = summary.state,
+	storedBytes = summary.storedBytes,
+): void {
+	const values = Object.entries(payloadSummaryMetadata(summary, state, storedBytes));
+	for (const [key, value] of values) {
+		if (!replaceMetadataValue(metadata, key, value)) metadata.diagnosticMetadataTruncated = true;
+	}
 }
 
 function configuredEmitterMaximum(): number {
@@ -556,7 +848,13 @@ export type IncidentRecorderAdmission =
 	| {
 			accepted: false;
 			disposition: "rejected";
-			reason: "stopped" | "terminal_reserved" | "occurrence_too_large" | "queue_capacity" | "encoding_failed";
+			reason:
+				| "stopped"
+				| "terminal_reserved"
+				| "occurrence_too_large"
+				| "queue_capacity"
+				| "encoding_failed"
+				| "run_identity_sealed";
 	  };
 
 interface ProducerCounters {
@@ -566,6 +864,14 @@ interface ProducerCounters {
 	queuedBytes: number;
 	droppedRecords: number;
 	droppedBytes: number;
+}
+
+interface BoundedFrameEmitterStopResult {
+	terminalAdmission?: IncidentRecorderAdmission;
+	totalLoss: { records: number; bytes: number };
+	drainTimeoutLoss: { records: number; bytes: number };
+	drainTimeoutUncertainty: { records: number; bytes: number };
+	terminalDrained: boolean;
 }
 
 interface OutboundOccurrence {
@@ -612,6 +918,7 @@ class BoundedFrameEmitter {
 		droppedBytes: 0,
 	};
 	private drainWaiters: Array<() => void> = [];
+	private stopOperation?: Promise<BoundedFrameEmitterStopResult>;
 
 	constructor(
 		private readonly writeOccurrence: (
@@ -651,8 +958,50 @@ class BoundedFrameEmitter {
 		for (const resolve of this.drainWaiters.splice(0)) resolve();
 	}
 
-	emitDerived(source: CaptureSource, type: string, fields: Record<string, unknown>): IncidentRecorderAdmission {
-		return this.emitOccurrence(source, type, Buffer.alloc(0), "derived-scalar", "none", scalarMetadata(fields));
+	fenceWithoutTerminal(): void {
+		this.disableInvalidOwner();
+	}
+
+	emitDerived(
+		source: CaptureSource,
+		type: string,
+		fields: Record<string, unknown>,
+		occurrenceIdOverride?: string,
+	): IncidentRecorderAdmission {
+		if (occurrenceIdOverride !== undefined && !CANONICAL_INCIDENT_RECORDER_ID.test(occurrenceIdOverride))
+			throw new Error("Invalid incident-recorder occurrence identity");
+		const serialized = serializeIncidentRecorderDiagnostic(fields);
+		const metadata = scalarMetadata(fields, serialized.summary);
+		const admission = this.emitOccurrence(
+			source,
+			type,
+			serialized.bytes,
+			"derived-scalar",
+			"utf8-json/derived-diagnostic-json-v2",
+			metadata,
+			false,
+			false,
+			false,
+			occurrenceIdOverride,
+		);
+		if (admission.accepted || (admission.reason !== "queue_capacity" && admission.reason !== "occurrence_too_large"))
+			return admission;
+		// Keep causal scalar metadata when the body cannot enter the bounded queue.
+		// The discarded serialized bytes are already counted by emitOccurrence; this
+		// second, empty occurrence is a scalar-only fallback and is not a duplicate.
+		addDiagnosticPayloadSummary(metadata, serialized.summary, "queue_dropped", 0);
+		return this.emitOccurrence(
+			source,
+			type,
+			Buffer.alloc(0),
+			"derived-scalar",
+			"none",
+			metadata,
+			false,
+			false,
+			false,
+			occurrenceIdOverride,
+		);
 	}
 
 	emitBytes(
@@ -688,6 +1037,7 @@ class BoundedFrameEmitter {
 		reserved = false,
 		terminal = false,
 		internalDuringStop = false,
+		occurrenceIdOverride?: string,
 	): IncidentRecorderAdmission {
 		this.counters.attemptedRecords += 1;
 		this.counters.attemptedBytes += bytes.byteLength;
@@ -724,7 +1074,7 @@ class BoundedFrameEmitter {
 		} catch {
 			return rejected("encoding_failed");
 		}
-		const occurrenceId = newIncidentRecorderIdentity();
+		const occurrenceId = occurrenceIdOverride ?? newIncidentRecorderIdentity();
 		const firstSequence = this.sequence + 1n;
 		this.sequence += BigInt(chunkCount);
 		this.counters.queuedRecords += 1;
@@ -992,12 +1342,31 @@ class BoundedFrameEmitter {
 		return { records: this.counters.droppedRecords, bytes: this.counters.droppedBytes };
 	}
 
-	async stop(deadlineMs = 1_000): Promise<IncidentRecorderAdmission | undefined> {
+	stop(deadlineMs = 1_000, terminalOccurrenceId?: string): Promise<BoundedFrameEmitterStopResult> {
+		this.stopOperation ??= this.stopOnce(deadlineMs, terminalOccurrenceId);
+		return this.stopOperation;
+	}
+
+	private async stopOnce(deadlineMs: number, terminalOccurrenceId?: string): Promise<BoundedFrameEmitterStopResult> {
+		if (terminalOccurrenceId !== undefined && !CANONICAL_INCIDENT_RECORDER_ID.test(terminalOccurrenceId)) {
+			throw new Error("Invalid incident-recorder terminal occurrence identity");
+		}
 		if (!this.ownerIsValid()) {
 			this.disableInvalidOwner();
-			return undefined;
+			return {
+				totalLoss: this.lossCounters(),
+				drainTimeoutLoss: { records: 0, bytes: 0 },
+				drainTimeoutUncertainty: { records: 0, bytes: 0 },
+				terminalDrained: false,
+			};
 		}
-		if (this.stopped || this.stopping) return undefined;
+		if (this.stopped || this.stopping)
+			return {
+				totalLoss: this.lossCounters(),
+				drainTimeoutLoss: { records: 0, bytes: 0 },
+				drainTimeoutUncertainty: { records: 0, bytes: 0 },
+				terminalDrained: false,
+			};
 		this.stopping = true;
 		if (this.lossCheckpointRetry) clearTimeout(this.lossCheckpointRetry);
 		this.lossCheckpointRetry = undefined;
@@ -1050,6 +1419,7 @@ class BoundedFrameEmitter {
 			true,
 			true,
 			true,
+			terminalOccurrenceId,
 		);
 		const terminalDrained = await this.flush(deadlineMs);
 		if (!terminalDrained) {
@@ -1062,7 +1432,16 @@ class BoundedFrameEmitter {
 		this.stopping = false;
 		if (this.lossCheckpointRetry) clearTimeout(this.lossCheckpointRetry);
 		this.lossCheckpointRetry = undefined;
-		return terminalAdmission;
+		return {
+			terminalAdmission,
+			totalLoss: this.lossCounters(),
+			drainTimeoutLoss: { records: drainTimeoutLostRecords, bytes: drainTimeoutLostBytes },
+			drainTimeoutUncertainty: {
+				records: drainTimeoutUncertainRecords,
+				bytes: drainTimeoutUncertainBytes,
+			},
+			terminalDrained,
+		};
 	}
 }
 
@@ -1164,6 +1543,24 @@ export function emitIncidentDerived(
 	try {
 		return (
 			captureEmitter?.emitDerived(source, type, fields) ?? {
+				accepted: false,
+				disposition: "rejected",
+				reason: "stopped",
+			}
+		);
+	} catch {
+		return { accepted: false, disposition: "rejected", reason: "encoding_failed" };
+	}
+}
+
+/**
+ * Emit one nonterminal reserved control occurrence from a configured capture
+ * producer. Terminal authority remains private to the emitter stop path.
+ */
+export function emitIncidentControl(type: string, fields: Record<string, unknown>): IncidentRecorderAdmission {
+	try {
+		return (
+			captureEmitter?.emitControl(type, fields, false) ?? {
 				accepted: false,
 				disposition: "rejected",
 				reason: "stopped",
@@ -1303,6 +1700,316 @@ export interface IncidentRecorderFinalizationExpectation {
 	emitterFinalTailLoss: { records: number; bytes: number };
 }
 
+export interface IncidentRecorderBoundedCount {
+	readonly records: number;
+	readonly bytes: number;
+}
+
+export interface IncidentRecorderRunIdentitySealResult {
+	readonly schemaVersion: 1;
+	readonly state: "sealed";
+	readonly runId: string;
+	readonly runToken: string;
+	readonly terminal: Readonly<{
+		type: "capture_channel_terminal";
+		admission: Readonly<IncidentRecorderAdmission> | null;
+		// A relay frontier proves local wrapper admission, not journal durability.
+		frontier: Readonly<IncidentRecorderRelayFrontier> | null;
+	}>;
+	readonly loss: Readonly<{
+		// Total emitter-reported loss. The categories below may overlap it; do not sum blindly.
+		emitter: IncidentRecorderBoundedCount;
+		drainTimeout: Readonly<{
+			definite: IncidentRecorderBoundedCount;
+			uncertain: IncidentRecorderBoundedCount;
+		}>;
+		terminalRelay: Readonly<{
+			definite: IncidentRecorderBoundedCount;
+			uncertain: IncidentRecorderBoundedCount;
+		}>;
+	}>;
+}
+
+export type IncidentRecorderRunIdentitySealAdoption =
+	| Readonly<{
+			adopted: true;
+			disposition: "adopted" | "already_adopted";
+			seal: IncidentRecorderRunIdentitySealResult;
+	  }>
+	| Readonly<{
+			adopted: false;
+			disposition: "rejected";
+			reason:
+				| "invalid_seal_record"
+				| "run_identity_active_or_stopping"
+				| "run_identity_seal_capacity_exhausted"
+				| "run_identity_seal_in_progress"
+				| "run_identity_seal_conflict";
+	  }>;
+
+interface ServiceEmitterSealState {
+	readonly promise: Promise<IncidentRecorderRunIdentitySealResult>;
+	result?: IncidentRecorderRunIdentitySealResult;
+	fingerprint?: string;
+}
+
+export interface IncidentRecorderRunIdentitySealReplayOptions {
+	/**
+	 * A seal loaded from durable service state may be validated without retaining
+	 * per-identity process state when this writer has no local emitter for it.
+	 */
+	durableReplay?: boolean;
+}
+
+const INCIDENT_RECORDER_ADMISSION_REASONS = new Set<Extract<IncidentRecorderAdmission, { accepted: false }>["reason"]>([
+	"stopped",
+	"terminal_reserved",
+	"occurrence_too_large",
+	"queue_capacity",
+	"encoding_failed",
+	"run_identity_sealed",
+]);
+
+const CANONICAL_INCIDENT_RECORDER_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+function validServiceIdentity(value: unknown): value is IncidentRecorderServiceIdentity {
+	const identity = objectRecord(value);
+	return (
+		identity !== undefined &&
+		typeof identity.runId === "string" &&
+		CANONICAL_INCIDENT_RECORDER_ID.test(identity.runId) &&
+		typeof identity.runToken === "string" &&
+		CANONICAL_INCIDENT_RECORDER_ID.test(identity.runToken)
+	);
+}
+
+function immutableCount(records: number, bytes: number): IncidentRecorderBoundedCount {
+	return Object.freeze({ records, bytes });
+}
+
+function immutableAdmission(value: IncidentRecorderAdmission | undefined): Readonly<IncidentRecorderAdmission> | null {
+	return value ? Object.freeze({ ...value }) : null;
+}
+
+function immutableFrontier(
+	value: IncidentRecorderRelayFrontier | undefined,
+): Readonly<IncidentRecorderRelayFrontier> | null {
+	return value ? Object.freeze({ ...value }) : null;
+}
+
+function immutableSealResult(
+	identity: { runId: string; runToken: string },
+	stop: BoundedFrameEmitterStopResult,
+	frontier: IncidentRecorderRelayFrontier | undefined,
+	terminalEvidenceRetired = false,
+): IncidentRecorderRunIdentitySealResult {
+	const admission = immutableAdmission(stop.terminalAdmission);
+	const terminalFrontier = immutableFrontier(frontier);
+	let terminalLost = 0;
+	let terminalUncertain = 0;
+	if (terminalEvidenceRetired) terminalUncertain = 1;
+	else if (!admission?.accepted) terminalLost = 1;
+	else if (!terminalFrontier) {
+		if (stop.terminalDrained) terminalLost = 1;
+		else terminalUncertain = 1;
+	}
+	return Object.freeze({
+		schemaVersion: 1,
+		state: "sealed",
+		runId: identity.runId,
+		runToken: identity.runToken,
+		terminal: Object.freeze({
+			type: "capture_channel_terminal",
+			admission,
+			frontier: terminalFrontier,
+		}),
+		loss: Object.freeze({
+			emitter: immutableCount(stop.totalLoss.records, stop.totalLoss.bytes),
+			drainTimeout: Object.freeze({
+				definite: immutableCount(stop.drainTimeoutLoss.records, stop.drainTimeoutLoss.bytes),
+				uncertain: immutableCount(stop.drainTimeoutUncertainty.records, stop.drainTimeoutUncertainty.bytes),
+			}),
+			terminalRelay: Object.freeze({
+				definite: immutableCount(terminalLost, 0),
+				uncertain: immutableCount(terminalUncertain, 0),
+			}),
+		}),
+	});
+}
+
+function immutableFenceOnlySealResult(identity: {
+	runId: string;
+	runToken: string;
+}): IncidentRecorderRunIdentitySealResult {
+	return immutableSealResult(
+		identity,
+		{
+			totalLoss: { records: 0, bytes: 0 },
+			drainTimeoutLoss: { records: 0, bytes: 0 },
+			drainTimeoutUncertainty: { records: 0, bytes: 0 },
+			terminalDrained: false,
+		},
+		undefined,
+		true,
+	);
+}
+
+function objectRecord(value: unknown): Record<string, unknown> | undefined {
+	return typeof value === "object" && value !== null && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: undefined;
+}
+
+function hasExactKeys(record: Record<string, unknown>, expected: readonly string[]): boolean {
+	const keys = Object.keys(record).sort();
+	const sortedExpected = [...expected].sort();
+	return keys.length === sortedExpected.length && keys.every((key, index) => key === sortedExpected[index]);
+}
+
+function normalizedCount(value: unknown): IncidentRecorderBoundedCount | undefined {
+	const record = objectRecord(value);
+	if (
+		!record ||
+		!hasExactKeys(record, ["records", "bytes"]) ||
+		!Number.isSafeInteger(record.records) ||
+		!Number.isSafeInteger(record.bytes) ||
+		(record.records as number) < 0 ||
+		(record.bytes as number) < 0
+	)
+		return undefined;
+	return immutableCount(record.records as number, record.bytes as number);
+}
+
+function normalizedAdmission(value: unknown): Readonly<IncidentRecorderAdmission> | null | undefined {
+	if (value === null) return null;
+	const record = objectRecord(value);
+	if (!record || record.disposition !== (record.accepted === true ? "locally_admitted" : "rejected")) return undefined;
+	if (
+		record.accepted === true &&
+		hasExactKeys(record, ["accepted", "occurrenceId", "disposition"]) &&
+		typeof record.occurrenceId === "string" &&
+		CANONICAL_INCIDENT_RECORDER_ID.test(record.occurrenceId)
+	)
+		return Object.freeze({
+			accepted: true,
+			occurrenceId: record.occurrenceId,
+			disposition: "locally_admitted",
+		});
+	if (
+		record.accepted !== false ||
+		!hasExactKeys(record, ["accepted", "disposition", "reason"]) ||
+		typeof record.reason !== "string" ||
+		!INCIDENT_RECORDER_ADMISSION_REASONS.has(
+			record.reason as Extract<IncidentRecorderAdmission, { accepted: false }>["reason"],
+		)
+	)
+		return undefined;
+	return Object.freeze({
+		accepted: false,
+		disposition: "rejected",
+		reason: record.reason as Extract<IncidentRecorderAdmission, { accepted: false }>["reason"],
+	});
+}
+
+function normalizedFrontier(value: unknown): Readonly<IncidentRecorderRelayFrontier> | null | undefined {
+	if (value === null) return null;
+	const record = objectRecord(value);
+	if (
+		!record ||
+		!hasExactKeys(record, [
+			"occurrenceId",
+			"producerId",
+			"type",
+			"firstProducerSequence",
+			"lastProducerSequence",
+			"firstWrapperSequence",
+			"lastWrapperSequence",
+		]) ||
+		typeof record.occurrenceId !== "string" ||
+		!CANONICAL_INCIDENT_RECORDER_ID.test(record.occurrenceId) ||
+		typeof record.producerId !== "string" ||
+		!CANONICAL_INCIDENT_RECORDER_ID.test(record.producerId) ||
+		record.type !== "capture_channel_terminal" ||
+		![
+			record.firstProducerSequence,
+			record.lastProducerSequence,
+			record.firstWrapperSequence,
+			record.lastWrapperSequence,
+		].every((sequence) => typeof sequence === "string" && /^(?:0|[1-9][0-9]{0,19})$/.test(sequence))
+	)
+		return undefined;
+	return Object.freeze({
+		occurrenceId: record.occurrenceId,
+		producerId: record.producerId,
+		type: "capture_channel_terminal",
+		firstProducerSequence: record.firstProducerSequence as string,
+		lastProducerSequence: record.lastProducerSequence as string,
+		firstWrapperSequence: record.firstWrapperSequence as string,
+		lastWrapperSequence: record.lastWrapperSequence as string,
+	});
+}
+
+export function parseIncidentRecorderRunIdentitySeal(
+	value: unknown,
+): IncidentRecorderRunIdentitySealResult | undefined {
+	const record = objectRecord(value);
+	const terminal = objectRecord(record?.terminal);
+	const loss = objectRecord(record?.loss);
+	const drainTimeout = objectRecord(loss?.drainTimeout);
+	const terminalRelay = objectRecord(loss?.terminalRelay);
+	const admission = normalizedAdmission(terminal?.admission);
+	const frontier = normalizedFrontier(terminal?.frontier);
+	const emitterLoss = normalizedCount(loss?.emitter);
+	const drainDefinite = normalizedCount(drainTimeout?.definite);
+	const drainUncertain = normalizedCount(drainTimeout?.uncertain);
+	const terminalDefinite = normalizedCount(terminalRelay?.definite);
+	const terminalUncertain = normalizedCount(terminalRelay?.uncertain);
+	if (
+		!record ||
+		!hasExactKeys(record, ["schemaVersion", "state", "runId", "runToken", "terminal", "loss"]) ||
+		record.schemaVersion !== 1 ||
+		record.state !== "sealed" ||
+		typeof record.runId !== "string" ||
+		!CANONICAL_INCIDENT_RECORDER_ID.test(record.runId) ||
+		typeof record.runToken !== "string" ||
+		!CANONICAL_INCIDENT_RECORDER_ID.test(record.runToken) ||
+		!terminal ||
+		!hasExactKeys(terminal, ["type", "admission", "frontier"]) ||
+		terminal.type !== "capture_channel_terminal" ||
+		!loss ||
+		!hasExactKeys(loss, ["emitter", "drainTimeout", "terminalRelay"]) ||
+		!drainTimeout ||
+		!hasExactKeys(drainTimeout, ["definite", "uncertain"]) ||
+		!terminalRelay ||
+		!hasExactKeys(terminalRelay, ["definite", "uncertain"]) ||
+		admission === undefined ||
+		frontier === undefined ||
+		!emitterLoss ||
+		!drainDefinite ||
+		!drainUncertain ||
+		!terminalDefinite ||
+		!terminalUncertain ||
+		(frontier !== null && (!admission?.accepted || frontier.occurrenceId !== admission.occurrenceId))
+	)
+		return undefined;
+	return Object.freeze({
+		schemaVersion: 1,
+		state: "sealed",
+		runId: record.runId,
+		runToken: record.runToken,
+		terminal: Object.freeze({ type: "capture_channel_terminal", admission, frontier }),
+		loss: Object.freeze({
+			emitter: emitterLoss,
+			drainTimeout: Object.freeze({ definite: drainDefinite, uncertain: drainUncertain }),
+			terminalRelay: Object.freeze({ definite: terminalDefinite, uncertain: terminalUncertain }),
+		}),
+	});
+}
+
+function sealFingerprint(value: IncidentRecorderRunIdentitySealResult): string {
+	return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+
 export interface IncidentRecorderWriterOptions {
 	runDir: string;
 	runId?: string;
@@ -1310,6 +2017,14 @@ export interface IncidentRecorderWriterOptions {
 	bootId?: string;
 	wrapperStartId?: string;
 	serviceSink?: boolean;
+	/** Internal process-fatal hook for bounded wrapper-frontier exhaustion. */
+	onWrapperFrontierSaturated?: (error: IncidentRecorderWrapperFrontierSaturatedError) => void;
+	/** Dependency-injection seam for deterministic bounded-frontier tests. */
+	wrapperFrontier?: IncidentRecorderWrapperFrontier;
+	/** Maximum exact service-identity fences retained by this writer. */
+	serviceIdentitySealFenceMaxIdentities?: number;
+	/** One-shot diagnostic hook for exact service-identity fence saturation. */
+	onServiceIdentitySealFenceSaturated?: (error: IncidentRecorderServiceIdentitySealFenceSaturatedError) => void;
 }
 
 export class IncidentRecorderWriter {
@@ -1318,14 +2033,24 @@ export class IncidentRecorderWriter {
 	private readonly wrapperStartId: string | undefined;
 	private readonly bootId: string | undefined;
 	private readonly serviceSink: boolean;
+	private readonly wrapperFrontier: IncidentRecorderWrapperFrontier;
+	private readonly onWrapperFrontierSaturated:
+		| ((error: IncidentRecorderWrapperFrontierSaturatedError) => void)
+		| undefined;
+	private wrapperFrontierSaturationReported = false;
 	private readonly machineId = linuxIdentity("/etc/machine-id", /^[0-9a-f]{32}$/i);
 	private readonly invocationId = process.env.INVOCATION_ID?.match(/^[0-9a-f]{32}$/i)?.[0];
 	private readonly emitter: BoundedFrameEmitter;
 	private readonly serviceEmitters = new Map<string, BoundedFrameEmitter>();
-	private readonly serviceEmitterStops = new Map<string, Promise<void>>();
+	private readonly serviceEmitterStops = new Map<string, Promise<BoundedFrameEmitterStopResult>>();
+	private readonly serviceIdentitySeals = new Map<string, ServiceEmitterSealState>();
+	private readonly serviceIdentitySealFence: ServiceIdentitySealFence;
+	private readonly onServiceIdentitySealFenceSaturated:
+		| ((error: IncidentRecorderServiceIdentitySealFenceSaturatedError) => void)
+		| undefined;
+	private serviceIdentitySealFenceSaturationReported = false;
 	private readonly relayQueue: RelayOccurrence[] = [];
 	private relayBytes = 0;
-	private readonly wrapperSequences = new Map<string, bigint>();
 	private relayDroppedRecords = 0;
 	private relayDroppedBytes = 0;
 	private relayUncertainRecords = 0;
@@ -1384,7 +2109,35 @@ export class IncidentRecorderWriter {
 		this.wrapperStartId = options.wrapperStartId ?? linuxProcessStartId(process.pid);
 		this.bootId = options.bootId ?? linuxIdentity("/proc/sys/kernel/random/boot_id", /^[0-9a-f-]{36}$/i);
 		this.serviceSink = options.serviceSink === true;
+		this.wrapperFrontier = options.wrapperFrontier ?? processLifetimeWrapperFrontier;
+		this.onWrapperFrontierSaturated = options.onWrapperFrontierSaturated;
+		this.serviceIdentitySealFence = new ExactServiceIdentitySealFence(
+			options.serviceIdentitySealFenceMaxIdentities ?? INCIDENT_RECORDER_SERVICE_SEAL_FENCE_MAX_IDENTITIES,
+		);
+		this.onServiceIdentitySealFenceSaturated = options.onServiceIdentitySealFenceSaturated;
+		this.reserveWrapperFrontier({ runId: this.runId, runToken: this.runToken });
 		this.emitter = this.createEmitter({ runId: this.runId, runToken: this.runToken });
+	}
+
+	private reserveWrapperFrontier(identity: IncidentRecorderWrapperFrontierIdentity): void {
+		try {
+			this.wrapperFrontier.reserve(identity);
+		} catch (error) {
+			if (!(error instanceof IncidentRecorderWrapperFrontierSaturatedError)) throw error;
+			this.reportWrapperFrontierSaturation(error);
+			throw error;
+		}
+	}
+
+	private reportWrapperFrontierSaturation(error: IncidentRecorderWrapperFrontierSaturatedError): void {
+		if (this.wrapperFrontierSaturationReported) return;
+		this.wrapperFrontierSaturationReported = true;
+		try {
+			this.onWrapperFrontierSaturated?.(error);
+		} catch {
+			// The frontier error remains the authoritative failure. A diagnostic hook
+			// must not replace it or prevent writer cleanup.
+		}
 	}
 
 	private createEmitter(
@@ -1407,15 +2160,76 @@ export class IncidentRecorderWriter {
 	}
 
 	private serviceEmitter(identity: { runId: string; runToken: string }): BoundedFrameEmitter | undefined {
-		if (!this.serviceSink || !/^[0-9a-f-]{36}$/i.test(identity.runId) || !/^[0-9a-f-]{36}$/i.test(identity.runToken))
-			return undefined;
 		const key = `${identity.runId}\0${identity.runToken}`;
+		if (this.serviceIdentityIsSealed(key)) return undefined;
+		if (
+			!this.serviceSink ||
+			!CANONICAL_INCIDENT_RECORDER_ID.test(identity.runId) ||
+			!CANONICAL_INCIDENT_RECORDER_ID.test(identity.runToken)
+		)
+			return undefined;
 		let emitter = this.serviceEmitters.get(key);
 		if (!emitter && this.serviceEmitters.size < SERVICE_EMITTER_MAX_IDENTITIES) {
+			// Reserve before constructing an emitter. If the process-lifetime
+			// frontier is full, construction and any later cleanup remain allocation-free.
+			this.reserveWrapperFrontier(identity);
 			emitter = this.createEmitter(identity, SERVICE_EMITTER_MAX_BYTES);
 			this.serviceEmitters.set(key, emitter);
 		}
 		return emitter;
+	}
+
+	private serviceIdentityIsSealed(key: string): boolean {
+		return this.serviceIdentitySeals.has(key) || this.serviceIdentitySealFence.has(this.identityFromKey(key));
+	}
+
+	private identityFromKey(key: string): IncidentRecorderServiceIdentity {
+		const separator = key.indexOf("\0");
+		return separator < 0
+			? { runId: key, runToken: "" }
+			: { runId: key.slice(0, separator), runToken: key.slice(separator + 1) };
+	}
+
+	private reserveServiceIdentitySealFence(identity: IncidentRecorderServiceIdentity): void {
+		try {
+			this.serviceIdentitySealFence.reserve(identity);
+		} catch (error) {
+			if (!(error instanceof IncidentRecorderServiceIdentitySealFenceSaturatedError)) throw error;
+			this.reportServiceIdentitySealFenceSaturation(error);
+			throw error;
+		}
+	}
+
+	private reportServiceIdentitySealFenceSaturation(
+		error: IncidentRecorderServiceIdentitySealFenceSaturatedError,
+	): void {
+		if (this.serviceIdentitySealFenceSaturationReported) return;
+		this.serviceIdentitySealFenceSaturationReported = true;
+		try {
+			this.onServiceIdentitySealFenceSaturated?.(error);
+		} catch {
+			// A diagnostic hook must not replace the authoritative saturation error.
+		}
+	}
+
+	private canRetainServiceIdentitySeal(): boolean {
+		return (
+			this.serviceIdentitySeals.size < INCIDENT_RECORDER_SERVICE_SEAL_RESULT_MAX_IDENTITIES ||
+			[...this.serviceIdentitySeals.values()].some((candidate) => candidate.result !== undefined)
+		);
+	}
+
+	private retainServiceIdentitySeal(key: string, state: ServiceEmitterSealState): boolean {
+		while (this.serviceIdentitySeals.size >= INCIDENT_RECORDER_SERVICE_SEAL_RESULT_MAX_IDENTITIES) {
+			const reclaimable = [...this.serviceIdentitySeals].find(([, candidate]) => candidate.result !== undefined);
+			if (!reclaimable) return false;
+			const [reclaimedKey, reclaimed] = reclaimable;
+			this.serviceIdentitySeals.delete(reclaimedKey);
+			const terminalOccurrenceId = reclaimed.result?.terminal.frontier?.occurrenceId;
+			if (terminalOccurrenceId) this.finalizationFrontiers.delete(terminalOccurrenceId);
+		}
+		this.serviceIdentitySeals.set(key, state);
+		return true;
 	}
 
 	async start(options: { requireJournal?: boolean } = {}): Promise<void> {
@@ -1867,10 +2681,16 @@ export class IncidentRecorderWriter {
 			this.noteRelayDrop(1, rawBytes, relayIdentity);
 			return { accepted: false, reason: this.stopped ? "stopped" : "relay_capacity" };
 		}
-		const identityKey = `${first.runId}\0${first.runToken}`;
-		let wrapperSequence = this.wrapperSequences.get(identityKey) ?? 0n;
-		const wrapperSequences = frames.map(() => ++wrapperSequence);
-		this.wrapperSequences.set(identityKey, wrapperSequence);
+		const identity = { runId: first.runId, runToken: first.runToken };
+		let firstWrapperSequence: bigint;
+		try {
+			firstWrapperSequence = this.wrapperFrontier.allocate(identity, frames.length);
+		} catch (error) {
+			if (error instanceof IncidentRecorderWrapperFrontierSaturatedError)
+				this.reportWrapperFrontierSaturation(error);
+			throw error;
+		}
+		const wrapperSequences = frames.map((_frame, index) => firstWrapperSequence + BigInt(index));
 		if (first.type === "supervisor_exit" || first.type === "capture_channel_terminal") {
 			this.finalizationFrontiers.set(first.occurrenceId, {
 				occurrenceId: first.occurrenceId,
@@ -2103,15 +2923,20 @@ export class IncidentRecorderWriter {
 		return this.emitter.emitBytes(source, type, bytes, metadata, encoding);
 	}
 
-	recordDerivedForRun(
+	private recordDerivedForRunInternal(
 		identity: { runId: string; runToken: string },
 		source: CaptureSource,
 		type: string,
 		fields: Record<string, unknown>,
+		occurrenceIdOverride?: string,
 	): IncidentRecorderAdmission {
+		const key = `${identity.runId}\0${identity.runToken}`;
+		if (this.serviceIdentityIsSealed(key))
+			return { accepted: false, disposition: "rejected", reason: "run_identity_sealed" };
+		if (this.stopped) return { accepted: false, disposition: "rejected", reason: "stopped" };
 		const emitter = this.serviceEmitter(identity);
 		return (
-			emitter?.emitDerived(source, type, fields) ?? {
+			emitter?.emitDerived(source, type, fields, occurrenceIdOverride) ?? {
 				accepted: false,
 				disposition: "rejected",
 				reason: this.stopped ? "stopped" : "queue_capacity",
@@ -2119,29 +2944,235 @@ export class IncidentRecorderWriter {
 		);
 	}
 
-	private async stopServiceEmitter(key: string, emitter: BoundedFrameEmitter, deadlineMs: number): Promise<void> {
+	recordDerivedForRun(
+		identity: { runId: string; runToken: string },
+		source: CaptureSource,
+		type: string,
+		fields: Record<string, unknown>,
+	): IncidentRecorderAdmission {
+		return this.recordDerivedForRunInternal(identity, source, type, fields);
+	}
+
+	recordDerivedForRunWithOccurrenceId(
+		identity: { runId: string; runToken: string },
+		source: CaptureSource,
+		type: string,
+		fields: Record<string, unknown>,
+		occurrenceId: string,
+	): IncidentRecorderAdmission {
+		if (!CANONICAL_INCIDENT_RECORDER_ID.test(occurrenceId))
+			throw new Error("Invalid incident-recorder occurrence identity");
+		return this.recordDerivedForRunInternal(identity, source, type, fields, occurrenceId);
+	}
+
+	private stopServiceEmitter(
+		key: string,
+		emitter: BoundedFrameEmitter,
+		deadlineMs: number,
+		terminalOccurrenceId?: string,
+	): Promise<BoundedFrameEmitterStopResult> {
 		const existing = this.serviceEmitterStops.get(key);
-		if (existing) {
-			await existing;
-			return;
-		}
-		const stopping = emitter.stop(deadlineMs).then(() => undefined);
-		this.serviceEmitterStops.set(key, stopping);
-		try {
-			await stopping;
-		} finally {
+		if (existing) return existing;
+		const stopping = emitter.stop(deadlineMs, terminalOccurrenceId).finally(() => {
 			if (this.serviceEmitters.get(key) === emitter) this.serviceEmitters.delete(key);
-			this.wrapperSequences.delete(key);
 			if (this.serviceEmitterStops.get(key) === stopping) this.serviceEmitterStops.delete(key);
+		});
+		this.serviceEmitterStops.set(key, stopping);
+		return stopping;
+	}
+
+	sealRunIdentity(
+		identity: IncidentRecorderServiceIdentity,
+		deadlineMs = 1_000,
+		terminalOccurrenceId?: string,
+	): Promise<IncidentRecorderRunIdentitySealResult> {
+		const key = `${identity.runId}\0${identity.runToken}`;
+		const existingSeal = this.serviceIdentitySeals.get(key);
+		if (existingSeal) return existingSeal.promise;
+		if (this.serviceIdentitySealFence.has(identity)) return Promise.resolve(immutableFenceOnlySealResult(identity));
+		// Claim the exact, never-evicted fence before stopping an emitter. If this
+		// writer is at fence capacity, the emitter and its queued records remain
+		// untouched and the caller receives the typed saturation error.
+		this.reserveServiceIdentitySealFence(identity);
+
+		let emitter = this.serviceEmitters.get(key);
+		if (
+			!emitter &&
+			this.serviceSink &&
+			CANONICAL_INCIDENT_RECORDER_ID.test(identity.runId) &&
+			CANONICAL_INCIDENT_RECORDER_ID.test(identity.runToken) &&
+			this.serviceEmitters.size < SERVICE_EMITTER_MAX_IDENTITIES
+		) {
+			// The terminal occurrence consumes wrapper sequence space too; reserve
+			// the identity before constructing its emitter.
+			this.reserveWrapperFrontier(identity);
+			emitter = this.createEmitter(identity, SERVICE_EMITTER_MAX_BYTES);
+			this.serviceEmitters.set(key, emitter);
 		}
+		const stopping = emitter
+			? this.stopServiceEmitter(key, emitter, deadlineMs, terminalOccurrenceId)
+			: Promise.resolve<BoundedFrameEmitterStopResult>({
+					terminalAdmission: {
+						accepted: false,
+						disposition: "rejected",
+						reason: this.stopped ? "stopped" : "queue_capacity",
+					},
+					totalLoss: { records: 0, bytes: 0 },
+					drainTimeoutLoss: { records: 0, bytes: 0 },
+					drainTimeoutUncertainty: { records: 0, bytes: 0 },
+					terminalDrained: true,
+				});
+		let sealState: ServiceEmitterSealState;
+		const promise = stopping.then((stopResult) => {
+			const terminalOccurrenceId = stopResult.terminalAdmission?.accepted
+				? stopResult.terminalAdmission.occurrenceId
+				: undefined;
+			const result = immutableSealResult(
+				identity,
+				stopResult,
+				terminalOccurrenceId ? this.finalizationFrontiers.get(terminalOccurrenceId) : undefined,
+			);
+			sealState.result = result;
+			sealState.fingerprint = sealFingerprint(result);
+			return result;
+		});
+		sealState = { promise };
+		if (!this.retainServiceIdentitySeal(key, sealState))
+			return Promise.resolve(immutableFenceOnlySealResult(identity));
+		return promise;
+	}
+
+	fenceRunIdentity(
+		identity: IncidentRecorderServiceIdentity,
+		options: IncidentRecorderRunIdentitySealReplayOptions = {},
+	): IncidentRecorderRunIdentitySealResult {
+		if (options.durableReplay === true && !validServiceIdentity(identity))
+			throw new Error("Invalid incident-recorder service identity");
+		const key = `${identity.runId}\0${identity.runToken}`;
+		const existing = this.serviceIdentitySeals.get(key);
+		if (existing?.result) return existing.result;
+		if (options.durableReplay === true && this.serviceEmitterStops.has(key))
+			throw new Error("Incident recorder service identity is active or stopping");
+		if (options.durableReplay === true && !this.serviceEmitters.has(key) && !this.serviceEmitterStops.has(key))
+			return immutableFenceOnlySealResult(identity);
+		if (!this.serviceIdentitySealFence.has(identity)) this.reserveServiceIdentitySealFence(identity);
+		this.serviceEmitters.get(key)?.fenceWithoutTerminal();
+		this.serviceEmitters.delete(key);
+		this.serviceEmitterStops.delete(key);
+		const result = immutableFenceOnlySealResult(identity);
+		const promise = Promise.resolve(result);
+		if (!this.retainServiceIdentitySeal(key, { promise, result, fingerprint: sealFingerprint(result) })) {
+			return result;
+		}
+		return result;
+	}
+
+	adoptRunIdentitySeal(
+		value: unknown,
+		options: IncidentRecorderRunIdentitySealReplayOptions = {},
+	): IncidentRecorderRunIdentitySealAdoption {
+		const seal = parseIncidentRecorderRunIdentitySeal(value);
+		if (!seal) return Object.freeze({ adopted: false, disposition: "rejected", reason: "invalid_seal_record" });
+		const key = `${seal.runId}\0${seal.runToken}`;
+		const fingerprint = sealFingerprint(seal);
+		const existingSeal = this.serviceIdentitySeals.get(key);
+		if (existingSeal) {
+			if (!existingSeal.result)
+				return Object.freeze({
+					adopted: false,
+					disposition: "rejected",
+					reason: "run_identity_seal_in_progress",
+				});
+			if (existingSeal.fingerprint !== fingerprint)
+				return Object.freeze({
+					adopted: false,
+					disposition: "rejected",
+					reason: "run_identity_seal_conflict",
+				});
+			return Object.freeze({
+				adopted: true,
+				disposition: "already_adopted",
+				seal: existingSeal.result,
+			});
+		}
+		const localEmitter = this.serviceEmitters.get(key);
+		if (this.serviceEmitterStops.has(key))
+			return Object.freeze({
+				adopted: false,
+				disposition: "rejected",
+				reason: "run_identity_active_or_stopping",
+			});
+		if (options.durableReplay === true) {
+			if (!localEmitter) return Object.freeze({ adopted: true, disposition: "adopted", seal });
+			try {
+				this.reserveServiceIdentitySealFence({ runId: seal.runId, runToken: seal.runToken });
+			} catch (error) {
+				if (error instanceof IncidentRecorderServiceIdentitySealFenceSaturatedError)
+					return Object.freeze({
+						adopted: false,
+						disposition: "rejected",
+						reason: "run_identity_seal_capacity_exhausted",
+					});
+				throw error;
+			}
+			localEmitter.fenceWithoutTerminal();
+			this.serviceEmitters.delete(key);
+			const promise = Promise.resolve(seal);
+			if (!this.retainServiceIdentitySeal(key, { promise, result: seal, fingerprint }))
+				return Object.freeze({
+					adopted: false,
+					disposition: "rejected",
+					reason: "run_identity_seal_capacity_exhausted",
+				});
+			return Object.freeze({ adopted: true, disposition: "adopted", seal });
+		}
+		if (localEmitter)
+			return Object.freeze({
+				adopted: false,
+				disposition: "rejected",
+				reason: "run_identity_active_or_stopping",
+			});
+		if (!this.canRetainServiceIdentitySeal())
+			return Object.freeze({
+				adopted: false,
+				disposition: "rejected",
+				reason: "run_identity_seal_capacity_exhausted",
+			});
+		if (!this.serviceIdentitySealFence.has({ runId: seal.runId, runToken: seal.runToken })) {
+			try {
+				this.reserveServiceIdentitySealFence({ runId: seal.runId, runToken: seal.runToken });
+			} catch (error) {
+				if (error instanceof IncidentRecorderServiceIdentitySealFenceSaturatedError)
+					return Object.freeze({
+						adopted: false,
+						disposition: "rejected",
+						reason: "run_identity_seal_capacity_exhausted",
+					});
+				throw error;
+			}
+		}
+		const promise = Promise.resolve(seal);
+		if (!this.retainServiceIdentitySeal(key, { promise, result: seal, fingerprint }))
+			return Object.freeze({
+				adopted: false,
+				disposition: "rejected",
+				reason: "run_identity_seal_capacity_exhausted",
+			});
+		return Object.freeze({ adopted: true, disposition: "adopted", seal });
 	}
 
 	async releaseRunIdentity(identity: { runId: string; runToken: string }, deadlineMs = 1_000): Promise<void> {
 		if (!this.serviceSink) return;
 		const key = `${identity.runId}\0${identity.runToken}`;
+		const seal = this.serviceIdentitySeals.get(key);
+		if (seal) {
+			await seal.promise;
+			return;
+		}
 		const emitter = this.serviceEmitters.get(key);
 		if (!emitter) {
-			this.wrapperSequences.delete(key);
+			const stopping = this.serviceEmitterStops.get(key);
+			if (stopping) await stopping;
 			return;
 		}
 		await this.stopServiceEmitter(key, emitter, deadlineMs);
@@ -2155,6 +3186,8 @@ export class IncidentRecorderWriter {
 		encoding: string,
 		metadata: Record<string, unknown>,
 	): IncidentRecorderAdmission {
+		if (this.serviceIdentityIsSealed(`${identity.runId}\0${identity.runToken}`))
+			return { accepted: false, disposition: "rejected", reason: "run_identity_sealed" };
 		const emitter = this.serviceEmitter(identity);
 		return (
 			emitter?.emitBytes(source, type, bytes, metadata, encoding) ?? {
@@ -2199,13 +3232,14 @@ export class IncidentRecorderWriter {
 		const serviceEmitters = [...this.serviceEmitters.entries()];
 		await Promise.all(serviceEmitters.map(([key, emitter]) => this.stopServiceEmitter(key, emitter, remaining())));
 		const emitterLossBefore = this.emitter.lossCounters();
-		const terminalAdmission = await this.emitter.stop(remaining());
+		const emitterStop = await this.emitter.stop(remaining());
 		const emitterLossAfter = this.emitter.lossCounters();
 		this.emitterFinalTailLoss = {
 			records: emitterLossAfter.records - emitterLossBefore.records,
 			bytes: emitterLossAfter.bytes - emitterLossBefore.bytes,
 		};
-		if (terminalAdmission?.accepted) this.terminalOccurrenceId = terminalAdmission.occurrenceId;
+		if (emitterStop.terminalAdmission?.accepted)
+			this.terminalOccurrenceId = emitterStop.terminalAdmission.occurrenceId;
 		while ((this.relayQueue.length > 0 || this.pumping) && Date.now() < shutdownDeadline) {
 			await new Promise<void>((resolve) => setTimeout(resolve, 10));
 		}

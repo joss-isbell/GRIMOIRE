@@ -10,6 +10,14 @@ const supported = assertNodeVersion({
 });
 
 if (supported) {
-	const { runCli } = await import("./cli-main.js");
-	await runCli();
+	// Keep the generation boundary ahead of daemon probing and all CLI imports.
+	if (process.argv.slice(2).includes("--incident-recorder-service")) {
+		console.error(
+			"GRIMOIRE_INCIDENT_CAS_V2_REJECTS_LEGACY_SELECTOR: The incident recorder requires its dedicated v2 service entrypoint.",
+		);
+		process.exitCode = 1;
+	} else {
+		const { runCli } = await import("./cli-main.js");
+		await runCli();
+	}
 }

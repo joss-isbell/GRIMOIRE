@@ -1,0 +1,1 @@
+- Fixed concurrent opening of a saved session creating competing workers, and verified that reopened sessions can receive replies from the Agents view.

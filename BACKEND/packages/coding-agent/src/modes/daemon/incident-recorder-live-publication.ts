@@ -1,25 +1,13 @@
 import { createHash } from "node:crypto";
-import {
-	closeSync,
-	constants as fsConstants,
-	fstatSync,
-	fsyncSync,
-	linkSync,
-	lstatSync,
-	mkdirSync,
-	opendirSync,
-	openSync,
-	readSync,
-	renameSync,
-	unlinkSync,
-	writeSync,
-} from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { closeSync, constants as fsConstants, fstatSync, lstatSync, opendirSync, openSync, readSync } from "node:fs";
+import { join, resolve } from "node:path";
+import type { IncidentCasRelativePath, IncidentCasRootMutation } from "./incident-recorder-cas-transaction.js";
 import type {
 	IncidentRecorderCompactor,
 	IncidentRecorderLiveRunEventsCursor,
 	IncidentRecorderLiveRunEventsPage,
 	IncidentRecorderRunHistoryEvent,
+	IncidentRecorderStorageAccountingEffect,
 } from "./incident-recorder-compactor.js";
 import type { IncidentRecorderSegmentLocator } from "./incident-recorder-segment-store.js";
 
@@ -66,6 +54,23 @@ export interface IncidentRecorderLiveIncidentPublicationInput {
 	deadlineMs?: number;
 	/** Independent readback state returned by a prior bounded inspection. */
 	validationCheckpoint?: IncidentRecorderLiveObservationValidationCheckpoint;
+}
+
+export type IncidentRecorderLiveIncidentPublicationCoreInput = Omit<
+	IncidentRecorderLiveIncidentPublicationInput,
+	"compactor"
+> & {
+	incidents: IncidentCasRootMutation;
+	readLiveRunEvents: (input: {
+		runId: string;
+		cursor?: IncidentRecorderLiveRunEventsCursor;
+	}) => IncidentRecorderLiveRunEventsPage;
+	storage: IncidentRecorderLivePublicationStorageContext;
+};
+
+export interface IncidentRecorderLivePublicationStorageContext {
+	reserve(bytes: number, entries: number, inodes: number): void;
+	effects: IncidentRecorderStorageAccountingEffect[];
 }
 
 export interface IncidentRecorderLiveObservationIdentity {
@@ -388,14 +393,19 @@ function observationPath(directory: string): string {
 	return join(directory, "live-observation.json");
 }
 
-function fsyncDirectory(path: string): void {
-	const descriptor = openSync(path, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
-	try {
-		fsyncSync(descriptor);
-	} finally {
-		closeSync(descriptor);
-	}
+function fsyncDirectory(root: IncidentCasRootMutation, path: IncidentCasRelativePath): void {
+	root.fsyncDirectory(path);
 }
+
+function temporaryName(prefix: string): string {
+	return `${prefix}-${process.pid}-${process.hrtime.bigint().toString(16)}`;
+}
+
+function immutablePageTemporaryName(sequence: number): string {
+	return `.live-observation-page.tmp-page-${sequence.toString().padStart(12, "0")}.json`;
+}
+
+const IMMUTABLE_DESCRIPTOR_TEMPORARY_NAME = ".live-observation-descriptor.tmp";
 
 function privateDirectory(path: string): boolean {
 	try {
@@ -427,101 +437,329 @@ function directoryRoot(path: string): string | undefined {
 	}
 }
 
-function writeImmutable(path: string, content: Buffer): "applied" | "noop" | "conflict" {
-	const parent = dirname(path);
-	mkdirSync(parent, { recursive: true, mode: 0o700 });
-	let existing: Buffer | undefined;
+function validRootOwnedFile(
+	stat: ReturnType<IncidentCasRootMutation["lstat"]>,
+	maximum: number,
+	allowedLinks: readonly bigint[] = [1n],
+): stat is NonNullable<ReturnType<IncidentCasRootMutation["lstat"]>> {
+	return (
+		stat !== undefined &&
+		stat.isFile() &&
+		!stat.isSymbolicLink() &&
+		allowedLinks.includes(stat.nlink) &&
+		(typeof process.getuid !== "function" || stat.uid === BigInt(process.getuid())) &&
+		(stat.mode & 0o077n) === 0n &&
+		stat.size <= BigInt(maximum)
+	);
+}
+
+function readImmutableRoot(
+	root: IncidentCasRootMutation,
+	path: IncidentCasRelativePath,
+	maximum = MAX_PAGE_BYTES,
+	allowedLinks: readonly bigint[] = [1n],
+): Buffer | undefined {
+	const stat = root.lstat(path);
+	if (!validRootOwnedFile(stat, maximum, allowedLinks)) return undefined;
 	try {
-		const stat = lstatSync(path, { bigint: true });
-		if (
-			!stat.isFile() ||
-			stat.isSymbolicLink() ||
-			stat.nlink !== 1n ||
-			(typeof process.getuid === "function" && stat.uid !== BigInt(process.getuid())) ||
-			(stat.mode & 0o077n) !== 0n
-		)
-			return "conflict";
-		if (stat.size > BigInt(Math.max(MAX_PAGE_BYTES, content.length))) return "conflict";
-		const descriptor = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-		try {
-			const value = Buffer.alloc(Number(stat.size));
-			let offset = 0;
-			while (offset < value.length) {
-				const count = readSync(descriptor, value, offset, value.length - offset, offset);
-				if (count <= 0) return "conflict";
-				offset += count;
-			}
-			existing = value;
-		} finally {
-			closeSync(descriptor);
-		}
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "ENOENT") return "conflict";
-	}
-	if (existing) return existing.equals(content) ? "noop" : "conflict";
-	const temporary = `${path}.tmp-${process.pid}-${process.hrtime.bigint()}`;
-	let descriptor: number | undefined;
-	try {
-		descriptor = openSync(
-			temporary,
-			fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
-			0o600,
-		);
-		let offset = 0;
-		while (offset < content.length) {
-			const count = writeSync(descriptor, content, offset, content.length - offset, offset);
-			if (count <= 0) throw new Error("live observation write made no progress");
-			offset += count;
-		}
-		fsyncSync(descriptor);
-		closeSync(descriptor);
-		descriptor = undefined;
-		try {
-			// A hard link gives the same no-overwrite publication semantics on Linux
-			// that an exchange-free same-parent rename is intended to provide.
-			linkSync(temporary, path);
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-			const readback = readImmutable(path);
-			if (!readback || !readback.equals(content)) return "conflict";
-			return "noop";
-		}
-		unlinkSync(temporary);
-		fsyncDirectory(parent);
-		return "applied";
-	} finally {
-		if (descriptor !== undefined)
-			try {
-				closeSync(descriptor);
-			} catch {}
-		try {
-			const stat = lstatSync(temporary);
-			if (stat.isFile() && !stat.isSymbolicLink()) unlinkSync(temporary);
-		} catch {}
+		return root.readFile(path, maximum);
+	} catch {
+		return undefined;
 	}
 }
 
-function writeProgress(path: string, progress: LiveProgress): void {
-	const temporary = `${path}.tmp-${process.pid}-${process.hrtime.bigint()}`;
-	const descriptor = openSync(
-		temporary,
-		fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
-		0o600,
-	);
-	try {
-		const content = bytes(progress);
+type ImmutableTemporaryInspection =
+	| { state: "missing" }
+	| { state: "invalid" }
+	| { state: "partial"; metadata: NonNullable<ReturnType<IncidentCasRootMutation["lstat"]>>; size: number }
+	| { state: "full"; metadata: NonNullable<ReturnType<IncidentCasRootMutation["lstat"]>> };
+
+/**
+ * Inspect a known, private temporary inode without treating an interrupted
+ * exclusive write as foreign residue. The caller still needs to reserve any
+ * capacity before completing a partial inode.
+ */
+function inspectImmutableTemporaryPrefix(
+	root: IncidentCasRootMutation,
+	path: IncidentCasRelativePath,
+	content: Buffer,
+): ImmutableTemporaryInspection {
+	const metadata = root.lstat(path);
+	if (!metadata) return { state: "missing" };
+	if (!validRootOwnedFile(metadata, content.length, [1n])) return { state: "invalid" };
+	const size = Number(metadata.size);
+	if (!Number.isSafeInteger(size) || size > content.length) return { state: "invalid" };
+	const readback = readImmutableRoot(root, path, content.length, [1n]);
+	if (!readback || readback.length !== size || !readback.equals(content.subarray(0, size))) {
+		return { state: "invalid" };
+	}
+	return size === content.length ? { state: "full", metadata } : { state: "partial", metadata, size };
+}
+
+function repairImmutableTemporaryPrefix(
+	root: IncidentCasRootMutation,
+	parent: IncidentCasRelativePath,
+	path: IncidentCasRelativePath,
+	content: Buffer,
+	storage: IncidentRecorderLivePublicationStorageContext,
+): NonNullable<ReturnType<IncidentCasRootMutation["lstat"]>> | undefined {
+	const before = root.lstat(path);
+	if (!before || !validRootOwnedFile(before, content.length, [1n])) return undefined;
+	const size = Number(before.size);
+	if (!Number.isSafeInteger(size) || size >= content.length) return undefined;
+	const blockSize = Math.max(4096, Number(root.statfs(root.relative()).bsize));
+	const beforeBlocks = Math.ceil(size / blockSize);
+	const afterBlocks = Math.ceil(content.length / blockSize);
+	// This is an existing baseline inode: only reserve the additional blocks
+	// needed to complete it, with no new directory entry or inode reservation.
+	storage.reserve(Math.max(0, afterBlocks - beforeBlocks) * blockSize, 0, 0);
+	const repaired = root.withFile(path, { access: "read_write" }, (file) => {
+		const opened = file.stat();
+		if (
+			!validRootOwnedFile(opened, content.length, [1n]) ||
+			opened.dev !== before.dev ||
+			opened.ino !== before.ino ||
+			opened.size !== before.size
+		)
+			throw new Error("live observation temporary changed during prefix repair");
+		const existing = Buffer.alloc(size);
 		let offset = 0;
-		while (offset < content.length) {
-			const count = writeSync(descriptor, content, offset, content.length - offset, offset);
-			if (count <= 0) throw new Error("live observation progress write made no progress");
+		while (offset < existing.length) {
+			const count = file.read(existing, offset, existing.length - offset, offset);
+			if (count <= 0) throw new Error("live observation temporary prefix read made no progress");
 			offset += count;
 		}
-		fsyncSync(descriptor);
-	} finally {
-		closeSync(descriptor);
+		if (!existing.equals(content.subarray(0, size)))
+			throw new Error("live observation temporary prefix changed during repair");
+		let written = size;
+		while (written < content.length) {
+			const count = file.write(content, written, content.length - written, written);
+			if (count <= 0) throw new Error("live observation temporary repair made no progress");
+			written += count;
+		}
+		file.sync();
+		const after = file.stat();
+		if (
+			!validRootOwnedFile(after, content.length, [1n]) ||
+			after.dev !== before.dev ||
+			after.ino !== before.ino ||
+			after.size !== BigInt(content.length)
+		)
+			throw new Error("live observation temporary repair did not verify");
+		const repaired = Buffer.alloc(content.length);
+		let read = 0;
+		while (read < repaired.length) {
+			const count = file.read(repaired, read, repaired.length - read, read);
+			if (count <= 0) throw new Error("live observation repaired temporary read made no progress");
+			read += count;
+		}
+		if (!repaired.equals(content)) throw new Error("live observation temporary repair bytes mismatch");
+		return after;
+	});
+	root.fsyncDirectory(parent);
+	return repaired;
+}
+
+function reconcileImmutableStagingPair(
+	root: IncidentCasRootMutation,
+	parent: IncidentCasRelativePath,
+	destinationPath: IncidentCasRelativePath,
+	destination: NonNullable<ReturnType<IncidentCasRootMutation["lstat"]>>,
+	temporary: IncidentCasRelativePath,
+	storage: IncidentRecorderLivePublicationStorageContext,
+): boolean {
+	storage.reserve(0, 0, 0);
+	const staged = root.lstat(temporary);
+	if (
+		!validRootOwnedFile(staged, MAX_PAGE_BYTES, [2n]) ||
+		staged.dev !== destination.dev ||
+		staged.ino !== destination.ino
+	)
+		return false;
+	let destinationBytes: Buffer;
+	let stagedBytes: Buffer;
+	try {
+		destinationBytes = root.readFile(destinationPath, MAX_PAGE_BYTES);
+		stagedBytes = root.readFile(temporary, MAX_PAGE_BYTES);
+	} catch {
+		return false;
 	}
-	renameSync(temporary, path);
-	fsyncDirectory(dirname(path));
+	if (!destinationBytes.equals(stagedBytes)) return false;
+	root.unlinkFile(temporary);
+	storage.effects.push({ kind: "remove", metadata: staged, releaseOwnedInode: false });
+	storage.effects.push({ kind: "account", metadata: root.stat(parent), entryCreated: false });
+	root.fsyncDirectory(parent);
+	return true;
+}
+
+function writeImmutable(
+	root: IncidentCasRootMutation,
+	path: IncidentCasRelativePath,
+	parent: IncidentCasRelativePath,
+	temporary: IncidentCasRelativePath,
+	content: Buffer,
+	storage: IncidentRecorderLivePublicationStorageContext,
+): "applied" | "noop" | "conflict" {
+	const existing = root.lstat(path);
+	if (existing) {
+		if (!validRootOwnedFile(existing, Math.max(MAX_PAGE_BYTES, content.length), [1n, 2n])) return "conflict";
+		const readback = readImmutableRoot(root, path, Math.max(MAX_PAGE_BYTES, content.length), [1n, 2n]);
+		if (!readback) return "conflict";
+		if (existing.nlink === 2n) {
+			if (!readback.equals(content)) return "conflict";
+			return reconcileImmutableStagingPair(root, parent, path, existing, temporary, storage) ? "noop" : "conflict";
+		}
+		if (!readback.equals(content)) return "conflict";
+		const temporaryState = inspectImmutableTemporaryPrefix(root, temporary, content);
+		if (temporaryState.state === "invalid") return "conflict";
+		if (temporaryState.state !== "missing") {
+			root.fsyncFile(temporary);
+			const stableTemporary = inspectImmutableTemporaryPrefix(root, temporary, content);
+			if (
+				stableTemporary.state === "invalid" ||
+				stableTemporary.state === "missing" ||
+				stableTemporary.metadata.dev !== temporaryState.metadata.dev ||
+				stableTemporary.metadata.ino !== temporaryState.metadata.ino
+			)
+				return "conflict";
+			storage.reserve(0, 0, 0);
+			root.unlinkFile(temporary);
+			storage.effects.push({ kind: "remove", metadata: stableTemporary.metadata, releaseOwnedInode: true });
+			storage.effects.push({ kind: "account", metadata: root.stat(parent), entryCreated: false });
+			root.fsyncDirectory(parent);
+		}
+		fsyncDirectory(root, parent);
+		return readback.equals(content) ? "noop" : "conflict";
+	}
+
+	let temporaryState = inspectImmutableTemporaryPrefix(root, temporary, content);
+	if (temporaryState.state === "invalid") return "conflict";
+	if (temporaryState.state !== "missing") {
+		if (temporaryState.state === "partial") {
+			const repaired = repairImmutableTemporaryPrefix(root, parent, temporary, content, storage);
+			if (!repaired) return "conflict";
+			temporaryState = { state: "full", metadata: repaired };
+			storage.effects.push({ kind: "account", metadata: repaired, entryCreated: false });
+			storage.effects.push({ kind: "account", metadata: root.stat(parent), entryCreated: false });
+		}
+		const blockSize = Math.max(4096, Number(root.statfs(root.relative()).bsize));
+		storage.reserve(blockSize, 1, 0);
+		root.fsyncFile(temporary);
+		const stableTemporary = inspectImmutableTemporaryPrefix(root, temporary, content);
+		if (
+			stableTemporary.state !== "full" ||
+			stableTemporary.metadata.dev !== temporaryState.metadata.dev ||
+			stableTemporary.metadata.ino !== temporaryState.metadata.ino
+		)
+			return "conflict";
+		root.fsyncDirectory(parent);
+		try {
+			// Reuse the exact, private temporary inode so a crash before the
+			// original hard-link attempt converges without rewriting it.
+			root.hardLink(temporary, path);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			const readback = readImmutableRoot(root, path, Math.max(MAX_PAGE_BYTES, content.length), [1n, 2n]);
+			const leftover = inspectImmutableTemporaryPrefix(root, temporary, content);
+			if (leftover.state !== "full") return "conflict";
+			root.unlinkFile(temporary);
+			storage.effects.push({ kind: "remove", metadata: leftover.metadata, releaseOwnedInode: true });
+			storage.effects.push({ kind: "account", metadata: root.stat(parent), entryCreated: false });
+			root.fsyncDirectory(parent);
+			return readback?.equals(content) ? "noop" : "conflict";
+		}
+		const linkedMetadata = root.lstat(path);
+		if (
+			!linkedMetadata ||
+			linkedMetadata.dev !== stableTemporary.metadata.dev ||
+			linkedMetadata.ino !== stableTemporary.metadata.ino
+		)
+			throw new Error("live observation immutable destination did not verify");
+		storage.effects.push({ kind: "account", metadata: linkedMetadata, entryCreated: true });
+		storage.effects.push({ kind: "account", metadata: root.stat(parent), entryCreated: false });
+		root.fsyncDirectory(parent);
+		const linkedTemporaryMetadata = root.lstat(temporary);
+		if (!linkedTemporaryMetadata) throw new Error("live observation temporary link disappeared");
+		root.unlinkFile(temporary);
+		storage.effects.push({ kind: "remove", metadata: linkedTemporaryMetadata, releaseOwnedInode: false });
+		storage.effects.push({ kind: "account", metadata: root.stat(parent), entryCreated: false });
+		root.fsyncDirectory(parent);
+		return "applied";
+	}
+
+	const blockSize = Math.max(4096, Number(root.statfs(root.relative()).bsize));
+	const reservedBytes = Math.ceil(content.length / blockSize) * blockSize + blockSize * 2;
+	storage.reserve(reservedBytes, 2, 1);
+	root.writeFileExclusive(temporary, content, 0o600);
+	const temporaryMetadata = root.lstat(temporary);
+	if (!temporaryMetadata || !validRootOwnedFile(temporaryMetadata, content.length))
+		throw new Error("live observation temporary file did not verify");
+	storage.effects.push({ kind: "account", metadata: temporaryMetadata, entryCreated: true });
+	storage.effects.push({ kind: "account", metadata: root.stat(parent), entryCreated: false });
+	root.fsyncFile(temporary);
+	root.fsyncDirectory(parent);
+	try {
+		// Linking the fsynced temporary inode preserves immutable no-overwrite
+		// publication semantics without a raw-path mutation.
+		root.hardLink(temporary, path);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+		const readback = readImmutableRoot(root, path, Math.max(MAX_PAGE_BYTES, content.length), [1n, 2n]);
+		const leftover = inspectImmutableTemporaryPrefix(root, temporary, content);
+		if (leftover.state !== "full") return "conflict";
+		root.unlinkFile(temporary);
+		storage.effects.push({ kind: "remove", metadata: leftover.metadata, releaseOwnedInode: true });
+		storage.effects.push({ kind: "account", metadata: root.stat(parent), entryCreated: false });
+		root.fsyncDirectory(parent);
+		if (!readback || !readback.equals(content)) return "conflict";
+		return "noop";
+	}
+	const linkedMetadata = root.lstat(path);
+	if (!linkedMetadata || linkedMetadata.dev !== temporaryMetadata.dev || linkedMetadata.ino !== temporaryMetadata.ino)
+		throw new Error("live observation immutable destination did not verify");
+	storage.effects.push({ kind: "account", metadata: linkedMetadata, entryCreated: true });
+	storage.effects.push({ kind: "account", metadata: root.stat(parent), entryCreated: false });
+	root.fsyncDirectory(parent);
+	const linkedTemporaryMetadata = root.lstat(temporary);
+	if (!linkedTemporaryMetadata) throw new Error("live observation temporary link disappeared");
+	root.unlinkFile(temporary);
+	storage.effects.push({ kind: "remove", metadata: linkedTemporaryMetadata, releaseOwnedInode: false });
+	storage.effects.push({ kind: "account", metadata: root.stat(parent), entryCreated: false });
+	root.fsyncDirectory(parent);
+	return "applied";
+}
+
+function writeProgress(
+	root: IncidentCasRootMutation,
+	path: IncidentCasRelativePath,
+	parent: IncidentCasRelativePath,
+	temporary: IncidentCasRelativePath,
+	progress: LiveProgress,
+	storage: IncidentRecorderLivePublicationStorageContext,
+): void {
+	const content = bytes(progress);
+	if (content.length > MAX_PAGE_BYTES) throw new Error("live observation progress exceeded its bound");
+	const existing = root.lstat(path);
+	if (existing && !validRootOwnedFile(existing, MAX_PAGE_BYTES))
+		throw new Error("live observation progress destination is invalid");
+	const blockSize = Math.max(4096, Number(root.statfs(root.relative()).bsize));
+	const reservedBytes = Math.ceil(content.length / blockSize) * blockSize + blockSize * 2;
+	storage.reserve(reservedBytes, 2, 1);
+	root.writeFileExclusive(temporary, content, 0o600);
+	const temporaryMetadata = root.lstat(temporary);
+	if (!temporaryMetadata || !validRootOwnedFile(temporaryMetadata, content.length))
+		throw new Error("live observation progress temporary file did not verify");
+	storage.effects.push({ kind: "account", metadata: temporaryMetadata, entryCreated: true });
+	storage.effects.push({ kind: "account", metadata: root.stat(parent), entryCreated: false });
+	root.fsyncFile(temporary);
+	root.fsyncDirectory(parent);
+	root.rename(temporary, path);
+	if (existing) storage.effects.push({ kind: "remove", metadata: existing, releaseOwnedInode: true });
+	const destinationMetadata = root.lstat(path);
+	if (!destinationMetadata) throw new Error("live observation progress destination did not verify");
+	storage.effects.push({ kind: "account", metadata: destinationMetadata, entryCreated: false });
+	storage.effects.push({ kind: "account", metadata: root.stat(parent), entryCreated: false });
+	root.fsyncDirectory(parent);
 }
 
 function readImmutable(path: string, maximum = MAX_PAGE_BYTES): Buffer | undefined {
@@ -562,6 +800,15 @@ function readImmutable(path: string, maximum = MAX_PAGE_BYTES): Buffer | undefin
 function parseJson(path: string, maximum = MAX_PAGE_BYTES): unknown {
 	const value = readImmutable(path, maximum);
 	if (!value || !value.toString("utf8").endsWith("\n")) return undefined;
+	try {
+		return JSON.parse(value.toString("utf8"));
+	} catch {
+		return undefined;
+	}
+}
+
+function parseJsonBytes(value: Buffer): unknown {
+	if (!value.toString("utf8").endsWith("\n")) return undefined;
 	try {
 		return JSON.parse(value.toString("utf8"));
 	} catch {
@@ -1551,6 +1798,89 @@ function validateStagePages(
 	return { state: "valid", progress: result };
 }
 
+type StagingPageReconciliation = "none" | "reconciled" | "invalid";
+
+/**
+ * Reconcile only the next page whose validation is pending. A hard-link crash
+ * leaves the destination and its deterministic temporary name on one private
+ * inode (nlink=2); raw reader inspection intentionally rejects that state, so
+ * this root-bound seam validates the page before unlinking the temporary name.
+ */
+function reconcileNextStagingPage(
+	root: IncidentCasRootMutation,
+	stageDirectory: string,
+	evidencePath: IncidentCasRelativePath,
+	destinationPath: IncidentCasRelativePath,
+	temporaryPath: IncidentCasRelativePath,
+	trigger: IncidentRecorderLiveTriggerIdentity,
+	fence: IncidentRecorderLiveOccurrenceIdentity,
+	progress: LiveProgress,
+	storage: IncidentRecorderLivePublicationStorageContext,
+): StagingPageReconciliation {
+	if (progress.pageCount !== progress.validatedPageCount) return "none";
+	const sequence = progress.validatedPageCount + 1;
+	const destination = root.lstat(destinationPath);
+	if (!destination || destination.nlink !== 2n) return "none";
+	const temporary = root.lstat(temporaryPath);
+	if (
+		!validRootOwnedFile(destination, MAX_PAGE_BYTES, [2n]) ||
+		!temporary ||
+		!validRootOwnedFile(temporary, MAX_PAGE_BYTES, [2n]) ||
+		destination.dev !== temporary.dev ||
+		destination.ino !== temporary.ino
+	)
+		return "invalid";
+	let destinationBytes: Buffer;
+	let temporaryBytes: Buffer;
+	try {
+		destinationBytes = root.readFile(destinationPath, MAX_PAGE_BYTES);
+		temporaryBytes = root.readFile(temporaryPath, MAX_PAGE_BYTES);
+	} catch {
+		return "invalid";
+	}
+	if (!destinationBytes.equals(temporaryBytes)) return "invalid";
+	const value = parseJsonBytes(destinationBytes);
+	const identity = observationIdentity(trigger, fence);
+	if (!validPage(value, identity, trigger.runId)) return "invalid";
+	const page = value as IncidentRecorderLiveEvidencePage;
+	const before = sequence === 1 ? null : progress.cursor;
+	const previousPageSha256 = sequence === 1 ? null : progress.chainHeadSha256;
+	const filterSha256 = progress.cursor?.filterSha256 ?? page.afterCursor.filterSha256;
+	if (sequence > 1) {
+		const previousResult = readPage(stageDirectory, sequence - 1);
+		if (previousResult.state !== "present") return "invalid";
+		if (!validPage(previousResult.value, identity, trigger.runId)) return "invalid";
+		const previous = previousResult.value as IncidentRecorderLiveEvidencePage;
+		if (
+			previous.sequence !== sequence - 1 ||
+			previous.pageSha256 !== previousPageSha256 ||
+			!sameCursor(previous.afterCursor, before) ||
+			previous.afterCursor.filterSha256 !== filterSha256
+		)
+			return "invalid";
+	}
+	if (
+		page.sequence !== sequence ||
+		!sameCursor(page.beforeCursor, before) ||
+		page.previousPageSha256 !== previousPageSha256 ||
+		(sequence > 1 && (before === null || previousPageSha256 === null))
+	)
+		return "invalid";
+	const pageValidation = validateStoredPage(
+		page,
+		trigger,
+		fence,
+		before,
+		filterSha256,
+		sequence === 1 ? false : progress.triggerSeen,
+		sequence === 1 ? null : progress.fenceProof,
+	);
+	if (pageValidation.state === "invalid") return "invalid";
+	return reconcileImmutableStagingPair(root, evidencePath, destinationPath, destination, temporaryPath, storage)
+		? "reconciled"
+		: "invalid";
+}
+
 function observationFrom(
 	trigger: IncidentRecorderLiveTriggerIdentity,
 	fence: IncidentRecorderLiveOccurrenceIdentity,
@@ -1955,12 +2285,15 @@ export function inspectLiveIncidentObservation(input: {
 	};
 }
 
-export function publishLiveIncidentObservation(
-	input: IncidentRecorderLiveIncidentPublicationInput,
+export function publishLiveIncidentObservationWithinRoot(
+	input: IncidentRecorderLiveIncidentPublicationCoreInput,
 ): IncidentRecorderLiveIncidentPublicationResult {
 	const normalized = validateIdentityInput(input.trigger, input.fence, input.classification);
 	const { trigger, fence, incidentId: id, publicationId: pub } = normalized;
 	const incidentsDirectory = resolve(input.incidentsDirectory);
+	const incidentsRootPath = input.incidents.publicPath(input.incidents.relative());
+	if (resolve(incidentsRootPath) !== incidentsDirectory)
+		return { state: "uncertain", incidentId: id, publicationId: pub, reason: "live_observation_root_mismatch" };
 	const finalDirectory = join(incidentsDirectory, id);
 	const existing = inspectLiveIncidentObservation({
 		incidentsDirectory,
@@ -1988,17 +2321,15 @@ export function publishLiveIncidentObservation(
 		return { state: "uncertain", incidentId: id, publicationId: pub, reason: existing.reason };
 	if (existing.state === "pending" || existing.state === "incomplete")
 		return pendingPublicationResult(id, pub, existing, progressPath(finalDirectory), progressFor(trigger, fence));
-	try {
-		mkdirSync(incidentsDirectory, { recursive: true, mode: 0o700 });
-	} catch {
-		return {
-			state: "uncertain",
-			incidentId: id,
-			publicationId: pub,
-			reason: "live_observation_incidents_directory_unavailable",
-		};
-	}
-	if (!privateDirectory(incidentsDirectory))
+	const incidentsRoot = input.incidents.relative();
+	const incidentsMetadata = input.incidents.lstat(incidentsRoot);
+	if (
+		!incidentsMetadata ||
+		!incidentsMetadata.isDirectory() ||
+		incidentsMetadata.isSymbolicLink() ||
+		(typeof process.getuid === "function" && incidentsMetadata.uid !== BigInt(process.getuid())) ||
+		(incidentsMetadata.mode & 0o077n) !== 0n
+	)
 		return {
 			state: "uncertain",
 			incidentId: id,
@@ -2021,23 +2352,46 @@ export function publishLiveIncidentObservation(
 			reason: "live_observation_conflicting_partial_stage",
 		};
 	const stageDirectory = join(incidentsDirectory, `.${id}.partial-${pub}`);
-	try {
-		mkdirSync(stageDirectory, { recursive: true, mode: 0o700 });
-	} catch {
-		return { state: "uncertain", incidentId: id, publicationId: pub, reason: "live_observation_stage_unavailable" };
+	const stageName = `.${id}.partial-${pub}`;
+	const stagePath = input.incidents.relative(stageName);
+	const evidencePath = input.incidents.relative(stageName, "evidence");
+	const progressRelativePath = input.incidents.relative(stageName, "progress.json");
+	const finalPath = input.incidents.relative(id);
+	const stageMetadata = input.incidents.lstat(stagePath);
+	const evidenceMetadata = stageMetadata ? input.incidents.lstat(evidencePath) : undefined;
+	if (
+		(stageMetadata && (!stageMetadata.isDirectory() || stageMetadata.isSymbolicLink())) ||
+		(evidenceMetadata && (!evidenceMetadata.isDirectory() || evidenceMetadata.isSymbolicLink()))
+	)
+		return { state: "uncertain", incidentId: id, publicationId: pub, reason: "live_observation_stage_invalid" };
+	const missingDirectories = [
+		...(stageMetadata ? [] : [{ path: stagePath, parent: incidentsRoot }]),
+		...(evidenceMetadata ? [] : [{ path: evidencePath, parent: stagePath }]),
+	];
+	if (missingDirectories.length > 0) {
+		const blockSize = Math.max(4096, Number(input.incidents.statfs(incidentsRoot).bsize));
+		input.storage.reserve(
+			blockSize * 2 * missingDirectories.length,
+			missingDirectories.length,
+			missingDirectories.length,
+		);
+		for (const directory of missingDirectories) {
+			input.incidents.mkdirPrivate(directory.path);
+			input.storage.effects.push({
+				kind: "account",
+				metadata: input.incidents.stat(directory.path),
+				entryCreated: true,
+			});
+			input.storage.effects.push({
+				kind: "account",
+				metadata: input.incidents.stat(directory.parent),
+				entryCreated: false,
+			});
+			fsyncDirectory(input.incidents, directory.parent);
+		}
 	}
 	if (!privateDirectory(stageDirectory))
 		return { state: "uncertain", incidentId: id, publicationId: pub, reason: "live_observation_stage_invalid" };
-	try {
-		mkdirSync(join(stageDirectory, "evidence"), { recursive: true, mode: 0o700 });
-	} catch {
-		return {
-			state: "uncertain",
-			incidentId: id,
-			publicationId: pub,
-			reason: "live_observation_evidence_directory_unavailable",
-		};
-	}
 	if (!privateDirectory(join(stageDirectory, "evidence")))
 		return {
 			state: "uncertain",
@@ -2048,13 +2402,6 @@ export function publishLiveIncidentObservation(
 	const progressRead = readProgress(stageDirectory);
 	if (progressRead.state === "invalid")
 		return { state: "uncertain", incidentId: id, publicationId: pub, reason: progressRead.reason };
-	if (progressRead.state === "missing" && readPage(stageDirectory, 1).state !== "missing")
-		return {
-			state: "uncertain",
-			incidentId: id,
-			publicationId: pub,
-			reason: "live_observation_progress_missing_for_durable_pages",
-		};
 	let progress = progressRead.state === "valid" ? progressRead.value : progressFor(trigger, fence);
 	if (!progressMatches(progress, trigger, fence))
 		return {
@@ -2062,6 +2409,28 @@ export function publishLiveIncidentObservation(
 			incidentId: id,
 			publicationId: pub,
 			reason: "live_observation_stage_identity_conflict",
+		};
+	const stagingReconciliation = reconcileNextStagingPage(
+		input.incidents,
+		stageDirectory,
+		evidencePath,
+		input.incidents.relative(
+			stageName,
+			"evidence",
+			`page-${(progress.validatedPageCount + 1).toString().padStart(12, "0")}.json`,
+		),
+		input.incidents.relative(stageName, "evidence", immutablePageTemporaryName(progress.validatedPageCount + 1)),
+		trigger,
+		fence,
+		progress,
+		input.storage,
+	);
+	if (stagingReconciliation === "invalid")
+		return {
+			state: "uncertain",
+			incidentId: id,
+			publicationId: pub,
+			reason: "live_observation_staged_page_recovery_failed",
 		};
 	const validation = validateStagePages(
 		stageDirectory,
@@ -2077,6 +2446,7 @@ export function publishLiveIncidentObservation(
 		return { state: "uncertain", incidentId: id, publicationId: pub, reason: validation.reason as string };
 	const loadedProgress = progress;
 	progress = validation.progress;
+	if (progress.fenceSeen && progress.state !== "published") progress = { ...progress, state: "published" };
 	if (validation.state === "pending") {
 		const pendingProgress = progressWithReason(
 			{ ...progress, state: "pending" },
@@ -2084,7 +2454,14 @@ export function publishLiveIncidentObservation(
 		);
 		try {
 			if (canonicalJson(pendingProgress) !== canonicalJson(loadedProgress))
-				writeProgress(progressPath(stageDirectory), pendingProgress);
+				writeProgress(
+					input.incidents,
+					progressRelativePath,
+					stagePath,
+					input.incidents.relative(stageName, temporaryName(".live-observation-progress.tmp")),
+					pendingProgress,
+					input.storage,
+				);
 		} catch {
 			return {
 				state: "uncertain",
@@ -2103,7 +2480,14 @@ export function publishLiveIncidentObservation(
 	}
 	if (canonicalJson(progress) !== canonicalJson(loadedProgress)) {
 		try {
-			writeProgress(progressPath(stageDirectory), progress);
+			writeProgress(
+				input.incidents,
+				progressRelativePath,
+				stagePath,
+				input.incidents.relative(stageName, temporaryName(".live-observation-progress.tmp")),
+				progress,
+				input.storage,
+			);
 		} catch {
 			return {
 				state: "uncertain",
@@ -2121,7 +2505,14 @@ export function publishLiveIncidentObservation(
 	let filterSha256 = progress.cursor?.filterSha256 ?? progress.fenceProof?.filterSha256;
 	const persistProgressOnly = (next: LiveProgress): boolean => {
 		try {
-			writeProgress(progressPath(stageDirectory), next);
+			writeProgress(
+				input.incidents,
+				progressRelativePath,
+				stagePath,
+				input.incidents.relative(stageName, temporaryName(".live-observation-progress.tmp")),
+				next,
+				input.storage,
+			);
 			return true;
 		} catch {
 			return false;
@@ -2130,7 +2521,7 @@ export function publishLiveIncidentObservation(
 	while (!progress.fenceSeen && pagesRead < maxPages && Date.now() < deadline) {
 		let page: IncidentRecorderLiveRunEventsPage;
 		try {
-			page = input.compactor.readLiveRunEvents({
+			page = input.readLiveRunEvents({
 				runId: trigger.runId,
 				...(progress.cursor ? { cursor: progress.cursor } : {}),
 			});
@@ -2426,7 +2817,18 @@ export function publishLiveIncidentObservation(
 		}
 		let writeResult: "applied" | "noop" | "conflict";
 		try {
-			writeResult = writeImmutable(pagePath(stageDirectory, durable.sequence), durableBytes);
+			writeResult = writeImmutable(
+				input.incidents,
+				input.incidents.relative(
+					stageName,
+					"evidence",
+					`page-${durable.sequence.toString().padStart(12, "0")}.json`,
+				),
+				evidencePath,
+				input.incidents.relative(stageName, "evidence", immutablePageTemporaryName(durable.sequence)),
+				durableBytes,
+				input.storage,
+			);
 		} catch {
 			return {
 				state: "uncertain",
@@ -2465,12 +2867,19 @@ export function publishLiveIncidentObservation(
 			durableReason,
 		);
 		try {
-			writeProgress(progressPath(stageDirectory), progress);
+			writeProgress(
+				input.incidents,
+				progressRelativePath,
+				stagePath,
+				input.incidents.relative(stageName, temporaryName(".live-observation-progress.tmp")),
+				progress,
+				input.storage,
+			);
 			// writeImmutable() fsyncs the page and evidence directory. The
 			// progress rename is fsynced by writeProgress(); repeat the directory
 			// syncs here to make the commit ordering explicit at this boundary.
-			fsyncDirectory(join(stageDirectory, "evidence"));
-			fsyncDirectory(stageDirectory);
+			fsyncDirectory(input.incidents, evidencePath);
+			fsyncDirectory(input.incidents, stagePath);
 		} catch {
 			return {
 				state: "uncertain",
@@ -2525,10 +2934,17 @@ export function publishLiveIncidentObservation(
 			publicationId: pub,
 			reason: "live_observation_descriptor_generation_invalid",
 		};
-	const descriptorWrite = writeImmutable(observationPath(stageDirectory), bytes(observation));
+	const descriptorWrite = writeImmutable(
+		input.incidents,
+		input.incidents.relative(stageName, "live-observation.json"),
+		stagePath,
+		input.incidents.relative(stageName, IMMUTABLE_DESCRIPTOR_TEMPORARY_NAME),
+		bytes(observation),
+		input.storage,
+	);
 	if (descriptorWrite === "conflict")
 		return { state: "conflict", incidentId: id, publicationId: pub, reason: "live_observation_descriptor_conflict" };
-	fsyncDirectory(stageDirectory);
+	fsyncDirectory(input.incidents, stagePath);
 	try {
 		lstatSync(finalDirectory);
 		const readback = inspectLiveIncidentObservation({
@@ -2563,9 +2979,19 @@ export function publishLiveIncidentObservation(
 				reason: "live_observation_final_directory_unavailable",
 			};
 	}
+	const finalRenameBlockSize = Math.max(4096, Number(input.incidents.statfs(incidentsRoot).bsize));
+	// The stage entry is renamed in place, so no inode or net entry is added;
+	// reserve one parent allocation unit for a filesystem that grows the
+	// directory while replacing the staged name with its final name.
+	input.storage.reserve(finalRenameBlockSize, 0, 0);
 	try {
-		renameSync(stageDirectory, finalDirectory);
-		fsyncDirectory(incidentsDirectory);
+		input.incidents.rename(stagePath, finalPath);
+		input.storage.effects.push({
+			kind: "account",
+			metadata: input.incidents.stat(incidentsRoot),
+			entryCreated: false,
+		});
+		fsyncDirectory(input.incidents, incidentsRoot);
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code !== "EEXIST")
 			return {
@@ -2621,6 +3047,18 @@ export function publishLiveIncidentObservation(
 		observation: readback.observation,
 		noOp: false,
 	};
+}
+
+export type IncidentRecorderLiveIncidentPublicationRequest = Omit<
+	IncidentRecorderLiveIncidentPublicationInput,
+	"compactor"
+>;
+
+export function liveIncidentPublicationIdentity(
+	input: Pick<IncidentRecorderLiveIncidentPublicationRequest, "trigger" | "fence" | "classification">,
+): { incidentId: string; publicationId: string } {
+	const normalized = validateIdentityInput(input.trigger, input.fence, input.classification);
+	return { incidentId: normalized.incidentId, publicationId: normalized.publicationId };
 }
 
 export function isLiveIncidentArtifactName(value: string): boolean {

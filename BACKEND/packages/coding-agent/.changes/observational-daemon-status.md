@@ -1,0 +1,2 @@
+- Fixed daemon discovery probing internal worker and diagnostic control sockets.
+- Changed status requests to report roster observation freshness locally without initiating worker lifecycle changes.
