@@ -1,11 +1,35 @@
-import { type ChildProcess, spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
+import { createRequire } from "node:module";
+import { join, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
+import { getPackageDir, isBunBinary } from "../../config.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
 import { deleteSessionFile } from "../../core/session-file-actions.js";
 import { readSessionInfo, type SessionInfo, SessionManager } from "../../core/session-manager.js";
+import { spawnHidden } from "../../utils/child-process.js";
 
 export const DAEMON_CATALOG_ROLE_ENV = "PRIME_AGENT_INTERNAL_DAEMON_CATALOG";
+const DAEMON_CATALOG_START_TIMEOUT_MS = 30_000;
+
+export function isDaemonCatalogSourcePath(modulePath: string, packageDir: string): boolean {
+	return modulePath.startsWith(`${join(packageDir, "src")}${sep}`);
+}
+
+function resolveDaemonCatalogEntrypoint(): string {
+	const packageDir = getPackageDir();
+	const sourceEntrypoint = join(packageDir, "src", "modes", "daemon", "daemon-catalog-entry.ts");
+	const compiledEntrypoint = join(packageDir, "dist", "modes", "daemon", "daemon-catalog-entry.js");
+	const runningFromSource = isDaemonCatalogSourcePath(fileURLToPath(import.meta.url), packageDir);
+	const candidates = runningFromSource
+		? [sourceEntrypoint, compiledEntrypoint]
+		: [compiledEntrypoint, sourceEntrypoint];
+	const entrypoint = candidates.find((candidate) => existsSync(candidate));
+	if (entrypoint) return entrypoint;
+	throw new Error("Cannot locate the daemon catalog entrypoint");
+}
 
 interface SessionInfoWire extends Omit<SessionInfo, "created" | "modified"> {
 	created: string;
@@ -319,8 +343,23 @@ export class DaemonCatalogClient {
 	}
 
 	private async spawnCatalog(): Promise<void> {
-		const launch = createCliSubprocessLaunchSpec(["--version"]);
-		const environment = createCliSubprocessEnv({ ...process.env, [DAEMON_CATALOG_ROLE_ENV]: "1" });
+		let command: string;
+		let args: string[];
+		let environment = createCliSubprocessEnv({ ...process.env, [DAEMON_CATALOG_ROLE_ENV]: "1" });
+		if (isBunBinary) {
+			const launch = createCliSubprocessLaunchSpec(["--version"]);
+			command = launch.command;
+			args = launch.args;
+		} else {
+			const catalogEntry = resolveDaemonCatalogEntrypoint();
+			const execArgs = catalogEntry.endsWith(".ts")
+				? [...process.execArgv, "--import", createRequire(import.meta.url).resolve("tsx")]
+				: process.execArgv;
+			const launch = createCliSubprocessLaunchSpec([], undefined, execArgs, catalogEntry);
+			command = launch.command;
+			args = launch.args;
+			environment = createCliSubprocessEnv(environment, catalogEntry, execArgs);
+		}
 		for (const name of [
 			"PRIME_AGENT_INTERNAL_INCIDENT_RECORDER_CHILD",
 			"PRIME_AGENT_INTERNAL_INCIDENT_RECORDER_RUN_DIR",
@@ -333,11 +372,10 @@ export class DaemonCatalogClient {
 			"PRIME_INCIDENT_RECORDER_RUN_TOKEN",
 		])
 			delete environment[name];
-		const child = spawn(launch.command, launch.args, {
+		const child = spawnHidden(command, args, {
 			cwd: process.cwd(),
 			env: environment,
-			// The supervisor-owned fd4 capture channel and fd5 recorder-root capability
-			// must never reach this controlled catalog descendant.
+			// The catalog must not inherit supervisor capture or recorder-root descriptors.
 			stdio: ["ignore", "ignore", "ignore", "ipc", "ignore", "ignore"],
 		});
 		this.child = child;
@@ -356,11 +394,12 @@ export class DaemonCatalogClient {
 				}
 				child.kill("SIGKILL");
 				rejectReady(error);
-			}, 5000);
+			}, DAEMON_CATALOG_START_TIMEOUT_MS);
 			const cleanup = () => {
 				clearTimeout(timeout);
 				child.off("message", onMessage);
 				child.off("error", onError);
+				child.off("exit", onExit);
 			};
 			const onMessage = (value: unknown) => {
 				if (isCatalogOutbound(value) && value.type === "ready") {
@@ -372,8 +411,12 @@ export class DaemonCatalogClient {
 				cleanup();
 				rejectReady(error);
 			};
+			const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+				onError(new Error(`Daemon catalog exited during startup (${signal ?? code ?? "unknown"})`));
+			};
 			child.on("message", onMessage);
 			child.once("error", onError);
+			child.once("exit", onExit);
 		});
 	}
 

@@ -42,12 +42,13 @@ import {
 	truncateToWidth,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
-import { spawn, spawnSync } from "child_process";
+import { spawnSync } from "child_process";
 import {
 	buildDaemonUpdateRestartReport,
 	launchDaemonUpdateRestartCoordinator,
 	resolveDaemonUpdateRestartSocketPath,
 } from "../../cli/daemon-update-restart.js";
+import { type CliSubprocessLaunchSpec, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
 import {
 	APP_NAME,
 	APP_TITLE,
@@ -98,6 +99,7 @@ import type { KernelSentAgentMessage } from "../../core/kernel/index.js";
 import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.js";
 import { runMcpManagementCommand } from "../../core/mcp/mcp-command.js";
 import {
+	ASYNC_BASH_COMPLETION_PREVIEW_LABEL,
 	bashOutputToText,
 	COMPACTION_OUTCOME_CUSTOM_TYPE,
 	type CustomMessage,
@@ -135,6 +137,7 @@ import {
 import { type TruncationResult, truncateTail } from "../../core/tools/truncate.js";
 import { PRIME_BUTTERFLY_LOGO } from "../../themes/prime-logo.js";
 import { getChangelogPath, parseChangelog } from "../../utils/changelog.js";
+import { spawnHidden, spawnSyncHidden } from "../../utils/child-process.js";
 import { copyToClipboard } from "../../utils/clipboard.js";
 import { readClipboardImage } from "../../utils/clipboard-image.js";
 import { parseGitUrl } from "../../utils/git.js";
@@ -166,6 +169,7 @@ import type {
 	AgentConnectionToolDefinition,
 } from "../agent-connection/index.js";
 import { AgentConnectionPromptAdmissionError } from "../agent-connection/index.js";
+import type { SessionSummary } from "../daemon/daemon-session-list.js";
 import { getModelArgumentCompletions } from "../model-autocomplete.js";
 import {
 	checkForPackageUpdates,
@@ -205,8 +209,10 @@ import { FooterComponent } from "./components/footer.js";
 import { HeartbeatManagerComponent } from "./components/heartbeat-manager.js";
 import { InjectedPromptMessageComponent, isInjectedPromptMessage } from "./components/injected-prompt-message.js";
 import { formatKeyText, keyHint, keyText, rawKeyHint } from "./components/keybinding-hints.js";
+import { createMermaidMarkdownTransform } from "./components/mermaid.js";
 import type { AuthSelectorProvider } from "./components/oauth-selector.js";
 import { PrimeOnboardingSplashComponent } from "./components/prime-onboarding-splash.js";
+import { styleArgumentTokens } from "./components/prompt-highlight.js";
 import {
 	MalformedRefinementOutcomeMessageComponent,
 	RefinementOutcomeMessageComponent,
@@ -221,7 +227,11 @@ import {
 	styleSlashCommandText,
 } from "./components/slash-command-message.js";
 import { SlashCommandResultMessageComponent } from "./components/slash-command-result-message.js";
-import { countDirectSubagentStatuses, SubagentSummaryLine } from "./components/subagent-summary-line.js";
+import {
+	countDirectSubagentStatuses,
+	countRosterSubagentStatuses,
+	SubagentSummaryLine,
+} from "./components/subagent-summary-line.js";
 import { ThinkingSelectorComponent } from "./components/thinking-selector.js";
 import {
 	selectLatestToolExpandHint,
@@ -252,7 +262,7 @@ import {
 	shouldRunPrimeCliOnboardingSplash,
 } from "./onboarding.js";
 import type { ClientPromptStashStore, PromptStash, PromptStashState } from "./prompt-stash-state.js";
-import { QueueSelection } from "./queue-selection.js";
+import { QueueSelection, type QueueSelectionItem } from "./queue-selection.js";
 import { formatResumeHint } from "./resume-hint.js";
 import {
 	getAvailableThemes,
@@ -303,7 +313,8 @@ function isLabeledQueuedPreview(message: string): boolean {
 	return (
 		message.startsWith(`${HEARTBEAT_PROMPT_PREVIEW_LABEL}: `) ||
 		message.startsWith(`${GOAL_CONTEXT_PREVIEW_LABEL}: `) ||
-		message.startsWith(`${AGENT_MESSAGE_RECEIVED_PREVIEW_LABEL}: `)
+		message.startsWith(`${AGENT_MESSAGE_RECEIVED_PREVIEW_LABEL}: `) ||
+		message.startsWith(`${ASYNC_BASH_COMPLETION_PREVIEW_LABEL}: `)
 	);
 }
 
@@ -317,9 +328,12 @@ export function styleQueuedMessagePreview(
 	isRecognizedSlashCommand: (name: string) => boolean,
 ): string {
 	const preview = formatQueuedMessagePreview(message, label);
-	if (!isLeadingSlashCommand(message, isRecognizedSlashCommand)) return theme.fg("dim", preview);
+	const styleDim = (segment: string) => theme.fg("dim", segment);
+	if (!isLeadingSlashCommand(message, isRecognizedSlashCommand)) return styleArgumentTokens(preview, styleDim);
 	const prefix = preview.slice(0, preview.length - message.length);
-	return `${theme.fg("dim", prefix)}${styleSlashCommandText(message, (rest) => theme.fg("dim", rest))}`;
+	return `${theme.fg("dim", prefix)}${styleSlashCommandText(message, (rest, includeBareSeparator) =>
+		styleArgumentTokens(rest, styleDim, includeBareSeparator),
+	)}`;
 }
 
 function isExpandable(obj: unknown): obj is Expandable {
@@ -764,6 +778,53 @@ export function buildUpdateRelaunchArgs(args: readonly string[], sessionFile: st
 	return relaunchArgs;
 }
 
+type UpdateRelaunchExecve = (file: string, args: string[], environment: Record<string, string>) => never;
+
+interface UpdateRelaunchExecOptions {
+	platform: string;
+	nodeVersion: string;
+	cwd: string;
+	previousCwd: string;
+	environment: NodeJS.ProcessEnv;
+	chdir: (directory: string) => void;
+	execve?: UpdateRelaunchExecve;
+}
+
+function execveFailureThrows(nodeVersion: string): boolean {
+	// Before Node 26.1, a failed execve syscall aborts the process instead of throwing for the fallback below.
+	const match = /^(\d+)\.(\d+)\./.exec(nodeVersion);
+	if (!match) {
+		return false;
+	}
+	const major = Number(match[1]);
+	const minor = Number(match[2]);
+	return major > 26 || (major === 26 && minor >= 1);
+}
+
+export function tryExecUpdateRelaunch(launch: CliSubprocessLaunchSpec, options: UpdateRelaunchExecOptions): boolean {
+	// Process replacement preserves the shell job and foreground terminal without retaining the old TUI.
+	if (
+		!options.execve ||
+		options.platform === "win32" ||
+		options.platform === "os400" ||
+		!execveFailureThrows(options.nodeVersion)
+	) {
+		return false;
+	}
+	const environment = Object.fromEntries(
+		Object.entries(options.environment).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+	);
+	options.chdir(options.cwd);
+	try {
+		options.execve(launch.command, [launch.command, ...launch.args], environment);
+	} catch (error) {
+		// A thrown execve must not leave the fallback's process on a changed cwd.
+		options.chdir(options.previousCwd);
+		throw error;
+	}
+	return true;
+}
+
 export function buildUpdateChildArgs(args: readonly string[], daemonSocketPath: string): string[] {
 	return args.includes("--daemon-socket") ? [...args] : [...args, "--daemon-socket", daemonSocketPath];
 }
@@ -973,16 +1034,20 @@ export class InteractiveMode {
 	private subagentSummaryLine: SubagentSummaryLine;
 	private subagentSnapshots = new Map<string, AgentConnectionRlmChildAgentSnapshot>();
 	private rlmNodeId: string | undefined;
+	private rosterBar: { summaries(): SessionSummary[]; dispose(): Promise<void> } | undefined;
 
 	private toolOutputExpanded = false;
 	private agentMessagesExpanded = false;
 	private editDiffsExpanded = false;
 
 	private hideThinkingBlock = false;
+	private readonly mermaidMarkdownTransform = createMermaidMarkdownTransform({
+		getMode: () => this.settingsManager.getMermaidRenderingMode(),
+		theme,
+	});
 
 	private skillCommands = new Map<string, string>();
 	private connectionCommands: AgentConnectionSlashCommand[] = [];
-	private connectionModels: AgentConnectionModel[] = [];
 	private connectionModelCatalog: AgentConnectionModel[] = [];
 	private connectionConfiguredProviders = new Set<string>();
 	private connectionModelsFetchedAt = 0;
@@ -990,14 +1055,13 @@ export class InteractiveMode {
 	private connectionModelsRefreshInFlight: { version: number; promise: Promise<AgentConnectionModel[]> } | undefined;
 	private connectionState: AgentConnectionState | undefined;
 	private connectionResourceSnapshot: AgentConnectionResourceSnapshot | undefined;
-	private sessionHasMessages = false;
 	private heartbeatCatalog: AgentConnectionHeartbeat[] = [];
-	private heartbeats: AgentConnectionHeartbeat[] = [];
 	private heartbeatRefreshPromise: Promise<void> | undefined;
 	private heartbeatRefreshRequested = false;
 	private heartbeatManager: HeartbeatManagerComponent | undefined;
 	private heartbeatManagerHandle: OverlayHandle | undefined;
 	private heartbeatManagerRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+	private heartbeatManagerRefreshAt: number | undefined;
 
 	// Registry of images pasted this session, keyed by the `[image #N]` marker
 	// shown to the user. Insertion-ordered; the bytes persist (bounded by
@@ -1017,12 +1081,11 @@ export class InteractiveMode {
 	private retryCountdown: CountdownTimer | undefined = undefined;
 	private traceUploadAllAbortController: AbortController | undefined = undefined;
 
-	// Session-owned queued messages mirrored from connection events.
-	private connectionQueue: AgentConnectionQueueState = { steering: [], followUp: [] };
 	private readonly queueSelection = new QueueSelection();
 	private isApplyingQueueSelectionText = false;
 	private queueMutationChain: Promise<void> = Promise.resolve();
 	private pendingQueueEdit: symbol | undefined;
+	private pendingQueueMove = false;
 
 	private shutdownRequested = false;
 
@@ -1605,7 +1668,7 @@ export class InteractiveMode {
 			// The agents view owns these for daemon sessions. When there is no agents view,
 			// show them once at the top of a fresh session, but never append them under a
 			// restored conversation where they read as disconnected clutter.
-			if (!ownsGlobalStartupNotices || this.sessionHasMessages) {
+			if (!ownsGlobalStartupNotices || !this.isNewChat()) {
 				return;
 			}
 
@@ -2505,25 +2568,11 @@ export class InteractiveMode {
 		}
 	}
 
-	private async refreshConnectionQueue(): Promise<void> {
-		this.replaceConnectionQueue(await this.agentConnection.getQueue());
-	}
-
-	private replaceConnectionQueue(queue: AgentConnectionQueueState): void {
-		this.connectionQueue = {
-			steering: [...queue.steering],
-			followUp: [...queue.followUp],
+	private getConnectionQueue(): AgentConnectionQueueState {
+		return {
+			steering: [...(this.connectionState?.sessionActions.steering ?? [])],
+			followUp: [...(this.connectionState?.sessionActions.followUps ?? [])],
 		};
-		const dropped = this.queueSelection.sync(this.connectionQueue);
-		if (dropped !== undefined) {
-			const editorText = this.editor.getText();
-			if (editorText === dropped) {
-				this.setEditorTextFromQueueSelection(this.queueSelection.reset());
-			} else if (!this.pendingQueueEdit) {
-				this.queueSelection.replaceDraft(editorText);
-			}
-		}
-		this.updatePendingMessagesDisplay();
 	}
 
 	private async refreshConnectionCatalog(): Promise<void> {
@@ -2565,32 +2614,19 @@ export class InteractiveMode {
 
 	private applyHeartbeatCatalog(heartbeats: AgentConnectionHeartbeat[]): void {
 		this.heartbeatCatalog = heartbeats;
-		this.updateScopedHeartbeats();
-	}
-
-	private updateScopedHeartbeats(): void {
-		const heartbeats = scopeHeartbeatsToSession(
-			this.heartbeatCatalog,
-			this.connectionState,
-			this.subagentSnapshots.values(),
-		);
-		if (
-			heartbeats.length === this.heartbeats.length &&
-			heartbeats.every((heartbeat, index) => heartbeat === this.heartbeats[index])
-		) {
-			return;
-		}
-		this.heartbeats = heartbeats;
-		this.heartbeatManager?.setHeartbeats(heartbeats);
 		this.scheduleHeartbeatManagerRefresh();
 		this.updateSubagentSummaryLine();
 		this.ui.requestRender();
 	}
 
+	private getScopedHeartbeats(): AgentConnectionHeartbeat[] {
+		return scopeHeartbeatsToSession(this.heartbeatCatalog, this.connectionState, this.subagentSnapshots.values());
+	}
+
 	private applyConnectionStateSnapshot(state: AgentConnectionState): void {
 		this.bindPromptStashSession(state.sessionId);
 		this.connectionState = state;
-		this.updateScopedHeartbeats();
+		this.scheduleHeartbeatManagerRefresh();
 		// Don't touch contextUsageTokenBaseline: a mid-stream snapshot reflects only completed
 		// turns (the in-flight message isn't persisted yet), so the in-flight delta must keep
 		// accumulating. The baseline is managed at turn end (refreshConnectionContextUsage) and
@@ -2647,19 +2683,42 @@ export class InteractiveMode {
 		this.patchConnectionState({ contextUsage: stats.contextUsage });
 	}
 
+	private refreshQueueSelectionFromState(): void {
+		const selected = this.queueSelection.selected;
+		if (selected && !this.pendingQueueEdit && !this.pendingQueueMove) {
+			this.refreshQueueSelectionAt(this.getConnectionQueue(), selected, selected.index);
+		}
+	}
+
 	private updateConnectionStateFromEvent(event: AgentConnectionSessionEvent): void {
 		if (!this.connectionState) {
 			return;
 		}
 		switch (event.type) {
-			case "agent_start":
+			case "agent_start": {
+				const wasNewChat = this.isNewChat();
 				this.patchConnectionState({ isStreaming: true, activeToolNames: [] });
+				if (wasNewChat) {
+					this.builtInHeader?.invalidate();
+					this.subagentSummaryLine.invalidate();
+				}
 				break;
+			}
+			case "message_end": {
+				const wasNewChat = this.isNewChat();
+				this.patchConnectionState({ messageCount: this.connectionState.messageCount + 1 });
+				if (wasNewChat) {
+					this.builtInHeader?.invalidate();
+					this.subagentSummaryLine.invalidate();
+				}
+				break;
+			}
 			case "agent_end":
 				this.patchConnectionState({ isStreaming: false, activeToolNames: [] });
 				break;
 			case "session_action_update":
 				this.patchConnectionState({ sessionActions: event.actions });
+				this.refreshQueueSelectionFromState();
 				break;
 			case "compaction_start":
 				this.patchConnectionState({ isCompacting: true });
@@ -2787,6 +2846,8 @@ export class InteractiveMode {
 	private async rebindCurrentSession(): Promise<void> {
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
+		void this.rosterBar?.dispose();
+		this.rosterBar = undefined;
 		if (this.localSessionHost) {
 			this.uiServices = this.localSessionHost.createUiServices();
 		}
@@ -2801,7 +2862,12 @@ export class InteractiveMode {
 			this.showLoadedResources({ force: false, showDiagnosticsWhenQuiet: true });
 		}
 		this.subscribeToAgent();
-		await Promise.all([this.refreshConnectionQueue(), this.refreshHeartbeatCatalog().catch(() => undefined)]);
+		await this.subscribeToRosterBar();
+		// A session_action_update in the unsubscribed gap above is lost; re-sync the queue post-subscription.
+		this.patchConnectionState({ sessionActions: (await this.agentConnection.getState()).sessionActions });
+		this.refreshQueueSelectionFromState();
+		this.updatePendingMessagesDisplay();
+		await this.refreshHeartbeatCatalog().catch(() => undefined);
 		await this.updateAvailableProviderCount();
 		this.updateEditorBorderColor();
 		this.updateTerminalTitle();
@@ -2824,8 +2890,8 @@ export class InteractiveMode {
 		this.shortcutGuideContainer.clear();
 		this.pendingMessagesContainer.clear();
 		this.queuedMessagesContainer.clear();
-		this.connectionQueue = { steering: [], followUp: [] };
 		this.pendingQueueEdit = undefined;
+		this.pendingQueueMove = false;
 		// The selection and its stashed draft belong to the previous session;
 		// every editor draft is cleared below, so discard rather than restore.
 		this.queueSelection.reset();
@@ -2883,9 +2949,7 @@ export class InteractiveMode {
 		await this.sessionEventQueue;
 		this.resetCurrentSessionRenderState();
 		await this.renderInitialMessages();
-		// The session transition and transcript are already authoritative here;
-		// a transient queue read must not turn a successful switch into a fatal error.
-		await this.refreshConnectionQueue().catch(() => undefined);
+		this.updatePendingMessagesDisplay();
 		this.syncWorkingLoader();
 	}
 
@@ -2901,6 +2965,7 @@ export class InteractiveMode {
 	private async renderResyncedSession(snapshot: AgentConnectionSnapshot): Promise<void> {
 		const bashFinished = this.isBashRunning() && !snapshot.state.isBashRunning;
 		this.applyConnectionStateSnapshot(snapshot.state);
+		this.refreshQueueSelectionFromState();
 		this.restoreTurnStartFromMessages(this.getSessionContextFromConnectionSnapshot(snapshot).messages);
 		this.streamingComponent = undefined;
 		this.streamingMessage = undefined;
@@ -2911,7 +2976,7 @@ export class InteractiveMode {
 			updateFooter: true,
 		});
 		await this.restoreStreamingMessageFromSnapshot(snapshot.streamingMessage);
-		await this.refreshConnectionQueue();
+		this.updatePendingMessagesDisplay();
 		if (bashFinished) {
 			if (this.activeBashComponent) {
 				this.activeBashComponent.setComplete(undefined, false);
@@ -4415,7 +4480,8 @@ export class InteractiveMode {
 		for (const entry of this.editor.getHistory?.() ?? []) {
 			add(entry);
 		}
-		for (const msg of [...this.connectionQueue.steering, ...this.connectionQueue.followUp]) {
+		const queue = this.getConnectionQueue();
+		for (const msg of [...queue.steering, ...queue.followUp]) {
 			add(msg);
 		}
 		return ids;
@@ -5072,6 +5138,19 @@ export class InteractiveMode {
 		};
 	}
 
+	private async subscribeToRosterBar(): Promise<void> {
+		if (!this.agentConnection.subscribeAgentRoster) return;
+		try {
+			this.rosterBar = await this.agentConnection.subscribeAgentRoster(() => {
+				this.updateSubagentSummaryLine();
+				this.ui.requestRender();
+			});
+		} catch {
+			this.rosterBar = undefined;
+		}
+		this.updateSubagentSummaryLine();
+	}
+
 	private subscribeToAgent(): void {
 		this.unsubscribe = this.agentConnection.subscribe(async (event) => {
 			try {
@@ -5326,7 +5405,6 @@ export class InteractiveMode {
 		}
 		if (event.type === "message_start" && (event.message.role === "user" || isAgentSessionMessage(event.message))) {
 			this.contextUsageTokenBaseline = 0;
-			this.setSessionHasMessages(true);
 			this.clearShortcutGuide();
 			this.agentRunFileChanges.clear();
 			this.renderRecap();
@@ -5358,10 +5436,7 @@ export class InteractiveMode {
 				break;
 
 			case "session_action_update": {
-				this.replaceConnectionQueue({
-					steering: [...event.actions.steering],
-					followUp: [...event.actions.followUps],
-				});
+				this.updatePendingMessagesDisplay();
 				this.ui.requestRender();
 				break;
 			}
@@ -5500,7 +5575,7 @@ export class InteractiveMode {
 			case "message_update":
 				if (event.message.role === "assistant") {
 					this.streamingMessage = event.message;
-					this.ensureAssistantStreamingComponent(event.message).updateContent(this.streamingMessage);
+					this.ensureAssistantStreamingComponent(event.message).updateContent(this.streamingMessage, true);
 
 					for (const content of this.streamingMessage.content) {
 						if (content.type === "toolCall") {
@@ -5528,7 +5603,7 @@ export class InteractiveMode {
 								: `Operation aborted${elapsedSuffix}`;
 						this.streamingMessage.errorMessage = errorMessage;
 					}
-					this.ensureAssistantStreamingComponent(event.message).updateContent(this.streamingMessage);
+					this.ensureAssistantStreamingComponent(event.message).updateContent(this.streamingMessage, false);
 
 					if (this.streamingMessage.stopReason === "aborted" || this.streamingMessage.stopReason === "error") {
 						if (!errorMessage) {
@@ -5615,7 +5690,7 @@ export class InteractiveMode {
 				this.syncWorkingLoader();
 				if (this.streamingComponent) {
 					if (this.streamingMessage) {
-						this.streamingComponent.updateContent(this.streamingMessage);
+						this.streamingComponent.updateContent(this.streamingMessage, false);
 					} else {
 						this.chatContainer.removeChild(this.streamingComponent);
 					}
@@ -5753,11 +5828,12 @@ export class InteractiveMode {
 				precededByToolActivity:
 					this.chatContainer.children.at(-1) instanceof ToolExecutionComponent ||
 					this.chatContainer.children.at(-1) instanceof AgentMessageComponent,
+				mermaidTransform: this.mermaidMarkdownTransform,
 			},
 		);
 		this.streamingMessage = message;
 		this.chatContainer.addChild(this.streamingComponent);
-		this.streamingComponent.updateContent(this.streamingMessage);
+		this.streamingComponent.updateContent(this.streamingMessage, true);
 	}
 
 	private ensureAssistantStreamingComponent(message: AssistantMessage): AssistantMessageComponent {
@@ -5923,6 +5999,7 @@ export class InteractiveMode {
 	}
 
 	private updateSubagentSummary(child: AgentConnectionRlmChildAgentSnapshot): void {
+		// "cancelled" also covers never-bound terminal runs; AgentSession owns that rule.
 		if (child.status === "cancelled") {
 			this.removeSubagentSnapshot(child.id);
 		} else {
@@ -5933,7 +6010,7 @@ export class InteractiveMode {
 	}
 
 	private refreshSubagentSummary(): void {
-		this.updateScopedHeartbeats();
+		this.scheduleHeartbeatManagerRefresh();
 		this.updateSubagentSummaryLine();
 		this.updateWorkingPulse();
 		this.syncWorkingLoader();
@@ -5942,13 +6019,19 @@ export class InteractiveMode {
 	}
 
 	private updateSubagentSummaryLine(): void {
-		const activeHeartbeatSessionIds = new Set(
-			this.heartbeatCatalog
-				.filter((heartbeat) => heartbeat.job.status === "active")
-				.map((heartbeat) => heartbeat.job.activeSessionId),
-		);
+		const rosterSummaries = this.rosterBar?.summaries();
+		// A client-owned session has no row on the public roster; only then do the
+		// snapshots carry the bar. A public parent with zero roster children shows zero.
+		const sessionOnRoster =
+			rosterSummaries?.some((row) => row.sessionId === this.connectionState?.sessionId) === true;
 		this.subagentSummaryLine.setSubagentCounts(
-			countDirectSubagentStatuses(this.subagentSnapshots.values(), this.rlmNodeId, activeHeartbeatSessionIds),
+			rosterSummaries && sessionOnRoster
+				? countRosterSubagentStatuses(rosterSummaries, {
+						activeSessionId: this.connectionState?.activeSessionId,
+						sessionId: this.connectionState?.sessionId,
+						sessionFile: this.connectionState?.sessionFile,
+					})
+				: countDirectSubagentStatuses(this.subagentSnapshots.values(), this.rlmNodeId),
 		);
 		if (!this.subagentSummaryLine.isSelectable() && this.subagentSummaryLine.focused) this.focusEditor();
 	}
@@ -5964,7 +6047,7 @@ export class InteractiveMode {
 		this.subagentSnapshots.clear();
 		this.rlmNodeId = undefined;
 		this.updateSubagentSummaryLine();
-		this.updateScopedHeartbeats();
+		this.scheduleHeartbeatManagerRefresh();
 		// Clearing snapshots can drop the last running subagent; reconcile the
 		// pulse and loader so neither lingers when nothing is in flight.
 		this.updateWorkingPulse();
@@ -6045,16 +6128,7 @@ export class InteractiveMode {
 	}
 
 	private isNewChat(): boolean {
-		return !this.sessionHasMessages;
-	}
-
-	private setSessionHasMessages(hasMessages: boolean): void {
-		if (this.sessionHasMessages === hasMessages) {
-			return;
-		}
-		this.sessionHasMessages = hasMessages;
-		this.builtInHeader?.invalidate();
-		this.subagentSummaryLine.invalidate();
+		return (this.connectionState?.messageCount ?? 0) === 0 && this.connectionState?.isStreaming !== true;
 	}
 
 	private getModelTrayLabel(): string {
@@ -6094,11 +6168,12 @@ export class InteractiveMode {
 	}
 
 	private getTrayHeartbeatLabel(): string | undefined {
-		if (this.heartbeats.length === 0) {
+		const heartbeats = this.getScopedHeartbeats();
+		if (heartbeats.length === 0) {
 			return undefined;
 		}
-		const paused = this.heartbeats.filter((heartbeat) => heartbeat.job.status === "paused").length;
-		const count = `${this.heartbeats.length} heartbeat${this.heartbeats.length === 1 ? "" : "s"}`;
+		const paused = heartbeats.filter((heartbeat) => heartbeat.job.status === "paused").length;
+		const count = `${heartbeats.length} heartbeat${heartbeats.length === 1 ? "" : "s"}`;
 		const pausedLabel = paused ? ` · ${paused} paused` : "";
 		const shortcut = keyText("app.heartbeats.open");
 		return `${count}${pausedLabel}${shortcut ? ` (${shortcut})` : ""}`;
@@ -6401,6 +6476,7 @@ export class InteractiveMode {
 						precededByToolActivity:
 							this.chatContainer.children.at(-1) instanceof ToolExecutionComponent ||
 							this.chatContainer.children.at(-1) instanceof AgentMessageComponent,
+						mermaidTransform: this.mermaidMarkdownTransform,
 					},
 				);
 				this.chatContainer.addChild(assistantComponent);
@@ -6574,7 +6650,6 @@ export class InteractiveMode {
 		const streamingMessage = snapshot.streamingMessage;
 		this.rlmNodeId = snapshot.parent?.childId;
 		this.seedSubagentSummary(snapshot.children);
-		this.setSessionHasMessages(context.messages.length > 0);
 		this.applyConnectionStateSnapshot(state);
 		this.restoreTurnStartFromMessages(context.messages);
 		await this.renderSessionContext(context, {
@@ -6985,9 +7060,20 @@ export class InteractiveMode {
 		}
 	}
 
+	private refreshQueueSelectionAt(
+		queue: AgentConnectionQueueState,
+		selected: QueueSelectionItem,
+		index: number,
+	): void {
+		const dropped = this.queueSelection.refreshAt(queue, selected.lane, index, selected.text);
+		if (dropped !== undefined && this.editor.getText() === selected.text) {
+			this.setEditorTextFromQueueSelection(dropped);
+		}
+	}
+
 	private browseQueueSelection(direction: -1 | 1): void {
-		if (this.pendingQueueEdit) return;
-		const text = this.queueSelection.move(this.connectionQueue, this.editor.getText(), direction);
+		if (this.pendingQueueEdit || this.pendingQueueMove) return;
+		const text = this.queueSelection.move(this.getConnectionQueue(), this.editor.getText(), direction);
 		if (text === undefined) return;
 		this.setEditorTextFromQueueSelection(text);
 		this.ui.requestRender();
@@ -7004,50 +7090,54 @@ export class InteractiveMode {
 	}
 
 	private moveQueueSelection(direction: -1 | 1): void {
-		if (this.pendingQueueEdit) return;
-		const submittedSelection = this.queueSelection.selected;
-		if (!submittedSelection) return;
+		if (this.pendingQueueEdit || !this.queueSelection.selected) return;
 		const sessionGeneration = this.sessionEventGeneration;
 		void this.enqueueQueueMutation(async () => {
 			if (sessionGeneration !== this.sessionEventGeneration) return;
-			const lane = this.connectionQueue[submittedSelection.lane];
-			const resolvedIndex =
-				lane[submittedSelection.index] === submittedSelection.text
-					? submittedSelection.index
-					: lane.indexOf(submittedSelection.text);
-			if (resolvedIndex < 0) {
-				this.showStatus("Queue changed; reorder not applied");
-				return;
-			}
-			const selected = { ...submittedSelection, index: resolvedIndex };
-			const queueBefore = this.connectionQueue;
-			const status = await this.agentConnection.mutateQueuedMessage(selected.lane, selected.index, selected.text, {
-				type: "move",
-				direction,
-			});
-			if (sessionGeneration !== this.sessionEventGeneration) return;
-			if (status === "applied") {
-				// The queue event for this mutation can land before or after the
-				// response. Patch the mirror only when no event has replaced it
-				// meanwhile (events always assign a fresh object); patching an
-				// already-updated mirror would apply the mutation twice.
-				const lane = this.connectionQueue[selected.lane];
-				const target = selected.index + direction;
-				if (
-					this.connectionQueue === queueBefore &&
-					lane[selected.index] === selected.text &&
-					target >= 0 &&
-					target < lane.length
-				) {
-					[lane[selected.index], lane[target]] = [lane[target] as string, selected.text];
-					this.queueSelection.sync(this.connectionQueue);
-					this.updatePendingMessagesDisplay();
-					this.ui.requestRender();
+			const selected = this.queueSelection.selected;
+			if (!selected) return;
+			this.pendingQueueMove = true;
+			const actionsBefore = this.connectionState?.sessionActions;
+			try {
+				const status = await this.agentConnection.mutateQueuedMessage(
+					selected.lane,
+					selected.index,
+					selected.text,
+					{
+						type: "move",
+						direction,
+					},
+				);
+				if (sessionGeneration !== this.sessionEventGeneration) return;
+				await this.sessionEventQueue;
+				if (sessionGeneration !== this.sessionEventGeneration) return;
+				// The move's event can land after the response; mirror it locally (events assign a fresh sessionActions).
+				if (status === "applied" && actionsBefore && this.connectionState?.sessionActions === actionsBefore) {
+					const queue = this.getConnectionQueue();
+					const lane = queue[selected.lane];
+					const target = selected.index + direction;
+					if (lane[selected.index] === selected.text && target >= 0 && target < lane.length) {
+						[lane[selected.index], lane[target]] = [lane[target] as string, selected.text];
+						this.patchConnectionState({
+							sessionActions: { ...actionsBefore, steering: queue.steering, followUps: queue.followUp },
+						});
+						this.updatePendingMessagesDisplay();
+					}
 				}
-			} else if (status === "unsupported") this.showStatus("Queue editing requires a newer daemon");
-			else this.showStatus("Queue changed; reorder not applied");
+				this.refreshQueueSelectionAt(
+					this.getConnectionQueue(),
+					selected,
+					status === "applied" ? selected.index + direction : selected.index,
+				);
+				if (status === "applied") this.ui.requestRender();
+				else if (status === "unsupported") this.showStatus("Queue editing requires a newer daemon");
+				else this.showStatus("Queue changed; reorder not applied");
+			} finally {
+				this.pendingQueueMove = false;
+			}
 		}).catch((error) => {
 			if (sessionGeneration === this.sessionEventGeneration) {
+				this.refreshQueueSelectionFromState();
 				this.showError(error instanceof Error ? error.message : String(error));
 			}
 		});
@@ -7059,9 +7149,7 @@ export class InteractiveMode {
 	 * Empty text deletes; otherwise replaces, moving the item to `targetLane`.
 	 */
 	private applyQueueSelection(text: string, targetLane: "steering" | "followUp"): Promise<boolean> {
-		if (this.pendingQueueEdit) return Promise.resolve(false);
-		const submittedSelection = this.queueSelection.selected;
-		if (!submittedSelection) return Promise.resolve(false);
+		if (this.pendingQueueEdit || !this.queueSelection.selected) return Promise.resolve(false);
 		const pendingQueueEdit = Symbol("pending-queue-edit");
 		this.pendingQueueEdit = pendingQueueEdit;
 		const sessionGeneration = this.sessionEventGeneration;
@@ -7091,68 +7179,40 @@ export class InteractiveMode {
 		};
 		return this.enqueueQueueMutation(async () => {
 			if (discardStaleSelection()) return true;
-			// Earlier serialized moves may have changed the selected item's index.
-			const lane = this.connectionQueue[submittedSelection.lane];
-			const resolvedIndex =
-				lane[submittedSelection.index] === submittedSelection.text
-					? submittedSelection.index
-					: lane.indexOf(submittedSelection.text);
-			if (resolvedIndex < 0) {
-				this.queueSelection.sync(this.connectionQueue);
-				const editorUntouched =
-					submissionGeneration === this.inputSubmissionGeneration && this.editor.getText() === editorTextBefore;
-				if (editorUntouched) {
-					this.setEditorTextFromQueueSelection(text);
-				}
-				this.queueSelection.replaceDraft(editorUntouched ? text : this.editor.getText());
-				this.showStatus("Queue changed; edit kept in the editor");
-				this.updatePendingMessagesDisplay();
-				this.ui.requestRender();
-				return true;
-			}
-			const selected = { ...submittedSelection, index: resolvedIndex };
-			const queueBefore = this.connectionQueue;
+			const selected = this.queueSelection.selected;
 			let status: AgentConnectionQueuedMessageMutationStatus;
-			try {
-				status = await this.agentConnection.mutateQueuedMessage(
-					selected.lane,
-					selected.index,
-					selected.text,
-					mutation,
-				);
-			} catch (error) {
-				if (discardStaleSelection()) return true;
-				// The editor was already cleared by Enter; restore the edit before surfacing the error.
-				const editorUntouched =
-					submissionGeneration === this.inputSubmissionGeneration && this.editor.getText() === editorTextBefore;
-				if (editorUntouched) {
-					this.setEditorTextFromQueueSelection(text);
+			if (selected) {
+				try {
+					status = await this.agentConnection.mutateQueuedMessage(
+						selected.lane,
+						selected.index,
+						selected.text,
+						mutation,
+					);
+				} catch (error) {
+					if (discardStaleSelection()) return true;
+					// The editor was already cleared by Enter; restore the edit before surfacing the error.
+					const editorUntouched =
+						submissionGeneration === this.inputSubmissionGeneration && this.editor.getText() === editorTextBefore;
+					if (editorUntouched) {
+						this.setEditorTextFromQueueSelection(text);
+					}
+					if (!this.queueSelection.isBrowsing) {
+						this.queueSelection.replaceDraft(editorUntouched ? text : this.editor.getText());
+					}
+					throw error;
 				}
-				if (!this.queueSelection.isBrowsing) {
-					this.queueSelection.replaceDraft(editorUntouched ? text : this.editor.getText());
-				}
-				throw error;
+			} else {
+				status = "rejected";
 			}
 			if (discardStaleSelection()) return true;
 			const editorUntouched =
 				submissionGeneration === this.inputSubmissionGeneration && this.editor.getText() === editorTextBefore;
 			if (status === "applied") {
-				// Same optimistic patch as moveQueueSelection, and the same guard:
-				// skip when a queue event already replaced the mirror.
-				const lane = this.connectionQueue[selected.lane];
-				if (this.connectionQueue === queueBefore && lane[selected.index] === selected.text) {
-					if (!trimmed) lane.splice(selected.index, 1);
-					else if (targetLane === selected.lane) lane[selected.index] = trimmed;
-					else {
-						lane.splice(selected.index, 1);
-						this.connectionQueue[targetLane].push(trimmed);
-					}
-				}
 				if (trimmed) this.editor.addToHistory?.(trimmed);
 				const draft = this.queueSelection.reset();
 				if (editorUntouched) this.setEditorTextFromQueueSelection(draft);
 			} else {
-				this.queueSelection.sync(this.connectionQueue);
 				// Enter submissions clear the editor before onSubmit runs; restore the
 				// edit so a failed mutation never swallows it.
 				if (editorUntouched) this.setEditorTextFromQueueSelection(text);
@@ -7168,7 +7228,11 @@ export class InteractiveMode {
 			this.ui.requestRender();
 			return true;
 		}).finally(() => {
-			if (this.pendingQueueEdit === pendingQueueEdit) this.pendingQueueEdit = undefined;
+			if (this.pendingQueueEdit === pendingQueueEdit) {
+				this.pendingQueueEdit = undefined;
+				// Queue events were not reconciled while the edit was pending; drop a now-stale selection.
+				this.refreshQueueSelectionFromState();
+			}
 		});
 	}
 
@@ -7425,10 +7489,7 @@ export class InteractiveMode {
 	}
 
 	private getAllQueuedMessages(): { steering: string[]; followUp: string[] } {
-		return {
-			steering: [...this.connectionQueue.steering],
-			followUp: [...this.connectionQueue.followUp],
-		};
+		return this.getConnectionQueue();
 	}
 
 	private updatePendingMessagesDisplay(): void {
@@ -7523,6 +7584,7 @@ export class InteractiveMode {
 					currentTheme: this.settingsManager.getTheme() || "prime",
 					availableThemes: getAvailableThemes(),
 					hideThinkingBlock: this.hideThinkingBlock,
+					mermaidRenderingMode: this.settingsManager.getMermaidRenderingMode(),
 					treeFilterMode: this.settingsManager.getTreeFilterMode(),
 					showHardwareCursor: this.settingsManager.getShowHardwareCursor(),
 					editorPaddingX: this.settingsManager.getEditorPaddingX(),
@@ -7621,6 +7683,11 @@ export class InteractiveMode {
 						void this.rebuildChatFromMessages().catch((error) => {
 							this.showError(error instanceof Error ? error.message : String(error));
 						});
+					},
+					onMermaidRenderingModeChange: (mode) => {
+						this.settingsManager.setMermaidRenderingMode(mode);
+						this.chatContainer.invalidate();
+						this.ui.requestRender();
 					},
 					onQuietStartupChange: (enabled) => {
 						this.settingsManager.setQuietStartup(enabled);
@@ -7775,7 +7842,10 @@ export class InteractiveMode {
 	private applyConnectionModelCatalog(catalog: AgentConnectionModelCatalog): void {
 		this.connectionModelCatalog = [...catalog.models];
 		this.connectionConfiguredProviders = new Set(catalog.configuredProviders);
-		this.connectionModels = catalog.models.filter((model) => this.connectionConfiguredProviders.has(model.provider));
+	}
+
+	private getAvailableConnectionModels(): AgentConnectionModel[] {
+		return this.connectionModelCatalog.filter((model) => this.connectionConfiguredProviders.has(model.provider));
 	}
 
 	private async getConnectionAvailableModels(): Promise<AgentConnectionModel[]> {
@@ -7787,11 +7857,11 @@ export class InteractiveMode {
 		const version = this.connectionModelsRefreshVersion;
 		const promise = this.agentConnection.getModelCatalog().then((catalog) => {
 			if (version !== this.connectionModelsRefreshVersion) {
-				return [...this.connectionModels];
+				return this.getAvailableConnectionModels();
 			}
 			this.applyConnectionModelCatalog(catalog);
 			this.connectionModelsFetchedAt = Date.now();
-			return [...this.connectionModels];
+			return this.getAvailableConnectionModels();
 		});
 		this.connectionModelsRefreshInFlight = { version, promise };
 
@@ -7842,7 +7912,6 @@ export class InteractiveMode {
 	}
 
 	private invalidateConnectionModels(): void {
-		this.connectionModels = [];
 		this.connectionConfiguredProviders = new Set();
 		this.connectionModelsFetchedAt = 0;
 		this.invalidateConnectionModelRefresh();
@@ -8789,7 +8858,28 @@ export class InteractiveMode {
 					);
 				}
 			}
-			const relaunchResult = spawnSync(process.execPath, [...process.execArgv, entrypoint, ...relaunchArgs], {
+			const relaunch = createCliSubprocessLaunchSpec(relaunchArgs);
+			const updateProcess = process as NodeJS.Process & { execve?: UpdateRelaunchExecve };
+			try {
+				if (
+					tryExecUpdateRelaunch(relaunch, {
+						platform: process.platform,
+						nodeVersion: process.versions.node,
+						cwd: updateCwd,
+						previousCwd: process.cwd(),
+						environment: process.env,
+						chdir: (directory) => process.chdir(directory),
+						execve: updateProcess.execve,
+					})
+				) {
+					return;
+				}
+			} catch (error: unknown) {
+				console.error(
+					`Could not replace the current ${APP_NAME} process (${error instanceof Error ? error.message : String(error)}). Falling back to a child relaunch.`,
+				);
+			}
+			const relaunchResult = spawnSync(relaunch.command, relaunch.args, {
 				stdio: "inherit",
 				cwd: updateCwd,
 				env: process.env,
@@ -9008,7 +9098,7 @@ export class InteractiveMode {
 	private async handleShareCommand(): Promise<void> {
 		// Check if gh is available and logged in
 		try {
-			const authResult = spawnSync("gh", ["auth", "status"], { encoding: "utf-8" });
+			const authResult = spawnSyncHidden("gh", ["auth", "status"], { encoding: "utf-8" });
 			if (authResult.status !== 0) {
 				this.showError("GitHub CLI is not logged in. Run 'gh auth login' first.");
 				return;
@@ -9047,7 +9137,7 @@ export class InteractiveMode {
 		};
 
 		// Create a secret gist asynchronously
-		let proc: ReturnType<typeof spawn> | null = null;
+		let proc: ReturnType<typeof spawnHidden> | null = null;
 
 		loader.onAbort = () => {
 			proc?.kill();
@@ -9057,7 +9147,7 @@ export class InteractiveMode {
 
 		try {
 			const result = await new Promise<{ stdout: string; stderr: string; code: number | null }>((resolve) => {
-				proc = spawn("gh", ["gist", "create", "--public=false", tmpFile]);
+				proc = spawnHidden("gh", ["gist", "create", "--public=false", tmpFile]);
 				let stdout = "";
 				let stderr = "";
 				proc.stdout?.on("data", (data) => {
@@ -9258,6 +9348,8 @@ export class InteractiveMode {
 				return `Trace uploaded (${result.bytesStored.toLocaleString()} bytes).`;
 			case "disabled":
 				return "Trace sharing is disabled.";
+			case "unchanged":
+				return "Trace is already uploaded; no new content since the last upload.";
 			case "missing_credentials":
 				return "Trace sharing needs a Prime API key. Run /traces login.";
 			case "no_session_file":
@@ -9588,7 +9680,8 @@ export class InteractiveMode {
 			this.showError(error instanceof Error ? error.message : String(error));
 			return;
 		}
-		const manager = new HeartbeatManagerComponent(this.heartbeats, {
+		const manager = new HeartbeatManagerComponent({
+			getHeartbeats: () => this.getScopedHeartbeats(),
 			getRows: () => this.ui.terminal.rows,
 			onAction: (heartbeat, action) => this.manageHeartbeat(heartbeat, action),
 			onClose: () => this.closeHeartbeatManager(),
@@ -9603,10 +9696,7 @@ export class InteractiveMode {
 	}
 
 	private closeHeartbeatManager(): void {
-		if (this.heartbeatManagerRefreshTimer) {
-			clearTimeout(this.heartbeatManagerRefreshTimer);
-			this.heartbeatManagerRefreshTimer = undefined;
-		}
+		this.clearHeartbeatManagerRefreshTimer();
 		this.heartbeatManagerHandle?.hide();
 		this.heartbeatManagerHandle = undefined;
 		this.heartbeatManager = undefined;
@@ -9614,31 +9704,51 @@ export class InteractiveMode {
 	}
 
 	private scheduleHeartbeatManagerRefresh(): void {
-		if (this.heartbeatManagerRefreshTimer) {
-			clearTimeout(this.heartbeatManagerRefreshTimer);
-			this.heartbeatManagerRefreshTimer = undefined;
-		}
 		if (!this.heartbeatManager) {
+			this.clearHeartbeatManagerRefreshTimer();
 			return;
 		}
-		const nextRunAt = this.heartbeats
+		const nextRunAt = this.getScopedHeartbeats()
 			.filter((heartbeat) => heartbeat.job.status === "active" && heartbeat.job.nextRunAt)
 			.map((heartbeat) => Date.parse(heartbeat.job.nextRunAt!))
 			.filter(Number.isFinite)
 			.sort((left, right) => left - right)[0];
 		if (nextRunAt === undefined) {
+			this.clearHeartbeatManagerRefreshTimer();
 			return;
 		}
 		const untilNextRun = nextRunAt - Date.now();
 		const delay = untilNextRun > 0 ? Math.min(60_000, untilNextRun + 250) : 5_000;
+		const refreshAt = Date.now() + delay;
+		// Subagent snapshots re-derive this schedule constantly; keep an earlier
+		// pending refresh instead of re-arming, or an overdue heartbeat's 5s
+		// fallback would be postponed for as long as children stay busy.
+		if (
+			this.heartbeatManagerRefreshTimer &&
+			this.heartbeatManagerRefreshAt !== undefined &&
+			this.heartbeatManagerRefreshAt <= refreshAt
+		) {
+			return;
+		}
+		this.clearHeartbeatManagerRefreshTimer();
+		this.heartbeatManagerRefreshAt = refreshAt;
 		this.heartbeatManagerRefreshTimer = setTimeout(() => {
 			this.heartbeatManagerRefreshTimer = undefined;
+			this.heartbeatManagerRefreshAt = undefined;
 			if (!this.heartbeatManager) {
 				return;
 			}
 			void this.refreshHeartbeatCatalog().catch(() => this.scheduleHeartbeatManagerRefresh());
 		}, delay);
 		this.heartbeatManagerRefreshTimer.unref?.();
+	}
+
+	private clearHeartbeatManagerRefreshTimer(): void {
+		if (this.heartbeatManagerRefreshTimer) {
+			clearTimeout(this.heartbeatManagerRefreshTimer);
+			this.heartbeatManagerRefreshTimer = undefined;
+		}
+		this.heartbeatManagerRefreshAt = undefined;
 	}
 
 	private async manageHeartbeat(
@@ -10023,6 +10133,8 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}${shor
 		if (this.unsubscribe) {
 			this.unsubscribe();
 		}
+		void this.rosterBar?.dispose();
+		this.rosterBar = undefined;
 		if (this.isInitialized) {
 			this.ui.stop({
 				preserveAltScreen: options.preserveAltScreen,

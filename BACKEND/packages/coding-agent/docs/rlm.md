@@ -1,6 +1,6 @@
 # RLM Programming Model
 
-Prime Agent is built around a recursive language model (RLM) runtime: the model works inside a persistent Python control environment and composes capabilities as code. Provider calls, session persistence, child lifecycles, scheduling, and safety policy remain in the TypeScript host; IPython is the model-facing programming surface.
+Prime Agent is built around a recursive language model (RLM) runtime: the model works inside a persistent Python control environment and composes capabilities as code. Provider calls, session persistence, child lifecycles, scheduling, and safety policy remain in the TypeScript host; the Python REPL is the model-facing programming surface.
 
 ## RLM Loop
 
@@ -8,14 +8,14 @@ Prime Agent is built around a recursive language model (RLM) runtime: the model 
 flowchart LR
     task["Task + working context"]
     parent["Parent model"]
-    kernel["Persistent IPython kernel"]
+    kernel["Persistent Python kernel"]
     data["Files · data · shell commands"]
     skills["Python-backed skills"]
     children["rlm(...) child agents"]
     answer["Answer or next turn"]
 
     task --> parent
-    parent -->|"IPython call"| kernel
+    parent -->|"Python call"| kernel
     kernel <-->|"inspect · search · transform"| data
     kernel <-->|"call functions"| skills
     kernel -->|"spawn focused work"| children
@@ -41,14 +41,25 @@ config_files = list(Path(".").rglob("*.toml"))
 large_files = [path for path in config_files if path.stat().st_size > 10_000]
 ```
 
-Run a project's normal commands through its own environment from an IPython cell:
+Run a project's normal commands through its own environment with `bash()`:
 
-```bash
-%%bash
-npm run check
+```python
+result = await bash("npm run check")
+print(result.output)
 ```
 
-Each `%%bash` cell is a temporary subshell, while Python state and `%cd` changes persist in the kernel. Prime Agent extensions may intentionally add custom tools, but the built-in RLM design does not require a separate model tool for every capability.
+For a long command, keep the live handle and let the turn end instead of blocking:
+
+```python
+checks = bash("npm test")
+checks.pid
+```
+
+When an unawaited handle's process group finishes, Prime Agent sends a Shell message with its PID and foreground exit code. A busy agent receives it as steering at the next safe turn boundary, without interrupting a running tool. An idle agent resumes to handle it. `await handle` and `handle.poll()` still return the foreground result before shell background jobs finish. The kernel stays resident until the process group is reaped, including for handles awaited in their creating cell. The message asks the agent to inspect the saved handle with `poll()`, `output()`, or `tail()` and continue the task. `await bash(...)` stays synchronous from the agent's perspective and does not send a second Shell message.
+
+Awaiting the original handle in its creating cell suppresses the Shell message, even after the command finishes. If an `asyncio.as_completed` wrapper task finishes before the cell starts consuming its result, that cached-result read does not mark the handle as awaited. A Shell message can still arrive. Await the original handle in the creating cell to suppress it.
+
+Each `bash()` call is its own process, while Python state, `os.chdir(...)`, and `os.environ[...]` changes persist in the kernel and apply to later `bash()` calls. Prime Agent extensions may intentionally add custom tools, but the built-in RLM design does not require a separate model tool for every capability.
 
 ### 2. Subagents are native RLM calls
 
@@ -140,6 +151,6 @@ This keeps credentials, provider execution, transcript writes, worker routing, a
 
 ## Trust Model
 
-The IPython kernel runs model-generated Python and project commands with the worker's operating-system permissions. It is a durable control environment, not a security sandbox. Review third-party Python skills and use an external sandbox or restricted environment for untrusted repositories and instructions.
+The Python kernel runs model-generated Python and project commands with the worker's operating-system permissions. It is a durable control environment, not a security sandbox. Review third-party Python skills and use an external sandbox or restricted environment for untrusted repositories and instructions.
 
 For implementation details, see [RLM Runtime Architecture](rlm-runtime.md).
