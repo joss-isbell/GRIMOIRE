@@ -106,27 +106,6 @@ To disable all built-in skills, set `enableBuiltinSkills` to `false` in `setting
 }
 ```
 
-### Using Skills from Other Harnesses
-
-To use skills from Claude Code or OpenAI Codex, add their directories to settings:
-
-```json
-{
-  "skills": [
-    "~/.claude/skills",
-    "~/.codex/skills"
-  ]
-}
-```
-
-For project-level Claude Code skills, add to `.prime/agent/settings.json`:
-
-```json
-{
-  "skills": ["../.claude/skills"]
-}
-```
-
 ## How Skills Work
 
 1. At startup, Prime Agent scans skill locations and extracts names, descriptions, type, and file locations

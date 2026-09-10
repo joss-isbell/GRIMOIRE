@@ -69,7 +69,7 @@
 ## [0.3.2] - 2026-07-20
 
 - Added Kimi K3 to the Prime Inference and OpenRouter model catalogs with multimodal input and mandatory max reasoning.
-- Fixed prompt caching and retention-aware cache-cost estimates for Anthropic models routed through Prime Inference ([ENG-4723](https://linear.app/primeintellect/issue/ENG-4723)).
+- Fixed prompt caching and retention-aware cache-cost estimates for Anthropic models routed through Prime Inference.
 
 ## [0.3.1] - 2026-07-15
 
@@ -108,7 +108,7 @@
 
 ## [0.2.3] - 2026-06-30
 
-- Added a `./mcp` entry point with a built-in MCP server catalog (Linear, Notion) and generic OAuth 2.1 (PKCE + dynamic client registration) providers stored as `mcp:<server>` in `auth.json`; the local OAuth callback server tries a range of ports so a stale or concurrent login can't block sign-in ([#280](https://github.com/PrimeIntellect-ai/prime-agent/issues/280)).
+- Added a `./mcp` entry point with a built-in MCP server catalog and generic OAuth 2.1 (PKCE + dynamic client registration) providers stored as `mcp:<server>` in `auth.json`; the local OAuth callback server tries a range of ports so a stale or concurrent login can't block sign-in ([#280](https://github.com/PrimeIntellect-ai/prime-agent/issues/280)).
 - Added the `qwen/qwen3-30b-a3b-instruct-2507` model to the Prime Inference catalog ([#284](https://github.com/PrimeIntellect-ai/prime-agent/issues/284)).
 
 ## [0.2.2] - 2026-06-25

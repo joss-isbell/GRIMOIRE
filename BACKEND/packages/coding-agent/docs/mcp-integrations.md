@@ -1,6 +1,6 @@
 # MCP Integrations
 
-Connect external services (Linear, Notion, …) to Prime Agent over the
+Connect external services (Notion, …) to Prime Agent over the
 [Model Context Protocol](https://modelcontextprotocol.io).
 
 Consistent with Prime Agent's single-tool design, MCP integrations are **not**
@@ -8,8 +8,8 @@ exposed as new agent tools. Each integration is a [Python-backed skill](skills.m
 that the model imports and calls from the Python kernel:
 
 ```python
-import linear
-issues = await linear.list_issues(team="Engineering")
+import notion
+result = await notion.call_tool("notion-search", {"query": "roadmap"})
 ```
 
 The MCP connection runs inside the kernel via the official `mcp` Python SDK. The
@@ -30,7 +30,7 @@ credentials in `auth.json`.
 
 ## Using a built-in integration
 
-Built-in integrations (Linear, Notion) ship **disabled**. Logging in enables them:
+Built-in integrations ship **disabled**. Logging in enables them:
 
 - Open `/login`, switch to **MCP Connections**, pick the integration, and
   complete OAuth in the browser. `/mcp login <name>` does the same from the TUI command line.
@@ -49,17 +49,19 @@ The tool set is defined by the **server**, not the skill, so discover before you
 call — don't assume tool names or arguments:
 
 ```python
-import linear
+import notion
 
 # 1. Discover available tools
-for tool in await linear.list_tools():
+tools = await notion.list_tools()
+for tool in tools:
     print(tool["name"], "-", tool["description"])
 
-# 2. Inspect a tool's argument schema
-help(linear.list_issues)        # populated once list_tools() has run
+# 2. Inspect the selected tool's argument schema
+tool = next(tool for tool in tools if tool["name"] == "notion-search")
+print(tool["inputSchema"])
 
-# 3. Call it; keyword args match the tool's JSON Schema
-result = await linear.list_issues(team="Engineering")
+# 3. Call it; the arguments match the tool's JSON Schema
+result = await notion.call_tool("notion-search", {"query": "roadmap"})
 ```
 
 - Every tool is an `async` method — always `await`.
@@ -90,12 +92,12 @@ are environment-variable references. Project `.prime/agent/settings.json` MCP
 entries are ignored for execution, so a repository cannot start a local process
 or shadow a user server.
 
-Built-in integration names (`linear`, `notion`, ...) are reserved: `mcp add`
+Built-in integration names (`notion`, ...) are reserved: `mcp add`
 rejects them, and a hand-edited `mcpServers` entry with such a name disables the
 built-in skill instead of reconfiguring it. Earlier releases documented a
 catalog-name override (custom `url` plus `bearerTokenEnvVar` under a built-in
 name); that override no longer works — rename the entry (for example
-`linear-proxy`) to reach a custom endpoint through the generic runtime.
+`notion-proxy`) to reach a custom endpoint through the generic runtime.
 
 Advanced runtime options may still be written directly
 to the user settings file:
@@ -145,8 +147,8 @@ by that kernel. Configuration changes replace the connection on the next call;
 calls have separate bounded timeouts, and kernel shutdown closes HTTP sessions
 and terminates stdio children.
 
-Authored Linear and Notion skills remain available as optional typed wrappers.
-They use the same existing login and credential behavior.
+The authored Notion skill remains available as an optional typed wrapper.
+It uses the same existing login and credential behavior.
 
 ## Authored wrapper API
 
@@ -158,7 +160,7 @@ use the pre-imported `mcp` API above.
 
 ## Enable-by-login lifecycle
 
-This auth-gating applies to the **built-in** integrations (Linear, Notion):
+This auth-gating applies to the **built-in** integrations:
 
 1. The built-in skill ships installed but **disabled** — excluded from the prompt
    and not imported into the kernel — because no credentials exist.

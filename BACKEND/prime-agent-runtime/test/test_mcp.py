@@ -294,7 +294,7 @@ class McpRegistryTest(unittest.TestCase):
             "credentialSource": "acp",
         }
         with mock.patch.object(mcp, "_read_auth", side_effect=AssertionError("auth.json must not be read")):
-            headers = run(mcp._headers("linear", config))
+            headers = run(mcp._headers("task", config))
         self.assertEqual(headers, {"Authorization": "Bearer task-token"})
 
     def test_acp_config_skips_oauth_identity_and_refresh(self):
@@ -309,7 +309,7 @@ class McpRegistryTest(unittest.TestCase):
         with mock.patch.object(mcp, "host_request", host_request), mock.patch.object(
             mcp, "_auth_identity", side_effect=AssertionError("ACP must not resolve host credentials")
         ):
-            config = run(mcp._config("linear"))
+            config = run(mcp._config("task"))
         self.assertNotIn("_authIdentity", config)
 
     def test_acp_stdio_env_uses_literal_values_without_ambient_secrets(self):

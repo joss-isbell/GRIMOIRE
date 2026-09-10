@@ -5,8 +5,8 @@ declares the MCP ``server`` it targets, and is imported in the kernel like any
 other skill. Tools are auto-discovered from the server and bound as async
 methods, so the agent writes ordinary Python:
 
-    import linear
-    issues = await linear.list_issues(team="Engineering")
+    import notion
+    results = await notion.call_tool("notion-search", {"query": "roadmap"})
 
 Credentials live in the host's ``auth.json`` (single store, survives kernel
 rebuilds). This module reads that file directly for the common case; on token

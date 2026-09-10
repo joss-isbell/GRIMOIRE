@@ -117,7 +117,7 @@
 - Workers bind their identity to a fresh per-process instance id, enforced only when the authenticating supervisor presents one, so a downgraded supervisor can still adopt live workers.
 - Fixed daemon startup and recovery to preserve slow live processes and fail closed after socket lock loss.
 - Recovery never signals a live worker process it cannot verify as its own: a persistently failing live worker parks as failed with its process left running (reclaimed automatically by the next fresh create once its identity is verified or it exits). The one deliberate exception is replacing an authenticated pre-roster worker during adoption. A live worker that stays silent through ten probe rounds (~2.5 minutes) also parks as failed instead of probing forever.
-- Reduced kernel memory spikes during namespace snapshots: the payload now pickles straight into the staged file instead of building serialized copies in memory (peak snapshot overhead ~3.9x payload -> ~1x; ENG-5819).
+- Reduced kernel memory spikes during namespace snapshots: the payload now pickles straight into the staged file instead of building serialized copies in memory (peak snapshot overhead ~3.9x payload -> ~1x).
 - Fixed empty draft sessions lingering as zombie rows after the last viewer quit: a direct-transport client's detach or socket drop now triggers the same last-detach eviction as supervisor-routed clients.
 - Stopped re-emitting `rlm_child_update` events whose child snapshot did not change; identical per-token progress updates no longer reach attached clients.
 - Fixed `/update` keeping the old TUI process alive until the relaunched TUI quit by replacing the process in place on POSIX platforms running Node 26.1 and newer; Windows and IBM i keep the previous child relaunch.
@@ -143,7 +143,7 @@
 - Fixed first IPython calls after an upgrade failing with a raw "Operation was not possible or timed out": kernel startup now tolerates cold venv boots (30s budget; crashes still fail fast via the exit handler), and zmq socket-teardown rejections surface as actionable retriable kernel errors.
 - Fixed headless completion reporting a clean finish when a post-compaction continuation failed to start: ACP and print-mode idle waiters now see the failure, while interactive idle behavior is unchanged.
 - Added a pre-imported generic MCP API and shell/TUI commands to manage persistent Streamable HTTP and stdio servers in user settings.
-- **Breaking**: removed the documented catalog-name override — an `mcpServers` entry named after a built-in integration (e.g. `linear`) no longer repoints the built-in at a custom `url`/`bearerTokenEnvVar`; it now disables the built-in skill and is not served by the generic runtime. Rename the entry (e.g. `linear-proxy`) to keep using a custom endpoint via the generic API. This closes a credential-replay surface where name-keyed tokens could be sent to an override URL.
+- **Breaking**: removed the documented catalog-name override — an `mcpServers` entry named after a built-in integration (e.g. `notion`) no longer repoints the built-in at a custom `url`/`bearerTokenEnvVar`; it now disables the built-in skill and is not served by the generic runtime. Rename the entry (e.g. `notion-proxy`) to keep using a custom endpoint via the generic API. This closes a credential-replay surface where name-keyed tokens could be sent to an override URL.
 - Fixed agents overlooking enabled generic MCP connections by advertising their names and pre-imported `mcp` API usage in the system prompt.
 - Fixed `/mcp` management feedback disappearing during resource reload and limited server details in TUI output to names and transports.
 - Fixed credentials configured as env var names resolving to the literal variable name when the variable is set but empty; an empty env var now reports a missing credential ([#1468](https://github.com/PrimeIntellect-ai/prime-agent/discussions/1468)).
@@ -202,16 +202,16 @@
 
 ## [0.7.2] - 2026-08-11
 
-- Fixed Down Arrow focusing the Agents View entry before moving a nonempty prompt cursor to the end ([ENG-5147](https://linear.app/primeintellect/issue/ENG-5147/keep-down-arrow-in-the-prompt-until-the-cursor-reaches-the-end)).
+- Fixed Down Arrow focusing the Agents View entry before moving a nonempty prompt cursor to the end.
 - Added `app.messages.expand` (`ctrl+p`) to collapse or expand agent-to-agent messages separately from `ctrl+o` tool output.
 - Added a `ctrl+t` expand hint to collapsed thinking blocks, matching the tool output hint.
 - Changed expand/collapse hints to a consistent bracketed `(Ctrl+O to expand)` style across tool, message, summary, and error rows.
 - Added a configurable copy action to login dialogs so raw sign-in URLs can be copied without selecting wrapped text ([#643](https://github.com/PrimeIntellect-ai/prime-agent/issues/643)).
-- Added privacy-safe pseudonymous product analytics for onboarding, command use, execution modes, run outcomes, TTFT, latency, usage, tools, retries, and compactions, with disclosure and opt-out controls ([ENG-4682](https://linear.app/primeintellect/issue/ENG-4682/add-privacy-safe-posthog-analytics-to-prime-agent)).
+- Added privacy-safe pseudonymous product analytics for onboarding, command use, execution modes, run outcomes, TTFT, latency, usage, tools, retries, and compactions, with disclosure and opt-out controls.
 - Changed sent agent messages in the IPython cell UI to show only the message text with a `╰─` gutter when expanded, matching received messages, and hid the raw `agent_message.send` receipt dictionary.
 - Fixed Homebrew installs attempting to self-update their versioned Cellar keg instead of directing users to `brew upgrade prime-agent` ([#844](https://github.com/PrimeIntellect-ai/prime-agent/issues/844))
-- Fixed the agents view collapsing expanded subagent lists when returning from an opened agent ([ENG-5105](https://linear.app/primeintellect/issue/ENG-5105/keep-the-agents-view-state-persistent)).
-- Kept the subagent summary row visible and selectable while its list is expanded in the agents view, so pressing enter on it collapses the list again ([ENG-5105](https://linear.app/primeintellect/issue/ENG-5105/keep-the-agents-view-state-persistent)).
+- Fixed the agents view collapsing expanded subagent lists when returning from an opened agent.
+- Kept the subagent summary row visible and selectable while its list is expanded in the agents view, so pressing enter on it collapses the list again.
 - Added in-place editing of queued steering and follow-up messages: Alt+Up/Alt+Down browse the queue from the draft, Enter applies the edit as steering, Alt+Enter as a follow-up, and submitting an empty editor deletes the item; interrupts now preserve the queue ([#838](https://github.com/PrimeIntellect-ai/prime-agent/pull/838)).
 - Fixed workers with no live connection reporting as `ready`; stopping workers now report a `stopping` state, are hidden from live sessions, and no longer receive daemon-wide commands ([#850](https://github.com/PrimeIntellect-ai/prime-agent/pull/850)).
 - Fixed timed-out worker stops stranding dead-but-registered workers ("Session worker is not connected"); stops now finalize in the background once the process exits, and zombie processes are no longer counted as alive ([#851](https://github.com/PrimeIntellect-ai/prime-agent/pull/851)).
@@ -347,7 +347,7 @@
 ## [0.3.3] - 2026-07-23
 
 - Removed the bundled orchestration heartbeat skill from the model system prompt.
-- Fixed feature hints crowding queued messages and side questions by placing them below the recap and hiding them while messages are queued ([ENG-4741](https://linear.app/primeintellect/issue/ENG-4741/recap-queuefollow-upmessage-hint-looks-cluttered)).
+- Fixed feature hints crowding queued messages and side questions by placing them below the recap and hiding them while messages are queued.
 - Fixed `/btw` truncating long answers by rendering side questions in the scrollable transcript.
 - Changed recognized slash commands to retain accent coloring after submission in live, replayed, and queued TUI surfaces while preserving Markdown arguments.
 - Unified prompt, steering, follow-up, and session-command scheduling under session-owned admission with durable queue state and coordinated update/restart checkpoints.
@@ -368,63 +368,63 @@
 
 ## [0.3.2] - 2026-07-20
 
-- Fixed invalid `--resume` session IDs being submitted as prompts, with nearest-session guidance instead ([ENG-4722](https://linear.app/primeintellect/issue/ENG-4722/prime-agent-resume-accepts-incorrect-session-ids)).
-- Changed `/model` to show all public models with authenticated providers first and open provider authentication when an unavailable model is selected ([ENG-4575](https://linear.app/primeintellect/issue/ENG-4575/show-all-models-in-model-and-prompt-auth-on-selection)).
+- Fixed invalid `--resume` session IDs being submitted as prompts, with nearest-session guidance instead.
+- Changed `/model` to show all public models with authenticated providers first and open provider authentication when an unavailable model is selected.
 - Changed the shared configuration menu to cycle tabs with Tab, use Shift+Tab for model scope, show an Escape close hint, preserve arrow-key search editing, and remove the model selector's provider shortcut.
 - Fixed searchable selectors retaining their previous scroll position after the query changed.
-- Changed interactive, print, JSON, RPC, piped-stdin, and no-session clients to use the same daemon-owned runtime while preserving their existing commands, output protocols, and lifecycle behavior ([ENG-4685](https://linear.app/primeintellect/issue/ENG-4685)).
-- Added RPC controls for schedules, heartbeats, agent messaging, and live session observation ([ENG-4685](https://linear.app/primeintellect/issue/ENG-4685)).
-- Fixed daemon-backed headless startup, rollback routing, RPC wire compatibility, and duplicate client runtime preparation ([ENG-4685](https://linear.app/primeintellect/issue/ENG-4685)).
+- Changed interactive, print, JSON, RPC, piped-stdin, and no-session clients to use the same daemon-owned runtime while preserving their existing commands, output protocols, and lifecycle behavior.
+- Added RPC controls for schedules, heartbeats, agent messaging, and live session observation.
+- Fixed daemon-backed headless startup, rollback routing, RPC wire compatibility, and duplicate client runtime preparation.
 - Fixed heartbeat-owning subagents appearing completed, showing completion checkmarks below the prompt, being omitted from active subagent counts, or remaining visible after deletion.
 - Fixed the heartbeat tray and manager showing heartbeats from unrelated sessions.
 - Fixed daemon backpressure triggering redundant catch-up snapshots for events already queued by the socket.
 - Added dedicated stable and beta installers, with stable advancing on version bumps and beta advancing on every commit to `main`.
-- Fixed incompatible daemon builds crashing startup or respawning after shutdown, with capability negotiation, verified provenance, and convergent force shutdown ([ENG-4687](https://linear.app/primeintellect/issue/ENG-4687/make-daemon-version-mismatches-self-healing)).
+- Fixed incompatible daemon builds crashing startup or respawning after shutdown, with capability negotiation, verified provenance, and convergent force shutdown.
 - Changed tool-result and announcement images to show compact metadata instead of terminal graphics ([#437](https://github.com/PrimeIntellect-ai/prime-agent/pull/437) by [@snimu](https://github.com/snimu)).
-- Changed top-level CLI help to show concise common options and commands without loading runtime resources ([ENG-4688](https://linear.app/primeintellect/issue/ENG-4688/help-command-is-obscenely-verbose)).
-- Fixed completed subagents cancelling their RLM heartbeats before the first run ([ENG-4652](https://linear.app/primeintellect/issue/ENG-4652/subagent-heartbeats-dont-work)).
-- Changed the fullscreen follow shortcut from `Alt+Down` to `Ctrl+Shift+Down` for more reliable terminal input ([ENG-4684](https://linear.app/primeintellect/issue/ENG-4684/altdown-doesnt-work)).
-- Added user-requested model selection for subagents with bounded account-authorized discovery and explicit parent-model fallback warnings ([ENG-4649](https://linear.app/primeintellect/issue/ENG-4649/allow-subagents-to-use-a-different-model-than-the-parent-agent)).
-- Added subtle feature hints to longer-running agent turns ([ENG-4521](https://linear.app/primeintellect/issue/ENG-4521/add-subtle-hints-for-new-prime-agent-features)).
-- Fixed active heartbeats not resuming after Prime Agent updates ([ENG-4657](https://linear.app/primeintellect/issue/ENG-4657/heartbeats-dont-survive-updatesdaemon-reboots)).
-- Fixed the Agents View reordering sessions whenever prompts or heartbeats updated their activity timestamps ([ENG-4650](https://linear.app/primeintellect/issue/ENG-4650/agents-view-shifts-session-list-constantly)).
+- Changed top-level CLI help to show concise common options and commands without loading runtime resources.
+- Fixed completed subagents cancelling their RLM heartbeats before the first run.
+- Changed the fullscreen follow shortcut from `Alt+Down` to `Ctrl+Shift+Down` for more reliable terminal input.
+- Added user-requested model selection for subagents with bounded account-authorized discovery and explicit parent-model fallback warnings.
+- Added subtle feature hints to longer-running agent turns.
+- Fixed active heartbeats not resuming after Prime Agent updates.
+- Fixed the Agents View reordering sessions whenever prompts or heartbeats updated their activity timestamps.
 - Added parent-scoped subagent lifecycle APIs: create children with readable default or orchestrator-chosen names, recover running or completed children through `rlm.list_subagents()`, continue them through agent messaging, and close/remove them with `rlm.delete_subagent()`.
-- Changed shell commands to use discoverable agent, schedule, package, model, session, update, doctor, and full-shutdown verbs without exposing the background daemon hierarchy ([ENG-4538](https://linear.app/primeintellect/issue/ENG-4538/standardize-bash-command-conventions-and-improve-command-discovery)).
-- Fixed unsupported Node versions crashing before startup by requiring Node 22.8.0 or newer and showing upgrade guidance before loading the CLI ([ENG-4260](https://linear.app/primeintellect/issue/ENG-4260/incorrect-node-version-breaks-first-launch)).
+- Changed shell commands to use discoverable agent, schedule, package, model, session, update, doctor, and full-shutdown verbs without exposing the background daemon hierarchy.
+- Fixed unsupported Node versions crashing before startup by requiring Node 22.8.0 or newer and showing upgrade guidance before loading the CLI.
 - Added `@` file-path autocomplete to new-agent and reply prompts in the Agents View.
 - Fixed slow daemon clients becoming stuck when newer session snapshots arrived during catch-up.
-- Fixed queued messages getting stranded when an agent turn ended ([ENG-4653](https://linear.app/primeintellect/issue/ENG-4653/queued-messages-can-get-stuck-with-heartbeats)).
+- Fixed queued messages getting stranded when an agent turn ended.
 - Changed `/traces upload-all` to pace requests within the platform rate limit, honor bounded `Retry-After` responses, and support interruption.
-- Fixed resuming a daemon-resident session to attach the requesting client to its existing worker without disturbing other clients ([ENG-4656](https://linear.app/primeintellect/issue/ENG-4656/resuming-prime-agent-sessions-should-attach)).
-- Fixed daemon-owned updates terminating their updater before the daemon restart and session restore completed ([ENG-4606](https://linear.app/primeintellect/issue/ENG-4606/benign-error-on-prime-agent-update)).
-- Fixed first-launch Prime login and kept onboarding visible between team and model selection ([ENG-4658](https://linear.app/primeintellect/issue/ENG-4658/fix-onboarding-login-enter-key-and-model-selector-flicker)).
-- Fixed active heartbeat sessions appearing under Needs Input or Completed instead of a dedicated Heartbeats section ([ENG-4654](https://linear.app/primeintellect/issue/ENG-4654/categorize-heartbeat-sessions-as-working)).
-- Fixed stashed prompts being lost when leaving and reopening a session from the Agents View ([ENG-4659](https://linear.app/primeintellect/issue/ENG-4659/stashed-prompts-should-persist)).
-- Added a combined heartbeat indicator and manager for pausing, resuming, or stopping user and agent heartbeats ([ENG-4536](https://linear.app/primeintellect/issue/ENG-4536/add-heartbeat-observability-and-management-ui)).
+- Fixed resuming a daemon-resident session to attach the requesting client to its existing worker without disturbing other clients.
+- Fixed daemon-owned updates terminating their updater before the daemon restart and session restore completed.
+- Fixed first-launch Prime login and kept onboarding visible between team and model selection.
+- Fixed active heartbeat sessions appearing under Needs Input or Completed instead of a dedicated Heartbeats section.
+- Fixed stashed prompts being lost when leaving and reopening a session from the Agents View.
+- Added a combined heartbeat indicator and manager for pausing, resuming, or stopping user and agent heartbeats.
 
 ## [0.3.1] - 2026-07-15
 
-- Added `/fast` for OpenAI Fast mode on supported ChatGPT models ([ENG-4620](https://linear.app/primeintellect/issue/ENG-4620/add-support-for-gpt-fast-mode-maybe-fast)).
+- Added `/fast` for OpenAI Fast mode on supported ChatGPT models.
 - Changed wrapped diff rows to use a blank hanging gutter.
-- Fixed team-gated Prime Inference routes being missing from model selectors by merging the authenticated team catalog during model refresh ([ENG-4645](https://linear.app/primeintellect/issue/ENG-4645/internalglm-52-fast-isnt-working)).
-- Added confirmation when fullscreen text selection copies to the clipboard ([ENG-4644](https://linear.app/primeintellect/issue/ENG-4644/copy-issues)).
+- Fixed team-gated Prime Inference routes being missing from model selectors by merging the authenticated team catalog during model refresh.
+- Added confirmation when fullscreen text selection copies to the clipboard.
 - Added an agent-run edit total above the recap.
 - Changed edit tool calls to always show full diffs while keeping IPython source collapsed until Ctrl+O expands it.
-- Changed tool expansion hints to appear only on the latest tool row instead of every tool call ([ENG-4583](https://linear.app/primeintellect/issue/ENG-4583/too-many-ctrlo-alerts)).
+- Changed tool expansion hints to appear only on the latest tool row instead of every tool call.
 - Changed IPython kernels to set `NO_COLOR=1`, preventing ANSI color escapes from inflating `%%bash` output.
-- Fixed update restarts starting concurrent daemon supervisors or unlinking a replacement supervisor's socket ([ENG-4600](https://linear.app/primeintellect/issue/ENG-4600/prevent-concurrent-daemon-supervisors-after-update-restart)).
-- Fixed worker recovery races and made daemon shutdown-all converge across hidden supervisors ([ENG-4603](https://linear.app/primeintellect/issue/ENG-4603/serialize-worker-recovery-and-make-shutdown-all-converge)).
-- Changed provider, model, and MCP setup to use one tabbed configuration menu ([ENG-4539](https://linear.app/primeintellect/issue/ENG-4539/unify-providers-models-and-mcp-connections-menu)).
-- Changed the shared configuration menu to show prominent, responsive tabs with configurable navigation shortcuts ([ENG-4534](https://linear.app/primeintellect/issue/ENG-4534/make-login-tabs-more-obvious)).
-- Fixed IPython edit diffs replacing syntax highlighting with a single foreground color ([ENG-4616](https://linear.app/primeintellect/issue/ENG-4616/syntax-highlighting-is-overridden-in-diff-view)).
-- Fixed Prime Inference login leaving new sessions without a persisted model selection ([ENG-4573](https://linear.app/primeintellect/issue/ENG-4573/prompt-for-model-selection-after-prime-inference-login)).
+- Fixed update restarts starting concurrent daemon supervisors or unlinking a replacement supervisor's socket.
+- Fixed worker recovery races and made daemon shutdown-all converge across hidden supervisors.
+- Changed provider, model, and MCP setup to use one tabbed configuration menu.
+- Changed the shared configuration menu to show prominent, responsive tabs with configurable navigation shortcuts.
+- Fixed IPython edit diffs replacing syntax highlighting with a single foreground color.
+- Fixed Prime Inference login leaving new sessions without a persisted model selection.
 - Fixed empty prompt placeholders hiding the input caret.
 - Fixed automatic model selection preferring other configured providers over Prime Inference's GLM 5.2 default.
-- Fixed missing ripgrep blocking subagents and added actionable installation guidance for the optional search helper ([ENG-4572](https://linear.app/primeintellect/issue/ENG-4572/ripgrep-not-installed)).
-- Removed the shared worker snapshot spill cache to prevent concurrent workers from deleting each other's snapshot chunks ([ENG-4601](https://linear.app/primeintellect/issue/ENG-4601/remove-shared-worker-snapshot-spill-cache-directories)).
-- Fixed narrow slash-command descriptions ending abruptly or clearing the prompt background, and added a content-sized popup above the input with the same distinct surface as `/btw` ([ENG-4542](https://linear.app/primeintellect/issue/ENG-4542/command-descriptions-are-cut-off-on-narrow-screens)).
-- Fixed snapshot transfers terminating resident workers, stranding partial readers, or rejecting identical retries ([ENG-4602](https://linear.app/primeintellect/issue/ENG-4602/make-snapshot-transfers-idempotent-and-non-fatal)).
-- Fixed the resume picker opening on an older session instead of the newest session ([ENG-4630](https://linear.app/primeintellect/issue/ENG-4630/show-latest-sessions-first-in-resume-list)).
+- Fixed missing ripgrep blocking subagents and added actionable installation guidance for the optional search helper.
+- Removed the shared worker snapshot spill cache to prevent concurrent workers from deleting each other's snapshot chunks.
+- Fixed narrow slash-command descriptions ending abruptly or clearing the prompt background, and added a content-sized popup above the input with the same distinct surface as `/btw`.
+- Fixed snapshot transfers terminating resident workers, stranding partial readers, or rejecting identical retries.
+- Fixed the resume picker opening on an older session instead of the newest session.
 - Fixed tool-only responses rendering directly against the preceding user prompt.
 
 ## [0.3.0] - 2026-07-13
@@ -436,66 +436,66 @@
 - Changed trace uploads to retry transient network and HTTP failures with bounded exponential backoff and jitter.
 - Fixed Prime Inference credential and team-header precedence to prefer `PRIME_API_KEY`, then the Prime CLI config, then `auth.json`.
 - Fixed aborted autonomous gates leaving detached process trees and supervisor recovery retaining intentionally stopped workers after stale scheduler locks.
-- Fixed supervisor replacement surfacing fatal socket errors or recovering roots that were intentionally stopped ([ENG-4526](https://linear.app/primeintellect/issue/ENG-4526/reconnect-daemon-clients-transparently-after-supervisor-replacement)).
+- Fixed supervisor replacement surfacing fatal socket errors or recovering roots that were intentionally stopped.
 - Fixed daemon catch-up snapshots being disposed mid-transfer or triggering resets that cleared drafts, local queues, dialogs, active UI state, or in-flight reasoning traces.
 - Fixed compact daemon streams occasionally duplicating the first token of an assistant response.
 - Fixed subagent prompts and usage counters flickering or disappearing during daemon resyncs and large parallel runs, and added compact fixed-width recap rows.
-- Fixed stale heartbeat jobs reopening sessions after they were archived, deleted, explicitly shut down, concurrently terminated, or lost resident worker ownership ([ENG-4519](https://linear.app/primeintellect/issue/ENG-4519/heartbeats-rebirth-sessions-that-were-previously-killed)).
-- Fixed heartbeat starvation by moving durable schedules into per-session artifacts and running them concurrently in their owning resident workers, independent of supervisor replacement ([ENG-4527](https://linear.app/primeintellect/issue/ENG-4527/dispatch-heartbeats-concurrently-across-isolated-session-workers)).
+- Fixed stale heartbeat jobs reopening sessions after they were archived, deleted, explicitly shut down, concurrently terminated, or lost resident worker ownership.
+- Fixed heartbeat starvation by moving durable schedules into per-session artifacts and running them concurrently in their owning resident workers, independent of supervisor replacement.
 
 ## [0.2.9] - 2026-07-13
 
 - Changed tool call groups to use one blank row above and below without blank rows between consecutive calls.
 - Changed the session tree to show only user messages by default.
-- Changed agent-to-agent messages to render as directional rows, with received messages expandable in chat and sent messages shown below their Python cell ([ENG-4531](https://linear.app/primeintellect/issue/ENG-4531/collapse-and-simplify-agent2agent-messages-in-chat-tui)).
-- Fixed IPython state restore notices rendering as full user messages when prompts were queued or restored ([ENG-4530](https://linear.app/primeintellect/issue/ENG-4530/collapse-ipython-state-restore-messages-in-chat-tui)).
-- Changed bare `/mcp` to open the Services menu while preserving explicit `list`, `login`, and `logout` subcommands ([ENG-4535](https://linear.app/primeintellect/issue/ENG-4535/open-services-mcp-menu-from-mcp)).
-- Added `/btw` and `/side` for one-turn inline side questions that use the current context without changing the main session ([ENG-4509](https://linear.app/primeintellect/issue/ENG-4509/add-btw-and-side-side-question-flows)).
+- Changed agent-to-agent messages to render as directional rows, with received messages expandable in chat and sent messages shown below their Python cell.
+- Fixed IPython state restore notices rendering as full user messages when prompts were queued or restored.
+- Changed bare `/mcp` to open the Services menu while preserving explicit `list`, `login`, and `logout` subcommands.
+- Added `/btw` and `/side` for one-turn inline side questions that use the current context without changing the main session.
 - Changed scheduled heartbeat prompts to steer (interrupt the current turn) by default, with a `steer`/`follow_up` delivery mode selectable via `/heartbeat --steer|--follow-up` and the `rlm_heartbeat` skill's `delivery_mode` argument.
 - Changed the new-chat splash to show only version, model, and cwd metadata and rotate among five example prompts.
 - Fixed self-updates losing restored daemon sessions to a socket cleanup race and leaving open session or agents-view windows disconnected.
 - Changed daemon connection errors to report the failed operation, session identity, recovery steps, socket, and diagnostic log instead of raw protocol reasons.
 - Changed the Agents View and new-chat splashes to keep one blank row above the butterfly.
 - Fixed Agents View retrying after an intentional daemon shutdown instead of stopping with restart guidance.
-- Fixed stale heartbeat jobs reopening archived, deleted, or concurrently terminated sessions ([ENG-4519](https://linear.app/primeintellect/issue/ENG-4519/heartbeats-rebirth-sessions-that-were-previously-killed)).
-- Fixed onboarding blocking normal TUI use by reopening login or model selection after startup ([ENG-4537](https://linear.app/primeintellect/issue/ENG-4537/stop-onboarding-from-gating-normal-tui-use)).
-- Fixed IPython Bash cells with leading blank lines being labeled and previewed as Python ([ENG-4529](https://linear.app/primeintellect/issue/ENG-4529/leading-newline-before-percentpercentbash-names-tool-call-as-python)).
-- Fixed recap layout shifts by keeping the previous recap visible until its replacement arrives ([ENG-4533](https://linear.app/primeintellect/issue/ENG-4533/reserve-space-for-recap-to-prevent-layout-shift)).
+- Fixed stale heartbeat jobs reopening archived, deleted, or concurrently terminated sessions.
+- Fixed onboarding blocking normal TUI use by reopening login or model selection after startup.
+- Fixed IPython Bash cells with leading blank lines being labeled and previewed as Python.
+- Fixed recap layout shifts by keeping the previous recap visible until its replacement arrives.
 - Changed the new-chat tray to hide shortcut guidance while typing and keep the `agents` link visible.
 
 ## [0.2.8] - 2026-07-09
 
 - Added built-in Herdr integration that reports agent lifecycle state to Herdr panes automatically, without requiring `herdr integration install pi`.
-- Changed Escape to interrupt active work with a visible abort notice, double Escape to open the session tree from an empty prompt or clear an idle draft, and `?` to show shortcuts ([ENG-4489](https://linear.app/primeintellect/issue/ENG-4489/rewire-prime-agent-shortcuts-to-match-claude-code-flow)).
-- Changed new-chat guidance to show concise shell, command, file, and shortcut hints, with Agents View first and `? for shortcuts` after the model and effort ([ENG-4489](https://linear.app/primeintellect/issue/ENG-4489/rewire-prime-agent-shortcuts-to-match-claude-code-flow)).
-- Changed `?` shortcut help to appear as a temporary compact panel below the transcript, while `/hotkeys` shows the full reference without Ctrl+Z ([ENG-4489](https://linear.app/primeintellect/issue/ENG-4489/rewire-prime-agent-shortcuts-to-match-claude-code-flow)).
-- Fixed Escape repeats around autocomplete, queued draft restoration, whitespace-only drafts, and active background work ([ENG-4489](https://linear.app/primeintellect/issue/ENG-4489/rewire-prime-agent-shortcuts-to-match-claude-code-flow)).
-- Fixed the agents-view splash shifting when opening an agent session ([ENG-4517](https://linear.app/primeintellect/issue/ENG-4517)).
+- Changed Escape to interrupt active work with a visible abort notice, double Escape to open the session tree from an empty prompt or clear an idle draft, and `?` to show shortcuts.
+- Changed new-chat guidance to show concise shell, command, file, and shortcut hints, with Agents View first and `? for shortcuts` after the model and effort.
+- Changed `?` shortcut help to appear as a temporary compact panel below the transcript, while `/hotkeys` shows the full reference without Ctrl+Z.
+- Fixed Escape repeats around autocomplete, queued draft restoration, whitespace-only drafts, and active background work.
+- Fixed the agents-view splash shifting when opening an agent session.
 - Changed `/model` to sort featured flagship models above a provider's long tail (with a numeric-aware alphabetical tiebreak), so the full Prime Inference catalog doesn't flood the picker.
 - Fixed selector prompts and choices filling their background through the terminal's right edge.
 - Changed automatic harness refinement to be enabled by default while keeping `autoRefine.enabled: false` as the opt-out.
 - Fixed non-numeric `autoRefine.turnInterval` and `autoRefine.cooldownMs` settings falling back to defaults instead of silently enabling a noisy auto-refine loop.
-- Fixed all session-resume entry points to share a searchable full-screen picker, stream results while loading, and support renaming ([ENG-4513](https://linear.app/primeintellect/issue/ENG-4513/resume-in-agents-view-is-broken)).
+- Fixed all session-resume entry points to share a searchable full-screen picker, stream results while loading, and support renaming.
 
 ## [0.2.7] - 2026-07-08
 
 - Changed subagent and refinement guidance to favor non-blocking subagent tasks by default, use disk-backed tracking for long-running fan-out, inspect or message live subagents when agent observation/messaging skills are available, and capture reusable delegation roles, procedures, facts, preferences, and prompt addendums with `/refine`.
 - Changed `attach_image` to resize and compress large inline image attachments before storing them for rendering and replay ([#340](https://github.com/PrimeIntellect-ai/prime-agent/pull/340) by [@sethkarten](https://github.com/sethkarten)).
-- Fixed heartbeat and goal continuation prompts rendering like ordinary user messages ([ENG-4482](https://linear.app/primeintellect/issue/ENG-4482/heartbeat-message-should-have-a-different-ui-from-user-message)).
-- Fixed `/heartbeat` guidance to show `stop` and the `every <duration> <instruction>` interval syntax ([ENG-4484](https://linear.app/primeintellect/issue/ENG-4484/improve-heartbeat-command-syntax-guidance-in-ui)).
-- Fixed Ctrl+C canceling the active turn, bash command, and IPython kernel execution deterministically, with a compact recovery prompt and model-visible reset notice when an interrupted IPython cell keeps running ([ENG-4490](https://linear.app/primeintellect/issue/ENG-4490)).
-- Fixed login dialogs in fullscreen so sign-in URLs can be selected natively ([ENG-4480](https://linear.app/primeintellect/issue/ENG-4480/new-fullscreen-tui-makes-it-impossible-to-copy-login-url)).
-- Fixed `/model` opening and selection staying blocked on live model refreshes ([ENG-4505](https://linear.app/primeintellect/issue/ENG-4505/model-ui-is-extremely-slow)).
-- Fixed provider auth failures leaving stale credentials shown as connected in `/login` ([ENG-4491](https://linear.app/primeintellect/issue/ENG-4491/mark-provider-stale-after-repeated-401s)).
-- Fixed typing into the prompt after highlighting an inline subagent ([ENG-4494](https://linear.app/primeintellect/issue/ENG-4494/allow-typing-after-highlighting-a-subagent)).
+- Fixed heartbeat and goal continuation prompts rendering like ordinary user messages.
+- Fixed `/heartbeat` guidance to show `stop` and the `every <duration> <instruction>` interval syntax.
+- Fixed Ctrl+C canceling the active turn, bash command, and IPython kernel execution deterministically, with a compact recovery prompt and model-visible reset notice when an interrupted IPython cell keeps running.
+- Fixed login dialogs in fullscreen so sign-in URLs can be selected natively.
+- Fixed `/model` opening and selection staying blocked on live model refreshes.
+- Fixed provider auth failures leaving stale credentials shown as connected in `/login`.
+- Fixed typing into the prompt after highlighting an inline subagent.
 - Fixed session-targeted heartbeat jobs staying scheduled after sessions are killed or saved sessions are deleted ([#332](https://github.com/PrimeIntellect-ai/prime-agent/pull/332)).
 - Fixed self-updates interrupting and automatically resuming daemon sessions instead of waiting for long-running work to finish.
-- Fixed provider errors being surfaced instead of retried within the retry budget ([ENG-4503](https://linear.app/primeintellect/issue/ENG-4503/restarting-old-session-returns-empty-model-response)).
-- Fixed Agents View returning from fullscreen sessions without flashing primary scrollback ([ENG-4508](https://linear.app/primeintellect/issue/ENG-4508/fullscreen-mode-agents-view-scroll)).
+- Fixed provider errors being surfaced instead of retried within the retry budget.
+- Fixed Agents View returning from fullscreen sessions without flashing primary scrollback.
 
 ## [0.2.6] - 2026-07-06
 
-- Fixed the installer splash flickering during animation and resize by stabilizing full-screen redraws and removing misleading synthetic percentages ([ENG-4481](https://linear.app/primeintellect/issue/ENG-4481/installer-screen-is-unstable-and-flickery)).
+- Fixed the installer splash flickering during animation and resize by stabilizing full-screen redraws and removing misleading synthetic percentages.
 - Fixed Prime Inference auth syncing with Prime CLI login and team selection.
 - Fixed provider auth failures showing provider-specific `/login` commands instead of the `/login` selector.
 - Removed the legacy pi-mono `bash` and `edit` built-in tools; use IPython `%%bash` cells and the Python `edit` skill instead.
@@ -511,7 +511,7 @@
 - Added subagent delegation guidance to encourage parallel and background `rlm` calls when recursion is available ([#306](https://github.com/PrimeIntellect-ai/prime-agent/pull/306) by [@alexzhang13](https://github.com/alexzhang13)).
 - Changed fullscreen TUI rendering to be enabled by default ([#325](https://github.com/PrimeIntellect-ai/prime-agent/pull/325)).
 - Changed `--resume` to accept an optional session path or ID ([#319](https://github.com/PrimeIntellect-ai/prime-agent/pull/319)).
-- Changed the installer onboarding splash to show ordered setup phases with a percentage instead of cycling detail text ([#327](https://github.com/PrimeIntellect-ai/prime-agent/pull/327), [ENG-4376](https://linear.app/primeintellect/issue/ENG-4376/onboarding-instructions-should-be-accurate-to-whats-happening)).
+- Changed the installer onboarding splash to show ordered setup phases with a percentage instead of cycling detail text ([#327](https://github.com/PrimeIntellect-ai/prime-agent/pull/327)).
 - Changed provider stream failures to show classified diagnostics and request IDs, with structured agent logs for debugging ([#313](https://github.com/PrimeIntellect-ai/prime-agent/pull/313)).
 - Fixed daemon-hosted extensions sharing the wrong Herdr pane environment across concurrent sessions ([#303](https://github.com/PrimeIntellect-ai/prime-agent/pull/303)).
 - Fixed parallel subagent guidance failing on first use by pre-importing `asyncio` in the IPython kernel bootstrap ([#315](https://github.com/PrimeIntellect-ai/prime-agent/pull/315)).
@@ -530,7 +530,7 @@
 
 ## [0.2.3] - 2026-06-30
 
-- Added built-in Linear and Notion integrations that the agent drives from Python in the kernel (no new agent tools); each is a bundled skill that talks to the service's official MCP server and auto-discovers its tools. They ship disabled and turn on after you sign in via the Services tab in `/login` or `/mcp login`, with credentials stored in the existing `auth.json` ([#280](https://github.com/PrimeIntellect-ai/prime-agent/issues/280)).
+- Added built-in service integrations that the agent drives from Python in the kernel (no new agent tools); each is a bundled skill that talks to the service's official MCP server and auto-discovers its tools. They ship disabled and turn on after you sign in via the Services tab in `/login` or `/mcp login`, with credentials stored in the existing `auth.json` ([#280](https://github.com/PrimeIntellect-ai/prime-agent/issues/280)).
 - Added an `attach-image` skill that loads an on-disk image (PNG, JPEG, GIF, WebP) into the model's context as a viewable attachment so a vision-capable model can directly see screenshots, diagrams, charts, or scanned pages ([#274](https://github.com/PrimeIntellect-ai/prime-agent/issues/274)).
 - Changed subagents to be first-class sessions: opening a subagent now attaches to its own session and renders through the same rich chat UI as the main conversation instead of a laggy parent-rebuilt transcript, finished subagents stay viewable in the list and sort below running ones, and the detail view shows the subagent's own recap and animated working status ([#282](https://github.com/PrimeIntellect-ai/prime-agent/issues/282)).
 - Changed session lifecycle handling so the agents view now lists every live session (not only daemon-resident ones), fixing reports of sessions going missing; abandoned new chats that were never sent a message are discarded instead of lingering ([#269](https://github.com/PrimeIntellect-ai/prime-agent/issues/269)).

@@ -37,17 +37,17 @@
 ## [0.3.2] - 2026-07-20
 
 - Removed the fullscreen image fallback instruction and kept fullscreen overlays from emitting terminal graphics ([#437](https://github.com/PrimeIntellect-ai/prime-agent/pull/437) by [@snimu](https://github.com/snimu)).
-- Changed the fullscreen follow shortcut from `Alt+Down` to `Ctrl+Shift+Down` for more reliable terminal input ([ENG-4684](https://linear.app/primeintellect/issue/ENG-4684/altdown-doesnt-work)).
+- Changed the fullscreen follow shortcut from `Alt+Down` to `Ctrl+Shift+Down` for more reliable terminal input.
 - Fixed terminal width, slicing, and wrapping helpers misreading standard CSI and DCS escape sequences.
 - Fixed autocomplete popups overlapping the prompt's top edge.
 
 ## [0.3.1] - 2026-07-15
 
-- Fixed fullscreen Markdown table selections copying borders instead of tab-separated cell content ([ENG-4629](https://linear.app/primeintellect/issue/ENG-4629/respect-table-boundaries-when-selecting)).
-- Fixed fullscreen drag selection so holding at a transcript edge scrolls through offscreen text ([ENG-4644](https://linear.app/primeintellect/issue/ENG-4644/copy-issues)).
-- Fixed slash-command and skill autocomplete not appearing for references typed in the middle of prompts ([ENG-4628](https://linear.app/primeintellect/issue/ENG-4628/support-skill-and-command-autocomplete-mid-prompt)).
+- Fixed fullscreen Markdown table selections copying borders instead of tab-separated cell content.
+- Fixed fullscreen drag selection so holding at a transcript edge scrolls through offscreen text.
+- Fixed slash-command and skill autocomplete not appearing for references typed in the middle of prompts.
 - Fixed focused full-pane overlays becoming slow to navigate on wider terminals.
-- Fixed plain-text truncation emitting ANSI resets, marked shortened descriptions with an ellipsis, and rendered autocomplete in content-sized popup surfaces that close when editing leaves the completion context ([ENG-4542](https://linear.app/primeintellect/issue/ENG-4542/command-descriptions-are-cut-off-on-narrow-screens)).
+- Fixed plain-text truncation emitting ANSI resets, marked shortened descriptions with an ellipsis, and rendered autocomplete in content-sized popup surfaces that close when editing leaves the completion context.
 
 ## [0.3.0] - 2026-07-13
 

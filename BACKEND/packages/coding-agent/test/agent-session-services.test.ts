@@ -127,7 +127,7 @@ describe("createAgentSessionFromServices", () => {
 						env: { TOKEN: { env: "FILESYSTEM_SECRET" } },
 					},
 					disabled: { type: "stdio", command: "disabled-secret", enabled: false },
-					linear: { type: "stdio", command: "reserved-secret" },
+					notion: { type: "stdio", command: "reserved-secret" },
 				},
 			}),
 		);
@@ -169,7 +169,7 @@ describe("createAgentSessionFromServices", () => {
 			]) {
 				expect(initialPrompt).not.toContain(hidden);
 			}
-			expect(initialPrompt).not.toContain("Enabled generic MCP servers: `linear`");
+			expect(initialPrompt).not.toContain("Enabled generic MCP servers: `notion`");
 
 			const rebuildRuntime = vi.spyOn(
 				session as unknown as { _rebuildRuntimeForAcpMcpServers(): void },

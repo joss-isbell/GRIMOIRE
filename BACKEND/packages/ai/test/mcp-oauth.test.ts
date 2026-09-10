@@ -64,9 +64,9 @@ describe.sequential("MCP OAuth provider", () => {
 	});
 
 	it("has a namespaced id and label", () => {
-		const provider = createMcpOAuthProvider({ server: "linear", label: "Linear", url: ORIGIN_URL });
-		expect(provider.id).toBe("mcp:linear");
-		expect(provider.name).toBe("Linear");
+		const provider = createMcpOAuthProvider({ server: "notion", label: "Notion", url: ORIGIN_URL });
+		expect(provider.id).toBe("mcp:notion");
+		expect(provider.name).toBe("Notion");
 		expect(provider.usesCallbackServer).toBe(true);
 	});
 

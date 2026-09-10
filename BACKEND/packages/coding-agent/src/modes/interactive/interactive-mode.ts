@@ -8712,7 +8712,7 @@ export class InteractiveMode {
 		const isAuthed = (name: string) => authStorage.get(`mcp:${name}`) !== undefined;
 		if (sub === "login") {
 			if (!server || argv.length !== 2) {
-				this.showError("Usage: /mcp login <name> (e.g. /mcp login linear)");
+				this.showError("Usage: /mcp login <name> (e.g. /mcp login notion)");
 				return;
 			}
 			const result = await this.createAuthFlows().runMcpLogin(server);

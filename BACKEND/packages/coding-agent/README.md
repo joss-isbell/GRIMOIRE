@@ -317,15 +317,14 @@ Prime Agent ships with a built-in `websearch` skill (Google search via the [Serp
 
 ### MCP Integrations
 
-Connect external services (Linear, Notion, …) over the [Model Context Protocol](https://modelcontextprotocol.io). Consistent with the single-tool design, MCP is **not** exposed as new agent tools — each integration is a Python skill package the model imports and calls from the kernel:
+Connect external services (Notion, …) over the [Model Context Protocol](https://modelcontextprotocol.io). Consistent with the single-tool design, MCP is **not** exposed as new agent tools — each integration is a Python skill package the model imports and calls from the kernel:
 
 ```python
-import linear
-issues = await linear.list_issues(team="Engineering")   # tools auto-discovered from the server
-help(linear.list_issues)                                 # description + argument schema
+import notion
+result = await notion.call_tool("notion-search", {"query": "roadmap"})
 ```
 
-Built-in integrations for Linear and Notion ship disabled. **Logging in enables them**: open `/login`, switch to **MCP Connections**, pick the integration, and complete OAuth in the browser. The integration's skill then becomes visible and is auto-imported into the kernel. `/mcp` opens the same tab, while its subcommands support direct management:
+Built-in integrations ship disabled. **Logging in enables them**: open `/login`, switch to **MCP Connections**, pick the integration, and complete OAuth in the browser. The integration's skill then becomes visible and is auto-imported into the kernel. `/mcp` opens the same tab, while its subcommands support direct management:
 
 ```
 /mcp                 list integrations and connection status

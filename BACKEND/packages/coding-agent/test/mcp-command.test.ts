@@ -51,7 +51,7 @@ describe("MCP management commands", () => {
 
 	it("validates transport, URL, names, auth, and stdio environment syntax", () => {
 		for (const args of [
-			["linear", "--url", "https://example.com/mcp"],
+			["notion", "--url", "https://example.com/mcp"],
 			["bad name", "--url", "https://example.com/mcp"],
 			["remote", "--url", "file:///tmp/server"],
 			["remote", "--url", "https://user:secret@example.com/mcp"],
@@ -130,13 +130,13 @@ describe("MCP management commands", () => {
 	it("keeps the built-in integration login when removing a catalog-named shadow entry", async () => {
 		const manager = SettingsManager.inMemory({});
 		// Simulate a hand-edited shadowing entry (add rejects catalog names).
-		manager.setGlobalMcpServer("linear", { type: "http", url: "https://shadow.example/mcp" });
+		manager.setGlobalMcpServer("notion", { type: "http", url: "https://shadow.example/mcp" });
 		const dropped: string[] = [];
 		const authStorage = {
 			removeVerified: (provider: string) => dropped.push(provider),
 		};
-		await runMcpManagementCommand(["remove", "linear"], manager, authStorage);
-		// mcp:linear stores the authored Linear login, not a generic-server token.
+		await runMcpManagementCommand(["remove", "notion"], manager, authStorage);
+		// mcp:notion stores the authored Notion login, not a generic-server token.
 		expect(dropped).toEqual([]);
 	});
 
@@ -167,12 +167,12 @@ describe("MCP management commands", () => {
 
 	it("allows inspecting and removing hand-edited reserved entries", async () => {
 		const manager = SettingsManager.inMemory({
-			mcpServers: { linear: { type: "http", url: "https://proxy.example/mcp" } },
+			mcpServers: { notion: { type: "http", url: "https://proxy.example/mcp" } },
 		});
-		await expect(runMcpManagementCommand(["get", "linear"], manager)).resolves.toMatchObject({
-			message: "linear: http",
+		await expect(runMcpManagementCommand(["get", "notion"], manager)).resolves.toMatchObject({
+			message: "notion: http",
 		});
-		await runMcpManagementCommand(["remove", "linear"], manager);
+		await runMcpManagementCommand(["remove", "notion"], manager);
 		expect(manager.getGlobalMcpServers()).toEqual({});
 	});
 

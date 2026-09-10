@@ -13,12 +13,6 @@ export interface McpCatalogEntry {
 
 export const BUILTIN_MCP_CATALOG: readonly McpCatalogEntry[] = [
 	{
-		server: "linear",
-		label: "Linear",
-		url: "https://mcp.linear.app/mcp",
-		oauth: { kind: "oauth", label: "Linear" },
-	},
-	{
 		server: "notion",
 		label: "Notion",
 		url: "https://mcp.notion.com/mcp",
