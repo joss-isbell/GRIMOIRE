@@ -1,4 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fauxAssistantMessage } from "@earendil-works/pi-ai";
+import { describe, expect, it, vi } from "vitest";
 import { type LabelEntry, SessionManager } from "../../src/core/session-manager.js";
 
 describe("SessionManager labels", () => {
@@ -132,6 +136,77 @@ describe("SessionManager labels", () => {
 		expect(msg1Node?.labelTimestamp).toBe(msg1LabelEntry.timestamp);
 		expect(msg2Node?.labelTimestamp).toBe(msg2LabelEntry.timestamp);
 	});
+
+	it.each([false, true])(
+		"relinks fork ancestry across consecutive labels without mutating source entries (persist=%s)",
+		(persist) => {
+			const directory = mkdtempSync(join(tmpdir(), "pi-label-fork-"));
+			vi.useFakeTimers({ toFake: ["Date"] });
+			vi.setSystemTime(new Date("2025-01-01T00:00:00Z"));
+			try {
+				const session = persist
+					? SessionManager.create(directory, join(directory, "sessions"))
+					: SessionManager.inMemory(directory);
+				const rootId = session.appendMessage({ role: "user", content: "start", timestamp: 1 });
+				const checkpointId = session.appendMessage(fauxAssistantMessage("checkpoint"));
+				const rootLabelId = session.appendLabelChange(rootId, "start label");
+				const checkpointLabelId = session.appendLabelChange(checkpointId, "checkpoint label");
+				const readId = session.appendMessage({ role: "user", content: "unchanged read", timestamp: 2 });
+				const targetId = session.appendMessage(fauxAssistantMessage("unchanged"));
+				vi.setSystemTime(new Date("2025-01-02T00:00:00Z"));
+				// Forks retain the latest label for retained targets, even if applied after the fork point.
+				const latestLabelId = session.appendLabelChange(checkpointId, "latest checkpoint label");
+				const laterId = session.appendMessage({ role: "user", content: "source only", timestamp: 3 });
+				session.appendLabelChange(laterId, "not inherited");
+				const expectedLabels = [rootLabelId, latestLabelId].map((id) => {
+					const entry = session.getEntry(id) as LabelEntry;
+					return { targetId: entry.targetId, label: entry.label, timestamp: entry.timestamp };
+				});
+				const sourceEntries = session.getEntries();
+				const sourceCopy = structuredClone(sourceEntries);
+				const sourcePath = session.getBranch(targetId);
+				const retained = sourcePath.filter((entry) => entry.type !== "label");
+				const sourceRead = session.getEntry(readId)!;
+				expect(sourceRead.parentId).toBe(checkpointLabelId);
+				const sourceFile = session.getSessionFile();
+				const sourceBytes = sourceFile ? readFileSync(sourceFile) : undefined;
+
+				vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
+				const forkFile = session.createBranchedSession(targetId);
+				const fork = forkFile ? SessionManager.open(forkFile) : session;
+				expect(Boolean(forkFile)).toBe(persist);
+				expect(sourceEntries).toEqual(sourceCopy);
+				expect(sourceRead.parentId).toBe(checkpointLabelId);
+				if (sourceFile) {
+					expect(forkFile).not.toBe(sourceFile);
+					expect(readFileSync(sourceFile)).toEqual(sourceBytes);
+					expect(SessionManager.open(sourceFile).getEntries()).toEqual(sourceCopy);
+				}
+				expect(session.getEntry(readId)?.parentId).toBe(checkpointId);
+				expect(session.getEntry(readId)).not.toBe(sourceRead);
+				expect(fork.getEntries().filter((entry) => entry.type !== "label")).toEqual(
+					retained.map((entry, index) => ({ ...entry, parentId: retained[index - 1]?.id ?? null })),
+				);
+				expect(fork.getBranch()).toEqual(fork.getEntries());
+				expect(session.getBranch()).toEqual(fork.getBranch());
+				const relocated = fork.getEntries().filter((entry): entry is LabelEntry => entry.type === "label");
+				expect(relocated.map(({ targetId, label, timestamp }) => ({ targetId, label, timestamp }))).toEqual(
+					expectedLabels,
+				);
+				const oldIds = new Set(sourceEntries.map((entry) => entry.id));
+				for (const [index, label] of relocated.entries()) {
+					expect(oldIds.has(label.id)).toBe(false);
+					expect(label.parentId).toBe(index === 0 ? targetId : relocated[index - 1].id);
+				}
+				expect(fork.getLabel(rootId)).toBe("start label");
+				expect(fork.getLabel(checkpointId)).toBe("latest checkpoint label");
+				expect(fork.getLabel(laterId)).toBeUndefined();
+			} finally {
+				vi.useRealTimers();
+				rmSync(directory, { recursive: true, force: true });
+			}
+		},
+	);
 
 	it("labels not on path are not preserved in createBranchedSession", () => {
 		const session = SessionManager.inMemory();

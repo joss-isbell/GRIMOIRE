@@ -1855,6 +1855,56 @@ export class SessionManager {
 		return entry.id;
 	}
 
+	/** Commit /tree's cursor, optional summary and label together, undoing failed appends. */
+	navigateBranchWithRollback(
+		branchFromId: string | null,
+		options: {
+			summary?: string;
+			details?: unknown;
+			fromHook?: boolean;
+			label?: string;
+			labelTargetId: string;
+		},
+	): BranchSummaryEntry | undefined {
+		const previousLeafId = this.leafId;
+		const previousEntryCount = this.fileEntries.length;
+		try {
+			let summaryEntry: BranchSummaryEntry | undefined;
+			if (options.summary) {
+				const id = this.branchWithSummary(branchFromId, options.summary, options.details, options.fromHook);
+				summaryEntry = this.byId.get(id) as BranchSummaryEntry;
+			} else if (branchFromId === null) {
+				this.resetLeaf();
+			} else {
+				this.branch(branchFromId);
+			}
+			if (options.label) {
+				this.appendLabelChange(summaryEntry?.id ?? options.labelTargetId, options.label);
+			}
+			return summaryEntry;
+		} catch (error) {
+			const appended = this.fileEntries.length > previousEntryCount;
+			if (appended) {
+				this.fileEntries.length = previousEntryCount;
+				this._buildIndex();
+			}
+			this.leafId = previousLeafId;
+			if (appended) {
+				this.flushed = false;
+				try {
+					this._rewriteFile();
+					this.flushed = true;
+				} catch (recoveryError) {
+					throw new AggregateError(
+						[error, recoveryError],
+						`Branch navigation failed (${String(error)}); transcript rollback also failed (${String(recoveryError)})`,
+					);
+				}
+			}
+			throw error;
+		}
+	}
+
 	createBranchedSession(leafId: string): string | undefined {
 		const previousSessionFile = this.sessionFile;
 		const path = this.getBranch(leafId);
@@ -1862,7 +1912,19 @@ export class SessionManager {
 			throw new Error(`Entry ${leafId} not found`);
 		}
 
-		const pathWithoutLabels = path.filter((e) => e.type !== "label");
+		const labelParents = new Map(
+			path.filter((entry) => entry.type === "label").map((entry) => [entry.id, entry.parentId]),
+		);
+		const pathWithoutLabels = path
+			.filter((entry) => entry.type !== "label")
+			.map((entry) => {
+				let parentId = entry.parentId;
+				while (parentId !== null && labelParents.has(parentId)) {
+					parentId = labelParents.get(parentId)!;
+				}
+				// Labels are relocated below. Keep retained ancestry intact without mutating the source entries.
+				return { ...entry, parentId };
+			});
 
 		const target = this.persist
 			? createUniqueSessionFileTarget(this.getSessionDir())

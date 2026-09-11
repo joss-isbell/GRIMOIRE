@@ -255,6 +255,7 @@ import {
 } from "./slash-commands.js";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.js";
 import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-prompt.js";
+import { TaskboardState, withTaskboardSnapshot } from "./taskboard-state.js";
 import { THINKING_LEVELS } from "./thinking-levels.js";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.js";
 import { createAllToolDefinitions } from "./tools/index.js";
@@ -1104,6 +1105,7 @@ export class AgentSession {
 	private _rlmMaxDepth: number;
 	private _rlmMaxDepthSource: RlmMaxDepthSource;
 	private _rlmSessionDir?: string;
+	private readonly _taskboardState: TaskboardState;
 	private _rlmParentNodeId?: string;
 	private _rlmParentAgent?: string;
 	private _repliedToParentSinceTask: boolean | undefined;
@@ -1207,6 +1209,11 @@ export class AgentSession {
 		this._autoRefineReviewer = config.autoRefineReviewer;
 		this._serializedRefine = config.serializedRefine ?? false;
 		this._rlmSessionDir = config.rlmSessionDir;
+		this._taskboardState = new TaskboardState(
+			this.sessionManager,
+			() => this._rlmSessionDir ?? this.sessionManager.getSessionArtifactDir(),
+		);
+		this._taskboardState.initialize();
 		this._rlmParentNodeId = config.rlmParentNodeId;
 		this._rlmParentAgent = config.rlmParentAgent;
 		// A resumed child may have replied before this process started; false would
@@ -1328,6 +1335,8 @@ export class AgentSession {
 		};
 
 		this.agent.afterToolCall = async ({ toolCall, args, result, isError }) => {
+			const snapshot = toolCall.name === "ipython" ? this._taskboardState.capture(toolCall.id) : undefined;
+			if (snapshot) result.details = withTaskboardSnapshot(result.details, snapshot);
 			const runner = this._extensionRunner;
 			if (!runner.hasHandlers("tool_result")) {
 				return undefined;
@@ -1344,12 +1353,15 @@ export class AgentSession {
 			});
 
 			if (!hookResult) {
+				if (snapshot) result.details = withTaskboardSnapshot(result.details, snapshot);
 				return undefined;
 			}
 
 			return {
 				content: hookResult.content,
-				details: hookResult.details,
+				details: snapshot
+					? withTaskboardSnapshot(hookResult.details ?? result.details, snapshot)
+					: hookResult.details,
 				isError: hookResult.isError ?? isError,
 			};
 		};
@@ -3248,6 +3260,10 @@ export class AgentSession {
 	}
 
 	private _handleAgentEvent = (event: AgentEvent): void => {
+		if (event.type === "tool_execution_end" && event.toolName === "ipython") {
+			// Abort or a failed after-tool hook can replace the result after capture.
+			event.result.details = this._taskboardState.toolResultDetails(event.toolCallId, event.result.details);
+		}
 		this._createRetryPromiseForAgentEnd(event);
 		if (event.type === "message_start" || event.type === "message_end") {
 			for (const action of this._actionStore.ownedActions()) {
@@ -3371,6 +3387,9 @@ export class AgentSession {
 			if (cleared?.payload.kind === "turn" && cleared.payload.captureRunMessages) {
 				const captured = cleared.payload.captureRunMessages;
 				this.agent.state.messages = this.agent.state.messages.filter((message) => !captured.has(message));
+				if (event.message.role === "toolResult") {
+					this._taskboardState.finishToolResult(event.message.toolCallId, false);
+				}
 				return;
 			}
 		}
@@ -3409,6 +3428,9 @@ export class AgentSession {
 			if (cleared?.payload.kind === "turn" && cleared.payload.captureRunMessages) {
 				const captured = cleared.payload.captureRunMessages;
 				this.agent.state.messages = this.agent.state.messages.filter((message) => !captured.has(message));
+				if (event.message.role === "toolResult") {
+					this._taskboardState.finishToolResult(event.message.toolCallId, false);
+				}
 				return;
 			}
 		}
@@ -3425,11 +3447,18 @@ export class AgentSession {
 					event.message.display,
 					event.message.details,
 				);
-			} else if (
-				event.message.role === "user" ||
-				event.message.role === "assistant" ||
-				event.message.role === "toolResult"
-			) {
+			} else if (event.message.role === "toolResult") {
+				const toolCallId = event.message.toolCallId;
+				// message_end extensions may replace details; use detached bytes, never the now-later file.
+				event.message.details = this._taskboardState.toolResultDetails(toolCallId, event.message.details);
+				try {
+					this.sessionManager.appendMessage(event.message);
+				} catch (error) {
+					this._taskboardState.finishToolResult(toolCallId, false);
+					throw error;
+				}
+				this._taskboardState.finishToolResult(toolCallId, true);
+			} else if (event.message.role === "user" || event.message.role === "assistant") {
 				this.sessionManager.appendMessage(event.message);
 			}
 
@@ -10592,6 +10621,10 @@ export class AgentSession {
 				summaryDetails = extensionSummary.details;
 			}
 
+			if (this._branchSummaryAbortController.signal.aborted) {
+				return { cancelled: true, aborted: true };
+			}
+
 			let newLeafId: string | null;
 			let editorText: string | undefined;
 
@@ -10611,27 +10644,26 @@ export class AgentSession {
 				newLeafId = targetId;
 			}
 
+			const rollbackTaskboard = this._taskboardState.restoreBranch(newLeafId);
 			let summaryEntry: BranchSummaryEntry | undefined;
-			if (summaryText) {
-				const summaryId = this.sessionManager.branchWithSummary(
-					newLeafId,
-					summaryText,
-					summaryDetails,
-					fromExtension,
-				);
-				summaryEntry = this.sessionManager.getEntry(summaryId) as BranchSummaryEntry;
-
-				if (label) {
-					this.sessionManager.appendLabelChange(summaryId, label);
+			try {
+				summaryEntry = this.sessionManager.navigateBranchWithRollback(newLeafId, {
+					summary: summaryText,
+					details: summaryDetails,
+					fromHook: fromExtension,
+					label,
+					labelTargetId: targetId,
+				});
+			} catch (error) {
+				try {
+					rollbackTaskboard();
+				} catch (recoveryError) {
+					throw new AggregateError(
+						[error, recoveryError],
+						`Branch navigation failed (${String(error)}); taskboard rollback also failed (${String(recoveryError)})`,
+					);
 				}
-			} else if (newLeafId === null) {
-				this.sessionManager.resetLeaf();
-			} else {
-				this.sessionManager.branch(newLeafId);
-			}
-
-			if (label && !summaryText) {
-				this.sessionManager.appendLabelChange(targetId, label);
+				throw error;
 			}
 
 			const sessionContext = this.sessionManager.buildSessionContext();

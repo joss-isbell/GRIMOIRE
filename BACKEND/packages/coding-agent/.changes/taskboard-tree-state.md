@@ -1,0 +1,1 @@
+- Fixed taskboards to follow the selected session branch during tree navigation, resume, and forks. Existing boards begin history tracking when next opened.
