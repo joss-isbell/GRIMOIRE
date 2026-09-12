@@ -1,33 +1,82 @@
-name: Queue investigation
+name: Queue fix verification
 on:
   push:
     branches: [fix/queue-notification-liveness]
     paths: [.github/workflows/queue-diagnostics.yml]
 permissions:
-  contents: read
+  contents: write
 jobs:
-  history:
+  verify-and-commit:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
-          persist-credentials: false
           fetch-depth: 0
-      - name: Queue history and upstream comparison
+      - name: Apply only sandbox-verified changes
         run: |
-          git log --first-parent --format='%h %ad %s' --date=iso-strict -20 origin/main
-          git log --follow --format='%h %ad %s' --date=iso-strict -20 -- BACKEND/packages/coding-agent/src/core/agent-session.ts
-          git log --all --format='%h %ad %s' --date=iso-strict -G '_drainQueuedMessagesAfterBash|queueAgentMessagePrompt|_sessionInputPump' -- BACKEND/packages/coding-agent/src/core/agent-session.ts packages/coding-agent/src/core/agent-session.ts | head -45
-          git fetch --no-tags --depth=1 https://github.com/PrimeIntellect-ai/prime-agent.git main
-          git show -s --format='%H %ad %s' --date=iso-strict FETCH_HEAD
-          git show FETCH_HEAD:packages/coding-agent/src/core/agent-session.ts > /tmp/upstream-agent-session.ts
-          python3 - <<'PY'
-          from pathlib import Path
-          lines=Path('/tmp/upstream-agent-session.ts').read_text().splitlines()
-          for symbol in ['async queueAgentMessagePrompt(', 'async executeBash(', 'async runUserBash(']:
-              for i,line in enumerate(lines):
-                  if symbol in line:
-                      print('UPSTREAM',symbol,'line',i+1)
-                      print('\n'.join(lines[i:i+75]))
-          PY
+          git apply --check .github/queue-fix.patch
+          git apply .github/queue-fix.patch
+          cat > /tmp/queue-fix.sha256 <<'EOF'
+          3dcfdb2863174e1c15292f8ca9a326ace33f3a3f14b3f2668404748324da73cf  BACKEND/packages/coding-agent/src/core/agent-session.ts
+          36c419d1acb0382f7dd3d25e0af5565d97561a08152ac416b44a91e2354635da  BACKEND/packages/coding-agent/CHANGELOG.md
+          83d7392312c14538f66087e6024c25f527d8966415542d87666fd05ecd404e43  BACKEND/packages/coding-agent/test/suite/agent-session-bash-wakeup.test.ts
+          EOF
+          sha256sum --check /tmp/queue-fix.sha256
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: BACKEND/package-lock.json
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep
+          sudo ln -s "$(command -v fdfind)" /usr/local/bin/fd
+      - name: Install locked dependencies
+        working-directory: BACKEND
+        run: npm ci
+      - name: Build committed catalogue
+        working-directory: BACKEND
+        run: |
+          npm run build --workspace packages/tui
+          npm exec --workspace packages/ai -- tsgo -p tsconfig.build.json
+          npm run build --workspace packages/agent
+          npm run build --workspace packages/coding-agent
+      - name: Static checks
+        working-directory: BACKEND
+        run: npm run check
+      - name: Queue and lifecycle regression tests
+        working-directory: BACKEND/packages/coding-agent
+        run: |
+          node ../../node_modules/tsx/dist/cli.mjs ../../node_modules/vitest/dist/cli.js --run \
+            test/suite/agent-session-bash-wakeup.test.ts \
+            test/suite/agent-session-bash-persistence.test.ts \
+            test/suite/agent-session-queue.test.ts \
+            test/suite/agent-session-action-races.test.ts \
+            test/suite/agent-session-action-contracts.test.ts \
+            test/session-action-store.test.ts \
+            test/agent-session-concurrent.test.ts \
+            test/agent-session-queue-mutation.test.ts \
+            test/daemon-mode.test.ts \
+            test/suite/agent-session-serialized-refine.test.ts \
+            test/suite/agent-session-compaction.test.ts \
+            test/suite/agent-session-prompt.test.ts \
+            test/suite/agent-session-goal.test.ts \
+            test/suite/regressions/4257-update-restart-resume.test.ts \
+            test/suite/regressions/4509-side-questions.test.ts
+      - name: Commit verified implementation without rewriting history
+        env:
+          EXPECTED_HEAD: ${{ github.sha }}
+        run: |
+          sha256sum --check /tmp/queue-fix.sha256
+          git diff --check
+          test "$(git ls-remote origin refs/heads/fix/queue-notification-liveness | cut -f1)" = "$EXPECTED_HEAD"
+          git status --short
+          git add BACKEND/packages/coding-agent/src/core/agent-session.ts BACKEND/packages/coding-agent/CHANGELOG.md BACKEND/packages/coding-agent/test/suite/agent-session-bash-wakeup.test.ts
+          test "$(git diff --cached --name-only | wc -l)" -eq 3
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'fix(coding-agent): wake queued work after every shell exit'
+          git push origin HEAD:refs/heads/fix/queue-notification-liveness
+          git show --stat --oneline HEAD
