@@ -6,20 +6,50 @@ on:
 permissions:
   contents: read
 jobs:
-  inspect:
+  prepare:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           persist-credentials: false
-      - name: Export tracked source without credentials
-        run: git archive --format=tar.gz --output=/tmp/grimoire-source.tar.gz HEAD
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
-          name: grimoire-source
-          path: /tmp/grimoire-source.tar.gz
-          retention-days: 1
-      - name: Locate background delivery paths
+          node-version: 22
+          cache: npm
+          cache-dependency-path: BACKEND/package-lock.json
+      - name: Install system dependencies
         run: |
-          git grep -n -E 'queueAgentMessagePrompt|acceptAgentMessagePrompt|shell.*notification|notification.*shell|shell.*followUp' -- BACKEND/packages/coding-agent/src BACKEND/packages/coding-agent/test || true
+          sudo apt-get update
+          sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep
+          sudo ln -s "$(command -v fdfind)" /usr/local/bin/fd
+      - name: Install locked dependencies
+        working-directory: BACKEND
+        run: npm ci
+      - name: Compile committed catalogue
+        working-directory: BACKEND
+        run: |
+          npm run build --workspace packages/tui
+          npm exec --workspace packages/ai -- tsgo -p tsconfig.build.json
+          npm run build --workspace packages/agent
+          npm run build --workspace packages/coding-agent
+      - name: Export installed dependencies and compiled assets
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import pathlib, tarfile
+          root = pathlib.Path('BACKEND')
+          paths = [root / 'node_modules']
+          paths += list((root / 'packages').glob('*/node_modules'))
+          paths += list((root / 'packages').glob('*/dist'))
+          paths += list((root / 'packages/coding-agent/examples/extensions').glob('*/node_modules'))
+          with tarfile.open('/tmp/grimoire-dependencies.tar.gz', 'w:gz') as archive:
+              for path in paths:
+                  if path.exists(): archive.add(path, arcname=str(path))
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: grimoire-dependencies
+          path: /tmp/grimoire-dependencies.tar.gz
+          retention-days: 1
