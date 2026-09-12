@@ -1,0 +1,25 @@
+name: Queue investigation
+on:
+  push:
+    branches: [fix/queue-notification-liveness]
+    paths: [.github/workflows/queue-diagnostics.yml]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+      - name: Export tracked source without credentials
+        run: git archive --format=tar.gz --output=/tmp/grimoire-source.tar.gz HEAD
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: grimoire-source
+          path: /tmp/grimoire-source.tar.gz
+          retention-days: 1
+      - name: Locate background delivery paths
+        run: |
+          git grep -n -E 'queueAgentMessagePrompt|acceptAgentMessagePrompt|shell.*notification|notification.*shell|shell.*followUp' -- BACKEND/packages/coding-agent/src BACKEND/packages/coding-agent/test || true
