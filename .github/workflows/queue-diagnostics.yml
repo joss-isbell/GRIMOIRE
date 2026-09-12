@@ -6,50 +6,28 @@ on:
 permissions:
   contents: read
 jobs:
-  prepare:
+  history:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           persist-credentials: false
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: BACKEND/package-lock.json
-      - name: Install system dependencies
+          fetch-depth: 0
+      - name: Queue history and upstream comparison
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep
-          sudo ln -s "$(command -v fdfind)" /usr/local/bin/fd
-      - name: Install locked dependencies
-        working-directory: BACKEND
-        run: npm ci
-      - name: Compile committed catalogue
-        working-directory: BACKEND
-        run: |
-          npm run build --workspace packages/tui
-          npm exec --workspace packages/ai -- tsgo -p tsconfig.build.json
-          npm run build --workspace packages/agent
-          npm run build --workspace packages/coding-agent
-      - name: Export installed dependencies and compiled assets
-        if: always()
-        run: |
+          git log --first-parent --format='%h %ad %s' --date=iso-strict -20 origin/main
+          git log --follow --format='%h %ad %s' --date=iso-strict -20 -- BACKEND/packages/coding-agent/src/core/agent-session.ts
+          git log --all --format='%h %ad %s' --date=iso-strict -G '_drainQueuedMessagesAfterBash|queueAgentMessagePrompt|_sessionInputPump' -- BACKEND/packages/coding-agent/src/core/agent-session.ts packages/coding-agent/src/core/agent-session.ts | head -45
+          git fetch --no-tags --depth=1 https://github.com/PrimeIntellect-ai/prime-agent.git main
+          git show -s --format='%H %ad %s' --date=iso-strict FETCH_HEAD
+          git show FETCH_HEAD:packages/coding-agent/src/core/agent-session.ts > /tmp/upstream-agent-session.ts
           python3 - <<'PY'
-          import pathlib, tarfile
-          root = pathlib.Path('BACKEND')
-          paths = [root / 'node_modules']
-          paths += list((root / 'packages').glob('*/node_modules'))
-          paths += list((root / 'packages').glob('*/dist'))
-          paths += list((root / 'packages/coding-agent/examples/extensions').glob('*/node_modules'))
-          with tarfile.open('/tmp/grimoire-dependencies.tar.gz', 'w:gz') as archive:
-              for path in paths:
-                  if path.exists(): archive.add(path, arcname=str(path))
+          from pathlib import Path
+          lines=Path('/tmp/upstream-agent-session.ts').read_text().splitlines()
+          for symbol in ['async queueAgentMessagePrompt(', 'async executeBash(', 'async runUserBash(']:
+              for i,line in enumerate(lines):
+                  if symbol in line:
+                      print('UPSTREAM',symbol,'line',i+1)
+                      print('\n'.join(lines[i:i+75]))
           PY
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: always()
-        with:
-          name: grimoire-dependencies
-          path: /tmp/grimoire-dependencies.tar.gz
-          retention-days: 1
