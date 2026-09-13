@@ -2,7 +2,7 @@ name: Verify and publish selective v0.9.3
 on:
   push:
     branches: [vi/selective-v093-tools]
-    paths: [selective-v093/**, .github/workflows/publish-selective-v093.yml]
+    paths: [selective-v093/**, reviewed-v093/**, .github/workflows/publish-selective-v093.yml]
 permissions:
   contents: write
 concurrency:
@@ -14,7 +14,7 @@ jobs:
     timeout-minutes: 20
     env:
       TERM: xterm
-      EXPECTED_TREE: f189be45809f24a1e7bb0613e9fd40564c0457fe
+      EXPECTED_TREE: d64d38972bbcbb019dc18271b6ba744fdc048034
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
@@ -34,6 +34,7 @@ jobs:
           python3 selective-v093/assemble.py "$candidate"
           sed 's/^ diff --git/diff --git/' selective-v093/final.patch > "$RUNNER_TEMP/selective-v093-final.patch"
           git -C "$candidate" apply "$RUNNER_TEMP/selective-v093-final.patch"
+          git -C "$candidate" apply "$GITHUB_WORKSPACE/reviewed-v093/restart-test.patch"
       - name: Install verification dependencies
         shell: bash
         run: |
