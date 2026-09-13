@@ -565,8 +565,9 @@ describe("AgentSession concurrent prompt guard", () => {
 		await session.abort();
 	});
 
-	it("enforces the agent message queue cap inside core admission", async () => {
+	it("enforces the pending agent-message cap while explicitly stopped", async () => {
 		createSession();
+		session.requestAbort();
 		const accept = (index: number) => {
 			const message = createAgentSessionMessage({
 				id: `agentmsg-${index}`,
@@ -587,10 +588,13 @@ describe("AgentSession concurrent prompt guard", () => {
 		}
 		await expect(accept(20)).rejects.toThrow("Target session has too many pending messages");
 		expect(session.unfinishedActionCount).toBe(20);
+		expect(session.getSteeringMessages()).toEqual([]);
+		expect(session.getFollowUpMessages()).toEqual([]);
 		const snapshot = session.getSessionActionRecoverySnapshot();
 		session.dispose();
 
 		createSession();
+		session.requestAbort();
 		await expect(session.restoreSessionActions(snapshot)).resolves.toBe(20);
 		expect(session.unfinishedActionCount).toBe(20);
 	});

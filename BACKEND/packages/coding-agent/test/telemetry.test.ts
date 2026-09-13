@@ -237,6 +237,8 @@ describe("telemetry controls", () => {
 		const settings = SettingsManager.inMemory({ telemetry: { enabled: true } });
 
 		vi.stubEnv("DO_NOT_TRACK", "0");
+		vi.stubEnv("PRIME_AGENT_TELEMETRY", "1");
+		vi.stubEnv("PI_OFFLINE", "0");
 		expect(isTelemetryEnabled(settings)).toBe(true);
 
 		vi.stubEnv("DO_NOT_TRACK", "1");
