@@ -13,6 +13,8 @@ describe("isolated test environments", () => {
 			PRIME_AGENT_KERNEL_PYTHON: "/live/python",
 			PRIME_AGENT_INTERNAL_DAEMON_SOCKET: "/live/socket",
 			PRIME_AGENT_SESSION_DIR: "/live/sessions",
+			PI_SESSION_DIR: "/live/legacy-sessions",
+			PRIME_AGENT_TELEMETRY: "1",
 			PYTHONPATH: "/live/modules",
 			ANTHROPIC_API_KEY: "secret",
 			AWS_PROFILE: "live",
@@ -23,9 +25,13 @@ describe("isolated test environments", () => {
 		const sandbox = isolatedTestEnvironment(base);
 		try {
 			expect(base).toEqual(original);
+			expect(sandbox.env.DO_NOT_TRACK).toBe("1");
 			for (const name of [
 				"PRIME_AGENT_KERNEL_PYTHON",
 				"PRIME_AGENT_INTERNAL_DAEMON_SOCKET",
+				"PRIME_AGENT_SESSION_DIR",
+				"PI_SESSION_DIR",
+				"PRIME_AGENT_TELEMETRY",
 				"PYTHONPATH",
 				"ANTHROPIC_API_KEY",
 				"AWS_PROFILE",
@@ -34,7 +40,6 @@ describe("isolated test environments", () => {
 				expect(sandbox.env[name]).toBeUndefined();
 			for (const name of [
 				"HOME",
-				"PRIME_AGENT_SESSION_DIR",
 				"PRIME_AGENT_CODING_AGENT_DIR",
 				"PRIME_AGENT_KERNEL_VENV",
 				"XDG_RUNTIME_DIR",

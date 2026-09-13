@@ -48,7 +48,6 @@ function testEnvironment(base: NodeJS.ProcessEnv, root: string, token: string): 
 		APPDATA: join(root, "config"),
 		LOCALAPPDATA: join(root, "data"),
 		PRIME_AGENT_CODING_AGENT_DIR: agent,
-		PRIME_AGENT_SESSION_DIR: join(root, "sessions"),
 		PRIME_AGENT_KERNEL_VENV: join(agent, "kernel-venv"),
 		XDG_CONFIG_HOME: join(root, "config"),
 		XDG_DATA_HOME: join(root, "data"),
@@ -61,7 +60,11 @@ function testEnvironment(base: NodeJS.ProcessEnv, root: string, token: string): 
 		TMP: join(root, "tmp"),
 		TEMP: join(root, "tmp"),
 	};
-	for (const path of Object.values(paths)) mkdirSync(path, { recursive: true, mode: 0o700 });
+	// Let each fixture's agentDir determine its sessions directory; a global override
+	// would mix otherwise independent fixtures in one shared catalog.
+	for (const path of [...Object.values(paths), join(agent, "sessions")]) {
+		mkdirSync(path, { recursive: true, mode: 0o700 });
+	}
 	return {
 		...env,
 		...paths,
@@ -69,7 +72,6 @@ function testEnvironment(base: NodeJS.ProcessEnv, root: string, token: string): 
 		HOMEPATH: home.slice(parse(home).root.length - 1),
 		NPM_CONFIG_USERCONFIG: join(home, ".npmrc"),
 		DO_NOT_TRACK: "1",
-		PRIME_AGENT_TELEMETRY: "0",
 		PRIME_AGENT_INSTALL_UV: "0",
 		[ROOT_ENV]: root,
 		[TOKEN_ENV]: token,

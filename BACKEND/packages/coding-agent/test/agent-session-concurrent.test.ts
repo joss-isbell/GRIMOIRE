@@ -567,6 +567,8 @@ describe("AgentSession concurrent prompt guard", () => {
 
 	it("enforces the agent message queue cap inside core admission", async () => {
 		createSession();
+		// Capacity/recovery assertions require undelivered messages, not a running scheduler.
+		session.acquireQueuedWorkPause();
 		const accept = (index: number) => {
 			const message = createAgentSessionMessage({
 				id: `agentmsg-${index}`,
@@ -591,6 +593,8 @@ describe("AgentSession concurrent prompt guard", () => {
 		session.dispose();
 
 		createSession();
+		// Capacity/recovery assertions require undelivered messages, not a running scheduler.
+		session.acquireQueuedWorkPause();
 		await expect(session.restoreSessionActions(snapshot)).resolves.toBe(20);
 		expect(session.unfinishedActionCount).toBe(20);
 	});
