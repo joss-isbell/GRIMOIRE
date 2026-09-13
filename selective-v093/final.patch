@@ -1,0 +1,294 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -96,6 +96,10 @@
+             package: packages/coding-agent
+             command: npm run test:kernel
+             install_uv: true
++          - name: coding-agent repair
++            package: packages/coding-agent
++            command: npm run test:repair
++            install_uv: true
+           - name: runtime python
+             package: prime-agent-runtime
+             command: uv run --with "mcp>=2,<3" --with "httpx>=0.27,<1" python -m unittest discover -s test
+ diff --git a/BACKEND/docs/grimoire-selective-v093.md b/BACKEND/docs/grimoire-selective-v093.md
+new file mode 100644
+--- /dev/null
++++ b/BACKEND/docs/grimoire-selective-v093.md
+@@ -0,0 +1,89 @@
++# GRIMOIRE selective v0.9.3 integration
++
++## Selection and provenance
++
++The upstream baseline is the exact prime-agent v0.9.3 tag, `915c78f42c248b08238dd27fcd4bcab32c60beab`, applied to `BACKEND/`. The starting main revision is `4cc20de8c9cbd95a554c27ffc84f3f20fb9ba4e1`.
++
++The source branch's integration commit `9a9f1b224b858454782a9ed92c2f36c801447351` used an upstream parent five commits after that tag. Those later upstream commits are not imported wholesale. In particular, the newer automatic Shell-message producer is not introduced. No v0.9.4 update is included.
++
++Existing main taskboard history/rollback, shell wake-up fixes, and root CI configuration are retained. Reviewed notification, kernel-repair, and test-isolation deltas were adapted from the previous integration candidate `3cf7964e27883eebb7e484fb8a33bcba266d2bc1`; that candidate's v0.9.4 baseline and unrelated fullscreen changes are not imported.
++
++The incident recorder and source-branch diagnostic changes are excluded. `grim-16-incident-recorder` is not merged as a whole and is not modified.
++
++## Behavior
++
++Automatic subagent messages and terminal notices bypass editable steering/follow-up drafts and unrelated running shell commands. They run at the next safe tool/turn boundary, rather than waiting for the entire agent run to finish. Explicit stops, pauses, compaction, and branch mutations still apply. Delivery receipts and recovery records remain intact; clearing editable drafts does not discard these notifications.
++
++Managed kernel startup checks `rlm.repl` protocol 3 and required imports. Source launches prefer the current runtime checkout over stale copied build assets. Repairs keep the virtual environment and interpreter in place when usable, reinstall the runtime and packages whose imports fail, and validate the result before updating the bootstrap marker. The same kernel manager revalidates its managed interpreter after restart. Explicit interpreter overrides are validated rather than silently modified.
++
++Test entry points create a disposable home, agent directory, session directory, kernel environment, cache, and runtime directory before bootstrap or application imports. Direct Vitest invocation uses the same isolation. Real repair tests refuse to operate outside their disposable environment.
++
++## Acceptance commands
++
++From `BACKEND/`:
++
++```sh
++npm run check
++cd packages/coding-agent
++npm run test -- test/kernel-bootstrap.test.ts test/isolated-environment.test.ts test/suite/regressions/grimoire-automatic-notifications.test.ts
++npm run test:repair
++```
++
++Root CI also runs agent-core, AI, TUI, the full coding-agent shards, process tests, real-kernel tests, and Python runtime tests. `test:repair` provisions its own isolated environment and verifies that the same manager repairs missing `dill` and `rlm.repl` files while preserving an environment sentinel and the interpreter inode.
++
++## Local handoff: environment-dependent operations only
++
++Do not repeat repository investigation or redesign these changes. Do not switch a checkout that a live agent is currently using. From a separate terminal, first finish the active session or choose a maintenance window, preserving any uncommitted work.
++
++From `GRIMOIRE-WORKSPACE/`, with the GRIMOIRE worktree clean:
++
++```sh
++git -C GRIMOIRE fetch origin main
++git -C GRIMOIRE status --short
++git -C GRIMOIRE switch main
++git -C GRIMOIRE merge --ff-only origin/main
++cd GRIMOIRE/BACKEND
++npm ci
++npm run build --workspace packages/tui
++npm exec --workspace packages/ai -- tsgo -p tsconfig.build.json
++npm run build --workspace packages/agent
++npm run build --workspace packages/coding-agent
++```
++
++If the worktree is dirty or the fast-forward is rejected, preserve that state and report the concrete conflict; do not reset, stash, or overwrite it automatically. The source branch must remain available.
++
++Verify the local managed kernel without making a model request:
++
++```sh
++node --import tsx --input-type=module <<'JS'
++import { ReplKernelManager } from './packages/coding-agent/src/core/kernel/index.ts';
++const kernel = new ReplKernelManager({ cwd: process.cwd() });
++try {
++  const result = await kernel.execute('print(6 * 7)');
++  if (result.status !== 'ok' || result.stdout.trim() !== '42') {
++    throw new Error(JSON.stringify(result));
++  }
++  console.log('Local managed kernel: 42');
++} finally {
++  await kernel.shutdown({ snapshot: false });
++}
++JS
++```
++
++This last check uses the local managed environment, unlike the isolated regression tests. Run it only after the maintenance transition. Then launch the normal GRIMOIRE entry point and verify the terminal UI attaches normally. Only investigate a concrete local failure, using its exact command and error; no broader re-audit is required.
++
++## File index for a concrete local failure
++
++| Directory and filename | Role |
++| --- | --- |
++| `packages/coding-agent/src/core/agent-session.ts` | Notification admission, safe-boundary scheduling, shell wake-up, and preserved taskboard integration. |
++| `packages/coding-agent/src/core/session-action-store.ts` | Delivery ownership and selection; supports notification priority without discarding receipts. |
++| `packages/coding-agent/src/core/kernel/bootstrap.ts` | Runtime asset selection, readiness checks, locking, package repair, and bootstrap markers. |
++| `packages/coding-agent/src/core/kernel/python-environment.ts` | Constructs the Python subprocess environment without inherited Python path overrides. |
++| `packages/coding-agent/src/core/kernel/repl-manager.ts` | Starts, restarts, and shuts down the REPL process; managed restarts re-run readiness checks. |
++| `packages/coding-agent/test/run-isolated.ts`, `test/isolated-environment.ts`, and `vitest.config.ts` | Establish disposable test state before bootstrap, Vitest, and application imports. |
++| `packages/coding-agent/test/kernel-bootstrap-repair.test.ts` | Real-package repair and same-manager restart regressions, confined to disposable test state. |
++| `packages/coding-agent/test/suite/regressions/grimoire-automatic-notifications.test.ts` | Delivery during shell activity, safe tool boundaries, explicit stops, draft clearing, ordering, and recovery. |
++| `.github/workflows/ci.yml` at repository root | Full acceptance matrix, including the isolated real-repair job. |
++
++All paths except the final workflow row are relative to `BACKEND/`.
+diff --git a/BACKEND/packages/coding-agent/package.json b/BACKEND/packages/coding-agent/package.json
+--- a/BACKEND/packages/coding-agent/package.json
++++ b/BACKEND/packages/coding-agent/package.json
+@@ -39,6 +39,7 @@
+ 		"copy-binary-assets": "shx cp package.json dist/ && shx cp README.md dist/ && shx cp CHANGELOG.md dist/ && shx mkdir -p dist/theme && shx cp src/modes/interactive/theme/*.json dist/theme/ && shx mkdir -p dist/assets && shx cp src/modes/interactive/assets/*.png dist/assets/ && shx mkdir -p dist/export-html/vendor && shx cp src/core/export-html/template.html dist/export-html/ && shx cp src/core/export-html/vendor/*.js dist/export-html/vendor/ && shx cp -r docs dist/ && shx cp -r examples dist/ && shx cp ../../node_modules/@silvia-odwyer/photon-node/photon_rs_bg.wasm dist/ && shx rm -rf dist/skills && shx cp -r skills dist/skills",
+ 		"test": "tsx test/run-isolated.ts",
+ 		"test:ci": "tsx test/run-isolated.ts --bootstrap --exclude test/daemon-supervisor-process.test.ts",
++		"test:repair": "tsx test/run-isolated.ts --bootstrap --no-file-parallelism --tagsFilter kernel-heavy test/kernel-bootstrap-repair.test.ts",
+ 		"test:process": "tsx test/run-isolated.ts test/daemon-supervisor-process.test.ts",
+ 		"test:process-stress": "tsx test/run-isolated.ts --tagsFilter process-stress test/daemon-supervisor-process.test.ts",
+ 		"postinstall": "node postinstall.cjs",
+diff --git a/BACKEND/packages/coding-agent/src/core/agent-session.ts b/BACKEND/packages/coding-agent/src/core/agent-session.ts
+--- a/BACKEND/packages/coding-agent/src/core/agent-session.ts
++++ b/BACKEND/packages/coding-agent/src/core/agent-session.ts
+@@ -4867,9 +4867,7 @@
+ 		message: CustomMessage,
+ 		options?: InternalPromptOptions & { executionPolicy?: TurnExecutionPolicy },
+ 	): Promise<void> {
+-		const automaticNotification =
+-			this._isRlmTerminalNotice(message) ||
+-			isAgentSessionMessage(message);
++		const automaticNotification = this._isRlmTerminalNotice(message) || isAgentSessionMessage(message);
+ 		if (automaticNotification && this._sessionInputPumpSuspended) {
+ 			throwIfPromptAdmissionCancelled(options?.signal);
+ 			const action = this._createPreparedTurnAction("steer", text, undefined, {
+diff --git a/BACKEND/packages/coding-agent/src/core/kernel/bootstrap.ts b/BACKEND/packages/coding-agent/src/core/kernel/bootstrap.ts
+--- a/BACKEND/packages/coding-agent/src/core/kernel/bootstrap.ts
++++ b/BACKEND/packages/coding-agent/src/core/kernel/bootstrap.ts
+@@ -771,13 +771,20 @@
+ 		await run(uv, ["python", "install", PYTHON_VERSION]);
+ 		await run(uv, ["venv", venv, "--python", PYTHON_VERSION, "--seed", "--allow-existing"]);
+ 	}
++	// A package can retain installation metadata while its importable files are missing.
++	const reinstall = [RUNTIME_REQUIREMENT];
++	for (const dependency of [
++		{ uvArg: STATE_SNAPSHOT_REQUIREMENT, importName: STATE_SNAPSHOT_REQUIREMENT },
++		...DEFAULT_RLM_EXTRA_PACKAGES,
++	]) {
++		if (!(await pythonImports(python, dependency.importName))) reinstall.push(dependency.uvArg);
++	}
+ 	await run(uv, [
+ 		"pip",
+ 		"install",
+ 		"--python",
+ 		python,
+-		"--reinstall-package",
+-		RUNTIME_REQUIREMENT,
++		...reinstall.flatMap((requirement) => ["--reinstall-package", requirement]),
+ 		runtimeRequirement,
+ 		STATE_SNAPSHOT_REQUIREMENT,
+ 		...DEFAULT_RLM_EXTRA_UV_ARGS,
+diff --git a/BACKEND/packages/coding-agent/test/isolated-environment.test.ts b/BACKEND/packages/coding-agent/test/isolated-environment.test.ts
+--- a/BACKEND/packages/coding-agent/test/isolated-environment.test.ts
++++ b/BACKEND/packages/coding-agent/test/isolated-environment.test.ts
+@@ -1,7 +1,8 @@
+ import { spawnSync } from "node:child_process";
+-import { existsSync, writeFileSync } from "node:fs";
++import fs, { existsSync, writeFileSync } from "node:fs";
++import { syncBuiltinESMExports } from "node:module";
+ import { join } from "node:path";
+-import { describe, expect, it } from "vitest";
++import { describe, expect, it, vi } from "vitest";
+ import { kernelPythonEnvironment } from "../src/core/kernel/python-environment.js";
+ import { isolatedTestEnvironment } from "./isolated-environment.js";
+ 
+@@ -119,4 +120,22 @@
+ 		});
+ 		expect(base.PYTHONPATH).toBe("/bad/path");
+ 	});
++	it("retains an in-use temporary directory without hiding the test result", () => {
++		const sandbox = isolatedTestEnvironment({});
++		const cleanup = vi.spyOn(fs, "rmSync").mockImplementationOnce(() => {
++			throw new Error("temporary fixture still writing");
++		});
++		const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
++		syncBuiltinESMExports();
++		try {
++			expect(() => sandbox.cleanup()).not.toThrow();
++			expect(existsSync(sandbox.root)).toBe(true);
++			expect(warning).toHaveBeenCalledWith(expect.stringContaining(sandbox.root));
++		} finally {
++			cleanup.mockRestore();
++			warning.mockRestore();
++			syncBuiltinESMExports();
++			sandbox.cleanup();
++		}
++	});
+ });
+diff --git a/BACKEND/packages/coding-agent/test/isolated-environment.ts b/BACKEND/packages/coding-agent/test/isolated-environment.ts
+--- a/BACKEND/packages/coding-agent/test/isolated-environment.ts
++++ b/BACKEND/packages/coding-agent/test/isolated-environment.ts
+@@ -88,7 +88,14 @@
+ 		owned: inherited === undefined,
+ 		cleanup: () => {
+ 			// Never delete a pathname supplied by an inherited environment variable.
+-			if (!inherited) rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
++			if (!inherited) {
++				try {
++					rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
++				} catch (error) {
++					// Preserve the test result when a late fixture writer still owns temporary files.
++					console.warn(`Test environment cleanup deferred for ${root}: ${String(error)}`);
++				}
++			}
+ 		},
+ 	};
+ }
+diff --git a/BACKEND/packages/coding-agent/test/kernel-bootstrap-repair.test.ts b/BACKEND/packages/coding-agent/test/kernel-bootstrap-repair.test.ts
+new file mode 100644
+--- /dev/null
++++ b/BACKEND/packages/coding-agent/test/kernel-bootstrap-repair.test.ts
+@@ -0,0 +1,62 @@
++import { spawnSync } from "node:child_process";
++import { existsSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
++import { dirname, isAbsolute, join, relative, sep } from "node:path";
++import { describe, expect, it } from "vitest";
++import { ensureKernelPython, getKernelVenvDir } from "../src/core/kernel/bootstrap.js";
++import { ReplKernelManager } from "../src/core/kernel/index.js";
++import { kernelPythonEnvironment } from "../src/core/kernel/python-environment.js";
++
++function fixturePath(path: string, root: string): string {
++	const child = relative(root, path);
++	if (!child || child === ".." || child.startsWith(`..${sep}`) || isAbsolute(child)) {
++		throw new Error(`Repair fixture must remain inside its disposable environment: ${path}`);
++	}
++	return path;
++}
++
++describe("managed kernel repair with real packages", { tags: ["kernel-heavy"] }, () => {
++	it.each(["dill", "rlm.repl"])(
++		"repairs missing %s files on the same manager's restart",
++		async (moduleName) => {
++			const root = process.env.GRIMOIRE_TEST_ENV_ROOT;
++			if (!root) throw new Error("Run this test through test/run-isolated.ts --bootstrap");
++			const venv = fixturePath(getKernelVenvDir(), root);
++			const python = await ensureKernelPython();
++			fixturePath(python, venv);
++			const locate = spawnSync(python, ["-c", `import ${moduleName}; print(${moduleName}.__file__)`], {
++				encoding: "utf8",
++				env: kernelPythonEnvironment(),
++			});
++			expect(locate.status, locate.stderr).toBe(0);
++			const moduleFile = fixturePath(locate.stdout.trim(), venv);
++			const target = moduleName === "dill" ? dirname(moduleFile) : moduleFile;
++			const backup = `${target}.repair-fixture`;
++			const sentinel = join(venv, "repair-test-sentinel");
++			writeFileSync(sentinel, "preserve this environment");
++			const inode = statSync(python).ino;
++			const manager = new ReplKernelManager({ cwd: root });
++			let moved = false;
++			try {
++				await manager.start();
++				expect((await manager.execute("print(6 * 7)")).stdout.trim()).toBe("42");
++				await manager.shutdown({ snapshot: false });
++				// Leave package metadata installed, as happens with an incomplete environment.
++				renameSync(target, backup);
++				moved = true;
++				await manager.start();
++				const result = await manager.execute("print(6 * 7)");
++				expect(result.status).toBe("ok");
++				expect(result.stdout.trim()).toBe("42");
++				expect(existsSync(target)).toBe(true);
++				expect(readFileSync(sentinel, "utf8")).toBe("preserve this environment");
++				expect(statSync(python).ino).toBe(inode);
++			} finally {
++				await manager.shutdown({ snapshot: false });
++				if (moved && !existsSync(target)) renameSync(backup, target);
++				else if (moved) rmSync(backup, { recursive: true, force: true });
++				rmSync(sentinel, { force: true });
++			}
++		},
++		120_000,
++	);
++});
+diff --git a/BACKEND/packages/coding-agent/test/kernel-bootstrap.test.ts b/BACKEND/packages/coding-agent/test/kernel-bootstrap.test.ts
+--- a/BACKEND/packages/coding-agent/test/kernel-bootstrap.test.ts
++++ b/BACKEND/packages/coding-agent/test/kernel-bootstrap.test.ts
+@@ -576,6 +576,8 @@
+ 		await expect(ensureKernelPython()).resolves.toBe(python);
+ 		expect(readFileSync(join(venv, "live-session-sentinel"), "utf8")).toBe("preserve");
+ 		expect(statSync(python).ino).toBe(inode);
++		const packageName = missing === "rlm" ? "prime-agent-runtime" : missing === "yaml" ? "pyyaml" : missing;
++		expect(readFileSync(logPath, "utf8")).toContain(`--reinstall-package ${packageName}`);
+ 		expect(readFileSync(logPath, "utf8")).not.toMatch(/^venv /m);
+ 		expect(readFileSync(logPath, "utf8")).toContain("--reinstall-package prime-agent-runtime");
+ 	});
