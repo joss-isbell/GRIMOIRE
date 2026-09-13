@@ -1,0 +1,33 @@
+diff --git a/BACKEND/packages/coding-agent/src/core/kernel/python-environment.ts b/BACKEND/packages/coding-agent/src/core/kernel/python-environment.ts
+index 1e5ca2feb..856b3e420 100644
+--- a/BACKEND/packages/coding-agent/src/core/kernel/python-environment.ts
++++ b/BACKEND/packages/coding-agent/src/core/kernel/python-environment.ts
+@@ -3 +3,6 @@ export function kernelPythonEnvironment(base: NodeJS.ProcessEnv = process.env):
+-	const env: NodeJS.ProcessEnv = { ...base, PYTHONUTF8: "1", PYTHONNOUSERSITE: "1", PYTHONSAFEPATH: "1" };
++	const env: NodeJS.ProcessEnv = {
++		...base,
++		PYTHONUTF8: process.platform === "win32" ? "1" : (base.PYTHONUTF8 ?? "1"),
++		PYTHONNOUSERSITE: "1",
++		PYTHONSAFEPATH: "1",
++	};
+diff --git a/BACKEND/packages/coding-agent/test/agent-session-concurrent.test.ts b/BACKEND/packages/coding-agent/test/agent-session-concurrent.test.ts
+index 1c8a6f950..cb5cb3080 100644
+--- a/BACKEND/packages/coding-agent/test/agent-session-concurrent.test.ts
++++ b/BACKEND/packages/coding-agent/test/agent-session-concurrent.test.ts
+@@ -568 +568 @@ describe("AgentSession concurrent prompt guard", () => {
+-	it("enforces the agent message queue cap inside core admission", async () => {
++	it("enforces the pending agent-message cap while explicitly stopped", async () => {
+@@ -569,0 +570 @@ describe("AgentSession concurrent prompt guard", () => {
++		session.requestAbort();
+@@ -589,0 +591,2 @@ describe("AgentSession concurrent prompt guard", () => {
++		expect(session.getSteeringMessages()).toEqual([]);
++		expect(session.getFollowUpMessages()).toEqual([]);
+@@ -593,0 +597 @@ describe("AgentSession concurrent prompt guard", () => {
++		session.requestAbort();
+diff --git a/BACKEND/packages/coding-agent/test/telemetry.test.ts b/BACKEND/packages/coding-agent/test/telemetry.test.ts
+index 49c2ba426..28019c73d 100644
+--- a/BACKEND/packages/coding-agent/test/telemetry.test.ts
++++ b/BACKEND/packages/coding-agent/test/telemetry.test.ts
+@@ -239,0 +240,2 @@ describe("telemetry controls", () => {
++		vi.stubEnv("PRIME_AGENT_TELEMETRY", "1");
++		vi.stubEnv("PI_OFFLINE", "0");
