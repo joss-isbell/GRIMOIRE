@@ -96,6 +96,10 @@ jobs:
             package: packages/coding-agent
             command: npm run test:kernel
             install_uv: true
+          - name: coding-agent repair
+            package: packages/coding-agent
+            command: npm run test:repair
+            install_uv: true
           - name: runtime python
             package: prime-agent-runtime
             command: uv run --with "mcp>=2,<3" --with "httpx>=0.27,<1" python -m unittest discover -s test
