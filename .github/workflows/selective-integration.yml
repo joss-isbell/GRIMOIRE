@@ -1,30 +1,70 @@
-name: Verify damaged kernel repair
+name: Verify repair corrections
 on:
   push:
     branches: [vi/selective-integration-tools-20260912]
     paths: [.github/workflows/selective-integration.yml]
 permissions:
-  contents: read
+  contents: write
+  actions: read
 jobs:
-  repair:
+  failure-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - name: Collect failed-test details
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import os, re, urllib.request
+          from pathlib import Path
+          sections = []
+          for job in (103660774936, 103660774938, 103660774958, 103660774975):
+              req = urllib.request.Request(f'https://api.github.com/repos/joss-isbell/GRIMOIRE/actions/jobs/{job}/logs', headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
+              with urllib.request.urlopen(req) as response:
+                  text = response.read().decode('utf-8-sig')
+              text = re.sub(r'\x1b\[[0-9;]*m', '', text)
+              start = text.find('Failed Tests')
+              if start < 0: start = text.find('Failed Suites')
+              if start < 0: start = max(0, len(text)-18000)
+              sections.append(f'=== JOB {job} ===\n' + text[start:][:30000])
+          Path('reports/ci-failures.txt').write_text('\n\n'.join(sections))
+          PY
+          git config user.name 'GRIMOIRE integration bot'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- reports/ci-failures.txt
+          git commit -m 'chore: preserve precise first CI failure evidence'
+          git push origin HEAD:refs/heads/vi/selective-integration-tools-20260912
+  repair-and-publish:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
-          ref: 3cf7964e27883eebb7e484fb8a33bcba266d2bc1
-          persist-credentials: false
+          fetch-depth: 0
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
           node-version: 22
-      - name: Install dependencies
-        working-directory: BACKEND
+      - name: Apply exact tested corrections in a clean worktree
+        run: |
+          set -euo pipefail
+          git config user.name 'GRIMOIRE integration bot'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git worktree add -b vi/selective-v094-verification-fixes /tmp/candidate 3cf7964e27883eebb7e484fb8a33bcba266d2bc1
+          cd /tmp/candidate
+          git apply --index --unidiff-zero "$GITHUB_WORKSPACE/integration-kit/verification-fixes.patch"
+          git diff --cached --check
+          test "$(git write-tree)" = 9af5e5e889264252de087d3161735050a7a4c45a
+          git commit -m 'fix(coding-agent): repair corrupt dependency installs and preserve fixture session roots'
+      - name: Install isolated verification prerequisites
+        working-directory: /tmp/candidate/BACKEND
         run: |
           python3 -m pip install --user uv
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           npm ci
-      - name: Corrupt and repair only a disposable kernel
-        working-directory: BACKEND/packages/coding-agent
+      - name: Verify real missing files and partial packages repair in place
+        working-directory: /tmp/candidate/BACKEND/packages/coding-agent
         run: |
           cat > repair-verification.mts <<'JS'
           import assert from 'node:assert/strict';
@@ -53,22 +93,26 @@ jobs:
             process.env.PYTHONHOME = '/invalid/inherited/python/home';
             process.env.PYTHONPATH = '/invalid/inherited/python/path';
             assert.equal(await ensureKernelPython(), python);
-            for (const [name, target] of [['runtime repl module', join(site, 'rlm', 'repl.py')], ['dependency with stale distribution metadata', join(site, 'yaml')]]) {
+            for (const [name, target] of [['runtime repl module', join(site, 'rlm', 'repl.py')], ['dependency with stale distribution metadata', join(site, 'yaml')], ['partial dill package', join(site, 'dill', '__init__.py')]]) {
               rmSync(target, {recursive: true});
-              try {
-                assert.equal(await ensureKernelPython({onProgress: console.log}), python);
-                probe('import rlm.repl, yaml, dill; assert rlm.repl.PROTOCOL_VERSION == 3; assert callable(yaml.safe_load); assert callable(dill.dumps)');
-                assert.equal(statSync(venv).ino, venvInode);
-                assert.equal(statSync(python).ino, pythonInode);
-                assert.equal(readFileSync(sentinel, 'utf8'), 'VALUE = 42\n');
-                console.log('PASS: ' + name + '; interpreter, venv and custom package preserved');
-              } catch (error) {
-                console.error('FAIL: ' + name, error);
-                process.exitCode = 1;
-              }
+              assert.equal(await ensureKernelPython({onProgress: console.log}), python);
+              probe('import rlm.repl, yaml, dill; assert rlm.repl.PROTOCOL_VERSION == 3; assert callable(yaml.safe_load); assert callable(dill.dumps)');
+              assert.equal(statSync(venv).ino, venvInode);
+              assert.equal(statSync(python).ino, pythonInode);
+              assert.equal(readFileSync(sentinel, 'utf8'), 'VALUE = 42\n');
+              console.log('PASS: ' + name + '; interpreter, venv and custom package preserved');
             }
           } finally {
             isolation.cleanup();
           }
           JS
           node --import tsx repair-verification.mts
+          rm repair-verification.mts
+      - name: Publish verified corrections without tooling
+        working-directory: /tmp/candidate
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain)"
+          test "$(git rev-parse HEAD^{tree})" = 9af5e5e889264252de087d3161735050a7a4c45a
+          git push origin HEAD:refs/heads/vi/selective-v094-verification-fixes
+          git show -s --format='%H %T %s'
