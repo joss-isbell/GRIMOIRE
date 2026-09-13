@@ -90,7 +90,7 @@ const REQUIRED_HARNESS_METHODS = [
 ];
 const RUNTIME_READY_CHECK = `import inspect; import rlm; from rlm import McpIntegration; import rlm.mcp as mcp; from rlm.harness import HarnessEntry; _harness_methods = ${JSON.stringify(REQUIRED_HARNESS_METHODS)}; assert callable(mcp.list_tools); assert callable(mcp.call_tool); assert hasattr(rlm, 'run'); assert callable(rlm); assert hasattr(rlm, 'rlm'); assert callable(rlm.rlm); assert callable(rlm.host_request); assert callable(rlm.find_models); assert callable(rlm.rlm.find_models); assert callable(rlm.create_session); assert callable(rlm.rlm.create_session); assert hasattr(rlm, 'harness'); assert hasattr(rlm, 'get_harness_state'); assert hasattr(rlm.rlm, 'harness'); assert hasattr(rlm.rlm, 'get_harness_state'); assert all(callable(getattr(_harness, _method, None)) for _harness in (rlm.harness, rlm.rlm.harness) for _method in _harness_methods); assert 'reference' in HarnessEntry.__dataclass_fields__; assert 'scope' in HarnessEntry.__dataclass_fields__; assert 'reference' in inspect.signature(rlm.harness.create_skill).parameters; assert 'reference' in inspect.signature(rlm.harness.update_skill).parameters; assert 'global_' in inspect.signature(rlm.harness.create_memory).parameters; assert 'global_' in inspect.signature(rlm.get_harness_state).parameters; assert not hasattr(rlm, 'background'); assert not hasattr(rlm.rlm, 'background'); from rlm.bash import BashHandle, BashResult; assert callable(rlm.bash); assert all(callable(getattr(BashHandle, _m, None)) for _m in ('tail', 'output', 'poll', 'kill')); assert {'exit_code', 'output', 'duration'} <= set(BashResult.__dataclass_fields__); import rlm.repl as _repl; assert callable(_repl.main); assert callable(_repl.emit); assert callable(_repl.host_request); assert callable(_repl.is_active); assert _repl.PROTOCOL_VERSION == 3; assert callable(rlm.emit); assert not hasattr(rlm, 'HOST_COMM_TARGET'); assert not hasattr(mcp, 'install_shutdown_hook')`;
 // Check required imports together, avoiding a dozen cold interpreter launches.
-const KERNEL_DEPENDENCIES_READY_CHECK = `# kernel dependencies\nimport ${[STATE_SNAPSHOT_REQUIREMENT, ...DEFAULT_RLM_EXTRA_IMPORT_NAMES].join(", ")}`;
+const KERNEL_DEPENDENCIES_READY_CHECK = `# kernel dependencies\nimport ${[STATE_SNAPSHOT_REQUIREMENT, ...DEFAULT_RLM_EXTRA_IMPORT_NAMES].join(", ")}; assert callable(dill.dumps); assert callable(dill.loads); assert callable(yaml.safe_load)`;
 const BOOTSTRAP_VERSION_FILE = ".bootstrap-version";
 const BOOTSTRAP_LOCK_NAME = ".bootstrap.lock";
 const BOOTSTRAP_LOCK_RETRY_MS = 100;
@@ -812,13 +812,15 @@ async function bootstrapVenv(
 		await run(uv, ["python", "install", PYTHON_VERSION]);
 		await run(uv, ["venv", venv, "--python", PYTHON_VERSION, "--seed", "--allow-existing"]);
 	}
+	// Distribution metadata can survive deleted modules. Force the dependency graph to
+	// reinstall only when its runtime probe fails; a normal runtime refresh stays narrow.
+	const repairDependencies = usableInterpreter && !(await hasKernelDependencies(python));
 	await run(uv, [
 		"pip",
 		"install",
 		"--python",
 		python,
-		"--reinstall-package",
-		RUNTIME_REQUIREMENT,
+		...(repairDependencies ? ["--reinstall"] : ["--reinstall-package", RUNTIME_REQUIREMENT]),
 		runtimeRequirement,
 		STATE_SNAPSHOT_REQUIREMENT,
 		...DEFAULT_RLM_EXTRA_UV_ARGS,

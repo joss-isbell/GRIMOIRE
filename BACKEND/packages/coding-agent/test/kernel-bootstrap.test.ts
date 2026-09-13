@@ -134,7 +134,7 @@ function installFakeUv(): string {
 			'  for arg in "$@"; do',
 			'    if [ "$UV_FAIL_ARG" != "" ] && [ "$arg" = "$UV_FAIL_ARG" ]; then exit 1; fi',
 			'    if [ "$previous" = "--python" ]; then python="$arg"; fi',
-			'    if [ "$arg" = "--reinstall-package" ]; then runtime="1"; fi',
+			'    if [ "$arg" = "--reinstall-package" ] || [ "$arg" = "--reinstall" ]; then runtime="1"; fi',
 			'    previous="$arg"',
 			"  done",
 			'  if [ "$runtime" = "1" ] && [ "$UV_SKIP_RUNTIME_REPAIR" != "1" ]; then',
@@ -464,6 +464,7 @@ dependencies = ["httpx"]
 				'if [ "$1" = "-c" ]; then',
 				'  case "$2" in',
 				'    "import rlm") exit 0 ;;',
+				'    *"# kernel dependencies"*) exit 0 ;;',
 				'    "import sys; assert sys.version_info >= (3, 11)") exit 0 ;;',
 				"    *) exit 1 ;;",
 				"  esac",
@@ -583,7 +584,12 @@ dependencies = ["httpx"]
 		expect(readFileSync(join(venv, "live-session-sentinel"), "utf8")).toBe("preserve");
 		expect(statSync(python).ino).toBe(inode);
 		expect(readFileSync(logPath, "utf8")).not.toMatch(/^venv /m);
-		expect(readFileSync(logPath, "utf8")).toContain("--reinstall-package prime-agent-runtime");
+		if (missing === "rlm") {
+			expect(readFileSync(logPath, "utf8")).toContain("--reinstall-package prime-agent-runtime");
+		} else {
+			// Installed distribution metadata may remain even though package files are gone.
+			expect(readFileSync(logPath, "utf8")).toMatch(/ --reinstall /);
+		}
 	});
 
 	it.each(["install failure", "false success"])("does not stamp or delete a failed repair: %s", async (failure) => {

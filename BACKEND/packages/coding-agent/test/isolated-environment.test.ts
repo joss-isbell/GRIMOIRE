@@ -25,6 +25,7 @@ describe("isolated test environments", () => {
 			for (const name of [
 				"PRIME_AGENT_KERNEL_PYTHON",
 				"PRIME_AGENT_INTERNAL_DAEMON_SOCKET",
+				"PRIME_AGENT_SESSION_DIR",
 				"PYTHONPATH",
 				"ANTHROPIC_API_KEY",
 				"AWS_PROFILE",
@@ -33,7 +34,6 @@ describe("isolated test environments", () => {
 				expect(sandbox.env[name]).toBeUndefined();
 			for (const name of [
 				"HOME",
-				"PRIME_AGENT_SESSION_DIR",
 				"PRIME_AGENT_CODING_AGENT_DIR",
 				"PRIME_AGENT_KERNEL_VENV",
 				"XDG_RUNTIME_DIR",
@@ -64,6 +64,30 @@ describe("isolated test environments", () => {
 				home: sandbox.env.HOME,
 				kernel: sandbox.env.PRIME_AGENT_KERNEL_VENV,
 			});
+		} finally {
+			sandbox.cleanup();
+		}
+	});
+	it("keeps default sessions isolated without overriding fixture agent directories", () => {
+		const sandbox = isolatedTestEnvironment({ ...process.env, PRIME_AGENT_SESSION_DIR: "/live/sessions" });
+		try {
+			const fixtureAgentDir = join(sandbox.root, "fixture-agent");
+			const result = spawnSync(
+				process.execPath,
+				[
+					"--import",
+					"tsx",
+					"--input-type=module",
+					"-e",
+					`import { getSessionsDir } from './src/config.ts'; console.log(JSON.stringify([getSessionsDir(), getSessionsDir(${JSON.stringify(fixtureAgentDir)})]));`,
+				],
+				{ env: sandbox.env, encoding: "utf8" },
+			);
+			expect(result.status, result.stderr).toBe(0);
+			expect(JSON.parse(result.stdout)).toEqual([
+				join(sandbox.env.PRIME_AGENT_CODING_AGENT_DIR!, "sessions"),
+				join(fixtureAgentDir, "sessions"),
+			]);
 		} finally {
 			sandbox.cleanup();
 		}

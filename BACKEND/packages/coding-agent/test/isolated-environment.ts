@@ -48,7 +48,6 @@ function testEnvironment(base: NodeJS.ProcessEnv, root: string, token: string): 
 		APPDATA: join(root, "config"),
 		LOCALAPPDATA: join(root, "data"),
 		PRIME_AGENT_CODING_AGENT_DIR: agent,
-		PRIME_AGENT_SESSION_DIR: join(root, "sessions"),
 		PRIME_AGENT_KERNEL_VENV: join(agent, "kernel-venv"),
 		XDG_CONFIG_HOME: join(root, "config"),
 		XDG_DATA_HOME: join(root, "data"),
