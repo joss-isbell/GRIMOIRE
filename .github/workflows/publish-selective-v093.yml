@@ -1,0 +1,99 @@
+name: Verify and publish selective v0.9.3
+on:
+  push:
+    branches: [vi/selective-v093-tools]
+    paths: [selective-v093/**, .github/workflows/publish-selective-v093.yml]
+permissions:
+  contents: write
+concurrency:
+  group: selective-v093-publication
+  cancel-in-progress: false
+jobs:
+  verify-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      TERM: xterm
+      EXPECTED_TREE: f189be45809f24a1e7bb0613e9fd40564c0457fe
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 22
+      - name: Assemble the pinned candidate in a separate worktree
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse origin/main)" = 4cc20de8c9cbd95a554c27ffc84f3f20fb9ba4e1
+          test "$(git rev-parse origin/grim-16-incident-recorder)" = ef0497d18607493e02ba5fb02b0ec476bc0445e9
+          candidate="$RUNNER_TEMP/selective-v093-candidate"
+          git worktree add -b vi/selective-v093-ready "$candidate" 4cc20de8c9cbd95a554c27ffc84f3f20fb9ba4e1
+          echo "CANDIDATE=$candidate" >> "$GITHUB_ENV"
+          python3 selective-v093/assemble.py "$candidate"
+          sed 's/^ diff --git/diff --git/' selective-v093/final.patch > "$RUNNER_TEMP/selective-v093-final.patch"
+          git -C "$candidate" apply "$RUNNER_TEMP/selective-v093-final.patch"
+      - name: Install verification dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep
+          sudo ln -s "$(command -v fdfind)" /usr/local/bin/fd
+          python3 -m pip install --user uv
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          cd "$CANDIDATE/BACKEND"
+          npm ci
+      - name: Build and check the committed catalog
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$CANDIDATE/BACKEND"
+          npm run build --workspace packages/tui
+          npm exec --workspace packages/ai -- tsgo -p tsconfig.build.json
+          npm run build --workspace packages/agent
+          npm run build --workspace packages/coding-agent
+          npm run check
+      - name: Verify focused notification and environment regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$CANDIDATE/BACKEND/packages/coding-agent"
+          npm run test -- test/kernel-bootstrap.test.ts test/isolated-environment.test.ts test/suite/regressions/grimoire-automatic-notifications.test.ts
+      - name: Verify real package repair and same-manager restart
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$CANDIDATE/BACKEND/packages/coding-agent"
+          npm run test:repair
+      - name: Verify exact tree and publish a clean candidate commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, re, subprocess
+          from pathlib import Path
+          source = Path.cwd()
+          target = Path(os.environ['CANDIDATE'])
+          def read(*args):
+              return subprocess.check_output(['git', *args], cwd=source).decode().splitlines()
+          paths = {'BACKEND/' + name for name in read('ls-tree', '-r', '--name-only', '915c78f42c248b08238dd27fcd4bcab32c60beab')}
+          for base, head in [('d3c595fd251307e02f4ec4d7d4e5d26208f4b732', '4cc20de8c9cbd95a554c27ffc84f3f20fb9ba4e1'), ('726db1e263d72b2a4a2d96dc9c8bb8e1ca8b079e', '3cf7964e27883eebb7e484fb8a33bcba266d2bc1')]:
+              paths.update(read('diff', '--name-only', base, head, '--', 'BACKEND'))
+          paths.update(re.findall(r'^\+\+\+ b/(.+)$', (source / 'selective-v093/final.patch').read_text(), re.M))
+          paths.add('BACKEND/packages/coding-agent/.changes/grimoire-selective-v093.md')
+          subprocess.run(['git', 'add', '-u', '--', 'BACKEND', '.github/workflows/ci.yml'], cwd=target, check=True)
+          existing = sorted(name for name in paths if (target / name).is_file())
+          for index in range(0, len(existing), 100):
+              subprocess.run(['git', 'add', '-f', '--', *existing[index:index+100]], cwd=target, check=True)
+          tree = subprocess.check_output(['git', 'write-tree'], cwd=target).decode().strip()
+          if tree != os.environ['EXPECTED_TREE']:
+              raise RuntimeError(f'Candidate tree differs from sandbox verification: {tree}')
+          subprocess.run(['git', 'diff', '--cached', '--stat'], cwd=target, check=True)
+          PY
+          git -C "$CANDIDATE" config user.name 'GRIMOIRE integration bot'
+          git -C "$CANDIDATE" config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git -C "$CANDIDATE" commit -m 'feat: integrate v0.9.3 with prompt notifications, kernel repair, and isolated tests'
+          git -C "$CANDIDATE" push origin HEAD:refs/heads/vi/selective-v093-ready
+          git -C "$CANDIDATE" rev-parse HEAD
