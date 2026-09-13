@@ -224,10 +224,9 @@ export class ActionStore<TAction extends SessionAction = SessionAction> {
 		this.tickets.set(action.id, new ActionTicketController(action.id));
 	}
 
-	selectFirst(): TAction | undefined {
-		const action =
-			this.nextTurnBoundary.find((item) => item.lifecycle.state === "queued") ??
-			this.whenRunIdle.find((item) => item.lifecycle.state === "queued");
+	selectFirst(predicate: (action: TAction) => boolean = () => true): TAction | undefined {
+		const eligible = (item: TAction) => item.lifecycle.state === "queued" && predicate(item);
+		const action = this.nextTurnBoundary.find(eligible) ?? this.whenRunIdle.find(eligible);
 		if (action) transitionSessionAction(action, { state: "selected" });
 		return action;
 	}
@@ -350,7 +349,6 @@ export type IdleEvictionMinutes = number | "off";
 export interface SessionEvictionSnapshot {
 	isSessionActive: boolean;
 	attachedClients: number;
-	hasRegisteredHeartbeat: boolean;
 	hasRegisteredCronJob: boolean;
 	lastActivityAt: number;
 }
@@ -367,6 +365,7 @@ export interface WorkerEvictionSnapshot {
 	isStopping: boolean;
 	hasOwnerClient: boolean;
 	isPreparingUpdateRestart: boolean;
+	hasWakeBlindSchedule: boolean;
 	sessions: readonly SessionEvictionSnapshot[];
 }
 
@@ -381,7 +380,6 @@ function isIdleEvictionThresholdMet(
 	return (
 		!session.isSessionActive &&
 		session.attachedClients === 0 &&
-		!session.hasRegisteredHeartbeat &&
 		!session.hasRegisteredCronJob &&
 		Number.isFinite(session.lastActivityAt) &&
 		now - session.lastActivityAt >= idleEvictionMinutes * 60_000
@@ -414,6 +412,7 @@ export function canEvictWorker(
 		worker.isStopping ||
 		worker.hasOwnerClient ||
 		worker.isPreparingUpdateRestart ||
+		worker.hasWakeBlindSchedule ||
 		worker.sessions.length === 0
 	) {
 		return false;

@@ -126,11 +126,23 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 		const maxAttempts = 10;
 		const delayMs = 20;
 		let lastError: unknown;
+		let compromisedError: Error | undefined;
 
 		for (let attempt = 1; attempt <= maxAttempts; attempt++) {
 			try {
-				return lockfile.lockSync(path, { realpath: false });
+				const release = lockfile.lockSync(path, {
+					realpath: false,
+					onCompromised: (error) => {
+						compromisedError ??= error;
+					},
+				});
+				if (compromisedError) {
+					release();
+					throw compromisedError;
+				}
+				return release;
 			} catch (error) {
+				if (compromisedError) throw compromisedError;
 				const code =
 					typeof error === "object" && error !== null && "code" in error
 						? String((error as { code?: unknown }).code)
@@ -211,11 +223,8 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 			return result;
 		} finally {
 			if (release) {
-				try {
-					await release();
-				} catch {
-					// Ignore unlock errors when lock is compromised.
-				}
+				if (lockCompromised) await release().catch(() => undefined);
+				else await release();
 			}
 		}
 	}
@@ -684,6 +693,25 @@ export class AuthStorage {
 		this.clearStaleAuthSource(provider, "stored");
 		delete this.data[provider];
 		this.persistProviderChange(provider, undefined);
+	}
+
+	/**
+	 * Remove a provider's credential with the disk write verified: throws on any
+	 * load or write failure instead of recording it, so callers can refuse to
+	 * proceed while the credential may still exist on disk. Disk-authoritative
+	 * and idempotent — in-memory state is only updated after the write succeeds.
+	 */
+	removeVerified(provider: string): void {
+		this.storage.withLock((current) => {
+			const currentData = this.parseStorageData(current);
+			if (!(provider in currentData)) return { result: undefined };
+			const merged: AuthStorageData = { ...currentData };
+			delete merged[provider];
+			return { result: undefined, next: JSON.stringify(merged, null, 2) };
+		});
+		delete this.data[provider];
+		// Post-success only: a failed removal must not make a stale-marked credential selectable again.
+		this.clearStaleAuthSource(provider, "stored");
 	}
 
 	/**

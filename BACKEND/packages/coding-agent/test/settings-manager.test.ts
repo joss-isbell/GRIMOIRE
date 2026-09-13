@@ -206,6 +206,19 @@ describe("SettingsManager", () => {
 		});
 	});
 
+	describe("mermaid rendering mode", () => {
+		it("survives a non-object markdown settings value when saving the mode", async () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ markdown: "custom" }));
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			manager.setMermaidRenderingMode("off");
+			await manager.flush();
+
+			expect(manager.getMermaidRenderingMode()).toBe("off");
+			expect(SettingsManager.create(projectDir, agentDir).getMermaidRenderingMode()).toBe("off");
+		});
+	});
+
 	describe("autoRefine", () => {
 		it("defaults to enabled while preserving explicit opt-out", () => {
 			const manager = SettingsManager.create(projectDir, agentDir);
@@ -448,13 +461,13 @@ describe("SettingsManager", () => {
 	});
 
 	describe("mcpServers", () => {
-		it("returns undefined when unset", () => {
+		it("returns undefined when global settings are unset", () => {
 			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ theme: "dark" }));
 			const manager = SettingsManager.create(projectDir, agentDir);
-			expect(manager.getMcpServers()).toBeUndefined();
+			expect(manager.getGlobalMcpServers()).toBeUndefined();
 		});
 
-		it("merges global and project mcpServers, project winning per key", () => {
+		it("ignores project mcpServers when returning executable servers", () => {
 			writeFileSync(
 				join(agentDir, "settings.json"),
 				JSON.stringify({
@@ -473,9 +486,10 @@ describe("SettingsManager", () => {
 				}),
 			);
 			const manager = SettingsManager.create(projectDir, agentDir);
-			const servers = manager.getMcpServers();
-			expect(servers?.acme).toEqual({ type: "http", url: "https://global.acme/mcp", oauth: true });
-			expect(servers?.shared).toEqual({ type: "http", url: "https://project.shared/mcp" });
+			expect(manager.getGlobalMcpServers()).toEqual({
+				acme: { type: "http", url: "https://global.acme/mcp", oauth: true },
+				shared: { type: "http", url: "https://global.shared/mcp" },
+			});
 		});
 	});
 	describe("idle worker eviction", () => {
