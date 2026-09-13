@@ -1,0 +1,31 @@
+name: Publish v0.9.3 fixture corrections
+on:
+  push:
+    branches: [vi/selective-v093-tools]
+    paths: [ci-fixture-fixes/**, .github/workflows/fix-selective-v093-fixtures.yml]
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          fetch-depth: 0
+      - name: Apply the reviewed test-only corrections
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse origin/vi/selective-v093-ready)" = 32aeb6c65ea4be5724d9df00ee17da70e3b66842
+          candidate="$RUNNER_TEMP/fixture-candidate"
+          git worktree add -b fixture-corrections "$candidate" origin/vi/selective-v093-ready
+          git -C "$candidate" apply "$GITHUB_WORKSPACE/ci-fixture-fixes/fix.patch"
+          git -C "$candidate" add -- BACKEND/packages/coding-agent/test/agent-session-concurrent.test.ts BACKEND/packages/coding-agent/test/isolated-environment.ts BACKEND/packages/coding-agent/test/isolated-environment.test.ts
+          test "$(git -C "$candidate" write-tree)" = c515a840aa7a352e5f19ce780baa6edf759634ff
+          git -C "$candidate" diff --cached --check
+          git -C "$candidate" config user.name 'GRIMOIRE integration bot'
+          git -C "$candidate" config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git -C "$candidate" commit -m 'test: keep session fixtures independent and pause capacity-only assertions'
+          git -C "$candidate" push origin HEAD:refs/heads/vi/selective-v093-ready
+          git -C "$candidate" rev-parse HEAD
