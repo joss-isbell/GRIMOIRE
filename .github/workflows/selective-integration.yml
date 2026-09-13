@@ -1,4 +1,4 @@
-name: Selective integration inspection
+name: Publish verified selective integration
 on:
   push:
     branches: [vi/selective-integration-tools-20260912]
@@ -6,38 +6,89 @@ on:
 permissions:
   contents: write
 jobs:
-  inspect:
+  publish-candidate:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      CANDIDATE: /tmp/grimoire-selective-candidate
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           fetch-depth: 0
-      - name: Inspect pinned source and upstream history
+      - name: Verify transported implementation
+        run: |
+          python3 - <<'PY'
+          import base64, hashlib, json, lzma
+          from pathlib import Path
+          encoded = ''.join(Path(f'integration-kit/part{i}.b64').read_text().strip() for i in (1, 2, 3))
+          data = base64.b64decode(encoded, validate=True)
+          assert hashlib.sha256(data).hexdigest() == '943d23b294e6fddbcd5b23083af49734463ad24e3c2a752855bb569b003f5c9a', 'Transport checksum mismatch'
+          kit = json.loads(lzma.decompress(data))
+          root = Path('/tmp/integration-kit')
+          root.mkdir()
+          for name in ('resolve081.py', 'resolve093.py'):
+              (root / name).write_text(kit[name])
+          (root / 'implementation.patch').write_text(kit['patch'])
+          (root / 'manifest.json').write_text(json.dumps({key: kit[key] for key in ('base', 'foundation_tree', 'final_tree')}))
+          print((root / 'manifest.json').read_text())
+          PY
+      - name: Reproduce reviewed upstream foundation
         shell: bash
         run: |
           set -euo pipefail
           base=4cc20de8c9cbd95a554c27ffc84f3f20fb9ba4e1
           source=ef0497d18607493e02ba5fb02b0ec476bc0445e9
-          git fetch https://github.com/PrimeIntellect-ai/prime-agent.git refs/tags/v0.9.4:refs/tags/vi-upstream-v0.9.4
-          mkdir -p reports
-          {
-            echo '=== Pinned refs ==='
-            git show -s --format='%H %s' "$base" "$source" vi-upstream-v0.9.4
-            echo '=== Source first-parent history ==='
-            git log --first-parent --format='%H %P %s' "$base..$source"
-            echo '=== Kernel / isolation / upstream commits on all refs ==='
-            git log --all --since=2026-09-07 --format='%H %P %s' --regexp-ignore-case --extended-regexp --grep='kernel|isola|repair|0[.]9[.]4|upstream' --max-count=100
-            echo '=== Local-only main commits ==='
-            git log --first-parent --format='%H %P %s' "$source..$base"
-          } > reports/history.txt
-          git show --format=fuller --stat e670c5b1e20dc780f07d20691ee5f49488b4ee7c > reports/checkpoint-stat.txt
-          git diff "$base" "$source" -- BACKEND/packages/coding-agent/src/core/kernel/bootstrap.ts BACKEND/packages/coding-agent/src/core/kernel/boot-gate.ts > reports/kernel.diff
-          git diff "$base" "$source" -- BACKEND/packages/coding-agent/vitest.config.ts BACKEND/packages/coding-agent/vitest.kernel.config.ts BACKEND/packages/coding-agent/vitest.process.config.ts BACKEND/packages/coding-agent/test/setup.ts BACKEND/packages/coding-agent/package.json > reports/tests.diff
-          git diff --name-status "$base" "$source" > reports/changed-files.txt
+          test "$(git rev-parse origin/main)" = "$base"
+          test "$(git rev-parse origin/grim-16-incident-recorder)" = "$source"
+          if git ls-remote --exit-code --heads origin refs/heads/vi/selective-v094-ready; then
+            echo 'Candidate already exists; refusing to overwrite it.' >&2
+            exit 1
+          fi
           git config user.name 'GRIMOIRE integration bot'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -- reports/history.txt reports/checkpoint-stat.txt reports/kernel.diff reports/tests.diff reports/changed-files.txt
-          git commit -m 'chore: record selective-integration inspection results'
-          git push origin HEAD:refs/heads/vi/selective-integration-tools-20260912
-          cat reports/history.txt
+          git fetch https://github.com/PrimeIntellect-ai/prime-agent.git refs/tags/v0.9.4:refs/tags/vi-upstream-v0.9.4
+          test "$(git rev-parse vi-upstream-v0.9.4^{commit})" = f771dfcedd684d1afff84ca2c6fa95c7a21efbc2
+          git worktree add -b vi/selective-v094-ready "$CANDIDATE" "$base"
+          cd "$CANDIDATE"
+          if ! git merge --no-commit --no-ff d9e331486c33ccf5985359da368d96f6aac1f427; then
+            python3 /tmp/integration-kit/resolve081.py
+          fi
+          git add -- BACKEND/packages/coding-agent/CHANGELOG.md BACKEND/packages/coding-agent/.changes/grimoire-shell-wakeup.md
+          test -z "$(git diff --name-only --diff-filter=U)"
+          git commit -m 'merge: select pre-recorder upstream integration through v0.8.1'
+          if ! git merge --no-commit --no-ff -s ort -Xsubtree=BACKEND 9c8230df67b378aaedc032f90e1ae8ba687cfe4a; then
+            python3 /tmp/integration-kit/resolve093.py
+          fi
+          git add -- BACKEND/packages/coding-agent/src/core/agent-session.ts BACKEND/packages/coding-agent/src/core/session-manager.ts BACKEND/prime-agent-runtime/src/rlm/mcp_base.py
+          test -z "$(git diff --name-only --diff-filter=U)"
+          git commit -m 'merge: integrate upstream v0.9.3 without incident recording'
+          git merge --no-commit --no-ff -s ort -Xsubtree=BACKEND f771dfcedd684d1afff84ca2c6fa95c7a21efbc2
+          git commit -m 'merge: integrate pinned prime-agent v0.9.4'
+          test "$(git rev-parse HEAD^{tree})" = 292974ca6a7cbba5a6d64317263178e511123719
+      - name: Apply tested fixes and publish clean candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$CANDIDATE"
+          git apply --index --unidiff-zero /tmp/integration-kit/implementation.patch
+          git diff --cached --check
+          test "$(git write-tree)" = d1ed432beb5ef188d029af0463945b16a0fe8c1f
+          git commit -m 'fix(coding-agent): deliver automatic notifications promptly and repair kernels safely'
+          test -z "$(git status --porcelain)"
+          test ! -e .github/workflows/selective-integration.yml
+          test ! -d integration-kit
+          if git merge-base --is-ancestor e670c5b1e20dc780f07d20691ee5f49488b4ee7c HEAD; then
+            echo 'Incident checkpoint must not be in candidate ancestry' >&2
+            exit 1
+          fi
+          if git ls-files | grep -E '(^|/)(incident-recorder|incident-recording|incident-bundle)'; then
+            echo 'Unexpected incident recording file' >&2
+            exit 1
+          fi
+          git merge-base --is-ancestor 4cc20de8c9cbd95a554c27ffc84f3f20fb9ba4e1 HEAD
+          git merge-base --is-ancestor f771dfcedd684d1afff84ca2c6fa95c7a21efbc2 HEAD
+          git push origin HEAD:refs/heads/vi/selective-v094-ready
+          echo '=== Published candidate ==='
+          git log --first-parent --format='%H %s' -5
+          echo '=== Content tree ==='
+          git rev-parse HEAD^{tree}
