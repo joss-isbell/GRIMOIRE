@@ -1,0 +1,12 @@
+diff --git a/BACKEND/packages/coding-agent/test/kernel-bootstrap-repair.test.ts b/BACKEND/packages/coding-agent/test/kernel-bootstrap-repair.test.ts
+--- a/BACKEND/packages/coding-agent/test/kernel-bootstrap-repair.test.ts
++++ b/BACKEND/packages/coding-agent/test/kernel-bootstrap-repair.test.ts
+@@ -43,7 +43,7 @@
+ 				// Leave package metadata installed, as happens with an incomplete environment.
+ 				renameSync(target, backup);
+ 				moved = true;
+-				await manager.start();
++				await manager.restart();
+ 				const result = await manager.execute("print(6 * 7)");
+ 				expect(result.status).toBe("ok");
+ 				expect(result.stdout.trim()).toBe("42");
