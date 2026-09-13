@@ -1,0 +1,71 @@
+diff --git a/BACKEND/packages/coding-agent/src/core/kernel/bootstrap.ts b/BACKEND/packages/coding-agent/src/core/kernel/bootstrap.ts
+index b9879096f..670e10b47 100644
+--- a/BACKEND/packages/coding-agent/src/core/kernel/bootstrap.ts
++++ b/BACKEND/packages/coding-agent/src/core/kernel/bootstrap.ts
+@@ -93 +93 @@ const RUNTIME_READY_CHECK = `import inspect; import rlm; from rlm import McpInte
+-const KERNEL_DEPENDENCIES_READY_CHECK = `# kernel dependencies\nimport ${[STATE_SNAPSHOT_REQUIREMENT, ...DEFAULT_RLM_EXTRA_IMPORT_NAMES].join(", ")}`;
++const KERNEL_DEPENDENCIES_READY_CHECK = `# kernel dependencies\nimport ${[STATE_SNAPSHOT_REQUIREMENT, ...DEFAULT_RLM_EXTRA_IMPORT_NAMES].join(", ")}; assert callable(dill.dumps); assert callable(dill.loads); assert callable(yaml.safe_load)`;
+@@ -814,0 +815,3 @@ async function bootstrapVenv(
++	// Distribution metadata can survive deleted modules. Force the dependency graph to
++	// reinstall only when its runtime probe fails; a normal runtime refresh stays narrow.
++	const repairDependencies = usableInterpreter && !(await hasKernelDependencies(python));
+@@ -820,2 +823 @@ async function bootstrapVenv(
+-		"--reinstall-package",
+-		RUNTIME_REQUIREMENT,
++		...(repairDependencies ? ["--reinstall"] : ["--reinstall-package", RUNTIME_REQUIREMENT]),
+diff --git a/BACKEND/packages/coding-agent/test/isolated-environment.test.ts b/BACKEND/packages/coding-agent/test/isolated-environment.test.ts
+index 9b8fd7232..fa0a6462a 100644
+--- a/BACKEND/packages/coding-agent/test/isolated-environment.test.ts
++++ b/BACKEND/packages/coding-agent/test/isolated-environment.test.ts
+@@ -27,0 +28 @@ describe("isolated test environments", () => {
++				"PRIME_AGENT_SESSION_DIR",
+@@ -36 +36,0 @@ describe("isolated test environments", () => {
+-				"PRIME_AGENT_SESSION_DIR",
+@@ -70,0 +71,24 @@ describe("isolated test environments", () => {
++	it("keeps default sessions isolated without overriding fixture agent directories", () => {
++		const sandbox = isolatedTestEnvironment({ ...process.env, PRIME_AGENT_SESSION_DIR: "/live/sessions" });
++		try {
++			const fixtureAgentDir = join(sandbox.root, "fixture-agent");
++			const result = spawnSync(
++				process.execPath,
++				[
++					"--import",
++					"tsx",
++					"--input-type=module",
++					"-e",
++					`import { getSessionsDir } from './src/config.ts'; console.log(JSON.stringify([getSessionsDir(), getSessionsDir(${JSON.stringify(fixtureAgentDir)})]));`,
++				],
++				{ env: sandbox.env, encoding: "utf8" },
++			);
++			expect(result.status, result.stderr).toBe(0);
++			expect(JSON.parse(result.stdout)).toEqual([
++				join(sandbox.env.PRIME_AGENT_CODING_AGENT_DIR!, "sessions"),
++				join(fixtureAgentDir, "sessions"),
++			]);
++		} finally {
++			sandbox.cleanup();
++		}
++	});
+diff --git a/BACKEND/packages/coding-agent/test/isolated-environment.ts b/BACKEND/packages/coding-agent/test/isolated-environment.ts
+index 6e80f0e89..1fbbfcef4 100644
+--- a/BACKEND/packages/coding-agent/test/isolated-environment.ts
++++ b/BACKEND/packages/coding-agent/test/isolated-environment.ts
+@@ -51 +50,0 @@ function testEnvironment(base: NodeJS.ProcessEnv, root: string, token: string):
+-		PRIME_AGENT_SESSION_DIR: join(root, "sessions"),
+diff --git a/BACKEND/packages/coding-agent/test/kernel-bootstrap.test.ts b/BACKEND/packages/coding-agent/test/kernel-bootstrap.test.ts
+index 54f50da0f..1ce6e300e 100644
+--- a/BACKEND/packages/coding-agent/test/kernel-bootstrap.test.ts
++++ b/BACKEND/packages/coding-agent/test/kernel-bootstrap.test.ts
+@@ -137 +137 @@ function installFakeUv(): string {
+-			'    if [ "$arg" = "--reinstall-package" ]; then runtime="1"; fi',
++			'    if [ "$arg" = "--reinstall-package" ] || [ "$arg" = "--reinstall" ]; then runtime="1"; fi',
+@@ -466,0 +467 @@ dependencies = ["httpx"]
++				'    *"# kernel dependencies"*) exit 0 ;;',
+@@ -586 +587,6 @@ dependencies = ["httpx"]
+-		expect(readFileSync(logPath, "utf8")).toContain("--reinstall-package prime-agent-runtime");
++		if (missing === "rlm") {
++			expect(readFileSync(logPath, "utf8")).toContain("--reinstall-package prime-agent-runtime");
++		} else {
++			// Installed distribution metadata may remain even though package files are gone.
++			expect(readFileSync(logPath, "utf8")).toMatch(/ --reinstall /);
++		}
