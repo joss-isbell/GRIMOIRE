@@ -1,0 +1,90 @@
+diff --git a/BACKEND/packages/coding-agent/test/agent-session-concurrent.test.ts b/BACKEND/packages/coding-agent/test/agent-session-concurrent.test.ts
+index 1c8a6f9..c08e371 100644
+--- a/BACKEND/packages/coding-agent/test/agent-session-concurrent.test.ts
++++ b/BACKEND/packages/coding-agent/test/agent-session-concurrent.test.ts
+@@ -567,6 +567,8 @@ describe("AgentSession concurrent prompt guard", () => {
+ 
+ 	it("enforces the agent message queue cap inside core admission", async () => {
+ 		createSession();
++		// Capacity/recovery assertions require undelivered messages, not a running scheduler.
++		session.acquireQueuedWorkPause();
+ 		const accept = (index: number) => {
+ 			const message = createAgentSessionMessage({
+ 				id: `agentmsg-${index}`,
+@@ -591,6 +593,8 @@ describe("AgentSession concurrent prompt guard", () => {
+ 		session.dispose();
+ 
+ 		createSession();
++		// Capacity/recovery assertions require undelivered messages, not a running scheduler.
++		session.acquireQueuedWorkPause();
+ 		await expect(session.restoreSessionActions(snapshot)).resolves.toBe(20);
+ 		expect(session.unfinishedActionCount).toBe(20);
+ 	});
+diff --git a/BACKEND/packages/coding-agent/test/isolated-environment.test.ts b/BACKEND/packages/coding-agent/test/isolated-environment.test.ts
+index b69e5c9..8690fb7 100644
+--- a/BACKEND/packages/coding-agent/test/isolated-environment.test.ts
++++ b/BACKEND/packages/coding-agent/test/isolated-environment.test.ts
+@@ -13,6 +13,8 @@ describe("isolated test environments", () => {
+ 			PRIME_AGENT_KERNEL_PYTHON: "/live/python",
+ 			PRIME_AGENT_INTERNAL_DAEMON_SOCKET: "/live/socket",
+ 			PRIME_AGENT_SESSION_DIR: "/live/sessions",
++			PI_SESSION_DIR: "/live/legacy-sessions",
++			PRIME_AGENT_TELEMETRY: "1",
+ 			PYTHONPATH: "/live/modules",
+ 			ANTHROPIC_API_KEY: "secret",
+ 			AWS_PROFILE: "live",
+@@ -23,9 +25,13 @@ describe("isolated test environments", () => {
+ 		const sandbox = isolatedTestEnvironment(base);
+ 		try {
+ 			expect(base).toEqual(original);
++			expect(sandbox.env.DO_NOT_TRACK).toBe("1");
+ 			for (const name of [
+ 				"PRIME_AGENT_KERNEL_PYTHON",
+ 				"PRIME_AGENT_INTERNAL_DAEMON_SOCKET",
++				"PRIME_AGENT_SESSION_DIR",
++				"PI_SESSION_DIR",
++				"PRIME_AGENT_TELEMETRY",
+ 				"PYTHONPATH",
+ 				"ANTHROPIC_API_KEY",
+ 				"AWS_PROFILE",
+@@ -34,7 +40,6 @@ describe("isolated test environments", () => {
+ 				expect(sandbox.env[name]).toBeUndefined();
+ 			for (const name of [
+ 				"HOME",
+-				"PRIME_AGENT_SESSION_DIR",
+ 				"PRIME_AGENT_CODING_AGENT_DIR",
+ 				"PRIME_AGENT_KERNEL_VENV",
+ 				"XDG_RUNTIME_DIR",
+diff --git a/BACKEND/packages/coding-agent/test/isolated-environment.ts b/BACKEND/packages/coding-agent/test/isolated-environment.ts
+index 1588da4..c9fffd9 100644
+--- a/BACKEND/packages/coding-agent/test/isolated-environment.ts
++++ b/BACKEND/packages/coding-agent/test/isolated-environment.ts
+@@ -48,7 +48,6 @@ function testEnvironment(base: NodeJS.ProcessEnv, root: string, token: string):
+ 		APPDATA: join(root, "config"),
+ 		LOCALAPPDATA: join(root, "data"),
+ 		PRIME_AGENT_CODING_AGENT_DIR: agent,
+-		PRIME_AGENT_SESSION_DIR: join(root, "sessions"),
+ 		PRIME_AGENT_KERNEL_VENV: join(agent, "kernel-venv"),
+ 		XDG_CONFIG_HOME: join(root, "config"),
+ 		XDG_DATA_HOME: join(root, "data"),
+@@ -61,7 +60,11 @@ function testEnvironment(base: NodeJS.ProcessEnv, root: string, token: string):
+ 		TMP: join(root, "tmp"),
+ 		TEMP: join(root, "tmp"),
+ 	};
+-	for (const path of Object.values(paths)) mkdirSync(path, { recursive: true, mode: 0o700 });
++	// Let each fixture's agentDir determine its sessions directory; a global override
++	// would mix otherwise independent fixtures in one shared catalog.
++	for (const path of [...Object.values(paths), join(agent, "sessions")]) {
++		mkdirSync(path, { recursive: true, mode: 0o700 });
++	}
+ 	return {
+ 		...env,
+ 		...paths,
+@@ -69,7 +72,6 @@ function testEnvironment(base: NodeJS.ProcessEnv, root: string, token: string):
+ 		HOMEPATH: home.slice(parse(home).root.length - 1),
+ 		NPM_CONFIG_USERCONFIG: join(home, ".npmrc"),
+ 		DO_NOT_TRACK: "1",
+-		PRIME_AGENT_TELEMETRY: "0",
+ 		PRIME_AGENT_INSTALL_UV: "0",
+ 		[ROOT_ENV]: root,
+ 		[TOKEN_ENV]: token,
