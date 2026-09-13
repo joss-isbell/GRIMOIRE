@@ -29,6 +29,7 @@ describe("createAgentSessionFromServices", () => {
 	});
 
 	it("shows the telemetry disclosure independently of the Herdr reporter", async () => {
+		vi.stubEnv("DO_NOT_TRACK", "0");
 		vi.stubEnv("PRIME_AGENT_TELEMETRY", "1");
 		const tempDir = join(tmpdir(), `pi-session-telemetry-notice-${Date.now()}`);
 		mkdirSync(tempDir, { recursive: true });
@@ -50,6 +51,7 @@ describe("createAgentSessionFromServices", () => {
 	});
 
 	it("honors an explicit daemon-carried telemetry opt-out", async () => {
+		vi.stubEnv("DO_NOT_TRACK", "0");
 		vi.stubEnv("PRIME_AGENT_TELEMETRY", "1");
 		const tempDir = join(tmpdir(), `pi-session-daemon-telemetry-opt-out-${Date.now()}`);
 		mkdirSync(tempDir, { recursive: true });
@@ -81,6 +83,7 @@ describe("createAgentSessionFromServices", () => {
 	});
 
 	it("does not install top-level telemetry for a resumed child session", async () => {
+		vi.stubEnv("DO_NOT_TRACK", "0");
 		vi.stubEnv("PRIME_AGENT_TELEMETRY", "1");
 		const tempDir = join(tmpdir(), `pi-session-child-telemetry-${Date.now()}`);
 		mkdirSync(tempDir, { recursive: true });
@@ -148,7 +151,7 @@ describe("createAgentSessionFromServices", () => {
 		try {
 			const initialPrompt = session.systemPrompt;
 			expect(initialPrompt).toContain(
-				"Generic MCP connections are accessed through the pre-imported Python `mcp` object in IPython, not as top-level native tool namespaces or installed Python skills.",
+				"Generic MCP connections are accessed through the pre-imported Python `mcp` object in the Python REPL, not as top-level native tool namespaces or installed Python skills.",
 			);
 			expect(initialPrompt).toContain("Enabled generic MCP servers: `filesystem`, `zebra`.");
 			expect(initialPrompt).toContain('await mcp.list_tools("filesystem")');
@@ -183,7 +186,9 @@ describe("createAgentSessionFromServices", () => {
 				],
 				"owner-a",
 			);
-			expect(session.systemPrompt).toContain("Enabled generic MCP servers: `filesystem`, `task`, `zebra`.");
+			expect(session.systemPrompt).toContain("Enabled generic MCP servers: `filesystem`, `zebra`.");
+			expect(session.systemPrompt).not.toContain('await mcp.list_tools("task")');
+			expect(session.getActiveToolNames()).toEqual(expect.arrayContaining(["mcp_list_tools_task", "mcp_call_task"]));
 			expect(session.systemPrompt).not.toContain("task-secret");
 			rebuildRuntime.mockClear();
 			const waitForIdle = vi.spyOn(session.agent, "waitForIdle");
@@ -199,6 +204,8 @@ describe("createAgentSessionFromServices", () => {
 			expect(execute.mock.calls[0]?.[0]).toContain("await _prime_mcp.reload(_prime_mcp_name)");
 			expect(execute.mock.calls[0]?.[0]).toContain('["task"]');
 			expect(session.systemPrompt).toContain("Enabled generic MCP servers: `filesystem`, `zebra`.");
+			expect(session.getAllTools().map((tool) => tool.name)).not.toContain("mcp_call_task");
+			expect(session.getActiveToolNames()).not.toContain("mcp_call_task");
 
 			settingsManager.setGlobalMcpServer("added", { type: "stdio", command: "new-secret" });
 			settingsManager.removeGlobalMcpServer("filesystem");

@@ -33,7 +33,7 @@ export const defaultModelPerProvider: Record<KnownProvider, string> = {
 	xai: "grok-4.20-0309-reasoning",
 	groq: "openai/gpt-oss-120b",
 	cerebras: "gpt-oss-120b",
-	zai: "glm-5.1",
+	zai: "glm-5.3",
 	mistral: "devstral-medium-latest",
 	minimax: "MiniMax-M2.7",
 	"minimax-cn": "MiniMax-M2.7",
@@ -147,7 +147,7 @@ function tryMatchModel(modelPattern: string, availableModels: Model<Api>[]): Mod
 	}
 }
 
-export interface ParsedModelResult {
+interface ParsedModelResult {
 	model: Model<Api> | undefined;
 	/** Thinking level if explicitly specified in pattern, undefined otherwise */
 	thinkingLevel?: ThinkingLevel;
@@ -199,10 +199,8 @@ function findPreferredDefaultModel(availableModels: Model<Api>[]): Model<Api> | 
  * 3. If not found and has colons, split on last colon:
  *    - If suffix is valid thinking level, use it and recurse on prefix
  *    - If suffix is invalid, warn and recurse on prefix with "off"
- *
- * @internal Exported for testing
  */
-export function parseModelPattern(
+function parseModelPattern(
 	pattern: string,
 	availableModels: Model<Api>[],
 	options?: { allowInvalidThinkingLevelFallback?: boolean },
