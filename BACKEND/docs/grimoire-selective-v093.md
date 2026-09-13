@@ -16,7 +16,7 @@ Automatic subagent messages and terminal notices bypass editable steering/follow
 
 Managed kernel startup checks `rlm.repl` protocol 3 and required imports. Source launches prefer the current runtime checkout over stale copied build assets. Repairs keep the virtual environment and interpreter in place when usable, reinstall the runtime and packages whose imports fail, and validate the result before updating the bootstrap marker. The same kernel manager revalidates its managed interpreter after restart. Explicit interpreter overrides are validated rather than silently modified.
 
-Test entry points create a disposable home, agent directory, session directory, kernel environment, cache, and runtime directory before bootstrap or application imports. Direct Vitest invocation uses the same isolation. Real repair tests refuse to operate outside their disposable environment.
+Test entry points create a disposable home, agent directory, session directory, kernel environment, cache, and runtime directory before bootstrap or application imports. Inherited session-directory overrides are removed; default sessions remain under the disposable agent directory, while fixtures with their own agent directory keep their own session storage. Direct Vitest invocation uses the same isolation. Real repair tests refuse to operate outside their disposable environment.
 
 ## Acceptance commands
 
