@@ -1,0 +1,31 @@
+name: Selective integration verification
+on:
+  push:
+    branches: [vi/selective-v094-no-message-queue]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Record source history and immutable inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/selective-integration
+          git log --first-parent --format='%H %s' origin/main..origin/grim-16-incident-recorder | tee /tmp/selective-integration/incident-history.txt
+          git log --first-parent --format='%H %s' origin/grim-16-incident-recorder..origin/main | tee /tmp/selective-integration/main-history.txt
+          git show origin/grim-16-incident-recorder:BACKEND/package.json
+          git for-each-ref --format='%(refname) %(objectname)' refs/remotes/origin refs/tags > /tmp/selective-integration/refs.txt
+          git bundle create /tmp/selective-integration/GRIMOIRE.bundle --all
+      - uses: actions/upload-artifact@v4
+        with:
+          name: selective-integration-source
+          path: /tmp/selective-integration
+          retention-days: 3
+          if-no-files-found: error
