@@ -1,0 +1,534 @@
+=== JOB 103660774936 ===
+Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+2026-09-13T02:40:20.2794529Z 
+2026-09-13T02:40:20.2797327Z  FAIL  test/daemon-supervisor-process.test.ts > daemon supervisor resident workers > lists, creates, and attaches passive children through their owning worker
+2026-09-13T02:40:20.2802130Z AssertionError: expected undefined to match object { …(5) }
+2026-09-13T02:40:20.2802682Z 
+2026-09-13T02:40:20.2803003Z - Expected:
+2026-09-13T02:40:20.2803491Z {
+2026-09-13T02:40:20.2803879Z   "rlmChildId": "passive-child",
+2026-09-13T02:40:20.2804281Z   "runtimeKind": "subagent",
+2026-09-13T02:40:20.2804835Z   "sessionId": "01a098a2-b771-70cd-bdf4-cee15e7af924",
+2026-09-13T02:40:20.2805319Z   "sessionName": "passive-child-worker",
+2026-09-13T02:40:20.2805806Z   "workerPid": 4278,
+2026-09-13T02:40:20.2806194Z }
+2026-09-13T02:40:20.2806470Z 
+2026-09-13T02:40:20.2806708Z + Received:
+2026-09-13T02:40:20.2807156Z undefined
+2026-09-13T02:40:20.2807386Z 
+2026-09-13T02:40:20.2807920Z  ❯ test/daemon-supervisor-process.test.ts:544:26
+2026-09-13T02:40:20.3005387Z     542|    (summary) => summary.sessionFile === child.sessionFile,
+2026-09-13T02:40:20.3006031Z     543|   );
+2026-09-13T02:40:20.3006674Z     544|   expect(passiveSummary).toMatchObject({
+2026-09-13T02:40:20.3007192Z        |                          ^
+2026-09-13T02:40:20.3007654Z     545|    sessionId: child.manager.getSessionId(),
+2026-09-13T02:40:20.3008367Z     546|    sessionName: "passive-child-worker",
+2026-09-13T02:40:20.3008701Z 
+2026-09-13T02:40:20.3008997Z ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+2026-09-13T02:40:20.3009184Z 
+2026-09-13T02:40:20.3009214Z 
+2026-09-13T02:40:20.3012328Z  Test Files  1 failed (1)
+2026-09-13T02:40:20.3013118Z       Tests  1 failed | 10 passed | 8 skipped (19)
+2026-09-13T02:40:20.3013724Z    Start at  02:39:48
+2026-09-13T02:40:20.3014888Z    Duration  31.32s (transform 280ms, setup 0ms, import 344ms, tests 30.88s, environment 0ms)
+2026-09-13T02:40:20.3016134Z 
+2026-09-13T02:40:20.3024090Z 
+2026-09-13T02:40:20.3042975Z ##[error]AssertionError: expected undefined to match object { …(5) }
+
+- Expected:
+{
+  "rlmChildId": "passive-child",
+  "runtimeKind": "subagent",
+  "sessionId": "01a098a2-b771-70cd-bdf4-cee15e7af924",
+  "sessionName": "passive-child-worker",
+  "workerPid": 4278,
+}
+
++ Received:
+undefined
+
+ ❯ test/daemon-supervisor-process.test.ts:544:26
+
+
+2026-09-13T02:40:20.3374538Z npm error Lifecycle script `test:process` failed with error:
+2026-09-13T02:40:20.3374959Z npm error code 1
+2026-09-13T02:40:20.3375563Z npm error path /home/runner/work/GRIMOIRE/GRIMOIRE/BACKEND/packages/coding-agent
+2026-09-13T02:40:20.3376314Z npm error workspace @earendil-works/pi-coding-agent@0.9.4
+2026-09-13T02:40:20.3376804Z npm error location /home/runner/work/GRIMOIRE/GRIMOIRE/BACKEND/packages/coding-agent
+2026-09-13T02:40:20.3377199Z npm error command failed
+2026-09-13T02:40:20.3377614Z npm error command sh -c tsx test/run-isolated.ts test/daemon-supervisor-process.test.ts
+2026-09-13T02:40:20.3413521Z ##[error]Process completed with exit code 1.
+2026-09-13T02:40:20.3531155Z 
+
+=== JOB 103660774938 ===
+Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+2026-09-13T02:41:01.3290384Z 
+2026-09-13T02:41:01.3291039Z  FAIL  test/sdk-session-manager.test.ts > createAgentSession session manager defaults > uses agentDir for the default persisted session path
+2026-09-13T02:41:01.3296165Z AssertionError: expected '/tmp/g-tests-3BETkq/sessions' to be '/tmp/g-tests-3BETkq/tmp/pi-sdk-sessio…' // Object.is equality
+2026-09-13T02:41:01.3296601Z 
+2026-09-13T02:41:01.3297117Z Expected: "/tmp/g-tests-3BETkq/tmp/pi-sdk-session-test-1789267252865-p4psn2g0yhe/agent/sessions"
+2026-09-13T02:41:01.3297693Z Received: "/tmp/g-tests-3BETkq/sessions"
+2026-09-13T02:41:01.3297845Z 
+2026-09-13T02:41:01.3298287Z  ❯ test/sdk-session-manager.test.ts:42:22
+2026-09-13T02:41:01.3323803Z      40|   const sessionFile = session.sessionManager.getSessionFile();
+2026-09-13T02:41:01.3324400Z      41|
+2026-09-13T02:41:01.3325031Z      42|   expect(sessionDir).toBe(expectedSessionDir);
+2026-09-13T02:41:01.3325603Z        |                      ^
+2026-09-13T02:41:01.3326537Z      43|   expect(sessionFile?.startsWith(`${expectedSessionDir}/`)).toBe(true);
+2026-09-13T02:41:01.3327260Z      44|
+2026-09-13T02:41:01.3327449Z 
+2026-09-13T02:41:01.3327865Z 
+2026-09-13T02:41:01.3328234Z ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+2026-09-13T02:41:01.3328566Z 
+2026-09-13T02:41:01.3337795Z  Test Files  1 failed | 121 passed | 2 skipped (124)
+2026-09-13T02:41:01.3344592Z       Tests  1 failed | 1398 passed | 19 skipped (1418)
+2026-09-13T02:41:01.3345155Z    Start at  02:40:13
+2026-09-13T02:41:01.3346452Z    Duration  47.94s (transform 6.72s, setup 0ms, import 57.93s, tests 69.53s, environment 10ms)
+2026-09-13T02:41:01.3347793Z 
+2026-09-13T02:41:01.3367275Z 
+2026-09-13T02:41:01.3391694Z ##[error]AssertionError: expected '/tmp/g-tests-3BETkq/sessions' to be '/tmp/g-tests-3BETkq/tmp/pi-sdk-sessio…' // Object.is equality
+
+Expected: "/tmp/g-tests-3BETkq/tmp/pi-sdk-session-test-1789267252865-p4psn2g0yhe/agent/sessions"
+Received: "/tmp/g-tests-3BETkq/sessions"
+
+ ❯ test/sdk-session-manager.test.ts:42:22
+
+
+2026-09-13T02:41:01.6494547Z npm error Lifecycle script `test:ci` failed with error:
+2026-09-13T02:41:01.6495607Z npm error code 1
+2026-09-13T02:41:01.6496376Z npm error path /home/runner/work/GRIMOIRE/GRIMOIRE/BACKEND/packages/coding-agent
+2026-09-13T02:41:01.6497320Z npm error workspace @earendil-works/pi-coding-agent@0.9.4
+2026-09-13T02:41:01.6498383Z npm error location /home/runner/work/GRIMOIRE/GRIMOIRE/BACKEND/packages/coding-agent
+2026-09-13T02:41:01.6499144Z npm error command failed
+2026-09-13T02:41:01.6500032Z npm error command sh -c tsx test/run-isolated.ts --bootstrap --exclude test/daemon-supervisor-process.test.ts --shard=3/3
+2026-09-13T02:41:01.6543996Z ##[error]Process completed with exit code 1.
+2026-09-13T02:41:01.6662737Z 
+
+=== JOB 103660774958 ===
+Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+2026-09-13T02:42:02.0314932Z 
+2026-09-13T02:42:02.0317174Z  FAIL  test/agent-session-concurrent.test.ts > AgentSession concurrent prompt guard > enforces the agent message queue cap inside core admission
+2026-09-13T02:42:02.0321864Z AssertionError: expected 18 to be 20 // Object.is equality
+2026-09-13T02:42:02.0322227Z 
+2026-09-13T02:42:02.0322448Z - Expected
+2026-09-13T02:42:02.0322782Z + Received
+2026-09-13T02:42:02.0322924Z 
+2026-09-13T02:42:02.0323180Z - 20
+2026-09-13T02:42:02.0323460Z + 18
+2026-09-13T02:42:02.0323650Z 
+2026-09-13T02:42:02.0324002Z  ❯ test/agent-session-concurrent.test.ts:594:56
+2026-09-13T02:42:02.0419436Z     592|
+2026-09-13T02:42:02.0420338Z     593|   createSession();
+2026-09-13T02:42:02.0421271Z     594|   await expect(session.restoreSessionActions(snapshot)).resolves.toBe(…
+2026-09-13T02:42:02.0422063Z        |                                                        ^
+2026-09-13T02:42:02.0423279Z     595|   expect(session.unfinishedActionCount).toBe(20);
+2026-09-13T02:42:02.0424091Z     596|  });
+2026-09-13T02:42:02.0424505Z 
+2026-09-13T02:42:02.0424935Z ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+2026-09-13T02:42:02.0425296Z 
+2026-09-13T02:42:02.0426389Z  FAIL  test/kernel-windows-process.test.ts > Windows kernel subprocesses > preserves the configured Python encoding and direct launch outside Windows
+2026-09-13T02:42:02.0430928Z AssertionError: expected '1' to be '0' // Object.is equality
+2026-09-13T02:42:02.0431546Z 
+2026-09-13T02:42:02.0431802Z Expected: "0"
+2026-09-13T02:42:02.0432229Z Received: "1"
+2026-09-13T02:42:02.0432514Z 
+2026-09-13T02:42:02.0435966Z  ❯ test/kernel-windows-process.test.ts:97:53
+2026-09-13T02:42:02.0437404Z      95|   await expect(ensureKernelPython()).rejects.toThrow("PRIME_AGENT_KERN…
+2026-09-13T02:42:02.0438450Z      96|   expect(spawn.mock.calls[0]?.[0]).toBe(python);
+2026-09-13T02:42:02.0439806Z      97|   expect(spawn.mock.calls[0]?.[2]?.env?.PYTHONUTF8).toBe("0");
+2026-09-13T02:42:02.0440704Z        |                                                     ^
+2026-09-13T02:42:02.0441261Z      98|  });
+2026-09-13T02:42:02.0441734Z      99| });
+2026-09-13T02:42:02.0453551Z 
+2026-09-13T02:42:02.0467215Z  Test Files  2 failed | 119 passed | 3 skipped (124)
+2026-09-13T02:42:02.0473505Z 
+2026-09-13T02:42:02.0492265Z ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯
+2026-09-13T02:42:02.0492950Z 
+2026-09-13T02:42:02.0494645Z       Tests  2 failed | 1599 passed | 26 skipped (1627)
+2026-09-13T02:42:02.0504483Z    Start at  02:40:20
+2026-09-13T02:42:02.0505429Z    Duration  101.60s (transform 8.31s, setup 0ms, import 62.32s, tests 206.30s, environment 9ms)
+2026-09-13T02:42:02.0505826Z 
+2026-09-13T02:42:02.0505830Z 
+2026-09-13T02:42:02.0524798Z ##[error]AssertionError: expected 18 to be 20 // Object.is equality
+
+- Expected
++ Received
+
+- 20
++ 18
+
+ ❯ test/agent-session-concurrent.test.ts:594:56
+
+
+2026-09-13T02:42:02.0531135Z 
+2026-09-13T02:42:02.0533588Z ##[error]AssertionError: expected '1' to be '0' // Object.is equality
+
+Expected: "0"
+Received: "1"
+
+ ❯ test/kernel-windows-process.test.ts:97:53
+
+
+2026-09-13T02:42:02.3771818Z npm error Lifecycle script `test:ci` failed with error:
+2026-09-13T02:42:02.3772621Z npm error code 1
+2026-09-13T02:42:02.3773523Z npm error path /home/runner/work/GRIMOIRE/GRIMOIRE/BACKEND/packages/coding-agent
+2026-09-13T02:42:02.3774157Z npm error workspace @earendil-works/pi-coding-agent@0.9.4
+2026-09-13T02:42:02.3774712Z npm error location /home/runner/work/GRIMOIRE/GRIMOIRE/BACKEND/packages/coding-agent
+2026-09-13T02:42:02.3775227Z npm error command failed
+2026-09-13T02:42:02.3775841Z npm error command sh -c tsx test/run-isolated.ts --bootstrap --exclude test/daemon-supervisor-process.test.ts --shard=1/3
+2026-09-13T02:42:02.3816136Z ##[error]Process completed with exit code 1.
+2026-09-13T02:42:02.3938804Z 
+
+=== JOB 103660774975 ===
+Failed Tests 5 ⎯⎯⎯⎯⎯⎯⎯
+2026-09-13T02:41:45.6090046Z 
+2026-09-13T02:41:45.6093783Z  FAIL  test/daemon-catalog-entry.test.ts > daemon catalog entrypoint > starts the dedicated catalog process over IPC
+2026-09-13T02:41:45.6100626Z AssertionError: expected [ Array(7) ] to deeply equal []
+2026-09-13T02:41:45.6101246Z 
+2026-09-13T02:41:45.6101549Z - Expected
+2026-09-13T02:41:45.6101999Z + Received
+2026-09-13T02:41:45.6102228Z 
+2026-09-13T02:41:45.6102405Z - []
+2026-09-13T02:41:45.6102773Z + [
+2026-09-13T02:41:45.6103144Z +   {
+2026-09-13T02:41:45.6103666Z +     "allMessagesText": "",
+2026-09-13T02:41:45.6104373Z +     "created": 2026-09-13T02:41:25.627Z,
+2026-09-13T02:41:45.6105460Z +     "cwd": "/home/runner/work/GRIMOIRE/GRIMOIRE/BACKEND/packages/coding-agent",
+2026-09-13T02:41:45.6106147Z +     "firstMessage": "(no messages)",
+2026-09-13T02:41:45.6106640Z +     "id": "01a098a4-167b-72d9-a8ba-dda6df0d47c8",
+2026-09-13T02:41:45.6107058Z +     "messageCount": 0,
+2026-09-13T02:41:45.6107463Z +     "modified": 2026-09-13T02:41:25.627Z,
+2026-09-13T02:41:45.6108122Z +     "path": "/tmp/g-tests-a0aWtE/sessions/01a098a4-167b-72d9-a8ba-dda6df0d47c8.jsonl",
+2026-09-13T02:41:45.6108647Z +     "rlmDepth": 0,
+2026-09-13T02:41:45.6108932Z +     "state": {
+2026-09-13T02:41:45.6109250Z +       "status": "active",
+2026-09-13T02:41:45.6109547Z +     },
+2026-09-13T02:41:45.6109766Z +   },
+2026-09-13T02:41:45.6109980Z +   {
+2026-09-13T02:41:45.6110268Z +     "allMessagesText": "",
+2026-09-13T02:41:45.6110665Z +     "created": 2026-09-13T02:41:11.977Z,
+2026-09-13T02:41:45.6111274Z +     "cwd": "/tmp/project",
+2026-09-13T02:41:45.6111657Z +     "firstMessage": "(no messages)",
+2026-09-13T02:41:45.6112029Z +     "id": "session-root",
+2026-09-13T02:41:45.6112364Z +     "messageCount": 0,
+2026-09-13T02:41:45.6112784Z +     "modified": 2026-09-13T02:41:11.977Z,
+2026-09-13T02:41:45.6113308Z +     "path": "/tmp/g-tests-a0aWtE/sessions/session-root.jsonl",
+2026-09-13T02:41:45.6113750Z +     "rlmDepth": 0,
+2026-09-13T02:41:45.6114015Z +   },
+2026-09-13T02:41:45.6114228Z +   {
+2026-09-13T02:41:45.6114516Z +     "allMessagesText": "",
+2026-09-13T02:41:45.6114914Z +     "created": 2026-09-13T02:41:09.498Z,
+2026-09-13T02:41:45.6115784Z +     "cwd": "/home/runner/work/GRIMOIRE/GRIMOIRE/BACKEND/packages/coding-agent",
+2026-09-13T02:41:45.6116367Z +     "firstMessage": "(no messages)",
+2026-09-13T02:41:45.6116832Z +     "id": "01a098a3-d77a-721a-9ffa-568b795648d4",
+2026-09-13T02:41:45.6117232Z +     "messageCount": 0,
+2026-09-13T02:41:45.6117618Z +     "modified": 2026-09-13T02:41:09.498Z,
+2026-09-13T02:41:45.6118261Z +     "path": "/tmp/g-tests-a0aWtE/sessions/01a098a3-d77a-721a-9ffa-568b795648d4.jsonl",
+2026-09-13T02:41:45.6118779Z +     "rlmDepth": 0,
+2026-09-13T02:41:45.6119221Z +     "state": {
+2026-09-13T02:41:45.6119545Z +       "status": "active",
+2026-09-13T02:41:45.6119833Z +     },
+2026-09-13T02:41:45.6120051Z +   },
+2026-09-13T02:41:45.6120263Z +   {
+2026-09-13T02:41:45.6120547Z +     "allMessagesText": "",
+2026-09-13T02:41:45.6120935Z +     "created": 2026-09-13T02:41:04.997Z,
+2026-09-13T02:41:45.6121536Z +     "cwd": "/home/runner/work/GRIMOIRE/GRIMOIRE/BACKEND/packages/coding-agent",
+2026-09-13T02:41:45.6122074Z +     "firstMessage": "(no messages)",
+2026-09-13T02:41:45.6122527Z +     "id": "01a098a3-c5e5-76c7-8328-69675a334b82",
+2026-09-13T02:41:45.6122921Z +     "messageCount": 0,
+2026-09-13T02:41:45.6123309Z +     "modified": 2026-09-13T02:41:04.997Z,
+2026-09-13T02:41:45.6123947Z +     "path": "/tmp/g-tests-a0aWtE/sessions/01a098a3-c5e5-76c7-8328-69675a334b82.jsonl",
+2026-09-13T02:41:45.6124465Z +     "rlmDepth": 0,
+2026-09-13T02:41:45.6124747Z +     "state": {
+2026-09-13T02:41:45.6125053Z +       "status": "active",
+2026-09-13T02:41:45.6125563Z +     },
+2026-09-13T02:41:45.6125785Z +   },
+2026-09-13T02:41:45.6125996Z +   {
+2026-09-13T02:41:45.6126451Z +     "allMessagesText": "Say hello Hello from the faux provider.",
+2026-09-13T02:41:45.6126971Z +     "created": 2026-09-13T02:41:00.787Z,
+2026-09-13T02:41:45.6129448Z +     "cwd": "/home/runner/work/GRIMOIRE/GRIMOIRE/BACKEND/packages/coding-agent",
+2026-09-13T02:41:45.6130503Z +     "firstMessage": "Say hello",
+2026-09-13T02:41:45.6131289Z +     "id": "01a098a3-b573-767d-b536-4bc621669c5e",
+2026-09-13T02:41:45.6131985Z +     "messageCount": 3,
+2026-09-13T02:41:45.6132683Z +     "modified": 2026-09-13T02:41:01.950Z,
+2026-09-13T02:41:45.6133775Z +     "path": "/tmp/g-tests-a0aWtE/sessions/01a098a3-b573-767d-b536-4bc621669c5e.jsonl",
+2026-09-13T02:41:45.6134556Z +     "rlmDepth": 0,
+2026-09-13T02:41:45.6134871Z +     "state": {
+2026-09-13T02:41:45.6135459Z +       "status": "active",
+2026-09-13T02:41:45.6136002Z +     },
+2026-09-13T02:41:45.6136441Z +     "usage": {
+2026-09-13T02:41:45.6136921Z +       "cost": 0,
+2026-09-13T02:41:45.6137485Z +       "inputTokens": 4638,
+2026-09-13T02:41:45.6138090Z +       "outputTokens": 8,
+2026-09-13T02:41:45.6138586Z +     },
+2026-09-13T02:41:45.6139063Z +   },
+2026-09-13T02:41:45.6139478Z +   {
+2026-09-13T02:41:45.6140039Z +     "allMessagesText": "",
+2026-09-13T02:41:45.6141087Z +     "created": 2026-09-13T02:40:59.850Z,
+2026-09-13T02:41:45.6142178Z +     "cwd": "/home/runner/work/GRIMOIRE/GRIMOIRE/BACKEND/packages/coding-agent",
+2026-09-13T02:41:45.6143152Z +     "firstMessage": "(no messages)",
+2026-09-13T02:41:45.6143953Z +     "id": "01a098a3-b1ca-7558-b04f-a4fe0c091f08",
+2026-09-13T02:41:45.6144632Z +     "messageCount": 0,
+2026-09-13T02:41:45.6145139Z +     "modified": 2026-09-13T02:40:59.850Z,
+2026-09-13T02:41:45.6146114Z +     "path": "/tmp/g-tests-a0aWtE/sessions/01a098a3-b1ca-7558-b04f-a4fe0c091f08.jsonl",
+2026-09-13T02:41:45.6146647Z +     "rlmDepth": 0,
+2026-09-13T02:41:45.6146935Z +     "state": {
+2026-09-13T02:41:45.6147244Z +       "status": "active",
+2026-09-13T02:41:45.6147525Z +     },
+2026-09-13T02:41:45.6147738Z +   },
+2026-09-13T02:41:45.6147947Z +   {
+2026-09-13T02:41:45.6148237Z +     "allMessagesText": "",
+2026-09-13T02:41:45.6148638Z +     "created": 2026-09-13T02:40:52.467Z,
+2026-09-13T02:41:45.6149229Z +     "cwd": "/home/runner/work/GRIMOIRE/GRIMOIRE/BACKEND/packages/coding-agent",
+2026-09-13T02:41:45.6149762Z +     "firstMessage": "(no messages)",
+2026-09-13T02:41:45.6150366Z +     "id": "01a098a3-94f3-74b0-ae38-874485eaefe2",
+2026-09-13T02:41:45.6150780Z +     "messageCount": 0,
+2026-09-13T02:41:45.6151178Z +     "modified": 2026-09-13T02:40:52.467Z,
+2026-09-13T02:41:45.6151818Z +     "path": "/tmp/g-tests-a0aWtE/sessions/01a098a3-94f3-74b0-ae38-874485eaefe2.jsonl",
+2026-09-13T02:41:45.6152326Z +     "rlmDepth": 0,
+2026-09-13T02:41:45.6152608Z +     "state": {
+2026-09-13T02:41:45.6152912Z +       "status": "active",
+2026-09-13T02:41:45.6153195Z +     },
+2026-09-13T02:41:45.6153417Z +   },
+2026-09-13T02:41:45.6153623Z + ]
+2026-09-13T02:41:45.6153741Z 
+2026-09-13T02:41:45.6154085Z  ❯ test/daemon-catalog-entry.test.ts:16:31
+2026-09-13T02:41:45.6154536Z      14|   try {
+2026-09-13T02:41:45.6155539Z      15|    await expect(client.start()).resolves.toBeUndefined();
+2026-09-13T02:41:45.6156605Z      16|    await expect(client.list()).resolves.toEqual([]);
+2026-09-13T02:41:45.6157272Z        |                               ^
+2026-09-13T02:41:45.6157638Z      17|   } finally {
+2026-09-13T02:41:45.6158096Z      18|    await client.stop();
+2026-09-13T02:41:45.6158378Z 
+2026-09-13T02:41:45.6158617Z ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/5]⎯
+2026-09-13T02:41:45.6158813Z 
+2026-09-13T02:41:45.6159496Z  FAIL  test/migrations.test.ts > session migrations > moves legacy per-cwd session files into the flat session root
+2026-09-13T02:41:45.6160398Z AssertionError: expected true to be false // Object.is equality
+2026-09-13T02:41:45.6160728Z 
+2026-09-13T02:41:45.6160852Z - Expected
+2026-09-13T02:41:45.6161099Z + Received
+2026-09-13T02:41:45.6161234Z 
+2026-09-13T02:41:45.6161350Z - false
+2026-09-13T02:41:45.6161564Z + true
+2026-09-13T02:41:45.6161678Z 
+2026-09-13T02:41:45.6161940Z  ❯ test/migrations.test.ts:80:34
+2026-09-13T02:41:45.6176165Z      78|
+2026-09-13T02:41:45.6176915Z      79|   const migratedFile = join(sessionsDir, "session-1.jsonl");
+2026-09-13T02:41:45.6177865Z      80|   expect(existsSync(legacyFile)).toBe(false);
+2026-09-13T02:41:45.6178479Z        |                                  ^
+2026-09-13T02:41:45.6179337Z      81|   expect(existsSync(legacyDir)).toBe(false);
+2026-09-13T02:41:45.6180160Z      82|   expect(readFileSync(migratedFile, "utf8")).toContain('"id":"session-…
+2026-09-13T02:41:45.6180664Z 
+2026-09-13T02:41:45.6181321Z ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/5]⎯
+2026-09-13T02:41:45.6181716Z 
+2026-09-13T02:41:45.6182924Z  FAIL  test/migrations.test.ts > session migrations > moves root session files using only the JSONL header
+2026-09-13T02:41:45.6185454Z Error: ENOENT: no such file or directory, open '/tmp/g-tests-a0aWtE/tmp/prime-agent-migrations-qIwxDS/sessions/session-root.jsonl'
+2026-09-13T02:41:45.6187002Z  ❯ test/migrations.test.ts:106:10
+2026-09-13T02:41:45.6188055Z     104|   const migratedFile = join(agentDir, "sessions", "session-root.jsonl"…
+2026-09-13T02:41:45.6189498Z     105|   expect(existsSync(legacyFile)).toBe(false);
+2026-09-13T02:41:45.6190913Z     106|   expect(readFileSync(migratedFile, "utf8")).toContain('"id":"session-…
+2026-09-13T02:41:45.6191840Z        |          ^
+2026-09-13T02:41:45.6192652Z     107|  });
+2026-09-13T02:41:45.6193209Z     108|
+2026-09-13T02:41:45.6193454Z 
+2026-09-13T02:41:45.6193861Z ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[3/5]⎯
+2026-09-13T02:41:45.6194233Z 
+2026-09-13T02:41:45.6195558Z  FAIL  test/telemetry.test.ts > telemetry controls > honors settings and environment opt-outs
+2026-09-13T02:41:45.6197126Z AssertionError: expected false to be true // Object.is equality
+2026-09-13T02:41:45.6197717Z 
+2026-09-13T02:41:45.6197948Z - Expected
+2026-09-13T02:41:45.6198369Z + Received
+2026-09-13T02:41:45.6198592Z 
+2026-09-13T02:41:45.6198797Z - true
+2026-09-13T02:41:45.6199195Z + false
+2026-09-13T02:41:45.6199406Z 
+2026-09-13T02:41:45.6199890Z  ❯ test/telemetry.test.ts:240:40
+2026-09-13T02:41:45.6244713Z     238|
+2026-09-13T02:41:45.6246508Z     239|   vi.stubEnv("DO_NOT_TRACK", "0");
+2026-09-13T02:41:45.6248646Z     240|   expect(isTelemetryEnabled(settings)).toBe(true);
+2026-09-13T02:41:45.6250331Z        |                                        ^
+2026-09-13T02:41:45.6251321Z     241|
+2026-09-13T02:41:45.6252570Z     242|   vi.stubEnv("DO_NOT_TRACK", "1");
+2026-09-13T02:41:45.6253531Z 
+2026-09-13T02:41:45.6254179Z ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[4/5]⎯
+2026-09-13T02:41:45.6254789Z 
+2026-09-13T02:41:45.6257496Z  FAIL  test/suite/daemon-serialized-refine-process.test.ts > Real-process serializedRefine — JSON mode > daemon supervisor scrubs inherited worker env, checkpoint applies refine_complete before agent_end
+2026-09-13T02:41:45.6260843Z Error: ENOENT: no such file or directory, scandir '/tmp/g-tests-a0aWtE/tmp/prime-agent-process-json-refine-haglHu/agent/sessions'
+2026-09-13T02:41:45.6263106Z  ❯ findSessionJsonl test/suite/daemon-serialized-refine-process.test.ts:255:23
+2026-09-13T02:41:45.6336191Z     253|
+2026-09-13T02:41:45.6356963Z     254|   function findSessionJsonl(dir: string): string | undefined {
+2026-09-13T02:41:45.6357843Z 
+2026-09-13T02:41:45.6386601Z     255|    for (const name of readdirSync(dir)) {
+2026-09-13T02:41:45.6388314Z  Test Files  4 failed | 116 passed | 4 skipped (124)
+2026-09-13T02:41:45.6389812Z        |                       ^
+2026-09-13T02:41:45.6390895Z     256|     const fullPath = join(dir, name);
+2026-09-13T02:41:45.6392139Z     257|     if (name.endsWith(".jsonl")) {
+2026-09-13T02:41:45.6393493Z  ❯ test/suite/daemon-serialized-refine-process.test.ts:283:28
+2026-09-13T02:41:45.6394149Z 
+2026-09-13T02:41:45.6394587Z ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[5/5]⎯
+2026-09-13T02:41:45.6394951Z 
+2026-09-13T02:41:45.6396272Z       Tests  5 failed | 2079 passed | 19 skipped (2103)
+2026-09-13T02:41:45.6397390Z    Start at  02:40:20
+2026-09-13T02:41:45.6398611Z    Duration  85.20s (transform 9.32s, setup 0ms, import 95.97s, tests 133.41s, environment 19ms)
+2026-09-13T02:41:45.6399376Z 
+2026-09-13T02:41:45.6411127Z 
+2026-09-13T02:41:45.6483536Z ##[error]AssertionError: expected [ Array(7) ] to deeply equal []
+
+- Expected
++ Received
+
+- []
++ [
++   {
++     "allMessagesText": "",
++     "created": 2026-09-13T02:41:25.627Z,
++     "cwd": "/home/runner/work/GRIMOIRE/GRIMOIRE/BACKEND/packages/coding-agent",
++     "firstMessage": "(no messages)",
++     "id": "01a098a4-167b-72d9-a8ba-dda6df0d47c8",
++     "messageCount": 0,
++     "modified": 2026-09-13T02:41:25.627Z,
++     "path": "/tmp/g-tests-a0aWtE/sessions/01a098a4-167b-72d9-a8ba-dda6df0d47c8.jsonl",
++     "rlmDepth": 0,
++     "state": {
++       "status": "active",
++     },
++   },
++   {
++     "allMessagesText": "",
++     "created": 2026-09-13T02:41:11.977Z,
++     "cwd": "/tmp/project",
++     "firstMessage": "(no messages)",
++     "id": "session-root",
++     "messageCount": 0,
++     "modified": 2026-09-13T02:41:11.977Z,
++     "path": "/tmp/g-tests-a0aWtE/sessions/session-root.jsonl",
++     "rlmDepth": 0,
++   },
++   {
++     "allMessagesText": "",
++     "created": 2026-09-13T02:41:09.498Z,
++     "cwd": "/home/runner/work/GRIMOIRE/GRIMOIRE/BACKEND/packages/coding-agent",
++     "firstMessage": "(no messages)",
++     "id": "01a098a3-d77a-721a-9ffa-568b795648d4",
++     "messageCount": 0,
++     "modified": 2026-09-13T02:41:09.498Z,
++     "path": "/tmp/g-tests-a0aWtE/sessions/01a098a3-d77a-721a-9ffa-568b795648d4.jsonl",
++     "rlmDepth": 0,
++     "state": {
++       "status": "active",
++     },
++   },
++   {
++     "allMessagesText": "",
++     "created": 2026-09-13T02:41:04.997Z,
++     "cwd": "/home/runner/work/GRIMOIRE/GRIMOIRE/BACKEND/packages/coding-agent",
++     "firstMessage": "(no messages)",
++     "id": "01a098a3-c5e5-76c7-8328-69675a334b82",
++     "messageCount": 0,
++     "modified": 2026-09-13T02:41:04.997Z,
++     "path": "/tmp/g-tests-a0aWtE/sessions/01a098a3-c5e5-76c7-8328-69675a334b82.jsonl",
++     "rlmDepth": 0,
++     "state": {
++       "status": "active",
++     },
++   },
++   {
++     "allMessagesText": "Say hello Hello from the faux provider.",
++     "created": 2026-09-13T02:41:00.787Z,
++     "cwd": "/home/runner/work/GRIMOIRE/GRIMOIRE/BACKEND/packages/coding-agent",
++     "firstMessage": "Say hello",
++     "id": "01a098a3-b573-767d-b536-4bc621669c5e",
++     "messageCount": 3,
++     "modified": 2026-09-13T02:41:01.950Z,
++     "path": "/tmp/g-tests-a0aWtE/sessions/01a098a3-b573-767d-b536-4bc621669c5e.jsonl",
++     "rlmDepth": 0,
++     "state": {
++       "status": "active",
++     },
++     "usage": {
++       "cost": 0,
++       "inputTokens": 4638,
++       "outputTokens": 8,
++     },
++   },
++   {
++     "allMessagesText": "",
++     "created": 2026-09-13T02:40:59.850Z,
++     "cwd": "/home/runner/work/GRIMOIRE/GRIMOIRE/BACKEND/packages/coding-agent",
++     "firstMessage": "(no messages)",
++     "id": "01a098a3-b1ca-7558-b04f-a4fe0c091f08",
++     "messageCount": 0,
++     "modified": 2026-09-13T02:40:59.850Z,
++     "path": "/tmp/g-tests-a0aWtE/sessions/01a098a3-b1ca-7558-b04f-a4fe0c091f08.jsonl",
++     "rlmDepth": 0,
++     "state": {
++       "status": "active",
++     },
++   },
++   {
++     "allMessagesText": "",
++     "created": 2026-09-13T02:40:52.467Z,
++     "cwd": "/home/runner/work/GRIMOIRE/GRIMOIRE/BACKEND/packages/coding-agent",
++     "firstMessage": "(no messages)",
++     "id": "01a098a3-94f3-74b0-ae38-874485eaefe2",
++     "messageCount": 0,
++     "modified": 2026-09-13T02:40:52.467Z,
++     "path": "/tmp/g-tests-a0aWtE/sessions/01a098a3-94f3-74b0-ae38-874485eaefe2.jsonl",
++     "rlmDepth": 0,
++     "state": {
++       "status": "active",
++     },
++   },
++ ]
+
+ ❯ test/daemon-catalog-entry.test.ts:16:31
+
+
+2026-09-13T02:41:45.6514815Z 
+2026-09-13T02:41:45.6518118Z ##[error]AssertionError: expected true to be false // Object.is equality
+
+- Expected
++ Received
+
+- false
++ true
+
+ ❯ test/migrations.test.ts:80:34
+
+
+2026-09-13T02:41:45.6519765Z 
+2026-09-13T02:41:45.6522939Z ##[error]Error: ENOENT: no such file or directory, open '/tmp/g-tests-a0aWtE/tmp/prime-agent-migrations-qIwxDS/sessions/session-root.jsonl'
+ ❯ test/migrations.test.ts:106:10
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯
+Serialized Error: { errno: -2, code: 'ENOENT', syscall: 'open', path: '/tmp/g-tests-a0aWtE/tmp/prime-agent-migrations-qIwxDS/sessions/session-root.jsonl' }
+
+2026-09-13T02:41:45.6526136Z 
+2026-09-13T02:41:45.6528954Z ##[error]AssertionError: expected false to be true // Object.is equality
+
+- Expected
++ Received
+
+- true
++ false
+
+ ❯ test/telemetry.test.ts:240:40
+
+
+2026-09-13T02:41:45.6530931Z 
+2026-09-13T02:41:45.6538563Z ##[error]Error: ENOENT: no such file or directory, scandir '/tmp/g-tests-a0aWtE/tmp/prime-agent-process-json-refine-haglHu/agent/sessions'
+ ❯ findSessionJsonl test/suite/daemon-serialized-refine-process.test.ts:255:23
+ ❯ test/suite/daemon-serialized-refine-process.test.ts:283:28
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯
+Serialized Error: { errno: -2, code: 'ENOENT', syscall: 'scandir', path: '/tmp/g-tests-a0aWtE/tmp/prime-agent-process-json-refine-haglHu/agent/sessions' }
+
+2026-09-13T02:41:46.3862172Z npm error Lifecycle script `test:ci` failed with error:
+2026-09-13T02:41:46.3862908Z npm error code 1
+2026-09-13T02:41:46.3863756Z npm error path /home/runner/work/GRIMOIRE/GRIMOIRE/BACKEND/packages/coding-agent
+2026-09-13T02:41:46.3864860Z npm error workspace @earendil-works/pi-coding-agent@0.9.4
+2026-09-13T02:41:46.3867070Z npm error location /home/runner/work/GRIMOIRE/GRIMOIRE/BACKEND/packages/coding-agent
+2026-09-13T02:41:46.3867986Z npm error command failed
+2026-09-13T02:41:46.3869233Z npm error command sh -c tsx test/run-isolated.ts --bootstrap --exclude test/daemon-supervisor-process.test.ts --shard=2/3
+2026-09-13T02:41:46.3928166Z ##[error]Process completed with exit code 1.
+2026-09-13T02:41:46.4085060Z 
