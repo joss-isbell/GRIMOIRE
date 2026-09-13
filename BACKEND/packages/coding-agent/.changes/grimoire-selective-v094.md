@@ -1,0 +1,3 @@
+- Changed shell-completion and subagent notifications to bypass editable user queues and unrelated shell commands, deliver at the next safe tool/turn boundary, and retain receipt ownership across explicit stops and recovery.
+- Fixed managed Python kernel startup by validating the REPL protocol and required packages, preferring current source assets in source launches, repairing environments in place, and revalidating managed interpreters on restart.
+- Isolated coding-agent test commands from running sessions, daemon sockets, kernel environments, Python overrides, saved credentials, and user configuration.

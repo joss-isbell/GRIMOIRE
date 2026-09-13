@@ -5,8 +5,12 @@ import type { BashOperations } from "../../src/core/tools/bash.js";
 import { createHarness, getUserTexts, type Harness } from "./harness.js";
 import { createDeferred } from "./scheduling.js";
 
-function agentPrompt(id: string): string {
-	return `Agent-to-agent message received.\nSource: agent_message\nTo: Target, active target, session session-target\nMessage id: ${id}\n\nqueued during shell execution`;
+function userPrompt(id: string): string {
+	return `User draft ${id}: continue after shell execution`;
+}
+function queueUserPrompt(harness: Harness, text: string, schedule: "steer" | "followUp") {
+	const id = /^User draft ([^:]+):/.exec(text)![1]!;
+	return harness.session[schedule](text, undefined, { agentMessageId: id });
 }
 
 function watchDelivery(harness: Harness, id: string) {
@@ -15,7 +19,7 @@ function watchDelivery(harness: Harness, id: string) {
 	return delivered;
 }
 
-describe("AgentSession bash queue wake-up", () => {
+describe("AgentSession user queue wake-up after bash", () => {
 	const harnesses: Harness[] = [];
 
 	afterEach(() => {
@@ -42,7 +46,7 @@ describe("AgentSession bash queue wake-up", () => {
 				harnesses.push(harness);
 				harness.setResponses([fauxAssistantMessage("received")]);
 				const id = `agentmsg_direct_${schedule}_${outcome}`;
-				const prompt = agentPrompt(id);
+				const prompt = userPrompt(id);
 				const delivered = watchDelivery(harness, id);
 
 				const run = harness.session.executeBash("gated shell", undefined, {
@@ -51,7 +55,7 @@ describe("AgentSession bash queue wake-up", () => {
 				});
 				const settled = run.catch((error: unknown) => error);
 				await started.promise;
-				await harness.session.queueAgentMessagePrompt(prompt, schedule);
+				await queueUserPrompt(harness, prompt, schedule);
 				expect(harness.session.queuedActionCount).toBe(1);
 				expect(delivered).not.toHaveBeenCalled();
 				if (outcome === "cancelled") harness.session.abortBash();
@@ -88,7 +92,7 @@ describe("AgentSession bash queue wake-up", () => {
 			const run = harness.session.runUserBash("never started");
 			const settled = run.catch((error: unknown) => error);
 			await started.promise;
-			await harness.session.queueAgentMessagePrompt(agentPrompt(id), schedule);
+			await queueUserPrompt(harness, userPrompt(id), schedule);
 			expect(harness.session.isBashRunning).toBe(true);
 			release.resolve();
 			expect(await settled).toEqual(new Error("dispatch unavailable"));
@@ -118,7 +122,7 @@ describe("AgentSession bash queue wake-up", () => {
 			},
 		});
 		await started.promise;
-		await harness.session.queueAgentMessagePrompt(agentPrompt(id), "steer");
+		await queueUserPrompt(harness, userPrompt(id), "steer");
 		const pause = barrier === "pause" ? harness.session.acquireQueuedWorkPause() : undefined;
 		if (barrier === "abort") harness.session.requestAbort();
 		release.resolve();
@@ -156,7 +160,7 @@ describe("AgentSession bash queue wake-up", () => {
 		const delivered = watchDelivery(harness, id);
 		const run = harness.session.runUserBash("gated shell");
 		await started.promise;
-		await harness.session.queueAgentMessagePrompt(agentPrompt(id), "steer");
+		await queueUserPrompt(harness, userPrompt(id), "steer");
 		release.resolve();
 		await run;
 		await vi.waitFor(() => expect(delivered).toHaveBeenCalledOnce(), { timeout: 1000 });
@@ -164,7 +168,7 @@ describe("AgentSession bash queue wake-up", () => {
 		expect(harness.events.findIndex((event) => event.type === "bash_end")).toBeLessThan(
 			harness.events.findIndex((event) => event.type === "message_start" && event.message.role === "user"),
 		);
-		expect(getUserTexts(harness)).toEqual([agentPrompt(id)]);
+		expect(getUserTexts(harness)).toEqual([userPrompt(id)]);
 		expect(harness.eventsOfType("agent_start")).toHaveLength(1);
 	});
 
@@ -185,7 +189,7 @@ describe("AgentSession bash queue wake-up", () => {
 				},
 			}),
 		);
-		await harness.session.queueAgentMessagePrompt(agentPrompt(id), "steer");
+		await queueUserPrompt(harness, userPrompt(id), "steer");
 		try {
 			releases[first].resolve();
 			await runs[first];
@@ -200,7 +204,7 @@ describe("AgentSession bash queue wake-up", () => {
 		await vi.waitFor(() => expect(delivered).toHaveBeenCalledOnce(), { timeout: 1000 });
 		await harness.session.waitForIdle();
 		expect(harness.session.isBashRunning).toBe(false);
-		expect(getUserTexts(harness)).toEqual([agentPrompt(id)]);
+		expect(getUserTexts(harness)).toEqual([userPrompt(id)]);
 		expect(harness.session.messages.filter((message) => message.role === "bashExecution")).toHaveLength(2);
 	});
 
@@ -223,7 +227,7 @@ describe("AgentSession bash queue wake-up", () => {
 				},
 			}),
 		);
-		await harness.session.queueAgentMessagePrompt(agentPrompt(id), "steer");
+		await queueUserPrompt(harness, userPrompt(id), "steer");
 		try {
 			harness.session.abortBash();
 			expect(signals).toHaveLength(2);
@@ -270,7 +274,7 @@ describe("AgentSession bash queue wake-up", () => {
 		});
 		const id = "agentmsg_dispatch_overlap_abort";
 		const delivered = watchDelivery(harness, id);
-		await harness.session.queueAgentMessagePrompt(agentPrompt(id), "steer");
+		await queueUserPrompt(harness, userPrompt(id), "steer");
 		try {
 			harness.session.abortBash();
 			releaseDispatch.resolve();
@@ -294,7 +298,7 @@ describe("AgentSession bash queue wake-up", () => {
 		harness.setResponses([fauxAssistantMessage("received")]);
 		const id = "agentmsg_shell_config_failure";
 		const delivered = watchDelivery(harness, id);
-		await harness.session.queueAgentMessagePrompt(agentPrompt(id), "steer");
+		await queueUserPrompt(harness, userPrompt(id), "steer");
 		vi.spyOn(harness.session.settingsManager, "getShellPath").mockImplementationOnce(() => {
 			throw new Error("shell configuration unavailable");
 		});

@@ -137,7 +137,7 @@ describe("ENG-4531 agent message UI", () => {
 		});
 	});
 
-	it("keeps queued agent messages structured and removable by message identity", async () => {
+	it("keeps pending notifications structured but outside the editable queue", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
 		const payload = createPayload("Use shard seven.");
@@ -146,15 +146,15 @@ describe("ENG-4531 agent message UI", () => {
 
 		await harness.session.queueAgentMessagePrompt(prompt, "followUp", message);
 
-		expect(harness.session.getFollowUpMessagePreviews()).toEqual(["Agent message received: Use shard seven."]);
+		expect(harness.session.getFollowUpMessagePreviews()).toEqual([]);
 		const queued = harness.session.getSessionActionRecoverySnapshot().actions[0];
 		expect(queued?.payload.kind === "turn" ? queued.payload.customMessage : undefined).toMatchObject({
 			customType: "agent_message",
 			details: { id: "agentmsg_4531", message: "Use shard seven." },
 		});
 		expect(harness.session.clearQueuedUserMessagesMatching(isAgentSessionMessagePrompt)).toEqual({
-			steering: [],
-			followUp: [prompt],
+			steering: [prompt],
+			followUp: [],
 		});
 	});
 
@@ -386,6 +386,7 @@ describe("ENG-4531 agent message UI", () => {
 		const mode = {
 			chatContainer,
 			toolOutputExpanded: false,
+			getCurrentCwd: () => "/tmp",
 			getMarkdownThemeWithSettings: () => undefined,
 		};
 		Object.setPrototypeOf(mode, InteractiveMode.prototype);
@@ -493,49 +494,6 @@ describe("ENG-4531 agent message UI", () => {
 		expect(expanded).not.toContain("Message id:");
 	});
 
-	it("renders sent messages beneath collapsed Python cells", () => {
-		const component = new IPythonCellComponent({
-			code: 'await agent_message.send("worker-active", "Review shard seven.")',
-			executionStarted: true,
-			details: {
-				status: "ok",
-				sentAgentMessages: [
-					{
-						id: "agentmsg_4531",
-						message: "Review shard seven.",
-						deliveryStatus: "queued",
-						receiverRole: "child",
-						target: {
-							activeSessionId: "worker-active",
-							sessionId: "worker-session",
-							sessionName: "Worker",
-						},
-					},
-					{
-						id: "agentmsg_4531_delivered",
-						message: "Continue with shard eight.",
-						deliveryStatus: "delivered",
-						receiverRole: "parent",
-						target: {
-							activeSessionId: "worker-active",
-							sessionId: "worker-session",
-							sessionName: "Worker",
-						},
-					},
-				],
-			},
-		});
-
-		const rendered = stripAnsi(component.render(120).join("\n"));
-		const lines = rendered.split("\n");
-		expect(lines).toEqual([
-			expect.stringContaining("python"),
-			" ◆ Agent message queued · to child Worker · Review shard seven.",
-			" ◆ Agent message sent · to parent Worker · Continue with shard eight.",
-		]);
-		expect(rendered).not.toContain("Agent message received");
-	});
-
 	it("expands sent messages to the message text without the receipt metadata", () => {
 		const receipt =
 			"{'id': 'agentmsg_4531_delivered',\n" +
@@ -574,7 +532,7 @@ describe("ENG-4531 agent message UI", () => {
 		expect(lines).toEqual([
 			expect.stringContaining("python"),
 			expect.stringContaining("await agent_message.send"),
-			" ◆ Agent message sent · to parent Worker",
+			expect.stringMatching(/^ ◆ Agent message sent · to parent Worker \(.*to collapse\)$/),
 			" ╰─ Continue with shard eight.",
 			"    Then report back.",
 		]);

@@ -32,7 +32,7 @@ class _FakeSession:
             t = Tool()
             t.name = name
             t.description = desc
-            t.inputSchema = schema
+            t.input_schema = schema
             return t
 
         resp = type("Resp", (), {})()
@@ -155,6 +155,20 @@ class McpIntegrationTest(unittest.TestCase):
             mcp_base._parse_result(result)
         self.assertIn("boom", str(ctx.exception))
 
+    def test_list_tools_reads_mcp_python_input_schema(self):
+        schema = {
+            "type": "object",
+            "properties": {"team": {"type": "string"}},
+            "required": ["team"],
+        }
+        session = _FakeSession(tools=[("list_issues", "List issues", schema)], result=None)
+        with self._patch_session(session):
+            tools = _run(_Integration().list_tools())
+        self.assertEqual(
+            tools,
+            [{"name": "list_issues", "description": "List issues", "inputSchema": schema}],
+        )
+
     def test_auto_bound_tool_calls_session(self):
         session = _FakeSession(
             tools=[("list_issues", "List issues", {"type": "object"})],
@@ -168,6 +182,29 @@ class McpIntegrationTest(unittest.TestCase):
             out = _run(integration.list_issues(team="Eng"))
         self.assertEqual(out, {"issues": [1, 2]})
         self.assertEqual(session.calls, [("list_issues", {"team": "Eng"})])
+
+    def test_snake_case_input_schema_surfaces(self):
+        # mcp>=2 Tool objects expose input_schema (pydantic field name), not inputSchema.
+        Tool = type("Tool", (), {})
+        tool = Tool()
+        tool.name = "list_issues"
+        tool.description = "List issues"
+        tool.input_schema = {"type": "object", "properties": {"team": {"type": "string"}}}
+        session = _FakeSession(tools=[], result=None)
+
+        async def list_tools():
+            resp = type("Resp", (), {})()
+            resp.tools = [tool]
+            return resp
+
+        session.list_tools = list_tools
+        self._write_auth(
+            {"type": "oauth", "access": "t", "refresh": "r", "expires": (time.time() + 3600) * 1000}
+        )
+        with self._patch_session(session):
+            integration = _Integration()
+            tools = _run(integration.list_tools())
+        self.assertEqual(tools[0]["inputSchema"], tool.input_schema)
 
     def test_unknown_tool_raises_with_available_list(self):
         session = _FakeSession(tools=[("list_issues", "", {})], result=None)
@@ -253,18 +290,13 @@ class McpIntegrationTest(unittest.TestCase):
         self._run_open_session_with_transport(transport)
         self.assertIsNotNone(captured["http_client"])
 
-    def test_resolve_config_prefers_host_override_and_headers(self):
+    def test_resolve_config_ignores_host_overrides(self):
+        # A same-named mcpServers entry must not repoint an authored integration:
+        # its credentials (auth.json or a bearer-token env var) would follow.
         async def host_with_override(req_type, payload):
-            return {"url": "https://override.test/mcp", "headers": {"X-Extra": "1"}}
-
-        async def host_empty(req_type, payload):
-            return {}
+            raise AssertionError("authored integrations must not consult mcp.config")
 
         with mock.patch.object(mcp_base, "host_request", host_with_override):
-            url, headers = _run(_Integration()._resolve_config())
-            self.assertEqual(url, "https://override.test/mcp")
-            self.assertEqual(headers, {"X-Extra": "1"})
-        with mock.patch.object(mcp_base, "host_request", host_empty):
             url, headers = _run(_Integration()._resolve_config())
             self.assertEqual(url, _Integration.url)
             self.assertEqual(headers, {})

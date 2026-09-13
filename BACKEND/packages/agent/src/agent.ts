@@ -112,7 +112,6 @@ export interface AgentOptions {
 	sessionId?: string;
 	thinkingBudgets?: ThinkingBudgets;
 	transport?: Transport;
-	maxRetryDelayMs?: number;
 	toolExecution?: ToolExecutionMode;
 }
 
@@ -172,6 +171,20 @@ type ActiveRun = {
 	abortController: AbortController;
 };
 
+/** Why {@link Agent.continue} refused to start a continuation. */
+export type AgentContinueErrorCode = "busy" | "nothing-to-continue";
+
+/** Typed precondition failure from {@link Agent.continue}, so callers classify by code instead of message text. */
+export class AgentContinueError extends Error {
+	constructor(
+		readonly code: AgentContinueErrorCode,
+		message: string,
+	) {
+		super(message);
+		this.name = "AgentContinueError";
+	}
+}
+
 export class Agent {
 	private _state: MutableAgentState;
 	private readonly listeners = new Set<(event: AgentEvent, signal: AbortSignal) => Promise<void> | void>();
@@ -202,7 +215,6 @@ export class Agent {
 	public sessionId?: string;
 	public thinkingBudgets?: ThinkingBudgets;
 	public transport: Transport;
-	public maxRetryDelayMs?: number;
 	public toolExecution: ToolExecutionMode;
 
 	constructor(options: AgentOptions = {}) {
@@ -223,7 +235,6 @@ export class Agent {
 		this.sessionId = options.sessionId;
 		this.thinkingBudgets = options.thinkingBudgets;
 		this.transport = options.transport ?? "auto";
-		this.maxRetryDelayMs = options.maxRetryDelayMs;
 		this.toolExecution = options.toolExecution ?? "parallel";
 	}
 
@@ -340,7 +351,7 @@ export class Agent {
 	/** The last message must convert to a user or tool-result message. */
 	async continue(): Promise<void> {
 		if (this.activeRun) {
-			throw new Error("Agent is already processing. Wait for completion before continuing.");
+			throw new AgentContinueError("busy", "Agent is already processing. Wait for completion before continuing.");
 		}
 
 		const runQueuedMessages = (): Promise<void> | undefined => {
@@ -365,7 +376,7 @@ export class Agent {
 				return;
 			}
 
-			throw new Error("No messages to continue from");
+			throw new AgentContinueError("nothing-to-continue", "No messages to continue from");
 		}
 
 		if (lastMessage.role === "assistant") {
@@ -375,7 +386,7 @@ export class Agent {
 				return;
 			}
 
-			throw new Error("Cannot continue from message role: assistant");
+			throw new AgentContinueError("nothing-to-continue", "Cannot continue from message role: assistant");
 		}
 
 		const lastMessageRole: string = lastMessage.role;
@@ -456,7 +467,6 @@ export class Agent {
 			onResponse: this.onResponse,
 			transport: this.transport,
 			thinkingBudgets: this.thinkingBudgets,
-			maxRetryDelayMs: this.maxRetryDelayMs,
 			toolExecution: this.toolExecution,
 			beforeToolCall: this.beforeToolCall,
 			afterToolCall: this.afterToolCall,

@@ -35,6 +35,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { headersToRecord } from "../utils/headers.js";
 import { parseStreamingJson } from "../utils/json-parse.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
+import { recordStreamFailure } from "../utils/stream-failure.js";
 import { isCloudflareProvider, resolveCloudflareBaseUrl } from "./cloudflare.js";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.js";
 import { buildBaseOptions } from "./simple-options.js";
@@ -73,6 +74,31 @@ function isToolCallBlock(block: { type: string }): block is ToolCall {
 
 function isImageContentBlock(block: { type: string }): block is ImageContent {
 	return block.type === "image";
+}
+
+const REASONING_DETAILS_SIGNATURE_TYPE = "openai-completions.reasoning_details.v1";
+
+interface ReasoningDetailsSignature {
+	type: typeof REASONING_DETAILS_SIGNATURE_TYPE;
+	details: Record<string, unknown>[];
+}
+
+function encodeReasoningDetails(details: Record<string, unknown>[]): string {
+	return JSON.stringify({ type: REASONING_DETAILS_SIGNATURE_TYPE, details } satisfies ReasoningDetailsSignature);
+}
+
+function decodeReasoningDetails(signature?: string): Record<string, unknown>[] | undefined {
+	if (!signature?.startsWith("{")) return undefined;
+	try {
+		const parsed = JSON.parse(signature) as Partial<ReasoningDetailsSignature>;
+		if (parsed.type !== REASONING_DETAILS_SIGNATURE_TYPE || !Array.isArray(parsed.details)) return undefined;
+		if (parsed.details.some((detail) => !detail || typeof detail !== "object" || Array.isArray(detail))) {
+			return undefined;
+		}
+		return parsed.details as Record<string, unknown>[];
+	} catch {
+		return undefined;
+	}
 }
 
 export interface OpenAICompletionsOptions extends StreamOptions {
@@ -156,7 +182,6 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 			const requestOptions = {
 				...(options?.signal ? { signal: options.signal } : {}),
 				...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
-				...(options?.maxRetries !== undefined ? { maxRetries: options.maxRetries } : {}),
 			};
 			const { data: openaiStream, response } = await client.chat.completions
 				.create(params, requestOptions)
@@ -175,6 +200,9 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 			let thinkingBlock: ThinkingContent | null = null;
 			const toolCallBlocksByIndex = new Map<number, StreamingToolCallBlock>();
 			const toolCallBlocksById = new Map<string, StreamingToolCallBlock>();
+			const reasoningDetailsByIndex = new Map<number, Record<string, unknown>>();
+			let nextReasoningDetailsIndex = 0;
+			let reasoningDetailsBlock: ThinkingContent | null = null;
 			const blocks = output.content as StreamingBlock[];
 			const getContentIndex = (block: StreamingBlock) => blocks.indexOf(block);
 			const finishBlock = (block: StreamingBlock) => {
@@ -372,14 +400,49 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 					const reasoningDetails = (choice.delta as any).reasoning_details;
 					if (reasoningDetails && Array.isArray(reasoningDetails)) {
 						for (const detail of reasoningDetails) {
-							if (detail.type === "reasoning.encrypted" && detail.id && detail.data) {
-								const matchingToolCall = output.content.find(
-									(b) => b.type === "toolCall" && b.id === detail.id,
-								) as ToolCall | undefined;
-								if (matchingToolCall) {
-									matchingToolCall.thoughtSignature = JSON.stringify(detail);
+							if (!detail || typeof detail !== "object" || Array.isArray(detail)) continue;
+							const detailRecord = detail as Record<string, unknown>;
+							const explicitIndex = typeof detailRecord.index === "number" ? detailRecord.index : undefined;
+							const index = explicitIndex ?? nextReasoningDetailsIndex;
+							nextReasoningDetailsIndex = Math.max(nextReasoningDetailsIndex, index + 1);
+							const previousDetail = reasoningDetailsByIndex.get(index);
+							const mergedDetail = { ...previousDetail, ...detailRecord };
+							for (const field of ["text", "summary"] as const) {
+								const previousFragment = previousDetail?.[field];
+								const fragment = detailRecord[field];
+								if (typeof previousFragment === "string" && typeof fragment === "string") {
+									mergedDetail[field] = previousFragment + fragment;
 								}
 							}
+							reasoningDetailsByIndex.set(index, mergedDetail);
+							if (
+								detailRecord.type === "reasoning.encrypted" &&
+								typeof detailRecord.id === "string" &&
+								detailRecord.data
+							) {
+								const matchingToolCall = output.content.find(
+									(b) => b.type === "toolCall" && b.id === detailRecord.id,
+								) as ToolCall | undefined;
+								if (matchingToolCall) {
+									matchingToolCall.thoughtSignature = JSON.stringify(detailRecord);
+								}
+							}
+						}
+						if (reasoningDetailsByIndex.size > 0) {
+							if (!reasoningDetailsBlock) {
+								reasoningDetailsBlock = { type: "thinking", thinking: "", redacted: true };
+								blocks.push(reasoningDetailsBlock);
+								stream.push({
+									type: "thinking_start",
+									contentIndex: getContentIndex(reasoningDetailsBlock),
+									partial: output,
+								});
+							}
+							reasoningDetailsBlock.thinkingSignature = encodeReasoningDetails(
+								[...reasoningDetailsByIndex.entries()]
+									.sort(([left], [right]) => left - right)
+									.map(([, detail]) => detail),
+							);
 						}
 					}
 				}
@@ -413,6 +476,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 			// Some providers via OpenRouter give additional information in this field.
 			const rawMetadata = (error as any)?.error?.metadata?.raw;
 			if (rawMetadata) output.errorMessage += `\n${rawMetadata}`;
+			recordStreamFailure(model, output, error);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
@@ -502,6 +566,7 @@ function createClient(
 		baseURL: isCloudflareProvider(model.provider) ? resolveCloudflareBaseUrl(model) : model.baseUrl,
 		dangerouslyAllowBrowser: true,
 		defaultHeaders,
+		maxRetries: 0,
 	});
 }
 
@@ -661,7 +726,7 @@ function addCacheControlToLastConversationMessage(
 ): void {
 	for (let i = messages.length - 1; i >= 0; i--) {
 		const message = messages[i];
-		if (message.role === "user" || message.role === "assistant") {
+		if (message.role === "user" || message.role === "assistant" || message.role === "tool") {
 			if (addCacheControlToMessage(message, cacheControl)) {
 				return;
 			}
@@ -692,7 +757,7 @@ function addCacheControlToMessage(
 	message: ChatCompletionMessageParam,
 	cacheControl: OpenAICompatCacheControl,
 ): boolean {
-	if (message.role === "user" || message.role === "assistant") {
+	if (message.role === "user" || message.role === "assistant" || message.role === "tool") {
 		return addCacheControlToTextContent(message, cacheControl);
 	}
 	return false;
@@ -702,6 +767,7 @@ function addCacheControlToTextContent(
 	message:
 		| ChatCompletionInstructionMessageParam
 		| ChatCompletionAssistantMessageParam
+		| ChatCompletionToolMessageParam
 		| Extract<ChatCompletionMessageParam, { role: "user" }>,
 	cacheControl: OpenAICompatCacheControl,
 ): boolean {
@@ -826,8 +892,16 @@ export function convertMessages(
 				);
 			const assistantText = assistantTextParts.map((part) => part.text).join("");
 
+			const replayReasoningDetails = msg.content
+				.filter(isThinkingContentBlock)
+				.flatMap((block) => decodeReasoningDetails(block.thinkingSignature) ?? []);
+			if (replayReasoningDetails.length > 0) {
+				(assistantMsg as any).reasoning_details = replayReasoningDetails;
+			}
+
 			const nonEmptyThinkingBlocks = msg.content
 				.filter(isThinkingContentBlock)
+				.filter((block) => decodeReasoningDetails(block.thinkingSignature) === undefined)
 				.filter((block) => block.thinking.trim().length > 0);
 			if (nonEmptyThinkingBlocks.length > 0) {
 				if (compat.requiresThinkingAsText) {
@@ -894,7 +968,7 @@ export function convertMessages(
 						}
 					})
 					.filter(Boolean);
-				if (reasoningDetails.length > 0) {
+				if (reasoningDetails.length > 0 && replayReasoningDetails.length === 0) {
 					(assistantMsg as any).reasoning_details = reasoningDetails;
 				}
 			}
@@ -905,6 +979,9 @@ export function convertMessages(
 			) {
 				(assistantMsg as { reasoning_content?: string }).reasoning_content = "";
 			}
+			if (replayReasoningDetails.length > 0 && assistantMsg.content === null && !assistantMsg.tool_calls) {
+				assistantMsg.content = "";
+			}
 			// Skip assistant messages that have no content and no tool calls.
 			// Some providers require "either content or tool_calls, but not none".
 			// Other providers also don't accept empty assistant messages.
@@ -914,7 +991,7 @@ export function convertMessages(
 				content !== null &&
 				content !== undefined &&
 				(typeof content === "string" ? content.length > 0 : content.length > 0);
-			if (!hasContent && !assistantMsg.tool_calls) {
+			if (!hasContent && !assistantMsg.tool_calls && replayReasoningDetails.length === 0) {
 				continue;
 			}
 			params.push(assistantMsg);

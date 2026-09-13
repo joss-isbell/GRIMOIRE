@@ -2,33 +2,29 @@
 
 from __future__ import annotations
 
-import asyncio
 import sys
 import types
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .bash import BashHandle, BashResult, bash
 from .harness import HarnessEntry, HarnessScope, HarnessState, RefinementEvent, get_harness_state
-
-try:
-    from ipykernel.comm import Comm
-except Exception:  # pragma: no cover - depends on ipykernel version
-    Comm = None  # type: ignore[assignment]
-
-try:
-    from IPython import get_ipython
-except Exception:  # pragma: no cover - only available in kernels
-    get_ipython = None  # type: ignore[assignment]
-
-HOST_COMM_TARGET = "host.request"
-
 
 @dataclass(frozen=True)
 class RLMSpawnHandle:
     rlm_child_id: str
     name: str
     session_dir: Path
+    model: str
+
+
+@dataclass(frozen=True)
+class RLMCreateSessionHandle:
+    active_session_id: str
+    session_id: str
+    name: str
+    session_file: Path
     model: str
 
 
@@ -50,20 +46,6 @@ class RLMSubagent:
     status: str
 
 
-def _install_control_comm_handlers() -> None:
-    """Let comm replies arrive on the control channel during an execute_request."""
-    if get_ipython is None:
-        return
-    shell = get_ipython()
-    kernel = getattr(shell, "kernel", None)
-    comm_manager = getattr(kernel, "comm_manager", None)
-    control_handlers = getattr(kernel, "control_handlers", None)
-    if comm_manager is None or not isinstance(control_handlers, dict):
-        return
-    control_handlers.setdefault("comm_msg", comm_manager.comm_msg)
-    control_handlers.setdefault("comm_close", comm_manager.comm_close)
-
-
 def _spawn_handle_from_payload(payload: Any) -> RLMSpawnHandle:
     if not isinstance(payload, dict):
         raise RuntimeError("rlm.run returned an invalid spawn handle")
@@ -81,6 +63,34 @@ def _spawn_handle_from_payload(payload: Any) -> RLMSpawnHandle:
     )
 
 
+def _create_session_handle_from_payload(payload: Any) -> RLMCreateSessionHandle:
+    if not isinstance(payload, dict):
+        raise RuntimeError("rlm.create_session returned an invalid payload")
+    active_session_id = payload.get("active_session_id")
+    session_id = payload.get("session_id")
+    name = payload.get("name")
+    session_file = payload.get("session_file")
+    model = payload.get("model")
+    if not all(isinstance(value, str) and value for value in (active_session_id, session_id, name, session_file, model)):
+        raise RuntimeError("rlm.create_session returned an invalid payload structure")
+    return RLMCreateSessionHandle(
+        active_session_id=active_session_id,
+        session_id=session_id,
+        name=name,
+        session_file=Path(session_file),
+        model=model,
+    )
+
+
+def _parse_host_reply(request_type: str, reply: dict[str, Any]) -> dict[str, Any]:
+    status = reply.get("status")
+    if status == "ok":
+        return reply["result"]
+    if status == "error":
+        raise RuntimeError(str(reply.get("error") or f"host request {request_type} failed"))
+    raise RuntimeError(f"host request {request_type} returned unexpected status: {status!r}")
+
+
 async def host_request(request_type: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
     """Send a typed request to the Prime Agent host and await its reply.
 
@@ -93,51 +103,18 @@ async def host_request(request_type: str, payload: dict[str, Any] | None = None)
         raise TypeError("request_type must be a non-empty str")
     if payload is not None and not isinstance(payload, dict):
         raise TypeError(f"payload must be a dict or None, got {type(payload).__name__}")
-    if Comm is None:
-        raise RuntimeError("Jupyter comm support is unavailable in this kernel")
-    _install_control_comm_handlers()
+    from . import repl
 
-    loop = asyncio.get_running_loop()
-    future: asyncio.Future[dict[str, Any]] = loop.create_future()
-    comm = Comm(target_name=HOST_COMM_TARGET, primary=False)
-
-    def _on_msg(msg: dict[str, Any]) -> None:
-        content = msg.get("content", {})
-        reply = content.get("data", {}) if isinstance(content, dict) else {}
-        if not isinstance(reply, dict):
-            return
-
-        status = reply.get("status")
-        if status == "ok":
-            def _resolve_result() -> None:
-                if not future.done():
-                    future.set_result({k: v for k, v in reply.items() if k != "status"})
-                    comm.close()
-
-            loop.call_soon_threadsafe(_resolve_result)
-            return
-        if status == "error":
-            message = reply.get("error") or f"host request {request_type} failed"
-            def _resolve_error() -> None:
-                if not future.done():
-                    future.set_exception(RuntimeError(str(message)))
-                    comm.close()
-
-            loop.call_soon_threadsafe(_resolve_error)
-            return
-
-        unexpected = f"host request {request_type} returned unexpected status: {status!r}"
-        def _resolve_unexpected() -> None:
-            if not future.done():
-                future.set_exception(RuntimeError(unexpected))
-                comm.close()
-
-        loop.call_soon_threadsafe(_resolve_unexpected)
-
-    comm.on_msg(_on_msg)
     # request_type goes last so a payload "type" key cannot reroute the request.
-    comm.open(data={**(payload or {}), "type": request_type})
-    return await future
+    reply = await repl.host_request({**(payload or {}), "type": request_type})
+    return _parse_host_reply(request_type, reply)
+
+
+def emit(data: dict[str, Any]) -> None:
+    """Ship one display event (dict of MIME type -> JSON payload) to the host."""
+    from . import repl
+
+    repl.emit(data)
 
 
 async def run(prompt: str, **kwargs: Any) -> RLMSpawnHandle:
@@ -163,6 +140,33 @@ def _model_from_payload(payload: Any) -> RLMModel:
     if not all(isinstance(value, str) and value for value in (provider, model_id, name, selector)):
         raise RuntimeError("rlm.find_models returned an invalid model entry")
     return RLMModel(provider=provider, id=model_id, name=name, selector=selector)
+
+
+async def create_session(
+    prompt: str,
+    name: str | None = None,
+    model: str | None = None,
+    thinking: str | None = None,
+    cwd: str | None = None,
+) -> RLMCreateSessionHandle:
+    """Create and prompt a resident depth-0 daemon session.
+
+    Only daemon-backed depth-0 sessions support this operation. The optional
+    arguments set the session name, model, thinking level, and working directory.
+    """
+    if not isinstance(prompt, str):
+        raise TypeError(f"prompt must be str, got {type(prompt).__name__}")
+    kwargs: dict[str, Any] = {}
+    if name is not None:
+        kwargs["name"] = name
+    if model is not None:
+        kwargs["model"] = model
+    if thinking is not None:
+        kwargs["thinking"] = thinking
+    if cwd is not None:
+        kwargs["cwd"] = cwd
+    payload = await host_request("rlm.create_session", {"prompt": prompt, "kwargs": kwargs})
+    return _create_session_handle_from_payload(payload)
 
 
 async def find_models(query: str = "", limit: int = 8) -> list[RLMModel]:
@@ -235,15 +239,13 @@ async def delete_subagent(target: str | RLMSubagent) -> RLMSubagent:
 class _HarnessProxy:
     """Resolve the harness state against the current environment on every access.
 
-    The kernel forkserver preimports rlm in a template process before per-session
-    env vars exist; a state bound at import time would freeze that (env-less)
-    resolution into every forked kernel. Resolving per access picks up the env
-    applied after fork. Resolution must never raise (a failure inside the kernel
-    namespace would take down the kernel). When the local store is genuinely
-    unconfigured (no session env, e.g. --no-session) reads see an empty view but
-    local writes raise instructively instead of vanishing on kernel exit; any
-    other resolution failure degrades to a shared in-memory store until local
-    resolution starts succeeding.
+    Session env vars may be applied after import, so a state bound at import
+    time could freeze an env-less resolution. Resolution must never raise (a
+    failure inside the kernel namespace would take down the kernel). When the
+    local store is genuinely unconfigured (no session env, e.g. --no-session)
+    reads see an empty view but local writes raise instructively instead of
+    vanishing on kernel exit; any other resolution failure degrades to a shared
+    in-memory store until local resolution starts succeeding.
     """
 
     _fallback: HarnessState | None = None
@@ -290,6 +292,16 @@ class _RLMCallable:
     async def run(self, prompt: str, **kwargs: Any) -> RLMSpawnHandle:
         return await run(prompt, **kwargs)
 
+    async def create_session(
+        self,
+        prompt: str,
+        name: str | None = None,
+        model: str | None = None,
+        thinking: str | None = None,
+        cwd: str | None = None,
+    ) -> RLMCreateSessionHandle:
+        return await create_session(prompt, name=name, model=model, thinking=thinking, cwd=cwd)
+
     async def find_models(self, query: str = "", limit: int = 8) -> list[RLMModel]:
         return await find_models(query, limit)
 
@@ -315,17 +327,23 @@ class _CallableModule(types.ModuleType):
 sys.modules[__name__].__class__ = _CallableModule
 
 __all__ = [
+    "BashHandle",
+    "BashResult",
     "HarnessEntry",
     "HarnessScope",
     "HarnessState",
     "McpIntegration",
     "McpToolError",
     "NotEnabled",
+    "RLMCreateSessionHandle",
     "RLMModel",
     "RLMSpawnHandle",
     "RLMSubagent",
+    "create_session",
     "RefinementEvent",
+    "bash",
     "delete_subagent",
+    "emit",
     "find_models",
     "get_harness_state",
     "harness",
