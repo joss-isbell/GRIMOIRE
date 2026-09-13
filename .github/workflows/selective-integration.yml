@@ -1,94 +1,74 @@
-name: Publish verified selective integration
+name: Verify damaged kernel repair
 on:
   push:
     branches: [vi/selective-integration-tools-20260912]
     paths: [.github/workflows/selective-integration.yml]
 permissions:
-  contents: write
+  contents: read
 jobs:
-  publish-candidate:
+  repair:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    env:
-      CANDIDATE: /tmp/grimoire-selective-candidate
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
-          fetch-depth: 0
-      - name: Verify transported implementation
+          ref: 3cf7964e27883eebb7e484fb8a33bcba266d2bc1
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 22
+      - name: Install dependencies
+        working-directory: BACKEND
         run: |
-          python3 - <<'PY'
-          import base64, hashlib, json, lzma
-          from pathlib import Path
-          encoded = ''.join(Path(f'integration-kit/part{i}.b64').read_text().strip() for i in (1, 2, 3))
-          data = base64.b64decode(encoded, validate=True)
-          assert hashlib.sha256(data).hexdigest() == '943d23b294e6fddbcd5b23083af49734463ad24e3c2a752855bb569b003f5c9a', 'Transport checksum mismatch'
-          kit = json.loads(lzma.decompress(data))
-          root = Path('/tmp/integration-kit')
-          root.mkdir()
-          for name in ('resolve081.py', 'resolve093.py'):
-              (root / name).write_text(kit[name])
-          (root / 'implementation.patch').write_text(kit['patch'])
-          (root / 'manifest.json').write_text(json.dumps({key: kit[key] for key in ('base', 'foundation_tree', 'final_tree')}))
-          print((root / 'manifest.json').read_text())
-          PY
-      - name: Reproduce reviewed upstream foundation
-        shell: bash
+          python3 -m pip install --user uv
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          npm ci
+      - name: Corrupt and repair only a disposable kernel
+        working-directory: BACKEND/packages/coding-agent
         run: |
-          set -euo pipefail
-          base=4cc20de8c9cbd95a554c27ffc84f3f20fb9ba4e1
-          source=ef0497d18607493e02ba5fb02b0ec476bc0445e9
-          test "$(git rev-parse origin/main)" = "$base"
-          test "$(git rev-parse origin/grim-16-incident-recorder)" = "$source"
-          if git ls-remote --exit-code --heads origin refs/heads/vi/selective-v094-ready; then
-            echo 'Candidate already exists; refusing to overwrite it.' >&2
-            exit 1
-          fi
-          git config user.name 'GRIMOIRE integration bot'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git fetch https://github.com/PrimeIntellect-ai/prime-agent.git refs/tags/v0.9.4:refs/tags/vi-upstream-v0.9.4
-          test "$(git rev-parse vi-upstream-v0.9.4^{commit})" = f771dfcedd684d1afff84ca2c6fa95c7a21efbc2
-          git worktree add -b vi/selective-v094-ready "$CANDIDATE" "$base"
-          cd "$CANDIDATE"
-          if ! git merge --no-commit --no-ff d9e331486c33ccf5985359da368d96f6aac1f427; then
-            python3 /tmp/integration-kit/resolve081.py
-          fi
-          git add -- BACKEND/packages/coding-agent/CHANGELOG.md BACKEND/packages/coding-agent/.changes/grimoire-shell-wakeup.md
-          test -z "$(git diff --name-only --diff-filter=U)"
-          git commit -m 'merge: select pre-recorder upstream integration through v0.8.1'
-          if ! git merge --no-commit --no-ff -s ort -Xsubtree=BACKEND 9c8230df67b378aaedc032f90e1ae8ba687cfe4a; then
-            python3 /tmp/integration-kit/resolve093.py
-          fi
-          git add -- BACKEND/packages/coding-agent/src/core/agent-session.ts BACKEND/packages/coding-agent/src/core/session-manager.ts BACKEND/prime-agent-runtime/src/rlm/mcp_base.py
-          test -z "$(git diff --name-only --diff-filter=U)"
-          git commit -m 'merge: integrate upstream v0.9.3 without incident recording'
-          git merge --no-commit --no-ff -s ort -Xsubtree=BACKEND f771dfcedd684d1afff84ca2c6fa95c7a21efbc2
-          git commit -m 'merge: integrate pinned prime-agent v0.9.4'
-          test "$(git rev-parse HEAD^{tree})" = 292974ca6a7cbba5a6d64317263178e511123719
-      - name: Apply tested fixes and publish clean candidate
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$CANDIDATE"
-          git apply --index --unidiff-zero /tmp/integration-kit/implementation.patch
-          git diff --cached --check
-          test "$(git write-tree)" = d1ed432beb5ef188d029af0463945b16a0fe8c1f
-          git commit -m 'fix(coding-agent): deliver automatic notifications promptly and repair kernels safely'
-          test -z "$(git status --porcelain)"
-          test ! -e .github/workflows/selective-integration.yml
-          test ! -d integration-kit
-          if git merge-base --is-ancestor e670c5b1e20dc780f07d20691ee5f49488b4ee7c HEAD; then
-            echo 'Incident checkpoint must not be in candidate ancestry' >&2
-            exit 1
-          fi
-          if git ls-files | grep -E '(^|/)(incident-recorder|incident-recording|incident-bundle)'; then
-            echo 'Unexpected incident recording file' >&2
-            exit 1
-          fi
-          git merge-base --is-ancestor 4cc20de8c9cbd95a554c27ffc84f3f20fb9ba4e1 HEAD
-          git merge-base --is-ancestor f771dfcedd684d1afff84ca2c6fa95c7a21efbc2 HEAD
-          git push origin HEAD:refs/heads/vi/selective-v094-ready
-          echo '=== Published candidate ==='
-          git log --first-parent --format='%H %s' -5
-          echo '=== Content tree ==='
-          git rev-parse HEAD^{tree}
+          cat > repair-verification.mts <<'JS'
+          import assert from 'node:assert/strict';
+          import { rmSync, statSync, writeFileSync, readFileSync } from 'node:fs';
+          import { join, sep } from 'node:path';
+          import { spawnSync } from 'node:child_process';
+          import { isolatedTestEnvironment } from './test/isolated-environment.ts';
+          const isolation = isolatedTestEnvironment();
+          process.env = isolation.env;
+          try {
+            const { ensureKernelPython } = await import('./src/core/kernel/bootstrap.ts');
+            const { kernelPythonEnvironment } = await import('./src/core/kernel/python-environment.ts');
+            const python = await ensureKernelPython({onProgress: console.log});
+            const probe = (code: string) => {
+              const result = spawnSync(python, ['-c', code], {encoding: 'utf8', env: kernelPythonEnvironment()});
+              assert.equal(result.status, 0, result.stderr);
+              return result.stdout.trim();
+            };
+            const site = probe('import sysconfig; print(sysconfig.get_path("purelib"))');
+            assert.ok(site.startsWith(isolation.root + sep));
+            const venv = isolation.env.PRIME_AGENT_KERNEL_VENV!;
+            const venvInode = statSync(venv).ino;
+            const pythonInode = statSync(python).ino;
+            const sentinel = join(site, 'grimoire_preserve_custom_package.py');
+            writeFileSync(sentinel, 'VALUE = 42\n');
+            process.env.PYTHONHOME = '/invalid/inherited/python/home';
+            process.env.PYTHONPATH = '/invalid/inherited/python/path';
+            assert.equal(await ensureKernelPython(), python);
+            for (const [name, target] of [['runtime repl module', join(site, 'rlm', 'repl.py')], ['dependency with stale distribution metadata', join(site, 'yaml')]]) {
+              rmSync(target, {recursive: true});
+              try {
+                assert.equal(await ensureKernelPython({onProgress: console.log}), python);
+                probe('import rlm.repl, yaml, dill; assert rlm.repl.PROTOCOL_VERSION == 3; assert callable(yaml.safe_load); assert callable(dill.dumps)');
+                assert.equal(statSync(venv).ino, venvInode);
+                assert.equal(statSync(python).ino, pythonInode);
+                assert.equal(readFileSync(sentinel, 'utf8'), 'VALUE = 42\n');
+                console.log('PASS: ' + name + '; interpreter, venv and custom package preserved');
+              } catch (error) {
+                console.error('FAIL: ' + name, error);
+                process.exitCode = 1;
+              }
+            }
+          } finally {
+            isolation.cleanup();
+          }
+          JS
+          node --import tsx repair-verification.mts
