@@ -18,6 +18,7 @@ import type { InteractiveModeUiServices } from "../src/modes/interactive/interac
 import { stopThemeWatcher } from "../src/modes/interactive/theme/theme.js";
 
 const modeMocks = vi.hoisted(() => ({
+	interactiveConstructor: vi.fn(),
 	interactiveRun: vi.fn<() => Promise<never>>(),
 	teardownSessionUi: vi.fn(async () => undefined),
 	dispose: vi.fn(async () => undefined),
@@ -50,6 +51,10 @@ vi.mock("../src/modes/interactive/interactive-mode.js", async (importOriginal) =
 	return {
 		...actual,
 		InteractiveMode: class {
+			constructor(options: unknown) {
+				modeMocks.interactiveConstructor(options);
+			}
+
 			run = modeMocks.interactiveRun;
 			teardownSessionUi = modeMocks.teardownSessionUi;
 		},
@@ -303,6 +308,8 @@ describe("AgentsViewMode", () => {
 			},
 		});
 
+		expect(modeMocks.interactiveConstructor).toHaveBeenCalledOnce();
+		expect(modeMocks.interactiveConstructor.mock.calls[0]?.[0]).not.toHaveProperty("forceFullscreen");
 		expect(modeMocks.teardownSessionUi).toHaveBeenCalledWith({ preserveAltScreen: true });
 		expect(modeMocks.dispose).toHaveBeenCalledOnce();
 		expect(DaemonAgentConnection.attach).toHaveBeenCalledWith(

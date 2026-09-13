@@ -1,0 +1,1 @@
+- Fixed queued messages remaining parked after direct shell execution or user-shell dispatch failure; overlapping shell calls retain independent busy and cancellation ownership until each finishes.

@@ -295,4 +295,35 @@ describe("InteractiveMode startup hints", () => {
 		expect(chatContainer.children).toHaveLength(2);
 		expect(shortcutGuideContainer.children).toHaveLength(0);
 	});
+
+	it("applies inline mode during startup when fullscreen is disabled", () => {
+		const applyFullscreen = vi.fn();
+		const mode = {
+			options: {},
+			settingsManager: { getFullscreen: () => false },
+			fullscreenEnabled: true,
+			applyFullscreen,
+		};
+
+		Reflect.get(InteractiveMode.prototype, "initializeFullscreen").call(mode);
+
+		expect(mode.fullscreenEnabled).toBe(false);
+		expect(applyFullscreen).toHaveBeenCalledWith(false);
+	});
+
+	it("leaves an inherited alternate screen before rendering inline", () => {
+		const exitFullscreen = vi.fn();
+		const leaveAltScreen = vi.fn();
+		const mode = {
+			ui: {
+				exitFullscreen,
+				terminal: { leaveAltScreen },
+			},
+		};
+
+		Reflect.get(InteractiveMode.prototype, "applyFullscreen").call(mode, false);
+
+		expect(exitFullscreen).toHaveBeenCalledOnce();
+		expect(leaveAltScreen).toHaveBeenCalledOnce();
+	});
 });

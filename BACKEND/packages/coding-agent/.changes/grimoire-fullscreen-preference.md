@@ -1,0 +1,1 @@
+- Fixed sessions opened from the agents view ignoring the persisted fullscreen preference.
