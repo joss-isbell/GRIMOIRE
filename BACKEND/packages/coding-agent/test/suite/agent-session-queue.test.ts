@@ -85,6 +85,13 @@ function agentPromptText(id: string, body: string): string {
 	return `Agent-to-agent message received.\nSource: agent_message\nTo: Target, active target, session session-target\nMessage id: ${id}\n\n${body}`;
 }
 
+function userPromptText(id: string, body: string): string {
+	return `User draft ${id}: ${body}`;
+}
+function queueUserPrompt(harness: Harness, text: string, schedule: "steer" | "followUp", _message?: undefined) {
+	const id = /^User draft ([^:]+):/.exec(text)![1]!;
+	return harness.session[schedule](text, undefined, { agentMessageId: id });
+}
 function heartbeatJob(): AgentCronJob {
 	return {
 		id: "heartbeat-test",
@@ -1832,10 +1839,10 @@ describe("AgentSession queue characterization", () => {
 		sessionInternals = harness.session as unknown as { _refineInFlight?: Promise<void> };
 		harness.setResponses([fauxAssistantMessage("kept response")]);
 
-		const clearedAgentMessage = agentPromptText("agentmsg_cleared", "cleared");
+		const clearedAgentMessage = userPromptText("agentmsg_cleared", "cleared");
 		const pause = harness.session.acquireQueuedWorkPause();
 		await harness.session.followUp("kept");
-		await harness.session.queueAgentMessagePrompt(clearedAgentMessage, "followUp", undefined);
+		await queueUserPrompt(harness, clearedAgentMessage, "followUp", undefined);
 		harness.session.setFollowUpMode("all");
 		let cleared: { steering: string[]; followUp: string[] } | undefined;
 		clearDuringRefineWait = () => {
@@ -1851,19 +1858,19 @@ describe("AgentSession queue characterization", () => {
 	it("restores next-turn context from cancelled actions in action order", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
-		const firstPrompt = agentPromptText("agentmsg_restore_first", "first");
-		const secondPrompt = agentPromptText("agentmsg_restore_second", "second");
+		const firstPrompt = userPromptText("agentmsg_restore_first", "first");
+		const secondPrompt = userPromptText("agentmsg_restore_second", "second");
 		withStreaming(harness, true);
 		await harness.session.sendCustomMessage(
 			{ customType: "next-turn", content: "context A", display: true, details: {} },
 			{ deliverAs: "nextTurn" },
 		);
-		await harness.session.queueAgentMessagePrompt(firstPrompt, "followUp");
+		await queueUserPrompt(harness, firstPrompt, "followUp");
 		await harness.session.sendCustomMessage(
 			{ customType: "next-turn", content: "context B", display: true, details: {} },
 			{ deliverAs: "nextTurn" },
 		);
-		await harness.session.queueAgentMessagePrompt(secondPrompt, "followUp");
+		await queueUserPrompt(harness, secondPrompt, "followUp");
 
 		expect(harness.session.clearQueue().followUp).toEqual([firstPrompt, secondPrompt]);
 		expect(harness.session.getPendingNextTurnMessageSnapshots().map(getMessageText)).toEqual([
@@ -1874,7 +1881,7 @@ describe("AgentSession queue characterization", () => {
 	});
 
 	it("delivers next-turn context when the first preparing turn is cancelled", async () => {
-		const firstPrompt = agentPromptText("agentmsg_cancel_first", "cancelled");
+		const firstPrompt = userPromptText("agentmsg_cancel_first", "cancelled");
 		let cancelFirst: (() => void) | undefined;
 		const harness = await createHarness({
 			extensionFactories: [
@@ -1906,7 +1913,7 @@ describe("AgentSession queue characterization", () => {
 			{ customType: "next-turn", content: "carry this", display: true, details: {} },
 			{ deliverAs: "nextTurn" },
 		);
-		await harness.session.queueAgentMessagePrompt(firstPrompt, "followUp");
+		await queueUserPrompt(harness, firstPrompt, "followUp");
 		await harness.session.followUp("surviving");
 		pause.release();
 		await harness.session.waitForIdle();
@@ -1961,7 +1968,7 @@ describe("AgentSession queue characterization", () => {
 	it("clears the agent queue when a queue update listener clears a newly queued steering prompt", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
-		const agentPrompt = agentPromptText("agentmsg_queue_update_clear", "clear during update");
+		const agentPrompt = userPromptText("agentmsg_queue_update_clear", "clear during update");
 		const delivery = harness.session.waitForAgentMessagePromptDelivery("agentmsg_queue_update_clear");
 		let cleared = false;
 		const unsubscribe = harness.session.subscribe((event) => {
@@ -1971,7 +1978,7 @@ describe("AgentSession queue characterization", () => {
 			}
 		});
 
-		await harness.session.queueAgentMessagePrompt(agentPrompt, "steer");
+		await queueUserPrompt(harness, agentPrompt, "steer");
 		unsubscribe();
 		await expect(delivery).rejects.toThrow("cleared before delivery");
 		expect(harness.session.getSteeringMessages()).toEqual([]);
@@ -2073,7 +2080,7 @@ describe("AgentSession queue characterization", () => {
 		expect(errors).toEqual([expect.stringContaining("No API key")]);
 	});
 
-	it("keeps a second one-at-a-time input queued when both use the same message object", async () => {
+	it("batches notifications with separate ownership even when they share a message object", async () => {
 		const firstResponse = createDeferred();
 		const firstProviderStarted = createDeferred();
 		const harness = await createHarness();
@@ -2102,14 +2109,14 @@ describe("AgentSession queue characterization", () => {
 
 		await firstProviderStarted.promise;
 		await new Promise<void>((resolve) => setImmediate(resolve));
-		expect(harness.session.queuedActionCount).toBe(1);
-		expect(harness.session.getFollowUpMessages()).toEqual([prompt]);
+		expect(harness.session.queuedActionCount).toBe(0);
+		expect(harness.session.getFollowUpMessages()).toEqual([]);
 		firstResponse.resolve();
 		await harness.session.waitForIdle();
 
 		expect(harness.session.queuedActionCount).toBe(0);
 		expect(harness.session.messages.filter((item) => item === message)).toHaveLength(2);
-		expect(getAssistantTexts(harness)).toEqual(["first done", "second done"]);
+		expect(getAssistantTexts(harness)).toEqual(["first done"]);
 	});
 
 	it("releases external promptAndWait outcomes for pre-registered id reuse", async () => {
@@ -2181,7 +2188,13 @@ describe("AgentSession queue characterization", () => {
 			agentMessageId: "agentmsg_dispose",
 			streamingBehavior: "followUp",
 		});
-		await vi.waitFor(() => expect(harness.session.getFollowUpMessages()).toEqual([agentPrompt]));
+		await vi.waitFor(() =>
+			expect(
+				harness.session
+					.getSessionActionRecoverySnapshot()
+					.actions.some((action) => action.payload.text === agentPrompt),
+			).toBe(true),
+		);
 		harness.session.dispose();
 
 		await expect(delivery).rejects.toThrow("disposed before prompt delivery");
@@ -3246,9 +3259,9 @@ describe("AgentSession scheduler scenarios", () => {
 		await harness.session.steer("second", undefined, { queueKey: "same-steer" });
 		expect(harness.session.getSteeringMessages()).toEqual(["first", "second"]);
 		expect(internals._steeringStopPending).toBe(true);
-		const agentPrompt = agentPromptText("agentmsg_s2_clear", "clear me");
+		const agentPrompt = userPromptText("agentmsg_s2_clear", "clear me");
 		const delivery = harness.session.waitForAgentMessagePromptDelivery("agentmsg_s2_clear");
-		await harness.session.queueAgentMessagePrompt(agentPrompt, "steer");
+		await queueUserPrompt(harness, agentPrompt, "steer");
 
 		// Phase 3: keyed duplicates reject both agent-message outcome legs.
 		const dupDelivery = expect(harness.session.waitForAgentMessagePromptDelivery("agentmsg_s2_dup")).rejects.toThrow(
@@ -3273,8 +3286,8 @@ describe("AgentSession scheduler scenarios", () => {
 		expect(harness.session.removeQueuedFollowUp("hb:one")).toBe(true);
 		expect(harness.session.removeQueuedFollowUp("hb:one")).toBe(false);
 		expect(harness.session.getFollowUpMessages()).toEqual(["same heartbeat", "keep me"]);
-		const followUpAgentPrompt = agentPromptText("agentmsg_s2_follow", "clear me too");
-		await harness.session.queueAgentMessagePrompt(followUpAgentPrompt, "followUp");
+		const followUpAgentPrompt = userPromptText("agentmsg_s2_follow", "clear me too");
+		await queueUserPrompt(harness, followUpAgentPrompt, "followUp");
 		const spoofedPlain = agentPromptText("agentmsg_spoof", "ordinary user text");
 		await harness.session.followUp(spoofedPlain);
 		expect(harness.session.clearQueuedUserMessagesMatching((text) => text.includes("agentmsg_"))).toEqual({
@@ -3339,12 +3352,12 @@ describe("AgentSession scheduler scenarios", () => {
 		]);
 
 		// Phase 1: a pause lease holds queued work.
-		const removedAgentMessage = agentPromptText("agentmsg_remove", "remove");
-		const keptAgentMessage = agentPromptText("agentmsg_keep", "keep");
+		const removedAgentMessage = userPromptText("agentmsg_remove", "remove");
+		const keptAgentMessage = userPromptText("agentmsg_keep", "keep");
 		const pause = harness.session.acquireQueuedWorkPause();
 		await harness.session.followUp("ordinary");
-		await harness.session.queueAgentMessagePrompt(removedAgentMessage, "followUp", undefined);
-		await harness.session.queueAgentMessagePrompt(keptAgentMessage, "followUp", undefined);
+		await queueUserPrompt(harness, removedAgentMessage, "followUp", undefined);
+		await queueUserPrompt(harness, keptAgentMessage, "followUp", undefined);
 		await harness.session.followUp("last anchor", undefined, { queueKey: "heartbeat:one" });
 		expect(prepared).toEqual([]);
 		expect(getUserTexts(harness)).toEqual([]);
@@ -3422,15 +3435,16 @@ describe("AgentSession scheduler scenarios", () => {
 		await harness.session.agent.waitForIdle();
 		await harness.session.waitForSessionInputIdle();
 		expect(providerCalls).toBe(0);
-		expect(harness.session.getFollowUpMessages()).toEqual(["queued for restart", "/goal inspect image", agentPrompt]);
+		expect(harness.session.getFollowUpMessages()).toEqual(["queued for restart", "/goal inspect image"]);
 		expect(harness.session.getSessionActionRecoverySnapshot().actions).toEqual([
+			expect.objectContaining({
+				agentMessageId: "agentmsg_abort",
+				delivery: "next_turn_boundary",
+				payload: expect.objectContaining({ text: agentPrompt, queueVisible: false }),
+			}),
 			expect.objectContaining({ payload: expect.objectContaining({ text: "queued for restart" }) }),
 			expect.objectContaining({
 				payload: expect.objectContaining({ text: "/goal inspect image", images: [image] }),
-			}),
-			expect.objectContaining({
-				agentMessageId: "agentmsg_abort",
-				payload: expect.objectContaining({ text: agentPrompt }),
 			}),
 		]);
 		expect(deliverySettled).toBe(false);

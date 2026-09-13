@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants, existsSync, readdirSync, readFileSync } from "node:fs";
-import { access, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { stderr, stdin } from "node:process";
@@ -11,6 +11,7 @@ import { getPackageDir } from "../../config.js";
 import { isProcessAlive, spawnHidden } from "../../utils/child-process.js";
 import { tryAcquireDirLock } from "../../utils/dir-lock.js";
 import type { PythonSkillRuntimeInfo } from "../skills.js";
+import { kernelPythonEnvironment } from "./python-environment.js";
 
 const BOOTSTRAP_SCHEMA = 9;
 const PYTHON_VERSION = "3.11";
@@ -88,6 +89,8 @@ const REQUIRED_HARNESS_METHODS = [
 	"record_refinement",
 ];
 const RUNTIME_READY_CHECK = `import inspect; import rlm; from rlm import McpIntegration; import rlm.mcp as mcp; from rlm.harness import HarnessEntry; _harness_methods = ${JSON.stringify(REQUIRED_HARNESS_METHODS)}; assert callable(mcp.list_tools); assert callable(mcp.call_tool); assert hasattr(rlm, 'run'); assert callable(rlm); assert hasattr(rlm, 'rlm'); assert callable(rlm.rlm); assert callable(rlm.host_request); assert callable(rlm.find_models); assert callable(rlm.rlm.find_models); assert callable(rlm.create_session); assert callable(rlm.rlm.create_session); assert hasattr(rlm, 'harness'); assert hasattr(rlm, 'get_harness_state'); assert hasattr(rlm.rlm, 'harness'); assert hasattr(rlm.rlm, 'get_harness_state'); assert all(callable(getattr(_harness, _method, None)) for _harness in (rlm.harness, rlm.rlm.harness) for _method in _harness_methods); assert 'reference' in HarnessEntry.__dataclass_fields__; assert 'scope' in HarnessEntry.__dataclass_fields__; assert 'reference' in inspect.signature(rlm.harness.create_skill).parameters; assert 'reference' in inspect.signature(rlm.harness.update_skill).parameters; assert 'global_' in inspect.signature(rlm.harness.create_memory).parameters; assert 'global_' in inspect.signature(rlm.get_harness_state).parameters; assert not hasattr(rlm, 'background'); assert not hasattr(rlm.rlm, 'background'); from rlm.bash import BashHandle, BashResult; assert callable(rlm.bash); assert all(callable(getattr(BashHandle, _m, None)) for _m in ('tail', 'output', 'poll', 'kill')); assert {'exit_code', 'output', 'duration'} <= set(BashResult.__dataclass_fields__); import rlm.repl as _repl; assert callable(_repl.main); assert callable(_repl.emit); assert callable(_repl.host_request); assert callable(_repl.is_active); assert _repl.PROTOCOL_VERSION == 3; assert callable(rlm.emit); assert not hasattr(rlm, 'HOST_COMM_TARGET'); assert not hasattr(mcp, 'install_shutdown_hook')`;
+// Check required imports together, avoiding a dozen cold interpreter launches.
+const KERNEL_DEPENDENCIES_READY_CHECK = `# kernel dependencies\nimport ${[STATE_SNAPSHOT_REQUIREMENT, ...DEFAULT_RLM_EXTRA_IMPORT_NAMES].join(", ")}`;
 const BOOTSTRAP_VERSION_FILE = ".bootstrap-version";
 const BOOTSTRAP_LOCK_NAME = ".bootstrap.lock";
 const BOOTSTRAP_LOCK_RETRY_MS = 100;
@@ -409,7 +412,7 @@ function isBatchShim(command: string): boolean {
 function run(command: string, args: string[], options: { stdio?: "ignore" | "inherit" } = {}): Promise<void> {
 	return new Promise((resolve, reject) => {
 		// CPython must read UTF-8 .pth files even under a Windows legacy code page.
-		const env = { ...process.env, ...(process.platform === "win32" ? { PYTHONUTF8: "1" } : {}) };
+		const env = kernelPythonEnvironment();
 		const batch = isBatchShim(command) ? buildBatchShimInvocation(command, args, env) : undefined;
 		const child = spawnHidden(batch ? (process.env.ComSpec ?? "cmd.exe") : command, batch?.args ?? args, {
 			env: batch?.env ?? env,
@@ -443,6 +446,26 @@ async function hasPrimeAgentRuntime(python: string): Promise<boolean> {
 		return true;
 	} catch {
 		return false;
+	}
+}
+
+async function hasKernelDependencies(python: string): Promise<boolean> {
+	try {
+		await run(python, ["-c", KERNEL_DEPENDENCIES_READY_CHECK], { stdio: "ignore" });
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+async function assertKernelHealthy(python: string): Promise<void> {
+	if (!(await hasPrimeAgentRuntime(python))) {
+		throw new Error(`Installed runtime failed its readiness check (including rlm.repl protocol 3): ${python}`);
+	}
+	if (!(await hasKernelDependencies(python))) {
+		const missing = await missingRlmExtraImportLabels(python);
+		if (!(await pythonImports(python, STATE_SNAPSHOT_REQUIREMENT))) missing.unshift(STATE_SNAPSHOT_REQUIREMENT);
+		throw new Error(`Installed kernel is missing required Python packages (${missing.join(", ")}): ${python}`);
 	}
 }
 
@@ -681,26 +704,41 @@ async function writeBootstrapVersion(
 		extraUvArgs: DEFAULT_RLM_EXTRA_UV_ARGS,
 		pythonSkills: [...pythonSkills],
 	};
-	await writeFile(path.join(venv, BOOTSTRAP_VERSION_FILE), `${JSON.stringify(version)}\n`, "utf8");
+	const target = path.join(venv, BOOTSTRAP_VERSION_FILE);
+	const temporary = `${target}.${randomUUID()}.tmp`;
+	try {
+		await writeFile(temporary, `${JSON.stringify(version)}\n`, "utf8");
+		await rename(temporary, target);
+	} finally {
+		await rm(temporary, { force: true });
+	}
 }
 
-function runtimeCandidateDirs(): string[] {
-	const moduleDir = path.dirname(fileURLToPath(import.meta.url));
-	// dist/prime-agent-runtime is listed first deliberately: it is the only path stable
-	// across every shipped layout (dist/, dist/bundle/, bun), where import.meta.url-relative
-	// resolution breaks. `npm run build` rebuilds it from live source (copy-assets does
-	// rm -rf + cp), so the staleness hash still refreshes on every build. The relative
-	// paths below cover running from source (tsx) where dist/ hasn't been built.
+export function runtimeCandidateDirs(
+	packageDir = getPackageDir(),
+	moduleDir = path.dirname(fileURLToPath(import.meta.url)),
+): string[] {
+	const checkoutRuntime = path.resolve(packageDir, "..", "..", "prime-agent-runtime");
+	const packagedRuntime = path.join(packageDir, "dist", "prime-agent-runtime");
+	const runningFromSource = path.resolve(moduleDir) === path.join(path.resolve(packageDir), "src", "core", "kernel");
+	// Source runs must not prefer stale copy-assets output; installed/bundled runs use shipped assets.
 	return [
-		path.join(getPackageDir(), "dist", "prime-agent-runtime"),
-		path.resolve(moduleDir, "..", "..", "prime-agent-runtime"),
-		path.resolve(moduleDir, "..", "..", "..", "..", "..", "prime-agent-runtime"),
+		...new Set([
+			...(runningFromSource ? [checkoutRuntime, packagedRuntime] : [packagedRuntime]),
+			path.resolve(moduleDir, "..", "..", "prime-agent-runtime"),
+			path.resolve(moduleDir, "..", "..", "..", "..", "..", "prime-agent-runtime"),
+		]),
 	];
 }
 
 async function resolveRuntimeSourceDir(): Promise<string | null> {
 	for (const candidate of runtimeCandidateDirs()) {
 		if (await exists(path.join(candidate, "pyproject.toml"))) {
+			if (!(await exists(path.join(candidate, "src", "rlm", "repl.py")))) {
+				throw new Error(
+					`Kernel runtime assets are incomplete: ${candidate}/src/rlm/repl.py is missing. Rebuild or reinstall this GRIMOIRE checkout.`,
+				);
+			}
 			return candidate;
 		}
 	}
@@ -762,17 +800,30 @@ async function bootstrapVenv(
 	const runtimeRequirement = sourceDir ?? RUNTIME_REQUIREMENT;
 	const runtimeIdentity = await resolveRuntimeIdentity();
 
-	await run(uv, ["python", "install", PYTHON_VERSION]);
-	await run(uv, ["venv", venv, "--python", PYTHON_VERSION, "--seed"]);
+	// Repair packages in place: replacing the venv breaks other running sessions and user packages.
+	let usableInterpreter = false;
+	try {
+		await run(python, ["-c", "import sys; assert sys.version_info >= (3, 11)"], { stdio: "ignore" });
+		usableInterpreter = true;
+	} catch {
+		/* Missing or broken interpreter requires creation, not directory deletion. */
+	}
+	if (!usableInterpreter) {
+		await run(uv, ["python", "install", PYTHON_VERSION]);
+		await run(uv, ["venv", venv, "--python", PYTHON_VERSION, "--seed", "--allow-existing"]);
+	}
 	await run(uv, [
 		"pip",
 		"install",
 		"--python",
 		python,
+		"--reinstall-package",
+		RUNTIME_REQUIREMENT,
 		runtimeRequirement,
 		STATE_SNAPSHOT_REQUIREMENT,
 		...DEFAULT_RLM_EXTRA_UV_ARGS,
 	]);
+	await assertKernelHealthy(python);
 	await syncPythonSkills(uv, venv, python, runtimeIdentity, pythonSkills, options);
 }
 
@@ -851,12 +902,15 @@ async function syncPythonSkills(
 			);
 		}
 	}
+	// Skill installation can alter dependencies; never mark a broken environment ready.
+	await assertKernelHealthy(python);
 	await writeBootstrapVersion(venv, runtimeIdentity, installedPythonSkills);
 }
 
 async function kernelBaseReady(python: string, venv: string, runtimeIdentity: string): Promise<boolean> {
 	return (
 		(await hasPrimeAgentRuntime(python)) &&
+		(await hasKernelDependencies(python)) &&
 		bootstrapBaseVersionCurrent(await readBootstrapVersion(venv), runtimeIdentity)
 	);
 }
@@ -869,6 +923,7 @@ async function kernelReady(
 ): Promise<boolean> {
 	return (
 		(await hasPrimeAgentRuntime(python)) &&
+		(await hasKernelDependencies(python)) &&
 		bootstrapVersionCurrent(await readBootstrapVersion(venv), runtimeIdentity, pythonSkills)
 	);
 }
@@ -900,6 +955,7 @@ async function ensureKernelPythonUncached(
 			);
 		}
 		if (missing.length === 0) {
+			if (!(await pythonImports(python, STATE_SNAPSHOT_REQUIREMENT))) missing.push(STATE_SNAPSHOT_REQUIREMENT);
 			const missingExtraImports = await missingRlmExtraImportLabels(python);
 			if (missingExtraImports.length > 0) {
 				missing.push(`default Python packages (${missingExtraImports.join(", ")})`);
@@ -933,10 +989,7 @@ async function ensureKernelPythonUncached(
 
 		const hadVenv = existsSync(venv);
 		reportProgress(options, "› setting up python kernel (one-time, ~30s)…");
-		if (hadVenv) {
-			reportProgress(options, "rebuilding kernel venv");
-			await rm(venv, { recursive: true, force: true });
-		}
+		if (hadVenv) reportProgress(options, "repairing kernel runtime without deleting the environment");
 
 		await bootstrapVenv(venv, pythonSkills, options);
 	} catch (error) {

@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
 	AGENT_MESSAGE_DISPLAY_MIME,
@@ -14,7 +14,6 @@ import {
 function resolveReplPython(): string | null {
 	const candidates = [
 		process.env.PRIME_AGENT_KERNEL_PYTHON,
-		resolve(__dirname, "..", "..", "..", "prime-agent-runtime", ".venv", "bin", "python"),
 		join(homedir(), ".prime", "agent", "kernel-venv", "bin", "python"),
 	].filter((p): p is string => Boolean(p));
 	for (const python of candidates) {

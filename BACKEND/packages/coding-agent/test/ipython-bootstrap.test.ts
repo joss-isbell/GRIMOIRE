@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import { ReplKernelManager } from "../src/core/kernel/index.js";
 import { buildRlmBootstrapCode } from "../src/core/tools/ipython.js";
@@ -55,7 +55,6 @@ describe("RLM bootstrap", () => {
 function resolveKernelPython(): string | null {
 	const candidates = [
 		process.env.PRIME_AGENT_KERNEL_PYTHON,
-		resolve(__dirname, "..", "..", "..", "prime-agent-runtime", ".venv", "bin", "python"),
 		join(homedir(), ".prime", "agent", "kernel-venv", "bin", "python"),
 	].filter((p): p is string => Boolean(p));
 	for (const python of candidates) {

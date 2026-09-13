@@ -983,7 +983,7 @@ stale post-hook extension instructions`,
 			streamingBehavior: "followUp",
 			queueIfBusy: true,
 		});
-		expect(harness.session.getFollowUpMessages()).toEqual([agentPrompt]);
+		expect(harness.session.getFollowUpMessages()).toEqual([]);
 
 		sessionInternals._compactionAbortController = undefined;
 		let queuedTurnSawSeparateNextTurnContext = false;
@@ -1044,7 +1044,7 @@ stale post-hook extension instructions`,
 		expect(sessionInternals._sessionInputCheckpointWaiters.size).toBe(0);
 	});
 
-	it("restores nextTurn context when handoff busy rejection cannot queue", async () => {
+	it("delivers nextTurn context with a notification despite a concurrent direct shell", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
 		await harness.session.sendCustomMessage(
@@ -1065,12 +1065,13 @@ stale post-hook extension instructions`,
 			"Agent-to-agent message received.\nSource: agent_message\nTo: Target, active target, session session-target\nMessage id: agentmsg_handoff_reject\n\nagent text",
 			{ expandPromptTemplates: false, queueIfBusy: true },
 		);
-		await vi.waitFor(() => expect(harness.session.getPendingNextTurnMessageSnapshots()).toEqual([]));
+		await new Promise<void>((resolve) => setImmediate(resolve));
 		sessionInternals._userBashRunning = true;
 		sessionInternals._refineInFlight = undefined;
 		releaseRefine?.();
 
-		await expect(accepted).rejects.toThrow("Agent became busy before prompt delivery");
+		await expect(accepted).resolves.toBeUndefined();
+		await harness.session.agent.waitForIdle();
 		sessionInternals._userBashRunning = false;
 
 		let sawRestoredContext = false;
@@ -1171,8 +1172,8 @@ stale post-hook extension instructions`,
 		await admitted;
 
 		expect(harness.session.clearQueuedUserMessagesMatching((text) => text.includes(agentMessageId))).toEqual({
-			steering: [],
-			followUp: [agentPrompt],
+			steering: [agentPrompt],
+			followUp: [],
 		});
 		releaseAdmission();
 		await Promise.all([acceptedRejection, deliveryRejection]);
@@ -2004,7 +2005,7 @@ stale post-hook extension instructions`,
 			streamingBehavior: "followUp",
 			queueIfBusy: true,
 		});
-		expect(harness.session.getFollowUpMessages()).toEqual([queuedAgentPrompt]);
+		expect(harness.session.getFollowUpMessages()).toEqual([]);
 		busyGate.resolve();
 		await running;
 		await harness.session.waitForIdle();
@@ -2049,8 +2050,8 @@ stale post-hook extension instructions`,
 		});
 		await admission.reached;
 		expect(harness.session.clearQueuedUserMessagesMatching((text) => text.includes("agentmsg_s7_cleared"))).toEqual({
-			steering: [],
-			followUp: [clearedAgentPrompt],
+			steering: [clearedAgentPrompt],
+			followUp: [],
 		});
 		admission.release();
 		await expect(accepted).rejects.toThrow("cleared before delivery");

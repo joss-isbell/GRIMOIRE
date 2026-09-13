@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -11,6 +11,7 @@ import {
 	type KernelPythonSkill,
 	kernelVenvPython,
 	resolveRuntimeIdentity,
+	runtimeCandidateDirs,
 } from "../src/core/kernel/bootstrap.js";
 
 let tempDir = "";
@@ -81,14 +82,21 @@ dependencies = ["${dependencyName}"]
 function writeFakePython(filePath: string, importableModules: readonly string[]): void {
 	const cases = importableModules.map((moduleName) => `    "import ${moduleName}") exit 0 ;;`).join("\n");
 	const runtimeCase = importableModules.includes("rlm") ? '    *"_harness_methods"*) exit 0 ;;' : "";
+	const dependenciesCase = ["dill", ...DEFAULT_RLM_EXTRA_IMPORT_NAMES].every((name) =>
+		importableModules.includes(name),
+	)
+		? '    *"# kernel dependencies"*) exit 0 ;;'
+		: "";
 	writeExecutable(
 		filePath,
 		[
 			"#!/bin/sh",
 			'if [ "$1" = "-c" ]; then',
 			'  case "$2" in',
+			'    "import sys; assert sys.version_info >= (3, 11)") exit 0 ;;',
 			cases,
 			runtimeCase,
+			dependenciesCase,
 			"    *) exit 1 ;;",
 			"  esac",
 			"fi",
@@ -102,7 +110,9 @@ function installFakeUv(): string {
 	const binDir = join(tempDir, "bin");
 	mkdirSync(binDir, { recursive: true });
 	const logPath = join(tempDir, "uv.log");
-	const extraImportCases = DEFAULT_RLM_EXTRA_IMPORT_NAMES.map((moduleName) => `    "import ${moduleName}") exit 0 ;;`);
+	const healthyPython = join(tempDir, "healthy-python");
+	writeFakePython(healthyPython, ["rlm", "dill", ...DEFAULT_RLM_EXTRA_IMPORT_NAMES]);
+	process.env.UV_HEALTHY_PYTHON = healthyPython;
 	process.env.UV_LOG = logPath;
 	process.env.PATH = `${binDir}${process.env.PATH ? `:${process.env.PATH}` : ""}`;
 	writeExecutable(
@@ -110,34 +120,26 @@ function installFakeUv(): string {
 		[
 			"#!/bin/sh",
 			"set -e",
-			'printf "%s\\n" "$*" >> "$UV_LOG"',
-			'if [ "$1" = "python" ]; then',
-			"  exit 0",
-			"fi",
+			'printf "%s\n" "$*" >> "$UV_LOG"',
+			'if [ "$1" = "python" ]; then exit 0; fi',
 			'if [ "$1" = "venv" ]; then',
 			'  venv="$2"',
 			'  mkdir -p "$venv/bin"',
-			"  cat > \"$venv/bin/python\" <<'PY'",
-			"#!/bin/sh",
-			'if [ "$1" = "-c" ]; then',
-			'  case "$2" in',
-			'    "import rlm") exit 0 ;;',
-			...extraImportCases,
-			'    *"_harness_methods"*) exit 0 ;;',
-			"    *) exit 1 ;;",
-			"  esac",
-			"fi",
-			"exit 0",
-			"PY",
+			'  cp "$UV_HEALTHY_PYTHON" "$venv/bin/python"',
 			'  chmod +x "$venv/bin/python"',
 			"  exit 0",
 			"fi",
 			'if [ "$1" = "pip" ]; then',
+			'  python=""; previous=""; runtime=""',
 			'  for arg in "$@"; do',
-			'    if [ "$UV_FAIL_ARG" != "" ] && [ "$arg" = "$UV_FAIL_ARG" ]; then',
-			"      exit 1",
-			"    fi",
+			'    if [ "$UV_FAIL_ARG" != "" ] && [ "$arg" = "$UV_FAIL_ARG" ]; then exit 1; fi',
+			'    if [ "$previous" = "--python" ]; then python="$arg"; fi',
+			'    if [ "$arg" = "--reinstall-package" ]; then runtime="1"; fi',
+			'    previous="$arg"',
 			"  done",
+			'  if [ "$runtime" = "1" ] && [ "$UV_SKIP_RUNTIME_REPAIR" != "1" ]; then',
+			'    cp "$UV_HEALTHY_PYTHON" "$python"',
+			"  fi",
 			"  exit 0",
 			"fi",
 			"exit 2",
@@ -316,7 +318,7 @@ version = "0.1.0"
 		const python = join(venv, "bin", "python");
 		const pythonSkill = createPythonSkill();
 		mkdirSync(join(venv, "bin"), { recursive: true });
-		writeFakePython(python, ["rlm", ...DEFAULT_RLM_EXTRA_IMPORT_NAMES]);
+		writeFakePython(python, ["rlm", "dill", ...DEFAULT_RLM_EXTRA_IMPORT_NAMES]);
 		writeBootstrapVersion(venv, [pythonSkill]);
 		writeFileSync(
 			pythonSkill.pyprojectPath,
@@ -373,13 +375,13 @@ dependencies = ["httpx"]
 		).toHaveLength(2);
 	});
 
-	it("rebuilds a warm venv with legacy unhashed Python skill manifest entries", async () => {
+	it("repairs a warm venv in place with legacy unhashed Python skill manifest entries", async () => {
 		const logPath = installFakeUv();
 		const venv = join(tempDir, "kernel-venv");
 		const python = join(venv, "bin", "python");
 		const pythonSkill = createPythonSkill();
 		mkdirSync(join(venv, "bin"), { recursive: true });
-		writeFakePython(python, ["rlm", ...DEFAULT_RLM_EXTRA_IMPORT_NAMES]);
+		writeFakePython(python, ["rlm", "dill", ...DEFAULT_RLM_EXTRA_IMPORT_NAMES]);
 		writeFileSync(
 			join(venv, ".bootstrap-version"),
 			`${JSON.stringify({
@@ -399,7 +401,7 @@ dependencies = ["httpx"]
 
 		await expect(ensureKernelPython()).resolves.toBe(python);
 
-		expect(readFileSync(logPath, "utf8")).toContain(`venv ${venv} --python 3.11 --seed`);
+		expect(readFileSync(logPath, "utf8")).toContain("--reinstall-package prime-agent-runtime");
 	});
 
 	it("shares concurrent bootstrap work in one process", async () => {
@@ -418,19 +420,19 @@ dependencies = ["httpx"]
 		const venv = join(tempDir, "kernel-venv");
 		const python = join(venv, "bin", "python");
 		mkdirSync(join(venv, "bin"), { recursive: true });
-		writeFakePython(python, ["rlm", ...DEFAULT_RLM_EXTRA_IMPORT_NAMES]);
+		writeFakePython(python, ["rlm", "dill", ...DEFAULT_RLM_EXTRA_IMPORT_NAMES]);
 		writeBootstrapVersion(venv);
 		process.env.PRIME_AGENT_KERNEL_VENV = venv;
 
 		await expect(ensureKernelPython()).resolves.toBe(python);
 	});
 
-	it("rebuilds a warm venv whose recorded runtime hash no longer matches local source", async () => {
+	it("repairs a warm venv in place whose recorded runtime hash no longer matches local source", async () => {
 		const logPath = installFakeUv();
 		const venv = join(tempDir, "kernel-venv");
 		const python = join(venv, "bin", "python");
 		mkdirSync(join(venv, "bin"), { recursive: true });
-		writeFakePython(python, ["rlm", ...DEFAULT_RLM_EXTRA_IMPORT_NAMES]);
+		writeFakePython(python, ["rlm", "dill", ...DEFAULT_RLM_EXTRA_IMPORT_NAMES]);
 		writeFileSync(
 			join(venv, ".bootstrap-version"),
 			`${JSON.stringify({
@@ -445,12 +447,12 @@ dependencies = ["httpx"]
 
 		await expect(ensureKernelPython()).resolves.toBe(python);
 
-		expect(readFileSync(logPath, "utf8")).toContain(`venv ${venv} --python 3.11 --seed`);
+		expect(readFileSync(logPath, "utf8")).toContain("--reinstall-package prime-agent-runtime");
 		const version = JSON.parse(readFileSync(join(venv, ".bootstrap-version"), "utf8"));
 		expect(version.runtime).toBe(runtimeIdentity);
 	});
 
-	it("rebuilds a warm venv with a stale rlm runtime", async () => {
+	it("repairs a warm venv in place with a stale rlm runtime", async () => {
 		const logPath = installFakeUv();
 		const venv = join(tempDir, "kernel-venv");
 		const python = join(venv, "bin", "python");
@@ -462,6 +464,7 @@ dependencies = ["httpx"]
 				'if [ "$1" = "-c" ]; then',
 				'  case "$2" in',
 				'    "import rlm") exit 0 ;;',
+				'    "import sys; assert sys.version_info >= (3, 11)") exit 0 ;;',
 				"    *) exit 1 ;;",
 				"  esac",
 				"fi",
@@ -474,7 +477,7 @@ dependencies = ["httpx"]
 
 		await expect(ensureKernelPython()).resolves.toBe(python);
 
-		expect(readFileSync(logPath, "utf8")).toContain(`venv ${venv} --python 3.11 --seed`);
+		expect(readFileSync(logPath, "utf8")).toContain("--reinstall-package prime-agent-runtime");
 	});
 
 	it("rebuilds a broken venv", async () => {
@@ -486,12 +489,12 @@ dependencies = ["httpx"]
 
 		await expect(ensureKernelPython()).resolves.toBe(join(venv, "bin", "python"));
 
-		expect(readFileSync(logPath, "utf8")).toContain(`venv ${venv} --python 3.11 --seed`);
+		expect(readFileSync(logPath, "utf8")).toContain("--reinstall-package prime-agent-runtime");
 	});
 
 	it("uses PRIME_AGENT_KERNEL_PYTHON as an override contract", async () => {
 		const overridePython = join(tempDir, "override-python");
-		writeFakePython(overridePython, ["rlm", ...DEFAULT_RLM_EXTRA_IMPORT_NAMES]);
+		writeFakePython(overridePython, ["rlm", "dill", ...DEFAULT_RLM_EXTRA_IMPORT_NAMES]);
 		process.env.PRIME_AGENT_KERNEL_PYTHON = overridePython;
 
 		await expect(ensureKernelPython()).resolves.toBe(overridePython);
@@ -500,7 +503,7 @@ dependencies = ["httpx"]
 	it("allows PRIME_AGENT_KERNEL_PYTHON missing Python skill imports", async () => {
 		const overridePython = join(tempDir, "override-python");
 		const pythonSkill = createPythonSkill();
-		writeFakePython(overridePython, ["rlm", ...DEFAULT_RLM_EXTRA_IMPORT_NAMES]);
+		writeFakePython(overridePython, ["rlm", "dill", ...DEFAULT_RLM_EXTRA_IMPORT_NAMES]);
 		process.env.PRIME_AGENT_KERNEL_PYTHON = overridePython;
 
 		await expect(ensureKernelPython({ pythonSkills: [pythonSkill] })).resolves.toBe(overridePython);
@@ -508,7 +511,11 @@ dependencies = ["httpx"]
 
 	it("rejects PRIME_AGENT_KERNEL_PYTHON missing default extra packages", async () => {
 		const overridePython = join(tempDir, "override-python");
-		writeFakePython(overridePython, ["rlm", ...DEFAULT_RLM_EXTRA_IMPORT_NAMES.filter((name) => name !== "yaml")]);
+		writeFakePython(overridePython, [
+			"rlm",
+			"dill",
+			...DEFAULT_RLM_EXTRA_IMPORT_NAMES.filter((name) => name !== "yaml"),
+		]);
 		process.env.PRIME_AGENT_KERNEL_PYTHON = overridePython;
 
 		await expect(ensureKernelPython()).rejects.toThrow(/default Python packages \(yaml \(PyYAML\)\)/);
@@ -533,6 +540,7 @@ dependencies = ["httpx"]
 				'    "import rlm") exit 0 ;;',
 				'    *"_harness_methods"*) exit 1 ;;',
 				"    *\"assert not hasattr(rlm.rlm, 'background')\"*) exit 0 ;;",
+				'    "import sys; assert sys.version_info >= (3, 11)") exit 0 ;;',
 				"    *) exit 1 ;;",
 				"  esac",
 				"fi",
@@ -557,5 +565,58 @@ dependencies = ["httpx"]
 		const venv = join(tempDir, "kernel-venv");
 		expect(kernelVenvPython(venv, "win32")).toBe(join(venv, "Scripts", "python.exe"));
 		expect(kernelVenvPython(venv, "linux")).toBe(join(venv, "bin", "python"));
+	});
+	it.each(["dill", "yaml", "rlm"])("repairs missing %s without deleting existing files", async (missing) => {
+		const logPath = installFakeUv();
+		const venv = join(tempDir, "kernel-venv");
+		const python = join(venv, "bin", "python");
+		mkdirSync(join(venv, "bin"), { recursive: true });
+		writeFakePython(
+			python,
+			["rlm", "dill", ...DEFAULT_RLM_EXTRA_IMPORT_NAMES].filter((name) => name !== missing),
+		);
+		writeBootstrapVersion(venv);
+		writeFileSync(join(venv, "live-session-sentinel"), "preserve");
+		const inode = statSync(python).ino;
+		process.env.PRIME_AGENT_KERNEL_VENV = venv;
+		await expect(ensureKernelPython()).resolves.toBe(python);
+		expect(readFileSync(join(venv, "live-session-sentinel"), "utf8")).toBe("preserve");
+		expect(statSync(python).ino).toBe(inode);
+		expect(readFileSync(logPath, "utf8")).not.toMatch(/^venv /m);
+		expect(readFileSync(logPath, "utf8")).toContain("--reinstall-package prime-agent-runtime");
+	});
+
+	it.each(["install failure", "false success"])("does not stamp or delete a failed repair: %s", async (failure) => {
+		installFakeUv();
+		const venv = join(tempDir, "kernel-venv");
+		const python = join(venv, "bin", "python");
+		mkdirSync(join(venv, "bin"), { recursive: true });
+		writeFakePython(python, []);
+		writeFileSync(join(venv, "live-session-sentinel"), "preserve");
+		process.env.PRIME_AGENT_KERNEL_VENV = venv;
+		if (failure === "install failure") process.env.UV_FAIL_ARG = "dill";
+		else process.env.UV_SKIP_RUNTIME_REPAIR = "1";
+		await expect(ensureKernelPython()).rejects.toThrow();
+		expect(readFileSync(join(venv, "live-session-sentinel"), "utf8")).toBe("preserve");
+		expect(existsSync(python)).toBe(true);
+		expect(existsSync(join(venv, ".bootstrap-version"))).toBe(false);
+	});
+
+	it("rejects an explicit interpreter missing dill without modifying it", async () => {
+		const python = join(tempDir, "override-python");
+		writeFakePython(python, ["rlm", ...DEFAULT_RLM_EXTRA_IMPORT_NAMES]);
+		const before = readFileSync(python, "utf8");
+		process.env.PRIME_AGENT_KERNEL_PYTHON = python;
+		await expect(ensureKernelPython()).rejects.toThrow(/dill/);
+		expect(readFileSync(python, "utf8")).toBe(before);
+	});
+
+	it("prefers live runtime source only for a source invocation", () => {
+		const pkg = join(tempDir, "BACKEND", "packages", "coding-agent");
+		const live = join(tempDir, "BACKEND", "prime-agent-runtime");
+		expect(runtimeCandidateDirs(pkg, join(pkg, "src", "core", "kernel"))[0]).toBe(live);
+		for (const moduleDir of [join(pkg, "dist", "core", "kernel"), join(pkg, "dist", "bundle"), pkg]) {
+			expect(runtimeCandidateDirs(pkg, moduleDir)[0]).toBe(join(pkg, "dist", "prime-agent-runtime"));
+		}
 	});
 });

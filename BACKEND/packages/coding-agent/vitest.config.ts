@@ -1,5 +1,11 @@
 import { fileURLToPath } from "node:url";
 import { defineConfig } from "vitest/config";
+import { isolatedTestEnvironment } from "./test/isolated-environment.js";
+
+// Before any test/source imports, including direct vitest invocations.
+const isolation = isolatedTestEnvironment();
+process.env = isolation.env;
+if (isolation.owned) process.once("exit", isolation.cleanup);
 
 const aiSrcIndex = fileURLToPath(new URL("../ai/src/index.ts", import.meta.url));
 const aiSrcOAuth = fileURLToPath(new URL("../ai/src/oauth.ts", import.meta.url));
@@ -20,7 +26,7 @@ export default defineConfig({
 			},
 			{
 				name: "kernel-heavy",
-				description: "Boots a real Python kernel and syncs skills into the shared venv",
+				description: "Boots a real Python kernel and syncs skills into the disposable test venv",
 			},
 		],
 		// Kernel-heavy tests are excluded from the default sharded run: several files

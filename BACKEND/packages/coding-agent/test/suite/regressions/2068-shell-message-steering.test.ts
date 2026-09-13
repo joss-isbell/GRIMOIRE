@@ -77,12 +77,17 @@ describe("#2068 shell message steering", () => {
 			order.push("shell-queued");
 			expect(order).toEqual(["tool-start", "shell-queued"]);
 			expect(harness.session.getFollowUpMessages()).toEqual([]);
-			expect(harness.session.getSteeringMessages()).toHaveLength(1);
+			expect(harness.session.getSteeringMessages()).toEqual([]);
+			expect(harness.session.queuedActionCount).toBe(0);
 			const queued = harness.session.getSessionActionRecoverySnapshot().actions;
 			expect(queued).toContainEqual(expect.objectContaining({ delivery: "next_turn_boundary" }));
-			const preview = harness.session.getSteeringMessagePreviews()[0]!;
-			expect(preview).toBe("Shell message received: pid 42, exit 0");
-			expect(formatQueuedMessagePreview(preview, "Steering")).toBe(preview);
+			expect(harness.session.getSteeringMessagePreviews()).toEqual([]);
+			expect(queued).toContainEqual(
+				expect.objectContaining({
+					delivery: "next_turn_boundary",
+					payload: expect.objectContaining({ queueVisible: false }),
+				}),
+			);
 		} finally {
 			release.resolve();
 			await original;

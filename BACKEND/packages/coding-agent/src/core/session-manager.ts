@@ -2186,7 +2186,13 @@ export class SessionManager {
 		try {
 			let summaryEntry: BranchSummaryEntry | undefined;
 			if (options.summary) {
-				const id = this.branchWithSummary(branchFromId, options.summary, options.details, options.fromHook, options.usage);
+				const id = this.branchWithSummary(
+					branchFromId,
+					options.summary,
+					options.details,
+					options.fromHook,
+					options.usage,
+				);
 				summaryEntry = this.byId.get(id) as BranchSummaryEntry;
 			} else if (branchFromId === null) {
 				this.resetLeaf();

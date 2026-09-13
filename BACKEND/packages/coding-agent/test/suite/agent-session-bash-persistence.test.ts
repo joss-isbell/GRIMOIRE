@@ -335,7 +335,7 @@ describe("AgentSession bash and persistence characterization", () => {
 		expect(runningAtBashEnd).toBe(false);
 	});
 
-	it("drains queued agent-message prompts after user bash finishes", async () => {
+	it("delivers agent notifications without adding an editable shell queue entry", async () => {
 		let releaseBash: (() => void) | undefined;
 		let bashStarted: (() => void) | undefined;
 		const bashStartedPromise = new Promise<void>((resolve) => {
@@ -368,7 +368,7 @@ describe("AgentSession bash and persistence characterization", () => {
 		await bashStartedPromise;
 		expect(harness.session.isBashRunning).toBe(true);
 		await harness.session.queueAgentMessagePrompt(agentPrompt, "followUp");
-		expect(harness.session.queuedActionCount).toBe(1);
+		expect(harness.session.queuedActionCount).toBe(0);
 
 		releaseBash?.();
 		await bashRun;
@@ -380,7 +380,7 @@ describe("AgentSession bash and persistence characterization", () => {
 		expect(harness.session.queuedActionCount).toBe(0);
 	});
 
-	it("drains steering before follow-up prompts after user bash finishes", async () => {
+	it("delivers automatic notifications before user steering while bash runs", async () => {
 		let releaseBash: (() => void) | undefined;
 		let bashStarted: (() => void) | undefined;
 		const bashStartedPromise = new Promise<void>((resolve) => {
@@ -424,7 +424,7 @@ describe("AgentSession bash and persistence characterization", () => {
 		await harness.session.waitForIdle();
 
 		const userTexts = harness.session.messages.filter((message) => message.role === "user").map(getMessageText);
-		expect(userTexts.findIndex((text) => text.includes("steer after bash"))).toBeLessThan(
+		expect(userTexts.findIndex((text) => text.includes("steer after bash"))).toBeGreaterThan(
 			userTexts.findIndex((text) => text.includes("follow-up after bash")),
 		);
 		expect(harness.session.queuedActionCount).toBe(0);

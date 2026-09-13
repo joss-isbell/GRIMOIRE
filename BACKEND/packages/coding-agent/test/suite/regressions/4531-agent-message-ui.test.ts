@@ -137,7 +137,7 @@ describe("ENG-4531 agent message UI", () => {
 		});
 	});
 
-	it("keeps queued agent messages structured and removable by message identity", async () => {
+	it("keeps pending notifications structured but outside the editable queue", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
 		const payload = createPayload("Use shard seven.");
@@ -146,15 +146,15 @@ describe("ENG-4531 agent message UI", () => {
 
 		await harness.session.queueAgentMessagePrompt(prompt, "followUp", message);
 
-		expect(harness.session.getFollowUpMessagePreviews()).toEqual(["Agent message received: Use shard seven."]);
+		expect(harness.session.getFollowUpMessagePreviews()).toEqual([]);
 		const queued = harness.session.getSessionActionRecoverySnapshot().actions[0];
 		expect(queued?.payload.kind === "turn" ? queued.payload.customMessage : undefined).toMatchObject({
 			customType: "agent_message",
 			details: { id: "agentmsg_4531", message: "Use shard seven." },
 		});
 		expect(harness.session.clearQueuedUserMessagesMatching(isAgentSessionMessagePrompt)).toEqual({
-			steering: [],
-			followUp: [prompt],
+			steering: [prompt],
+			followUp: [],
 		});
 	});
 

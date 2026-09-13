@@ -224,10 +224,9 @@ export class ActionStore<TAction extends SessionAction = SessionAction> {
 		this.tickets.set(action.id, new ActionTicketController(action.id));
 	}
 
-	selectFirst(): TAction | undefined {
-		const action =
-			this.nextTurnBoundary.find((item) => item.lifecycle.state === "queued") ??
-			this.whenRunIdle.find((item) => item.lifecycle.state === "queued");
+	selectFirst(predicate: (action: TAction) => boolean = () => true): TAction | undefined {
+		const eligible = (item: TAction) => item.lifecycle.state === "queued" && predicate(item);
+		const action = this.nextTurnBoundary.find(eligible) ?? this.whenRunIdle.find(eligible);
 		if (action) transitionSessionAction(action, { state: "selected" });
 		return action;
 	}

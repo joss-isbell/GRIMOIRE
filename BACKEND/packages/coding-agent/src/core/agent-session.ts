@@ -776,12 +776,28 @@ function queuedAgentMessagePreview(action: QueuedSessionAction): string {
 	return payload.preview ?? payload.text;
 }
 
+/** Automatic notifications are not editable drafts, including restored older snapshots. */
+function isAutomaticSessionNotification(action: QueuedSessionAction): boolean {
+	if (action.payload.kind !== "turn") return false;
+	const message = primaryDeliveryRecord(action).message;
+	return (
+		isAgentSessionMessage(message) ||
+		(action.agentMessageId !== undefined &&
+			parseAgentSessionMessagePromptId(action.payload.text) === action.agentMessageId) ||
+		(message.role === "custom" &&
+			(message.customType === ASYNC_BASH_COMPLETION_CUSTOM_TYPE ||
+				message.customType === RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE ||
+				message.customType === RLM_CHILD_FAILURE_CUSTOM_TYPE))
+	);
+}
+
 function visibleSessionActionProjection(actions: readonly QueuedSessionAction[]): readonly QueuedSessionAction[] {
 	return actions.filter(
 		(action) =>
-			action.payload.kind === "session_command" ||
-			action.payload.queueVisible ||
-			action.payload.acceptedAgentMessage,
+			!isAutomaticSessionNotification(action) &&
+			(action.payload.kind === "session_command" ||
+				action.payload.queueVisible ||
+				action.payload.acceptedAgentMessage),
 	);
 }
 
@@ -4920,7 +4936,22 @@ export class AgentSession {
 		message: CustomMessage,
 		options?: InternalPromptOptions & { executionPolicy?: TurnExecutionPolicy },
 	): Promise<void> {
-		if (!this.isStreaming && options?.resumeIfIdle) this._resumeSessionInputAdmission();
+		const automaticNotification =
+			message.customType === ASYNC_BASH_COMPLETION_CUSTOM_TYPE ||
+			this._isRlmTerminalNotice(message) ||
+			isAgentSessionMessage(message);
+		if (automaticNotification && this._sessionInputPumpSuspended) {
+			throwIfPromptAdmissionCancelled(options?.signal);
+			const action = this._createPreparedTurnAction("steer", text, undefined, {
+				message,
+				suppressAutonomousContinuation: options?.suppressAutonomousContinuation,
+			});
+			this._admitSessionInput(action, { wake: false });
+			options?.admissionCommitted?.();
+			options?.preflightResult?.(true, true);
+			return;
+		}
+		if (!automaticNotification && !this.isStreaming && options?.resumeIfIdle) this._resumeSessionInputAdmission();
 		const admissionEpoch = this._sessionInputPumpEpoch;
 		const admissionFence = await this._acquireDirectTurnAdmissionFence(options?.signal).catch((error: unknown) => {
 			throwIfPromptAdmissionCancelled(options?.signal);
@@ -5526,12 +5557,28 @@ export class AgentSession {
 	}
 
 	private _turnExecutionPolicy(
-		kind: "queued" | "directPrompt" | "injected" | "customTrigger",
+		kind: "queued" | "directPrompt" | "injected" | "customTrigger" | "notification",
 		options: {
 			returnAfterAccepted?: boolean;
 			skipPrePromptWork?: boolean;
 		} = {},
 	): TurnExecutionPolicy {
+		if (kind === "notification") {
+			return {
+				preparation: {
+					initialRefineBarrier: "skip",
+					flushPendingBashBeforeValidation: true,
+					validateModelAndAuth: true,
+					awaitPendingModelSelection: true,
+					preTurnCompaction: "beforeModelSelection",
+					finalRefineBarrier: "ifInFlight",
+				},
+				runBeforeAgentStart: false,
+				nextTurnContextTiming: "commit",
+				preserveEmptyExtensionPrompt: false,
+				completionIncludesRetryChain: true,
+			};
+		}
 		if (kind === "queued") {
 			return {
 				preparation: {
@@ -5740,6 +5787,14 @@ export class AgentSession {
 				DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
 			);
 		}
+		if (action.payload.kind === "turn" && isAutomaticSessionNotification(action)) {
+			// Retain receipt/recovery ownership, but deliver at the next safe tool/turn
+			// boundary, not through editable follow-ups waiting for full-run idle.
+			action.delivery = "next_turn_boundary";
+			action.wake = "immediate";
+			action.payload.queueVisible = false;
+			action.payload.executionPolicy = this._turnExecutionPolicy("notification");
+		}
 		const coalescedOwner = options.restore ? undefined : this._coalescedFollowUpOwner(action);
 		if (coalescedOwner) {
 			if (action.agentMessageId !== coalescedOwner.agentMessageId) {
@@ -5773,7 +5828,7 @@ export class AgentSession {
 				action.payload.kind === "session_command" ||
 				action.wake === "immediate")
 		) {
-			if (action.payload.kind === "turn" && action.wake === "immediate") {
+			if (action.payload.kind === "turn" && action.wake === "immediate" && !isAutomaticSessionNotification(action)) {
 				this._resumeSessionInputAdmission();
 			}
 			this._scheduleSessionInputPump();
@@ -5804,17 +5859,22 @@ export class AgentSession {
 		return this._admitSessionInput(action).accepted;
 	}
 
-	private _runtimeActivity(): RuntimeActivity {
+	private _runtimeActivity(allowConcurrentBash = false): RuntimeActivity {
 		return {
 			lowerAgentRun: this.isStreaming,
 			compaction: this.isCompacting,
 			retry: this.isRetrying,
-			bash: this.isBashRunning,
+			bash: !allowConcurrentBash && this.isBashRunning,
 			refinementApply: this._refineInFlight !== undefined,
 			branchMutation: this._branchSummaryOperation !== undefined,
 			schedulerPauseCount: this._queuedWorkPauses.size + (this._sessionInputPumpSuspended ? 1 : 0),
 			disposing: this._disposed || this._disposing,
 		};
+	}
+
+	private _nextQueuedSessionInput(): QueuedSessionAction | undefined {
+		const pending = this._actionStore.queuedActions();
+		return pending.find(isAutomaticSessionNotification) ?? pending[0];
 	}
 
 	private _hasSelectableSessionInput(): boolean {
@@ -5864,9 +5924,7 @@ export class AgentSession {
 		try {
 			while (!this._disposed && !this._disposing && this._hasSelectableSessionInput()) {
 				await this.agent.waitForIdle();
-				const preselected = this._actionStore
-					.activeActions()
-					.find((action) => action.lifecycle.state === "selected");
+				let preselected = this._actionStore.activeActions().find((action) => action.lifecycle.state === "selected");
 				if (epoch !== this._sessionInputPumpEpoch) {
 					if (preselected) {
 						this._actionStore.rollback(preselected);
@@ -5875,38 +5933,55 @@ export class AgentSession {
 					}
 					return;
 				}
+				if (
+					preselected &&
+					preselected.payload.kind === "turn" &&
+					!isAutomaticSessionNotification(preselected) &&
+					this._actionStore.queuedActions().some(isAutomaticSessionNotification)
+				) {
+					this._actionStore.rollback(preselected);
+					preselected = undefined;
+				}
 				if (!this._hasCancelledDispatchCapture()) await this._agentEventQueue;
 				if (!preselected || preselected.payload.kind === "session_command") await this._waitForRefineIdle();
-				const activity = this._runtimeActivity();
+				const candidate = preselected ?? this._nextQueuedSessionInput();
+				const automaticNotification = candidate !== undefined && isAutomaticSessionNotification(candidate);
+				const activity = this._runtimeActivity(automaticNotification);
 				const canSelectPreselectedTurn =
 					preselected?.payload.kind === "turn" && canSelectSessionAction({ ...activity, refinementApply: false });
 				if (
-					this._isSessionInputHandoffDeferred(epoch) ||
+					this._isSessionInputHandoffDeferred(epoch, automaticNotification) ||
 					(!canSelectPreselectedTurn && !canSelectSessionAction(activity))
 				) {
 					blocked = true;
 					this._notifySessionInputCheckpointChange();
 					return;
 				}
-				const first = preselected ?? this._actionStore.selectFirst();
+				const first = preselected ?? this._actionStore.selectFirst((action) => action === candidate);
 				if (!first) return;
 				if (first.payload.kind === "session_command") {
 					await this._executeSelectedSessionCommand(first, epoch);
 					return;
 				}
 
-				const mode = first.delivery === "next_turn_boundary" ? this.steeringMode : this.followUpMode;
+				const mode = automaticNotification
+					? "all"
+					: first.delivery === "next_turn_boundary"
+						? this.steeringMode
+						: this.followUpMode;
 				const actions: QueuedSessionAction[] = [first];
 				while (!preselected && mode === "all") {
-					const next = this._actionStore.queuedActions(first.delivery)[0];
+					const next = this._nextQueuedSessionInput();
 					if (
 						!next ||
+						next.delivery !== first.delivery ||
+						isAutomaticSessionNotification(next) !== automaticNotification ||
 						next.payload.kind !== "turn" ||
 						!turnExecutionPoliciesEqual(first.payload.executionPolicy, next.payload.executionPolicy)
 					) {
 						break;
 					}
-					this._actionStore.selectFirst();
+					this._actionStore.selectFirst((action) => action === next);
 					actions.push(next);
 				}
 				if (epoch !== this._sessionInputPumpEpoch) {
@@ -5949,7 +6024,7 @@ export class AgentSession {
 						});
 						if (!primaryDeliveryRecord(action).durable) undelivered.push(action);
 					}
-					if (this._isDeferredSessionInputError(error, epoch)) {
+					if (this._isDeferredSessionInputError(error, epoch, automaticNotification)) {
 						for (const action of undelivered) {
 							if (action.lifecycle.state === "committing") {
 								this._actionStore.rollback(action, {
@@ -5961,7 +6036,9 @@ export class AgentSession {
 							}
 						}
 						if (undelivered.length > 0) this._emitQueueUpdate();
-						blocked = epoch !== this._sessionInputPumpEpoch || this._isBusyForSessionInput("pump");
+						blocked =
+							epoch !== this._sessionInputPumpEpoch ||
+							this._isBusyForSessionInput("pump", automaticNotification);
 						if (blocked) return;
 						continue;
 					}
@@ -6064,8 +6141,8 @@ export class AgentSession {
 		}
 	}
 
-	private _isBusyForSessionInput(point: "preflight" | "pump"): boolean {
-		const externalBusy = this.isCompacting || this.isRetrying || this.isBashRunning;
+	private _isBusyForSessionInput(point: "preflight" | "pump", allowConcurrentBash = false): boolean {
+		const externalBusy = this.isCompacting || this.isRetrying || (!allowConcurrentBash && this.isBashRunning);
 		if (point === "pump") {
 			return (
 				externalBusy ||
@@ -6079,18 +6156,18 @@ export class AgentSession {
 		return externalBusy || this._actionStore.unfinishedActions().length > 0;
 	}
 
-	private _isSessionInputHandoffDeferred(epoch: number): boolean {
-		return epoch !== this._sessionInputPumpEpoch || this._isBusyForSessionInput("pump");
+	private _isSessionInputHandoffDeferred(epoch: number, allowConcurrentBash = false): boolean {
+		return epoch !== this._sessionInputPumpEpoch || this._isBusyForSessionInput("pump", allowConcurrentBash);
 	}
 
 	private _asError(error: unknown): Error {
 		return error instanceof Error ? error : new Error(String(error));
 	}
 
-	private _isDeferredSessionInputError(error: unknown, epoch: number): boolean {
+	private _isDeferredSessionInputError(error: unknown, epoch: number, allowConcurrentBash = false): boolean {
 		if (error instanceof DeferredSessionInputError) return true;
 		if (epoch !== this._sessionInputPumpEpoch) return true;
-		if (this._isBusyForSessionInput("pump")) {
+		if (this._isBusyForSessionInput("pump", allowConcurrentBash)) {
 			this._surfaceSessionInputError(error);
 			return true;
 		}
@@ -6121,6 +6198,7 @@ export class AgentSession {
 		const firstTurn = activeTurns()[0];
 		if (!firstTurn) return;
 		const executionPolicy = firstTurn.payload.executionPolicy;
+		const automaticNotification = actions.every(isAutomaticSessionNotification);
 		const restoreNextTurnContext = () => {
 			this._pendingNextTurnMessages.unshift(...nextTurnMessages);
 			nextTurnMessages = [];
@@ -6128,7 +6206,7 @@ export class AgentSession {
 		try {
 			const preparedTurn = await this._prepareForCommit(executionPolicy.preparation, {
 				afterValidation: () => {
-					if (this._isSessionInputHandoffDeferred(epoch)) {
+					if (this._isSessionInputHandoffDeferred(epoch, automaticNotification)) {
 						throw new DeferredSessionInputError("Session input paused before preflight");
 					}
 				},
@@ -6138,7 +6216,7 @@ export class AgentSession {
 					}
 					if (!executionPolicy.runBeforeAgentStart) return undefined;
 					while (activeTurns().some((action) => action.payload.prepared === undefined)) {
-						if (this._isSessionInputHandoffDeferred(epoch)) {
+						if (this._isSessionInputHandoffDeferred(epoch, automaticNotification)) {
 							throw new DeferredSessionInputError("Session input paused before preparation");
 						}
 						const preparationAction = activeTurns().at(-1);
@@ -6154,14 +6232,14 @@ export class AgentSession {
 						const prepared = { result, basePromptSnapshot };
 						for (const action of activeTurns()) action.payload.prepared = prepared;
 					}
-					if (this._isSessionInputHandoffDeferred(epoch)) {
+					if (this._isSessionInputHandoffDeferred(epoch, automaticNotification)) {
 						throw new DeferredSessionInputError("Session input paused before handoff");
 					}
 					return activeTurns()[0]?.payload.prepared;
 				},
 				shouldCommit: () => activeTurns().length > 0,
 				commit: (prepared) => {
-					if (this._isSessionInputHandoffDeferred(epoch)) {
+					if (this._isSessionInputHandoffDeferred(epoch, automaticNotification)) {
 						throw new DeferredSessionInputError("Session input paused before handoff");
 					}
 					const turns = activeTurns();
@@ -6179,7 +6257,7 @@ export class AgentSession {
 			try {
 				promptPromise = this._sessionActionCommitContext.run(commitFence.owner, () => {
 					if (
-						this._isSessionInputHandoffDeferred(epoch) ||
+						this._isSessionInputHandoffDeferred(epoch, automaticNotification) ||
 						this.isStreaming ||
 						turns.some((action) => action.lifecycle.state !== "preparing")
 					) {
@@ -7128,6 +7206,7 @@ export class AgentSession {
 			(action) =>
 				action.payload.kind === "turn" &&
 				!action.payload.queueVisible &&
+				!isAutomaticSessionNotification(action) &&
 				!this._durableRlmTerminalNoticeActionIds.has(action.id),
 			new Error("Prompt aborted before delivery."),
 		);

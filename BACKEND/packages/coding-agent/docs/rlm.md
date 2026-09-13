@@ -55,7 +55,7 @@ checks = bash("npm test")
 checks.pid
 ```
 
-When an unawaited handle's process group finishes, Prime Agent sends a Shell message with its PID and foreground exit code. A busy agent receives it as steering at the next safe turn boundary, without interrupting a running tool. An idle agent resumes to handle it. `await handle` and `handle.poll()` still return the foreground result before shell background jobs finish. The kernel stays resident until the process group is reaped, including for handles awaited in their creating cell. The message asks the agent to inspect the saved handle with `poll()`, `output()`, or `tail()` and continue the task. `await bash(...)` stays synchronous from the agent's perspective and does not send a second Shell message.
+When an unawaited handle's process group finishes, Prime Agent sends a Shell message with its PID and foreground exit code. In GRIMOIRE, a busy agent receives it at the next safe tool/turn boundary, without interrupting a running tool. Automatic notifications bypass editable steering/follow-up drafts and unrelated user-shell commands; an idle agent resumes immediately unless explicitly stopped or paused. `await handle` and `handle.poll()` still return the foreground result before shell background jobs finish. The kernel stays resident until the process group is reaped, including for handles awaited in their creating cell. The message asks the agent to inspect the saved handle with `poll()`, `output()`, or `tail()` and continue the task. `await bash(...)` stays synchronous from the agent's perspective and does not send a second Shell message.
 
 Awaiting the original handle in its creating cell suppresses the Shell message, even after the command finishes. If an `asyncio.as_completed` wrapper task finishes before the cell starts consuming its result, that cached-result read does not mark the handle as awaited. A Shell message can still arrive. Await the original handle in the creating cell to suppress it.
 
@@ -80,7 +80,7 @@ test_review = await rlm("Review the test coverage", name="test-reviewer")
 integration_audit = await rlm("Run the slow integration audit", name="integration-audit")
 ```
 
-Results arrive only through explicit `agent_message` replies or files, never as an `rlm()` return value. Children reply when an answer is needed:
+Results arrive only through explicit `agent_message` replies or files, never as an `rlm()` return value. GRIMOIRE delivers these notifications at the next safe tool/turn boundary even when an older sender requests follow-up delivery. They are not editable user drafts, and clearing the draft queue does not discard them. Explicit stops and pauses still prevent execution until resumed. Children reply when an answer is needed:
 
 ```python
 await agent_message.send(message, receiver_role="parent")

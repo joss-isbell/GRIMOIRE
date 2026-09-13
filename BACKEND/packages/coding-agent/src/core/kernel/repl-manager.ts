@@ -9,6 +9,7 @@ import { v4 as uuid } from "uuid";
 import { spawnHidden } from "../../utils/child-process.js";
 import { reapKernelOrphanProcesses, recordOrphanProcessState } from "../orphan-process-journal.js";
 import { ensureKernelPython } from "./bootstrap.js";
+import { kernelPythonEnvironment } from "./python-environment.js";
 import {
 	AGENT_MESSAGE_DISPLAY_MIME,
 	ATTACHMENT_DISPLAY_MIME,
@@ -300,7 +301,7 @@ export class ReplKernelManager {
 					onProgress: startOptions.onBootstrapProgress,
 				}));
 			if (this.startStale(generation)) throw new Error("Kernel start superseded");
-			this.options.python = python;
+			// Keep managed restarts on the revalidation path, not the explicit override path.
 		} catch (error) {
 			if (this.startStale(generation)) throw error; // never touch a newer start's state
 			liveKernels.delete(this);
@@ -317,7 +318,7 @@ export class ReplKernelManager {
 			// bash.py journals its process groups under this pid so the host can
 			// reap them if the runtime dies without running its shutdown hook.
 			env: {
-				...process.env,
+				...kernelPythonEnvironment(),
 				...this.options.env,
 				...(process.platform === "win32" ? { PYTHONUTF8: "1" } : {}),
 				PRIME_AGENT_KERNEL_OWNER_PID: String(process.pid),
