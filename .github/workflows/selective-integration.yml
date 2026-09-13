@@ -5,7 +5,7 @@ on:
 permissions:
   contents: read
 jobs:
-  inspect:
+  python:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -13,27 +13,22 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-      - name: Prepare immutable upstream and test dependencies
+      - uses: astral-sh/setup-uv@v6
+      - name: Prepare pinned Python runtime for sandbox checks
         shell: bash
+        env:
+          UV_PYTHON_INSTALL_DIR: /tmp/grimoire-verification-python
         run: |
           set -euo pipefail
-          mkdir -p /tmp/selective-integration
           git fetch https://github.com/PrimeIntellect-ai/prime-agent.git f771dfcedd684d1afff84ca2c6fa95c7a21efbc2
-          git update-ref refs/heads/upstream-v094 FETCH_HEAD
-          test "$(git rev-parse upstream-v094)" = f771dfcedd684d1afff84ca2c6fa95c7a21efbc2
-          git log --format='%H %s' 9c8230df6..upstream-v094 | tee /tmp/selective-integration/upstream-history.txt
-          git bundle create /tmp/selective-integration/upstream-v094.bundle upstream-v094 ^9c8230df6
-          git worktree add --detach /tmp/upstream-v094 upstream-v094
-          cd /tmp/upstream-v094
-          npm ci
-          tar -czf /tmp/selective-integration/node_modules.tar.gz node_modules
+          git worktree add --detach /tmp/upstream-v094 FETCH_HEAD
+          uv venv /tmp/grimoire-verification-kernel --python 3.11 --seed
+          uv pip install --python /tmp/grimoire-verification-kernel/bin/python /tmp/upstream-v094/prime-agent-runtime dill requests httpx pyyaml tomli python-dotenv pandas numpy scipy beautifulsoup4 lxml pydantic tyro 'mcp>=2,<3'
+          /tmp/grimoire-verification-kernel/bin/python -c 'import rlm.repl; assert rlm.repl.PROTOCOL_VERSION == 3; import dill, pandas, scipy, yaml'
+          tar -C /tmp -czf /tmp/python-verification.tar.gz grimoire-verification-python grimoire-verification-kernel
       - uses: actions/upload-artifact@v4
-        if: always()
         with:
-          name: selective-integration-dependencies
-          path: /tmp/selective-integration
+          name: selective-python-runtime
+          path: /tmp/python-verification.tar.gz
           retention-days: 3
           if-no-files-found: error
