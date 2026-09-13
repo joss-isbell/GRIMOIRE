@@ -1,0 +1,43 @@
+name: Selective integration inspection
+on:
+  push:
+    branches: [vi/selective-integration-tools-20260912]
+    paths: [.github/workflows/selective-integration.yml]
+permissions:
+  contents: write
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          fetch-depth: 0
+      - name: Inspect pinned source and upstream history
+        shell: bash
+        run: |
+          set -euo pipefail
+          base=4cc20de8c9cbd95a554c27ffc84f3f20fb9ba4e1
+          source=ef0497d18607493e02ba5fb02b0ec476bc0445e9
+          git fetch https://github.com/PrimeIntellect-ai/prime-agent.git refs/tags/v0.9.4:refs/tags/vi-upstream-v0.9.4
+          mkdir -p reports
+          {
+            echo '=== Pinned refs ==='
+            git show -s --format='%H %s' "$base" "$source" vi-upstream-v0.9.4
+            echo '=== Source first-parent history ==='
+            git log --first-parent --format='%H %P %s' "$base..$source"
+            echo '=== Kernel / isolation / upstream commits on all refs ==='
+            git log --all --since=2026-09-07 --format='%H %P %s' --regexp-ignore-case --extended-regexp --grep='kernel|isola|repair|0[.]9[.]4|upstream' --max-count=100
+            echo '=== Local-only main commits ==='
+            git log --first-parent --format='%H %P %s' "$source..$base"
+          } > reports/history.txt
+          git show --format=fuller --stat e670c5b1e20dc780f07d20691ee5f49488b4ee7c > reports/checkpoint-stat.txt
+          git diff "$base" "$source" -- BACKEND/packages/coding-agent/src/core/kernel/bootstrap.ts BACKEND/packages/coding-agent/src/core/kernel/boot-gate.ts > reports/kernel.diff
+          git diff "$base" "$source" -- BACKEND/packages/coding-agent/vitest.config.ts BACKEND/packages/coding-agent/vitest.kernel.config.ts BACKEND/packages/coding-agent/vitest.process.config.ts BACKEND/packages/coding-agent/test/setup.ts BACKEND/packages/coding-agent/package.json > reports/tests.diff
+          git diff --name-status "$base" "$source" > reports/changed-files.txt
+          git config user.name 'GRIMOIRE integration bot'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- reports/history.txt reports/checkpoint-stat.txt reports/kernel.diff reports/tests.diff reports/changed-files.txt
+          git commit -m 'chore: record selective-integration inspection results'
+          git push origin HEAD:refs/heads/vi/selective-integration-tools-20260912
+          cat reports/history.txt
