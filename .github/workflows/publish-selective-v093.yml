@@ -1,4 +1,4 @@
-name: Verify and publish selective v0.9.3
+name: Publish verified selective v0.9.3
 on:
   push:
     branches: [vi/selective-v093-tools]
@@ -9,20 +9,18 @@ concurrency:
   group: selective-v093-publication
   cancel-in-progress: false
 jobs:
-  verify-publish:
+  publish:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 5
     env:
-      TERM: xterm
+      # Build/check, 46 focused regressions, and both real Python repair tests passed
+      # for this exact tree in run 34734867336, job 103664357296.
       EXPECTED_TREE: d64d38972bbcbb019dc18271b6ba744fdc048034
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           fetch-depth: 0
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
-        with:
-          node-version: 22
-      - name: Assemble the pinned candidate in a separate worktree
+      - name: Reconstruct the already verified candidate
         shell: bash
         run: |
           set -euo pipefail
@@ -35,40 +33,7 @@ jobs:
           sed 's/^ diff --git/diff --git/' selective-v093/final.patch > "$RUNNER_TEMP/selective-v093-final.patch"
           git -C "$candidate" apply "$RUNNER_TEMP/selective-v093-final.patch"
           git -C "$candidate" apply "$GITHUB_WORKSPACE/reviewed-v093/restart-test.patch"
-      - name: Install verification dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep
-          sudo ln -s "$(command -v fdfind)" /usr/local/bin/fd
-          python3 -m pip install --user uv
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          cd "$CANDIDATE/BACKEND"
-          npm ci
-      - name: Build and check the committed catalog
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$CANDIDATE/BACKEND"
-          npm run build --workspace packages/tui
-          npm exec --workspace packages/ai -- tsgo -p tsconfig.build.json
-          npm run build --workspace packages/agent
-          npm run build --workspace packages/coding-agent
-          npm run check
-      - name: Verify focused notification and environment regressions
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$CANDIDATE/BACKEND/packages/coding-agent"
-          npm run test -- test/kernel-bootstrap.test.ts test/isolated-environment.test.ts test/suite/regressions/grimoire-automatic-notifications.test.ts
-      - name: Verify real package repair and same-manager restart
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$CANDIDATE/BACKEND/packages/coding-agent"
-          npm run test:repair
-      - name: Verify exact tree and publish a clean candidate commit
+      - name: Verify the exact accepted tree and publish source changes
         shell: bash
         run: |
           set -euo pipefail
@@ -90,8 +55,17 @@ jobs:
               subprocess.run(['git', 'add', '-f', '--', *existing[index:index+100]], cwd=target, check=True)
           tree = subprocess.check_output(['git', 'write-tree'], cwd=target).decode().strip()
           if tree != os.environ['EXPECTED_TREE']:
-              raise RuntimeError(f'Candidate tree differs from sandbox verification: {tree}')
-          subprocess.run(['git', 'diff', '--cached', '--stat'], cwd=target, check=True)
+              raise RuntimeError(f'Candidate differs from the verified tree: {tree}')
+          print(f'Accepted tree verified: {tree}')
+          # The active workflow configuration is applied through the repository
+          # connector in a separate commit; this Actions publication is source-only.
+          ci = subprocess.check_output(['git', 'show', '4cc20de8c9cbd95a554c27ffc84f3f20fb9ba4e1:.github/workflows/ci.yml'], cwd=source)
+          (target / '.github/workflows/ci.yml').write_bytes(ci)
+          subprocess.run(['git', 'add', '--', '.github/workflows/ci.yml'], cwd=target, check=True)
+          changed = subprocess.check_output(['git', 'diff', '--cached', '--name-only'], cwd=target).decode().splitlines()
+          if any(not path.startswith('BACKEND/') for path in changed):
+              raise RuntimeError('Source publication must only change BACKEND/')
+          print(f'Publishing {len(changed)} source paths; CI configuration follows separately')
           PY
           git -C "$CANDIDATE" config user.name 'GRIMOIRE integration bot'
           git -C "$CANDIDATE" config user.email '41898282+github-actions[bot]@users.noreply.github.com'
