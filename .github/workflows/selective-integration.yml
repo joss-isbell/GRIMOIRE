@@ -1,48 +1,31 @@
-name: Collect CI failure details
+name: Publish compatibility corrections
 on:
   push:
     branches: [vi/selective-integration-tools-20260912]
     paths: [.github/workflows/selective-integration.yml]
 permissions:
   contents: write
-  actions: read
 jobs:
-  report:
+  publish:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
-      - name: Collect failed-test details
-        env:
-          GH_TOKEN: ${{ github.token }}
+        with:
+          fetch-depth: 0
+      - name: Publish exact sandbox-verified corrections
         run: |
-          python3 - <<'PY'
-          import os, re, urllib.request, urllib.parse
-          from pathlib import Path
-          class SafeRedirect(urllib.request.HTTPRedirectHandler):
-              def redirect_request(self, req, fp, code, msg, headers, newurl):
-                  redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
-                  if redirected is not None and urllib.parse.urlsplit(req.full_url).netloc != urllib.parse.urlsplit(newurl).netloc:
-                      redirected.remove_header('Authorization')
-                  return redirected
-          opener = urllib.request.build_opener(SafeRedirect())
-          sections = []
-          for job in (103660774936, 103660774938, 103660774958, 103660774975):
-              req = urllib.request.Request(f'https://api.github.com/repos/joss-isbell/GRIMOIRE/actions/jobs/{job}/logs', headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
-              with opener.open(req) as response:
-                  text = response.read().decode('utf-8-sig')
-              text = re.sub(r'\x1b\[[0-9;]*m', '', text)
-              start = text.find('Failed Tests')
-              if start < 0: start = text.find('Failed Suites')
-              if start < 0: start = max(0, len(text)-18000)
-              text = text[start:]
-              end = text.find('Post job cleanup.')
-              if end > 0: text = text[:end]
-              sections.append(f'=== JOB {job} ===\n' + text[:30000])
-          Path('reports/ci-failures.txt').write_text('\n\n'.join(sections))
-          PY
+          set -euo pipefail
           git config user.name 'GRIMOIRE integration bot'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -- reports/ci-failures.txt
-          git commit -m 'chore: preserve precise first CI failure evidence'
-          git push origin HEAD:refs/heads/vi/selective-integration-tools-20260912
+          git worktree add -b vi/selective-v094-final-corrections /tmp/candidate 3f6bea170a55c0bb3158b89dc46cb8ddc702cf93
+          cd /tmp/candidate
+          git apply --index --unidiff-zero "$GITHUB_WORKSPACE/integration-kit/ci-compatibility.patch"
+          git diff --cached --check
+          test "$(git write-tree)" = b94b3439a4611f178e4ba5b086a04578f77b5813
+          git commit -m 'fix(coding-agent): preserve encoding compatibility and isolate control-test assumptions'
+          test -z "$(git status --porcelain)"
+          test ! -d integration-kit
+          test ! -e .github/workflows/selective-integration.yml
+          git push origin HEAD:refs/heads/vi/selective-v094-final-corrections
+          git show -s --format='%H %T %s'
