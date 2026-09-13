@@ -1,0 +1,40 @@
+name: Export selective v0.9.3 sources
+on:
+  push:
+    branches: [vi/selective-v093-tools]
+permissions:
+  contents: read
+jobs:
+  sources:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 22
+      - name: Export reviewed development snapshots
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p exports prepared
+          git archive --format=tar.gz 915c78f42c248b08238dd27fcd4bcab32c60beab > exports/upstream-v093.tar.gz
+          git archive --format=tar.gz f771dfcedd684d1afff84ca2c6fa95c7a21efbc2 > exports/upstream-v094.tar.gz
+          git archive --format=tar.gz 4cc20de8c9cbd95a554c27ffc84f3f20fb9ba4e1 > exports/main.tar.gz
+          git archive --format=tar.gz 3cf7964e27883eebb7e484fb8a33bcba266d2bc1 > exports/previous-candidate.tar.gz
+          git diff 9c8230df67b378aaedc032f90e1ae8ba687cfe4a:packages/coding-agent/src/core/kernel/bootstrap.ts ef0497d18607493e02ba5fb02b0ec476bc0445e9:BACKEND/packages/coding-agent/src/core/kernel/bootstrap.ts > exports/source-bootstrap.diff
+          git diff 9c8230df67b378aaedc032f90e1ae8ba687cfe4a:packages/coding-agent/test/setup.ts ef0497d18607493e02ba5fb02b0ec476bc0445e9:BACKEND/packages/coding-agent/test/setup.ts > exports/source-test-setup.diff
+          tar -xzf exports/upstream-v093.tar.gz -C prepared
+      - name: Install pinned JavaScript test dependencies
+        working-directory: prepared
+        run: npm ci --ignore-scripts
+      - name: Package local test dependencies
+        run: tar -czf exports/node_modules.tar.gz -C prepared node_modules
+      - uses: actions/upload-artifact@v4
+        with:
+          name: selective-v093-sources
+          path: exports/
+          retention-days: 3
